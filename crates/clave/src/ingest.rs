@@ -14,6 +14,52 @@ pub struct IngestReport {
     pub rejected: Vec<(String, String)>,
 }
 
+/// WIST-2 §4: `host` MUST be a bare authority (`host[:port]`) — no scheme,
+/// path, query, fragment or userinfo — before it is interpolated into a
+/// fetch URL. This is narrower validation than WIST-1 §2's full Canonical
+/// Host (which forbids a port and requires UTS #46 processing); this
+/// codebase already treats `host` as `host[:port]` throughout (see the
+/// aggregator's own `log_id`), so bare-authority syntax is what's enforced.
+pub fn is_bare_authority(host: &str) -> bool {
+    if host.is_empty()
+        || host
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, '/' | '?' | '#' | '@' | '\\'))
+    {
+        return false;
+    }
+    let Ok(parsed) = url::Url::parse(&format!("http://{host}/")) else {
+        return false;
+    };
+    parsed.host_str().is_some()
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+        && parsed.path() == "/"
+        && parsed.query().is_none()
+        && parsed.fragment().is_none()
+}
+
+fn url_authority(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url).ok()?;
+    let host = parsed.host_str()?;
+    Some(match parsed.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    })
+}
+
+/// WIST-1 §3.2 scope rule: a Delta's `url` authority must equal the
+/// Publisher's `domain` or one of its `subdomain_scope` hostnames.
+fn url_in_scope(url: &str, domain: &str, subdomain_scope: &[String]) -> bool {
+    let Some(authority) = url_authority(url) else {
+        return false;
+    };
+    authority.eq_ignore_ascii_case(domain)
+        || subdomain_scope
+            .iter()
+            .any(|s| authority.eq_ignore_ascii_case(s))
+}
+
 fn record_rejection(
     db: &Db,
     domain: &str,
@@ -31,7 +77,7 @@ fn onboard_publisher(
     base: &str,
     host: &str,
     now: &str,
-) -> Result<Option<(String, String)>> {
+) -> Result<Option<(String, String, Vec<String>)>> {
     let publisher_url = format!("{base}publisher.json");
     let (raw, value) = match client.get_json(&publisher_url) {
         Ok(v) => v,
@@ -78,6 +124,18 @@ fn onboard_publisher(
             return Ok(None);
         }
     };
+    if parsed.publisher.domain != host {
+        record_rejection(
+            db,
+            host,
+            "WIST2-E04",
+            now,
+            None,
+            "publisher declaration domain does not match ping host",
+        )?;
+        return Ok(None);
+    }
+
     let key = match parsed.publisher.keys.first() {
         Some(k) => k,
         None => {
@@ -88,7 +146,11 @@ fn onboard_publisher(
 
     db.record_publisher_declaration(host, &raw, &key.key_id, &key.public_key, &value)?;
 
-    Ok(Some((key.key_id.clone(), key.public_key.clone())))
+    Ok(Some((
+        key.key_id.clone(),
+        key.public_key.clone(),
+        parsed.publisher.subdomain_scope.clone().unwrap_or_default(),
+    )))
 }
 
 pub fn run(
@@ -99,13 +161,19 @@ pub fn run(
     now: &str,
 ) -> Result<IngestReport> {
     let mut report = IngestReport::default();
+    if !is_bare_authority(host) {
+        return Ok(report);
+    }
     let scheme = if client.allow_http() { "http" } else { "https" };
     let base = format!("{scheme}://{host}/.well-known/wist/");
 
-    let public_key_b64u = match db.get_publisher(host)? {
-        Some(row) => row.public_key,
+    let (public_key_b64u, subdomain_scope) = match db.get_publisher(host)? {
+        Some(row) => (
+            row.public_key,
+            db.get_publisher_scope(host)?.unwrap_or_default(),
+        ),
         None => match onboard_publisher(db, client, &base, host, now)? {
-            Some((_, public_key)) => public_key,
+            Some((_, public_key, scope)) => (public_key, scope),
             None => return Ok(report),
         },
     };
@@ -143,6 +211,18 @@ pub fn run(
             return Ok(report);
         }
     };
+
+    if feed_parsed.feed.domain != host {
+        record_rejection(
+            db,
+            host,
+            "WIST2-E01",
+            now,
+            None,
+            "feed domain does not match ping host",
+        )?;
+        return Ok(report);
+    }
 
     let mut chain_pos: i64 = 0;
     for id in &feed_parsed.feed.deltas {
@@ -233,6 +313,20 @@ pub fn run(
             report.rejected.push((id.clone(), "WIST2-E03".to_string()));
             continue;
         }
+
+        if !url_in_scope(&delta_env.delta.url, host, &subdomain_scope) {
+            record_rejection(
+                db,
+                host,
+                "WIST1-E03",
+                now,
+                Some(id.as_str()),
+                "delta url is outside the publisher's authority (scope rule)",
+            )?;
+            report.rejected.push((id.clone(), "WIST1-E03".to_string()));
+            continue;
+        }
+
         let expected_prev = db.url_tip(&delta_env.delta.url)?;
         if delta_env.delta.prev != expected_prev {
             record_rejection(
@@ -325,4 +419,44 @@ pub fn run(
     db.set_publisher_pulled(host, now)?;
 
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_bare_authority_accepts_host_and_host_port() {
+        assert!(is_bare_authority("example.com"));
+        assert!(is_bare_authority("127.0.0.1:8080"));
+        assert!(is_bare_authority("EXAMPLE.com"));
+    }
+
+    #[test]
+    fn is_bare_authority_rejects_scheme_path_query_fragment_userinfo() {
+        assert!(!is_bare_authority(""));
+        assert!(!is_bare_authority("https://example.com"));
+        assert!(!is_bare_authority("example.com/x"));
+        assert!(!is_bare_authority("example.com?x=1"));
+        assert!(!is_bare_authority("example.com#frag"));
+        assert!(!is_bare_authority("trusted.example@evil.example"));
+        assert!(!is_bare_authority("example.com/../../etc/passwd"));
+        assert!(!is_bare_authority("exa mple.com"));
+    }
+
+    #[test]
+    fn url_in_scope_matches_domain_or_subdomain_scope() {
+        assert!(url_in_scope("https://example.com/a", "example.com", &[]));
+        assert!(url_in_scope(
+            "https://blog.example.com/a",
+            "example.com",
+            &["blog.example.com".to_string()]
+        ));
+        assert!(!url_in_scope(
+            "https://other.example/a",
+            "example.com",
+            &["blog.example.com".to_string()]
+        ));
+        assert!(!url_in_scope("not a url", "example.com", &[]));
+    }
 }

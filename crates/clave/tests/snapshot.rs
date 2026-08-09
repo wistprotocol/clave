@@ -1,6 +1,6 @@
 mod common;
 
-use common::{add_delta, make_publisher, serve_static, write_feed};
+use common::{add_delta, make_publisher_with_scope, reserve_addr, serve_static, write_feed};
 use sha2::{Digest, Sha256};
 use wist_core::objects::StateEntry;
 
@@ -20,15 +20,16 @@ fn record_projection(r: &clave::db::RecordRow) -> serde_json::Value {
 
 #[test]
 fn snapshot_build_produces_verifiable_tier0_state_and_signed_artifacts() {
-    let p = make_publisher("127.0.0.1");
+    let (listener, host) = reserve_addr();
+    let p = make_publisher_with_scope(&host, &["example.com"]);
     let id1 = add_delta(&p, "https://example.com/alpha", "alpha body", None);
     write_feed(
         &p,
-        "127.0.0.1",
+        &host,
         std::slice::from_ref(&id1),
         "2026-08-09T12:00:00Z",
     );
-    let host = serve_static(p.dir.path().to_path_buf());
+    serve_static(listener, p.dir.path().to_path_buf());
 
     let data = tempfile::tempdir().unwrap();
     clave::init::run(&host, data.path()).unwrap();
@@ -187,15 +188,16 @@ fn snapshot_build_produces_verifiable_tier0_state_and_signed_artifacts() {
 
 #[test]
 fn snapshot_index_replaces_same_date_entry_on_reseal() {
-    let p = make_publisher("127.0.0.1");
+    let (listener, host) = reserve_addr();
+    let p = make_publisher_with_scope(&host, &["example.com"]);
     let id1 = add_delta(&p, "https://example.com/alpha", "alpha body", None);
     write_feed(
         &p,
-        "127.0.0.1",
+        &host,
         std::slice::from_ref(&id1),
         "2026-08-09T12:00:00Z",
     );
-    let host = serve_static(p.dir.path().to_path_buf());
+    serve_static(listener, p.dir.path().to_path_buf());
 
     let data = tempfile::tempdir().unwrap();
     clave::init::run(&host, data.path()).unwrap();

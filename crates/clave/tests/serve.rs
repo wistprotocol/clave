@@ -1,6 +1,6 @@
 mod common;
 
-use common::{add_delta, make_publisher, serve_static, write_feed};
+use common::{add_delta, make_publisher_with_scope, reserve_addr, serve_static, write_feed};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
@@ -64,6 +64,50 @@ fn ingest_endpoint_and_status_and_static() {
 }
 
 #[test]
+fn serve_exposes_only_public_subtrees() {
+    let tmp = tempfile::tempdir().unwrap();
+    clave::init::run("127.0.0.1:0", tmp.path()).unwrap();
+    std::fs::write(tmp.path().join("log/checkpoint.json"), b"{}").unwrap();
+    let addr = spawn_server(tmp.path());
+    let c = reqwest::blocking::Client::new();
+
+    let r = c.get(format!("{addr}/keys/seed")).send().unwrap();
+    assert_eq!(r.status(), 404, "private signing seed must not be served");
+
+    let r = c.get(format!("{addr}/clave.sqlite")).send().unwrap();
+    assert_eq!(r.status(), 404, "aggregator database must not be served");
+
+    let r = c.get(format!("{addr}/log/checkpoint.json")).send().unwrap();
+    assert_eq!(r.status(), 200);
+
+    let r = c.get(format!("{addr}/anchor.json")).send().unwrap();
+    assert_eq!(r.status(), 200);
+}
+
+#[test]
+fn ingest_rejects_non_bare_authority_host() {
+    let tmp = tempfile::tempdir().unwrap();
+    clave::init::run("127.0.0.1:0", tmp.path()).unwrap();
+    let addr = spawn_server(tmp.path());
+    let c = reqwest::blocking::Client::new();
+
+    for bad in [
+        "example.com/../../etc/passwd",
+        "trusted.example@evil.example",
+        "https://example.com",
+        "example.com#frag",
+        "example.com?x=1",
+    ] {
+        let r = c
+            .post(format!("{addr}/ingest"))
+            .json(&serde_json::json!({"host": bad}))
+            .send()
+            .unwrap();
+        assert_eq!(r.status(), 400, "expected 400 for host {bad:?}");
+    }
+}
+
+#[test]
 fn ingest_rejects_unknown_fields() {
     let tmp = tempfile::tempdir().unwrap();
     clave::init::run("127.0.0.1:0", tmp.path()).unwrap();
@@ -79,15 +123,16 @@ fn ingest_rejects_unknown_fields() {
 
 #[test]
 fn status_reports_last_pull_and_quota_after_ingest() {
-    let p = make_publisher("127.0.0.1");
+    let (listener, host) = reserve_addr();
+    let p = make_publisher_with_scope(&host, &["example.com"]);
     let id1 = add_delta(&p, "https://example.com/a", "alpha body", None);
     write_feed(
         &p,
-        "127.0.0.1",
+        &host,
         std::slice::from_ref(&id1),
         "2026-08-09T12:00:00Z",
     );
-    let host = serve_static(p.dir.path().to_path_buf());
+    serve_static(listener, p.dir.path().to_path_buf());
 
     let tmp = tempfile::tempdir().unwrap();
     clave::init::run("127.0.0.1:0", tmp.path()).unwrap();
