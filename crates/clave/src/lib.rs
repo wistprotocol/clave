@@ -2,6 +2,8 @@
 
 pub mod db;
 pub mod error;
+pub mod fetch;
+pub mod ingest;
 pub mod init;
 pub mod keys;
 
