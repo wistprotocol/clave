@@ -69,8 +69,8 @@ fn seal_produces_verifiable_chain() {
 #[test]
 fn seal_orders_same_type_entries_by_ascending_leaf_hash() {
     let p = make_publisher("127.0.0.1");
-    let id1 = add_delta(&p, "https://example.com/a", "alpha body", None);
-    let id2 = add_delta(&p, "https://example.com/b", "beta body", None);
+    let id1 = add_delta(&p, "https://example.com/a0", "alpha body", None);
+    let id2 = add_delta(&p, "https://example.com/b0", "beta body", None);
     write_feed(
         &p,
         "127.0.0.1",
@@ -126,6 +126,17 @@ fn seal_orders_same_type_entries_by_ascending_leaf_hash() {
     );
     assert!(observed_delta_ids.contains(&id1));
     assert!(observed_delta_ids.contains(&id2));
+
+    let ingestion_order = vec![id1.clone(), id2.clone()];
+    assert_ne!(
+        observed_delta_ids, ingestion_order,
+        "fixture must invert ingestion order so this test cannot pass without a real leaf-hash sort"
+    );
+    assert_eq!(
+        observed_delta_ids,
+        vec![id2, id1],
+        "id2 (ingested second) must sort before id1 (ingested first): its entry's leaf hash is smaller"
+    );
 }
 
 #[test]
