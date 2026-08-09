@@ -1,4 +1,4 @@
-use crate::db::Db;
+use crate::db::{Db, PendingEntryRow, RecordUpsert};
 use crate::error::{Error, Result};
 use crate::WIST_VERSION;
 use serde_json::Value;
@@ -37,6 +37,16 @@ struct DeltaApply {
     prev: Option<String>,
 }
 
+struct OwnedRecordUpsert {
+    url: String,
+    publisher: String,
+    delta_id: String,
+    observed_at: String,
+    title: String,
+    abstract_text: Option<String>,
+    lang: String,
+}
+
 fn entry_type_rank(entry_type: &str) -> usize {
     ENTRY_TYPE_ORDER
         .iter()
@@ -44,9 +54,8 @@ fn entry_type_rank(entry_type: &str) -> usize {
         .unwrap_or(ENTRY_TYPE_ORDER.len())
 }
 
-fn storage_order(db: &Db) -> Result<Vec<SealEntry>> {
-    let mut entries = db
-        .drain_pending_entries()?
+fn storage_order(peeked: Vec<PendingEntryRow>) -> Result<Vec<SealEntry>> {
+    let mut entries = peeked
         .into_iter()
         .map(|p| {
             let wrapped = serde_json::json!({"type": p.entry_type, "body": p.entry_json});
@@ -91,7 +100,10 @@ fn chain_order(mut remaining: Vec<DeltaApply>) -> Vec<DeltaApply> {
     ordered
 }
 
-fn apply_delta_entries(db: &Db, data_dir: &Path, seal_entries: &[SealEntry]) -> Result<()> {
+fn resolve_record_updates(
+    data_dir: &Path,
+    seal_entries: &[SealEntry],
+) -> Result<Vec<OwnedRecordUpsert>> {
     let mut deltas = Vec::new();
     for e in seal_entries {
         if e.entry_type != "publisher_delta" {
@@ -107,6 +119,7 @@ fn apply_delta_entries(db: &Db, data_dir: &Path, seal_entries: &[SealEntry]) -> 
         });
     }
 
+    let mut updates = Vec::new();
     for d in chain_order(deltas) {
         let delta: wist_core::objects::Delta = serde_json::from_value(d.body["delta"].clone())?;
         if !matches!(delta.change_type, ChangeType::New | ChangeType::Update)
@@ -122,18 +135,17 @@ fn apply_delta_entries(db: &Db, data_dir: &Path, seal_entries: &[SealEntry]) -> 
         let Ok(payload) = serde_json::from_slice::<Payload>(&payload_bytes) else {
             continue;
         };
-        db.upsert_record(
-            &delta.url,
-            &d.domain,
-            &d.id,
-            &delta.observed_at,
-            "full",
-            &payload.content.summary.title,
-            payload.content.summary.r#abstract.as_deref(),
-            &delta.meta.lang,
-        )?;
+        updates.push(OwnedRecordUpsert {
+            url: delta.url,
+            publisher: d.domain,
+            delta_id: d.id,
+            observed_at: delta.observed_at,
+            title: payload.content.summary.title,
+            abstract_text: payload.content.summary.r#abstract,
+            lang: delta.meta.lang,
+        });
     }
-    Ok(())
+    Ok(updates)
 }
 
 pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<SealReport> {
@@ -157,7 +169,8 @@ pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<
         None => (0, "sha256:genesis".to_string()),
     };
 
-    let seal_entries = storage_order(db)?;
+    let (peeked, up_to_rowid) = db.peek_pending_entries()?;
+    let seal_entries = storage_order(peeked)?;
     let entries: Vec<Value> = seal_entries.iter().map(|e| e.wrapped.clone()).collect();
     let leaves: Vec<[u8; 32]> = seal_entries.iter().map(|e| e.leaf).collect();
     let entry_count = entries.len() as u64;
@@ -190,6 +203,8 @@ pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<
         },
     };
 
+    let record_updates = resolve_record_updates(data_dir, &seal_entries)?;
+
     let blocks_dir = data_dir.join("log/blocks");
     std::fs::create_dir_all(&blocks_dir)?;
     let block_bytes = serde_json::to_vec(&block)?;
@@ -198,8 +213,6 @@ pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<
         blocks_dir.join(format!("{block_number:09}.json.zst")),
         &compressed,
     )?;
-
-    db.insert_block(block_number, &block_hash, &sealed_at)?;
 
     let checkpoint = Checkpoint {
         wist_version: WIST_VERSION.into(),
@@ -218,7 +231,20 @@ pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<
         &checkpoint_bytes,
     )?;
 
-    apply_delta_entries(db, data_dir, &seal_entries)?;
+    let records: Vec<RecordUpsert> = record_updates
+        .iter()
+        .map(|r| RecordUpsert {
+            url: &r.url,
+            publisher: &r.publisher,
+            delta_id: &r.delta_id,
+            observed_at: &r.observed_at,
+            weight: "full",
+            title: &r.title,
+            abstract_text: r.abstract_text.as_deref(),
+            lang: &r.lang,
+        })
+        .collect();
+    db.commit_seal(up_to_rowid, block_number, &block_hash, &sealed_at, &records)?;
 
     let snapshot_date = sealed_at.get(..10).unwrap_or(&sealed_at).to_string();
     crate::snapshot::build(db, data_dir, sk, block_number, &block_hash, &snapshot_date)?;
