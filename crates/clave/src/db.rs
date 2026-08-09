@@ -2,6 +2,7 @@ use crate::error::{Error, Result};
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::Value;
 use std::path::Path;
+use wist_core::objects::{PublisherState, StatusRejection};
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS publishers(domain TEXT PRIMARY KEY, declaration_json BLOB NOT NULL, key_id TEXT NOT NULL, public_key TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'new', last_pull_at TEXT);
@@ -23,6 +24,11 @@ pub struct PendingEntry {
     pub entry_type: String,
     pub domain: String,
     pub entry_json: Value,
+}
+
+pub struct PublisherStatusRow {
+    pub last_pull_at: Option<String>,
+    pub state: PublisherState,
 }
 
 fn exec_insert_publisher(
@@ -236,6 +242,42 @@ impl Db {
         Ok(())
     }
 
+    pub fn get_publisher_status(&self, domain: &str) -> Result<Option<PublisherStatusRow>> {
+        let row: Option<(Option<String>, String)> = self
+            .conn
+            .query_row(
+                "SELECT last_pull_at, state FROM publishers WHERE domain = ?1",
+                [domain],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(Error::Db)?;
+        row.map(|(last_pull_at, state)| {
+            Ok(PublisherStatusRow {
+                last_pull_at,
+                state: serde_json::from_value(Value::String(state))?,
+            })
+        })
+        .transpose()
+    }
+
+    pub fn list_rejections(&self, domain: &str) -> Result<Vec<StatusRejection>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT code, at, delta_id, detail FROM rejections WHERE domain = ?1 ORDER BY rowid DESC",
+        )?;
+        let rows = stmt
+            .query_map([domain], |row| {
+                Ok(StatusRejection {
+                    code: row.get(0)?,
+                    at: row.get(1)?,
+                    delta_id: row.get(2)?,
+                    detail: row.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     pub fn insert_rejection(
         &self,
         domain: &str,
@@ -418,6 +460,51 @@ mod tests {
         assert_eq!(entries[2].entry_json, serde_json::json!({"n": 2}));
 
         assert!(db.drain_pending_entries().unwrap().is_empty());
+    }
+
+    #[test]
+    fn get_publisher_status_none_for_unknown_row_for_known() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+        assert!(db.get_publisher_status("example.com").unwrap().is_none());
+        db.insert_publisher("example.com", b"{}", "k1", "pk")
+            .unwrap();
+        let row = db.get_publisher_status("example.com").unwrap().unwrap();
+        assert!(row.last_pull_at.is_none());
+        assert!(matches!(row.state, PublisherState::New));
+        db.set_publisher_pulled("example.com", "2026-08-09T00:00:00Z")
+            .unwrap();
+        let row = db.get_publisher_status("example.com").unwrap().unwrap();
+        assert_eq!(row.last_pull_at.as_deref(), Some("2026-08-09T00:00:00Z"));
+        assert!(matches!(row.state, PublisherState::Active));
+    }
+
+    #[test]
+    fn list_rejections_orders_newest_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+        assert!(db.list_rejections("example.com").unwrap().is_empty());
+        db.insert_rejection(
+            "example.com",
+            "WIST2-E01",
+            "2026-08-09T00:00:00Z",
+            None,
+            None,
+        )
+        .unwrap();
+        db.insert_rejection(
+            "example.com",
+            "WIST2-E03",
+            "2026-08-09T00:01:00Z",
+            Some("sha256:abc"),
+            Some("bad commitment"),
+        )
+        .unwrap();
+        let rejections = db.list_rejections("example.com").unwrap();
+        assert_eq!(rejections.len(), 2);
+        assert_eq!(rejections[0].code, "WIST2-E03");
+        assert_eq!(rejections[0].delta_id.as_deref(), Some("sha256:abc"));
+        assert_eq!(rejections[1].code, "WIST2-E01");
     }
 
     #[test]

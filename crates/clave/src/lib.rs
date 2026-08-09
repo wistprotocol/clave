@@ -6,6 +6,7 @@ pub mod fetch;
 pub mod ingest;
 pub mod init;
 pub mod keys;
+pub mod serve;
 
 pub use error::Error;
 
