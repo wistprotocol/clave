@@ -20,6 +20,8 @@ pub enum Error {
     Fetch(String),
     #[error("seal: {0}")]
     Seal(String),
+    #[error("snapshot: {0}")]
+    Snapshot(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

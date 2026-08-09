@@ -48,6 +48,11 @@ pub struct RecordRow {
     pub lang: String,
 }
 
+pub struct PublisherListRow {
+    pub domain: String,
+    pub declaration_json: Vec<u8>,
+}
+
 pub struct PendingEntryRow {
     pub rowid: i64,
     pub entry_type: String,
@@ -350,6 +355,42 @@ impl Db {
             )
             .optional()
             .map_err(Error::Db)
+    }
+
+    pub fn list_records(&self) -> Result<Vec<RecordRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT url, publisher, delta_id, observed_at, weight, title, abstract, lang FROM records ORDER BY publisher, url",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(RecordRow {
+                    url: row.get(0)?,
+                    publisher: row.get(1)?,
+                    delta_id: row.get(2)?,
+                    observed_at: row.get(3)?,
+                    weight: row.get(4)?,
+                    title: row.get(5)?,
+                    abstract_text: row.get(6)?,
+                    lang: row.get(7)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn list_publishers(&self) -> Result<Vec<PublisherListRow>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT domain, declaration_json FROM publishers ORDER BY domain")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(PublisherListRow {
+                    domain: row.get(0)?,
+                    declaration_json: row.get(1)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     pub fn url_tip(&self, url: &str) -> Result<Option<String>> {
