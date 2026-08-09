@@ -86,8 +86,7 @@ fn onboard_publisher(
         }
     };
 
-    db.insert_publisher(host, &raw, &key.key_id, &key.public_key)?;
-    db.insert_pending_entry("publisher_declaration", host, &value, 0)?;
+    db.record_publisher_declaration(host, &raw, &key.key_id, &key.public_key, &value)?;
 
     Ok(Some((key.key_id.clone(), key.public_key.clone())))
 }
@@ -318,9 +317,7 @@ pub fn run(
             std::fs::write(payloads_dir.join(format!("{hex}.json")), &payload_raw)?;
         }
 
-        db.insert_seen_delta(id, host)?;
-        db.insert_pending_entry("publisher_delta", host, &delta_value, chain_pos)?;
-        db.set_url_tip(&delta_env.delta.url, host, id)?;
+        db.record_accepted_delta(host, id, &delta_value, chain_pos, &delta_env.delta.url, id)?;
         report.accepted.push(id.clone());
         chain_pos += 1;
     }
