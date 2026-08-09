@@ -1,11 +1,14 @@
 mod common;
 
-use common::{add_delta, make_publisher, serve_static, write_feed};
+use common::{
+    add_delta, make_publisher, make_publisher_with_scope, reserve_addr, serve_static, write_feed,
+};
 use std::fs;
 
 #[test]
 fn ingest_accepts_valid_and_rejects_bad_commitment() {
-    let p = make_publisher("127.0.0.1");
+    let (listener, host) = reserve_addr();
+    let p = make_publisher_with_scope(&host, &["example.com"]);
     let id1 = add_delta(&p, "https://example.com/a", "alpha body", None);
     let id2 = add_delta(&p, "https://example.com/b", "beta body", None);
     let hex2 = id2.strip_prefix("sha256:").unwrap().to_string();
@@ -18,11 +21,11 @@ fn ingest_accepts_valid_and_rejects_bad_commitment() {
     fs::write(&bad, serde_json::to_vec(&v).unwrap()).unwrap();
     write_feed(
         &p,
-        "127.0.0.1",
+        &host,
         &[id1.clone(), id2.clone()],
         "2026-08-09T12:00:00Z",
     );
-    let host = serve_static(p.dir.path().to_path_buf());
+    serve_static(listener, p.dir.path().to_path_buf());
 
     let tmp = tempfile::tempdir().unwrap();
     clave::init::run(&host, tmp.path()).unwrap();
@@ -63,15 +66,16 @@ fn ingest_accepts_valid_and_rejects_bad_commitment() {
 
 #[test]
 fn drain_pending_entries_orders_declaration_then_deltas_across_passes() {
-    let p = make_publisher("127.0.0.1");
+    let (listener, host) = reserve_addr();
+    let p = make_publisher_with_scope(&host, &["example.com"]);
     let id1 = add_delta(&p, "https://example.com/a", "alpha body", None);
     write_feed(
         &p,
-        "127.0.0.1",
+        &host,
         std::slice::from_ref(&id1),
         "2026-08-09T12:00:00Z",
     );
-    let host = serve_static(p.dir.path().to_path_buf());
+    serve_static(listener, p.dir.path().to_path_buf());
 
     let tmp = tempfile::tempdir().unwrap();
     clave::init::run(&host, tmp.path()).unwrap();
@@ -85,7 +89,7 @@ fn drain_pending_entries_orders_declaration_then_deltas_across_passes() {
     let id2 = add_delta(&p, "https://example.com/a", "alpha body v2", Some(&id1));
     write_feed(
         &p,
-        "127.0.0.1",
+        &host,
         &[id1.clone(), id2.clone()],
         "2026-08-09T12:00:10Z",
     );
@@ -108,4 +112,111 @@ fn drain_pending_entries_orders_declaration_then_deltas_across_passes() {
     );
 
     assert!(db.drain_pending_entries().unwrap().is_empty());
+}
+
+#[test]
+fn ingest_rejects_publisher_domain_mismatch() {
+    let (listener, host) = reserve_addr();
+    let p = make_publisher("not-the-host.example");
+    let id1 = add_delta(&p, "https://not-the-host.example/a", "alpha body", None);
+    write_feed(
+        &p,
+        "not-the-host.example",
+        std::slice::from_ref(&id1),
+        "2026-08-09T12:00:00Z",
+    );
+    serve_static(listener, p.dir.path().to_path_buf());
+
+    let tmp = tempfile::tempdir().unwrap();
+    clave::init::run(&host, tmp.path()).unwrap();
+    let db = clave::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+    let client = clave::fetch::Client::new(true);
+
+    let report =
+        clave::ingest::run(&db, &client, tmp.path(), &host, "2026-08-09T12:00:05Z").unwrap();
+
+    assert!(report.accepted.is_empty());
+    assert!(db.get_publisher(&host).unwrap().is_none());
+    let rejections = db.list_rejections(&host).unwrap();
+    assert_eq!(rejections.len(), 1);
+    assert_eq!(rejections[0].code, "WIST2-E04");
+}
+
+#[test]
+fn ingest_rejects_feed_domain_mismatch() {
+    let (listener, host) = reserve_addr();
+    let p = make_publisher_with_scope(&host, &["example.com"]);
+    let id1 = add_delta(&p, "https://example.com/a", "alpha body", None);
+    write_feed(
+        &p,
+        "different.example",
+        std::slice::from_ref(&id1),
+        "2026-08-09T12:00:00Z",
+    );
+    serve_static(listener, p.dir.path().to_path_buf());
+
+    let tmp = tempfile::tempdir().unwrap();
+    clave::init::run(&host, tmp.path()).unwrap();
+    let db = clave::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+    let client = clave::fetch::Client::new(true);
+
+    let report =
+        clave::ingest::run(&db, &client, tmp.path(), &host, "2026-08-09T12:00:05Z").unwrap();
+
+    assert!(report.accepted.is_empty());
+    assert!(
+        db.get_publisher(&host).unwrap().is_some(),
+        "onboarding itself succeeds; only the feed pull is rejected"
+    );
+    let rejections = db.list_rejections(&host).unwrap();
+    assert_eq!(rejections[0].code, "WIST2-E01");
+}
+
+#[test]
+fn ingest_rejects_delta_url_outside_publisher_scope() {
+    let (listener, host) = reserve_addr();
+    let p = make_publisher(&host);
+    let id1 = add_delta(&p, "https://not-in-scope.example/a", "alpha body", None);
+    write_feed(
+        &p,
+        &host,
+        std::slice::from_ref(&id1),
+        "2026-08-09T12:00:00Z",
+    );
+    serve_static(listener, p.dir.path().to_path_buf());
+
+    let tmp = tempfile::tempdir().unwrap();
+    clave::init::run(&host, tmp.path()).unwrap();
+    let db = clave::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+    let client = clave::fetch::Client::new(true);
+
+    let report =
+        clave::ingest::run(&db, &client, tmp.path(), &host, "2026-08-09T12:00:05Z").unwrap();
+
+    assert!(report.accepted.is_empty());
+    assert_eq!(report.rejected, vec![(id1, "WIST1-E03".to_string())]);
+}
+
+#[test]
+fn ingest_accepts_delta_url_within_subdomain_scope() {
+    let (listener, host) = reserve_addr();
+    let p = make_publisher_with_scope(&host, &["scoped.example"]);
+    let id1 = add_delta(&p, "https://scoped.example/a", "alpha body", None);
+    write_feed(
+        &p,
+        &host,
+        std::slice::from_ref(&id1),
+        "2026-08-09T12:00:00Z",
+    );
+    serve_static(listener, p.dir.path().to_path_buf());
+
+    let tmp = tempfile::tempdir().unwrap();
+    clave::init::run(&host, tmp.path()).unwrap();
+    let db = clave::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+    let client = clave::fetch::Client::new(true);
+
+    let report =
+        clave::ingest::run(&db, &client, tmp.path(), &host, "2026-08-09T12:00:05Z").unwrap();
+
+    assert_eq!(report.accepted, vec![id1]);
 }

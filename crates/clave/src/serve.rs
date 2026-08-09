@@ -1,7 +1,7 @@
 use crate::db::Db;
 use crate::error::{Error, Result};
 use crate::fetch::Client;
-use crate::ingest;
+use crate::ingest::{self, is_bare_authority};
 use crate::WIST_VERSION;
 use axum::body::Bytes;
 use axum::extract::{Path, State};
@@ -13,7 +13,7 @@ use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
-use tower_http::services::ServeDir;
+use tower_http::services::{ServeDir, ServeFile};
 use wist_core::objects::Status;
 
 #[derive(Clone)]
@@ -55,6 +55,9 @@ async fn ingest_handler(State(state): State<AppState>, body: Bytes) -> StatusCod
         Ok(p) => p,
         Err(_) => return StatusCode::BAD_REQUEST,
     };
+    if !is_bare_authority(&payload.host) {
+        return StatusCode::BAD_REQUEST;
+    }
     let now = now_utc();
     let db = state.db.clone();
     let client = state.client.clone();
@@ -92,7 +95,10 @@ pub fn run(data_dir: PathBuf, db_path: PathBuf, bind: SocketAddr, allow_http: bo
     let app = Router::new()
         .route("/ingest", post(ingest_handler))
         .route("/status/:domain", get(status_handler))
-        .fallback_service(ServeDir::new(data_dir))
+        .nest_service("/log", ServeDir::new(data_dir.join("log")))
+        .nest_service("/payloads", ServeDir::new(data_dir.join("payloads")))
+        .nest_service("/snapshots", ServeDir::new(data_dir.join("snapshots")))
+        .route_service("/anchor.json", ServeFile::new(data_dir.join("anchor.json")))
         .with_state(state);
 
     let rt = tokio::runtime::Runtime::new()?;

@@ -180,6 +180,26 @@ impl Db {
             .map_err(Error::Db)
     }
 
+    pub fn get_publisher_scope(&self, domain: &str) -> Result<Option<Vec<String>>> {
+        let blob: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT declaration_json FROM publishers WHERE domain = ?1",
+                [domain],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Error::Db)?;
+        let Some(blob) = blob else {
+            return Ok(None);
+        };
+        let doc: Value = serde_json::from_slice(&blob)?;
+        Ok(doc
+            .pointer("/publisher/subdomain_scope")
+            .cloned()
+            .and_then(|v| serde_json::from_value(v).ok()))
+    }
+
     pub fn insert_publisher(
         &self,
         domain: &str,

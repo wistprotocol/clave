@@ -1,18 +1,19 @@
 mod common;
 
-use common::{add_delta, make_publisher, serve_static, write_feed};
+use common::{add_delta, make_publisher_with_scope, reserve_addr, serve_static, write_feed};
 
 #[test]
 fn seal_produces_verifiable_chain() {
-    let p = make_publisher("127.0.0.1");
+    let (listener, host) = reserve_addr();
+    let p = make_publisher_with_scope(&host, &["example.com"]);
     let id1 = add_delta(&p, "https://example.com/a", "alpha body", None);
     write_feed(
         &p,
-        "127.0.0.1",
+        &host,
         std::slice::from_ref(&id1),
         "2026-08-09T12:00:00Z",
     );
-    let host = serve_static(p.dir.path().to_path_buf());
+    serve_static(listener, p.dir.path().to_path_buf());
 
     let data = tempfile::tempdir().unwrap();
     clave::init::run(&host, data.path()).unwrap();
@@ -68,16 +69,17 @@ fn seal_produces_verifiable_chain() {
 
 #[test]
 fn seal_orders_same_type_entries_by_ascending_leaf_hash() {
-    let p = make_publisher("127.0.0.1");
+    let (listener, host) = reserve_addr();
+    let p = make_publisher_with_scope(&host, &["example.com"]);
     let id1 = add_delta(&p, "https://example.com/a0", "alpha body", None);
     let id2 = add_delta(&p, "https://example.com/b0", "beta body", None);
     write_feed(
         &p,
-        "127.0.0.1",
+        &host,
         &[id1.clone(), id2.clone()],
         "2026-08-09T12:00:00Z",
     );
-    let host = serve_static(p.dir.path().to_path_buf());
+    serve_static(listener, p.dir.path().to_path_buf());
 
     let data = tempfile::tempdir().unwrap();
     clave::init::run(&host, data.path()).unwrap();
@@ -141,16 +143,17 @@ fn seal_orders_same_type_entries_by_ascending_leaf_hash() {
 
 #[test]
 fn seal_applies_chained_deltas_in_chain_order_regardless_of_storage_order() {
-    let p = make_publisher("127.0.0.1");
+    let (listener, host) = reserve_addr();
+    let p = make_publisher_with_scope(&host, &["example.com"]);
     let id1 = add_delta(&p, "https://example.com/a0", "first content", None);
     let id2 = add_delta(&p, "https://example.com/a0", "second content", Some(&id1));
     write_feed(
         &p,
-        "127.0.0.1",
+        &host,
         &[id1.clone(), id2.clone()],
         "2026-08-09T12:00:00Z",
     );
-    let host = serve_static(p.dir.path().to_path_buf());
+    serve_static(listener, p.dir.path().to_path_buf());
 
     let data = tempfile::tempdir().unwrap();
     clave::init::run(&host, data.path()).unwrap();
