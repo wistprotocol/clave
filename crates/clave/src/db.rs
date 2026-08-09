@@ -19,6 +19,57 @@ pub struct PublisherRow {
     pub public_key: String,
 }
 
+pub struct PendingEntry {
+    pub entry_type: String,
+    pub domain: String,
+    pub entry_json: Value,
+}
+
+fn exec_insert_publisher(
+    conn: &Connection,
+    domain: &str,
+    declaration_json: &[u8],
+    key_id: &str,
+    public_key: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO publishers(domain, declaration_json, key_id, public_key) VALUES (?1, ?2, ?3, ?4)",
+        (domain, declaration_json, key_id, public_key),
+    )?;
+    Ok(())
+}
+
+fn exec_insert_pending_entry(
+    conn: &Connection,
+    entry_type: &str,
+    domain: &str,
+    entry_json: &Value,
+    chain_pos: i64,
+) -> Result<()> {
+    let bytes = serde_json::to_vec(entry_json)?;
+    conn.execute(
+        "INSERT INTO pending_entries(entry_type, domain, entry_json, chain_pos) VALUES (?1, ?2, ?3, ?4)",
+        (entry_type, domain, bytes, chain_pos),
+    )?;
+    Ok(())
+}
+
+fn exec_insert_seen_delta(conn: &Connection, delta_id: &str, domain: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO seen_deltas(delta_id, domain) VALUES (?1, ?2)",
+        (delta_id, domain),
+    )?;
+    Ok(())
+}
+
+fn exec_set_url_tip(conn: &Connection, url: &str, domain: &str, tip: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO url_tips(url, domain, tip) VALUES (?1, ?2, ?3) ON CONFLICT(url) DO UPDATE SET tip = excluded.tip, domain = excluded.domain",
+        (url, domain, tip),
+    )?;
+    Ok(())
+}
+
 pub struct Db {
     conn: Connection,
 }
@@ -72,10 +123,21 @@ impl Db {
         key_id: &str,
         public_key: &str,
     ) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO publishers(domain, declaration_json, key_id, public_key) VALUES (?1, ?2, ?3, ?4)",
-            (domain, declaration_json, key_id, public_key),
-        )?;
+        exec_insert_publisher(&self.conn, domain, declaration_json, key_id, public_key)
+    }
+
+    pub fn record_publisher_declaration(
+        &self,
+        domain: &str,
+        declaration_json: &[u8],
+        key_id: &str,
+        public_key: &str,
+        entry_json: &Value,
+    ) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        exec_insert_publisher(&tx, domain, declaration_json, key_id, public_key)?;
+        exec_insert_pending_entry(&tx, "publisher_declaration", domain, entry_json, 0)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -100,11 +162,7 @@ impl Db {
     }
 
     pub fn insert_seen_delta(&self, delta_id: &str, domain: &str) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO seen_deltas(delta_id, domain) VALUES (?1, ?2)",
-            (delta_id, domain),
-        )?;
-        Ok(())
+        exec_insert_seen_delta(&self.conn, delta_id, domain)
     }
 
     pub fn insert_pending_entry(
@@ -114,12 +172,7 @@ impl Db {
         entry_json: &Value,
         chain_pos: i64,
     ) -> Result<()> {
-        let bytes = serde_json::to_vec(entry_json)?;
-        self.conn.execute(
-            "INSERT INTO pending_entries(entry_type, domain, entry_json, chain_pos) VALUES (?1, ?2, ?3, ?4)",
-            (entry_type, domain, bytes, chain_pos),
-        )?;
-        Ok(())
+        exec_insert_pending_entry(&self.conn, entry_type, domain, entry_json, chain_pos)
     }
 
     pub fn count_pending_entries(&self, entry_type: &str) -> Result<i64> {
@@ -132,6 +185,27 @@ impl Db {
             .map_err(Error::Db)
     }
 
+    pub fn drain_pending_entries(&self) -> Result<Vec<PendingEntry>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut stmt = tx
+            .prepare("SELECT entry_type, domain, entry_json FROM pending_entries ORDER BY rowid")?;
+        let rows: Vec<(String, String, Vec<u8>)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        drop(stmt);
+        tx.execute("DELETE FROM pending_entries", [])?;
+        tx.commit()?;
+        rows.into_iter()
+            .map(|(entry_type, domain, blob)| {
+                Ok(PendingEntry {
+                    entry_type,
+                    domain,
+                    entry_json: serde_json::from_slice(&blob)?,
+                })
+            })
+            .collect()
+    }
+
     pub fn url_tip(&self, url: &str) -> Result<Option<String>> {
         self.conn
             .query_row("SELECT tip FROM url_tips WHERE url = ?1", [url], |row| {
@@ -142,10 +216,23 @@ impl Db {
     }
 
     pub fn set_url_tip(&self, url: &str, domain: &str, tip: &str) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO url_tips(url, domain, tip) VALUES (?1, ?2, ?3) ON CONFLICT(url) DO UPDATE SET tip = excluded.tip, domain = excluded.domain",
-            (url, domain, tip),
-        )?;
+        exec_set_url_tip(&self.conn, url, domain, tip)
+    }
+
+    pub fn record_accepted_delta(
+        &self,
+        domain: &str,
+        delta_id: &str,
+        entry_json: &Value,
+        chain_pos: i64,
+        url: &str,
+        tip: &str,
+    ) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        exec_insert_seen_delta(&tx, delta_id, domain)?;
+        exec_insert_pending_entry(&tx, "publisher_delta", domain, entry_json, chain_pos)?;
+        exec_set_url_tip(&tx, url, domain, tip)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -248,6 +335,89 @@ mod tests {
             db.url_tip("https://example.com/a").unwrap().unwrap(),
             "sha256:2"
         );
+    }
+
+    #[test]
+    fn record_publisher_declaration_is_atomic_on_conflict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+        db.record_publisher_declaration("example.com", b"{}", "k1", "pk", &Value::Null)
+            .unwrap();
+        assert_eq!(
+            db.count_pending_entries("publisher_declaration").unwrap(),
+            1
+        );
+        assert!(db
+            .record_publisher_declaration("example.com", b"{}", "k1", "pk", &Value::Null)
+            .is_err());
+        assert_eq!(
+            db.count_pending_entries("publisher_declaration").unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn record_accepted_delta_is_atomic_on_conflict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+        db.record_accepted_delta(
+            "example.com",
+            "sha256:a",
+            &Value::Null,
+            0,
+            "https://example.com/x",
+            "sha256:a",
+        )
+        .unwrap();
+        assert_eq!(db.count_pending_entries("publisher_delta").unwrap(), 1);
+        assert!(db
+            .record_accepted_delta(
+                "example.com",
+                "sha256:a",
+                &Value::Null,
+                1,
+                "https://example.com/y",
+                "sha256:a",
+            )
+            .is_err());
+        assert_eq!(db.count_pending_entries("publisher_delta").unwrap(), 1);
+        assert!(db.url_tip("https://example.com/y").unwrap().is_none());
+    }
+
+    #[test]
+    fn drain_pending_entries_orders_by_rowid_and_empties_table() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+        db.record_publisher_declaration("example.com", b"{}", "k1", "pk", &Value::Null)
+            .unwrap();
+        db.record_accepted_delta(
+            "example.com",
+            "sha256:a",
+            &serde_json::json!({"n": 1}),
+            0,
+            "https://example.com/x",
+            "sha256:a",
+        )
+        .unwrap();
+        db.record_accepted_delta(
+            "example.com",
+            "sha256:b",
+            &serde_json::json!({"n": 2}),
+            0,
+            "https://example.com/y",
+            "sha256:b",
+        )
+        .unwrap();
+
+        let entries = db.drain_pending_entries().unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].entry_type, "publisher_declaration");
+        assert_eq!(entries[1].entry_type, "publisher_delta");
+        assert_eq!(entries[1].entry_json, serde_json::json!({"n": 1}));
+        assert_eq!(entries[2].entry_type, "publisher_delta");
+        assert_eq!(entries[2].entry_json, serde_json::json!({"n": 2}));
+
+        assert!(db.drain_pending_entries().unwrap().is_empty());
     }
 
     #[test]
