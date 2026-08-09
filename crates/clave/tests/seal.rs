@@ -63,4 +63,5 @@ fn seal_produces_verifiable_chain() {
             .as_str(),
     )
     .unwrap();
+    wist_core::block::verify_block(&b1, &sk.public()).unwrap();
 }
