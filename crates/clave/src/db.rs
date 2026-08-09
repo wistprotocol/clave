@@ -48,6 +48,24 @@ pub struct RecordRow {
     pub lang: String,
 }
 
+pub struct PendingEntryRow {
+    pub rowid: i64,
+    pub entry_type: String,
+    pub domain: String,
+    pub entry_json: Value,
+}
+
+pub struct RecordUpsert<'a> {
+    pub url: &'a str,
+    pub publisher: &'a str,
+    pub delta_id: &'a str,
+    pub observed_at: &'a str,
+    pub weight: &'a str,
+    pub title: &'a str,
+    pub abstract_text: Option<&'a str>,
+    pub lang: &'a str,
+}
+
 fn exec_insert_publisher(
     conn: &Connection,
     domain: &str,
@@ -89,6 +107,24 @@ fn exec_set_url_tip(conn: &Connection, url: &str, domain: &str, tip: &str) -> Re
     conn.execute(
         "INSERT INTO url_tips(url, domain, tip) VALUES (?1, ?2, ?3) ON CONFLICT(url) DO UPDATE SET tip = excluded.tip, domain = excluded.domain",
         (url, domain, tip),
+    )?;
+    Ok(())
+}
+
+fn exec_upsert_record(conn: &Connection, r: &RecordUpsert) -> Result<()> {
+    conn.execute(
+        "INSERT INTO records(url, publisher, delta_id, observed_at, weight, title, abstract, lang) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(url, publisher) DO UPDATE SET delta_id = excluded.delta_id, observed_at = excluded.observed_at, weight = excluded.weight, title = excluded.title, abstract = excluded.abstract, lang = excluded.lang",
+        (
+            r.url,
+            r.publisher,
+            r.delta_id,
+            r.observed_at,
+            r.weight,
+            r.title,
+            r.abstract_text,
+            r.lang,
+        ),
     )?;
     Ok(())
 }
@@ -246,31 +282,51 @@ impl Db {
             .map_err(Error::Db)
     }
 
-    pub fn insert_block(&self, block_number: u64, block_hash: &str, sealed_at: &str) -> Result<()> {
-        self.conn.execute(
+    pub fn peek_pending_entries(&self) -> Result<(Vec<PendingEntryRow>, i64)> {
+        let mut stmt = self.conn.prepare(
+            "SELECT rowid, entry_type, domain, entry_json FROM pending_entries ORDER BY rowid ASC",
+        )?;
+        let rows: Vec<(i64, String, String, Vec<u8>)> = stmt
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        let max_rowid = rows.iter().map(|(rowid, ..)| *rowid).max().unwrap_or(0);
+        let entries = rows
+            .into_iter()
+            .map(|(rowid, entry_type, domain, blob)| {
+                Ok(PendingEntryRow {
+                    rowid,
+                    entry_type,
+                    domain,
+                    entry_json: serde_json::from_slice(&blob)?,
+                })
+            })
+            .collect::<Result<_>>()?;
+        Ok((entries, max_rowid))
+    }
+
+    pub fn commit_seal(
+        &self,
+        up_to_rowid: i64,
+        block_number: u64,
+        block_hash: &str,
+        sealed_at: &str,
+        records: &[RecordUpsert],
+    ) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM pending_entries WHERE rowid <= ?1",
+            [up_to_rowid],
+        )?;
+        tx.execute(
             "INSERT INTO blocks(block_number, block_hash, sealed_at) VALUES (?1, ?2, ?3)",
             (block_number as i64, block_hash, sealed_at),
         )?;
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn upsert_record(
-        &self,
-        url: &str,
-        publisher: &str,
-        delta_id: &str,
-        observed_at: &str,
-        weight: &str,
-        title: &str,
-        abstract_text: Option<&str>,
-        lang: &str,
-    ) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO records(url, publisher, delta_id, observed_at, weight, title, abstract, lang) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-             ON CONFLICT(url, publisher) DO UPDATE SET delta_id = excluded.delta_id, observed_at = excluded.observed_at, weight = excluded.weight, title = excluded.title, abstract = excluded.abstract, lang = excluded.lang",
-            (url, publisher, delta_id, observed_at, weight, title, abstract_text, lang),
-        )?;
+        for r in records {
+            exec_upsert_record(&tx, r)?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -544,6 +600,111 @@ mod tests {
         assert_eq!(entries[2].entry_json, serde_json::json!({"n": 2}));
 
         assert!(db.drain_pending_entries().unwrap().is_empty());
+    }
+
+    #[test]
+    fn peek_pending_entries_orders_without_deleting_then_commit_seal_drains_up_to_rowid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+        db.record_publisher_declaration("example.com", b"{}", "k1", "pk", &Value::Null)
+            .unwrap();
+        db.record_accepted_delta(
+            "example.com",
+            "sha256:a",
+            &serde_json::json!({"n": 1}),
+            0,
+            "https://example.com/x",
+            "sha256:a",
+        )
+        .unwrap();
+
+        let (peeked, up_to) = db.peek_pending_entries().unwrap();
+        assert_eq!(peeked.len(), 2);
+        assert_eq!(peeked[0].entry_type, "publisher_declaration");
+        assert_eq!(peeked[1].entry_type, "publisher_delta");
+        assert_eq!(up_to, peeked[1].rowid);
+        let (peeked_again, _) = db.peek_pending_entries().unwrap();
+        assert_eq!(peeked_again.len(), 2);
+
+        db.commit_seal(
+            up_to,
+            0,
+            "sha256:blockhash0",
+            "2026-08-09T00:00:00Z",
+            &[RecordUpsert {
+                url: "https://example.com/x",
+                publisher: "example.com",
+                delta_id: "sha256:a",
+                observed_at: "2026-08-09T00:00:00Z",
+                weight: "full",
+                title: "t",
+                abstract_text: None,
+                lang: "en",
+            }],
+        )
+        .unwrap();
+
+        let (drained, _) = db.peek_pending_entries().unwrap();
+        assert!(drained.is_empty());
+        assert_eq!(
+            db.last_block().unwrap().unwrap().block_hash,
+            "sha256:blockhash0"
+        );
+        assert_eq!(
+            db.get_record("https://example.com/x", "example.com")
+                .unwrap()
+                .unwrap()
+                .delta_id,
+            "sha256:a"
+        );
+    }
+
+    #[test]
+    fn commit_seal_rolls_back_pending_delete_on_conflicting_block_number() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+        db.record_accepted_delta(
+            "example.com",
+            "sha256:a",
+            &serde_json::json!({"n": 1}),
+            0,
+            "https://example.com/x",
+            "sha256:a",
+        )
+        .unwrap();
+        let (peeked, up_to) = db.peek_pending_entries().unwrap();
+        db.commit_seal(up_to, 0, "sha256:blockhash0", "2026-08-09T00:00:00Z", &[])
+            .unwrap();
+        let _ = peeked;
+
+        db.record_accepted_delta(
+            "example.com",
+            "sha256:b",
+            &serde_json::json!({"n": 2}),
+            0,
+            "https://example.com/y",
+            "sha256:b",
+        )
+        .unwrap();
+        let (peeked2, up_to2) = db.peek_pending_entries().unwrap();
+        assert_eq!(peeked2.len(), 1);
+
+        let result = db.commit_seal(
+            up_to2,
+            0,
+            "sha256:blockhash0-conflict",
+            "2026-08-09T00:01:00Z",
+            &[],
+        );
+        assert!(result.is_err());
+
+        let (still_pending, _) = db.peek_pending_entries().unwrap();
+        assert_eq!(still_pending.len(), 1);
+        assert_eq!(still_pending[0].rowid, peeked2[0].rowid);
+        assert_eq!(
+            db.last_block().unwrap().unwrap().block_hash,
+            "sha256:blockhash0"
+        );
     }
 
     #[test]
