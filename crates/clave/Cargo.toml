@@ -21,6 +21,7 @@ rusqlite = { workspace = true }
 zstd = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+url = { workspace = true }
 ed25519-dalek = "2"
 
 [dev-dependencies]
