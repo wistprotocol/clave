@@ -18,6 +18,8 @@ pub enum Error {
     Param(String),
     #[error("fetch: {0}")]
     Fetch(String),
+    #[error("seal: {0}")]
+    Seal(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

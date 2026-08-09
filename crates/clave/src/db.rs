@@ -31,6 +31,23 @@ pub struct PublisherStatusRow {
     pub state: PublisherState,
 }
 
+pub struct BlockRow {
+    pub block_number: u64,
+    pub block_hash: String,
+    pub sealed_at: String,
+}
+
+pub struct RecordRow {
+    pub url: String,
+    pub publisher: String,
+    pub delta_id: String,
+    pub observed_at: String,
+    pub weight: String,
+    pub title: String,
+    pub abstract_text: Option<String>,
+    pub lang: String,
+}
+
 fn exec_insert_publisher(
     conn: &Connection,
     domain: &str,
@@ -210,6 +227,73 @@ impl Db {
                 })
             })
             .collect()
+    }
+
+    pub fn last_block(&self) -> Result<Option<BlockRow>> {
+        self.conn
+            .query_row(
+                "SELECT block_number, block_hash, sealed_at FROM blocks ORDER BY block_number DESC LIMIT 1",
+                [],
+                |row| {
+                    Ok(BlockRow {
+                        block_number: row.get::<_, i64>(0)? as u64,
+                        block_hash: row.get(1)?,
+                        sealed_at: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Error::Db)
+    }
+
+    pub fn insert_block(&self, block_number: u64, block_hash: &str, sealed_at: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO blocks(block_number, block_hash, sealed_at) VALUES (?1, ?2, ?3)",
+            (block_number as i64, block_hash, sealed_at),
+        )?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_record(
+        &self,
+        url: &str,
+        publisher: &str,
+        delta_id: &str,
+        observed_at: &str,
+        weight: &str,
+        title: &str,
+        abstract_text: Option<&str>,
+        lang: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO records(url, publisher, delta_id, observed_at, weight, title, abstract, lang) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(url, publisher) DO UPDATE SET delta_id = excluded.delta_id, observed_at = excluded.observed_at, weight = excluded.weight, title = excluded.title, abstract = excluded.abstract, lang = excluded.lang",
+            (url, publisher, delta_id, observed_at, weight, title, abstract_text, lang),
+        )?;
+        Ok(())
+    }
+
+    pub fn get_record(&self, url: &str, publisher: &str) -> Result<Option<RecordRow>> {
+        self.conn
+            .query_row(
+                "SELECT url, publisher, delta_id, observed_at, weight, title, abstract, lang FROM records WHERE url = ?1 AND publisher = ?2",
+                (url, publisher),
+                |row| {
+                    Ok(RecordRow {
+                        url: row.get(0)?,
+                        publisher: row.get(1)?,
+                        delta_id: row.get(2)?,
+                        observed_at: row.get(3)?,
+                        weight: row.get(4)?,
+                        title: row.get(5)?,
+                        abstract_text: row.get(6)?,
+                        lang: row.get(7)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Error::Db)
     }
 
     pub fn url_tip(&self, url: &str) -> Result<Option<String>> {
