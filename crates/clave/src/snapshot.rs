@@ -52,7 +52,12 @@ fn build_tier0(dir: &Path, records: &[RecordRow]) -> Result<Vec<u8>> {
     Ok(std::fs::read(&sqlite_path)?)
 }
 
-fn build_state(db: &Db, data_dir: &Path, log_position: u64) -> Result<(SnapshotState, String)> {
+fn build_state(
+    db: &Db,
+    data_dir: &Path,
+    log_position: u64,
+    records: &[RecordRow],
+) -> Result<(SnapshotState, String)> {
     let seed_bytes = std::fs::read(data_dir.join("keys/seed"))?;
     let seed: [u8; 32] = seed_bytes
         .try_into()
@@ -60,7 +65,6 @@ fn build_state(db: &Db, data_dir: &Path, log_position: u64) -> Result<(SnapshotS
     let aggregator_public_key = keys::public_b64u(&seed);
     let cadence = db.param("block_cadence_seconds")?;
     let publishers = db.list_publishers()?;
-    let records = db.list_records()?;
 
     let mut entries = Vec::with_capacity(2 + publishers.len() + records.len());
     entries.push(StateEntry::AggregatorKey(AggregatorKeyEntry {
@@ -82,7 +86,7 @@ fn build_state(db: &Db, data_dir: &Path, log_position: u64) -> Result<(SnapshotS
             sealing_height: 0,
         }));
     }
-    for r in &records {
+    for r in records {
         entries.push(StateEntry::Record(RecordEntry {
             publisher: r.publisher.clone(),
             url: r.url.clone(),
@@ -169,7 +173,7 @@ pub fn build(
     let record_values: Vec<Value> = records.iter().map(record_projection).collect();
     let content_digest_value = content_digest(&record_values)?;
 
-    let (state, state_digest_value) = build_state(db, data_dir, log_position)?;
+    let (state, state_digest_value) = build_state(db, data_dir, log_position, &records)?;
     let state_value = serde_json::to_value(&state)?;
     let state_envelope = sign_envelope(&state_value, "state", AGGREGATOR_KEY_ID, sk)?;
     let state_bytes = serde_json::to_vec(&state_envelope)?;
