@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "WIST aggregator: publisher ingest, verified feed, snapshot service"
+repository = "https://github.com/wistprotocol/clave"
 
 [dependencies]
 wist-core = { workspace = true }

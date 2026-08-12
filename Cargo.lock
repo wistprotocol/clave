@@ -2100,9 +2100,10 @@ checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 
 [[package]]
 name = "wist-core"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "base64",
+ "curve25519-dalek",
  "ed25519-dalek",
  "hmac",
  "serde",
