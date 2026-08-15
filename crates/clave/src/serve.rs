@@ -16,11 +16,54 @@ use std::sync::{Arc, Mutex, PoisonError};
 use tower_http::services::{ServeDir, ServeFile};
 use wist_core::objects::Status;
 
+pub const MAX_CONCURRENT_INGESTS: usize = 4;
+
+pub struct IngestGate {
+    inflight: Mutex<std::collections::HashSet<String>>,
+    pub semaphore: Arc<tokio::sync::Semaphore>,
+}
+
+pub struct InflightGuard {
+    gate: Arc<IngestGate>,
+    host: String,
+}
+
+impl IngestGate {
+    pub fn new(max_concurrent: usize) -> Arc<IngestGate> {
+        Arc::new(IngestGate {
+            inflight: Mutex::new(std::collections::HashSet::new()),
+            semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
+        })
+    }
+
+    pub fn begin(self: &Arc<Self>, host: &str) -> Option<InflightGuard> {
+        let mut set = self.inflight.lock().unwrap_or_else(PoisonError::into_inner);
+        if !set.insert(host.to_string()) {
+            return None;
+        }
+        Some(InflightGuard {
+            gate: self.clone(),
+            host: host.to_string(),
+        })
+    }
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.gate
+            .inflight
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.host);
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
     db: Arc<Mutex<Db>>,
     client: Arc<Client>,
     data_dir: PathBuf,
+    gate: Arc<IngestGate>,
 }
 
 #[derive(Deserialize)]
@@ -59,12 +102,23 @@ async fn ingest_handler(State(state): State<AppState>, body: Bytes) -> StatusCod
         return StatusCode::BAD_REQUEST;
     }
     let now = now_utc();
+    let Some(guard) = state.gate.begin(&payload.host) else {
+        return StatusCode::ACCEPTED;
+    };
+    let semaphore = state.gate.semaphore.clone();
     let db = state.db.clone();
     let client = state.client.clone();
     let data_dir = state.data_dir.clone();
-    tokio::task::spawn_blocking(move || {
-        let db = db.lock().unwrap_or_else(PoisonError::into_inner);
-        let _ = ingest::run(&db, &client, &data_dir, &payload.host, &now);
+    tokio::spawn(async move {
+        let Ok(_permit) = semaphore.acquire_owned().await else {
+            return;
+        };
+        let _guard = guard;
+        let _ = tokio::task::spawn_blocking(move || {
+            let db = db.lock().unwrap_or_else(PoisonError::into_inner);
+            let _ = ingest::run(&db, &client, &data_dir, &payload.host, &now);
+        })
+        .await;
     });
     StatusCode::ACCEPTED
 }
@@ -91,6 +145,7 @@ pub fn run(data_dir: PathBuf, db_path: PathBuf, bind: SocketAddr, allow_http: bo
         db: Arc::new(Mutex::new(db)),
         client: Arc::new(Client::new(allow_http)),
         data_dir: data_dir.clone(),
+        gate: IngestGate::new(MAX_CONCURRENT_INGESTS),
     };
     let app = Router::new()
         .route("/ingest", post(ingest_handler))
@@ -110,4 +165,29 @@ pub fn run(data_dir: PathBuf, db_path: PathBuf, bind: SocketAddr, allow_http: bo
         axum::serve(listener, app).await?;
         Ok::<(), Error>(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gate_dedups_inflight_hosts_and_releases_on_drop() {
+        let gate = IngestGate::new(4);
+        let guard = gate.begin("example.com").unwrap();
+        assert!(gate.begin("example.com").is_none());
+        assert!(gate.begin("other.example").is_some());
+        drop(guard);
+        assert!(gate.begin("example.com").is_some());
+    }
+
+    #[test]
+    fn gate_semaphore_caps_concurrency() {
+        let gate = IngestGate::new(2);
+        let p1 = gate.semaphore.clone().try_acquire_owned().unwrap();
+        let _p2 = gate.semaphore.clone().try_acquire_owned().unwrap();
+        assert!(gate.semaphore.clone().try_acquire_owned().is_err());
+        drop(p1);
+        assert!(gate.semaphore.clone().try_acquire_owned().is_ok());
+    }
 }
