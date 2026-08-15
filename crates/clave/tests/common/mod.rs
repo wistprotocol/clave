@@ -40,8 +40,18 @@ pub fn make_publisher_with_scope(domain: &str, subdomain_scope: &[&str]) -> Test
 }
 
 pub fn add_delta(p: &TestPub, url: &str, extract: &str, prev: Option<&str>) -> String {
+    add_delta_with_links(p, url, extract, prev, &[])
+}
+
+pub fn add_delta_with_links(
+    p: &TestPub,
+    url: &str,
+    extract: &str,
+    prev: Option<&str>,
+    links: &[&str],
+) -> String {
     let salt = wist_core::crypto::b64u_encode(&[5u8; 16]);
-    let content = serde_json::json!({"extract": extract, "links": {"total": 0, "urls": []}, "summary": {"title": url}});
+    let content = serde_json::json!({"extract": extract, "links": {"total": links.len(), "urls": links}, "summary": {"title": url}});
     let payload = serde_json::json!({"wist_version": "1.0.0", "salt": salt, "content": content});
     let mut delta = serde_json::json!({
         "wist_version": "1.0.0", "url": url,

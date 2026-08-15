@@ -77,7 +77,7 @@ fn snapshot_build_produces_verifiable_tier0_state_and_signed_artifacts() {
     let snapshot_dir = man_path.parent().unwrap();
 
     let files = man["manifest"]["files"].as_array().unwrap();
-    assert_eq!(files.len(), 1);
+    assert_eq!(files.len(), 3);
     for f in files {
         let path = f["path"].as_str().unwrap();
         let bytes = std::fs::read(snapshot_dir.join(path)).unwrap();
@@ -223,4 +223,132 @@ fn snapshot_index_replaces_same_date_entry_on_reseal() {
     );
     assert_eq!(snapshots[0]["snapshot_date"], "2025-08-09");
     assert_eq!(snapshots[0]["log_position"], 1);
+}
+
+fn tier1_fixture(shards: Option<i64>) -> (common::TestPub, tempfile::TempDir, String, String) {
+    let (listener, host) = reserve_addr();
+    let p = make_publisher_with_scope(&host, &["example.com"]);
+    let id = common::add_delta_with_links(
+        &p,
+        "https://example.com/linked",
+        "extract text here",
+        None,
+        &["https://other.example/x", "https://another.example/y"],
+    );
+    write_feed(&p, &host, std::slice::from_ref(&id), "2026-08-09T12:00:00Z");
+    serve_static(listener, p.dir.path().to_path_buf());
+
+    let data = tempfile::tempdir().unwrap();
+    clave::init::run(&host, data.path()).unwrap();
+    let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
+    db.set_param("block_cadence_seconds", 1).unwrap();
+    if let Some(n) = shards {
+        db.set_param("snapshot_shard_count", n).unwrap();
+    }
+    let client = clave::fetch::Client::new(true);
+    clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
+    let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
+    clave::seal::run(&db, data.path(), &sk, 1_754_740_800).unwrap();
+    (p, data, host, id)
+}
+
+fn read_parquet_rows(path: &std::path::Path) -> Vec<Vec<String>> {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    let file = std::fs::File::open(path).unwrap();
+    let reader = SerializedFileReader::new(file).unwrap();
+    reader
+        .get_row_iter(None)
+        .unwrap()
+        .map(|row| {
+            row.unwrap()
+                .get_column_iter()
+                .map(|(_, v)| match v {
+                    parquet::record::Field::Str(s) => s.clone(),
+                    other => format!("{other}"),
+                })
+                .collect()
+        })
+        .collect()
+}
+
+#[test]
+fn snapshot_includes_tier1_extracts_and_link_graph() {
+    let (_p, data, host, id) = tier1_fixture(None);
+    let dir = data.path().join("snapshots/2025-08-09");
+
+    let extracts = read_parquet_rows(&dir.join("tier1/extracts.parquet"));
+    assert_eq!(
+        extracts,
+        vec![vec![
+            "https://example.com/linked".to_string(),
+            host.clone(),
+            id.clone(),
+            "extract text here".to_string(),
+        ]]
+    );
+
+    let links = read_parquet_rows(&dir.join("tier1/links.parquet"));
+    assert_eq!(
+        links,
+        vec![
+            vec![
+                "https://example.com/linked".to_string(),
+                "https://other.example/x".to_string(),
+                "0".to_string(),
+            ],
+            vec![
+                "https://example.com/linked".to_string(),
+                "https://another.example/y".to_string(),
+                "1".to_string(),
+            ],
+        ]
+    );
+
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+    let files = manifest["manifest"]["files"].as_array().unwrap();
+    for path in ["tier1/extracts.parquet", "tier1/links.parquet"] {
+        let entry = files.iter().find(|f| f["path"] == path).unwrap();
+        assert_eq!(entry["tier"], 1);
+        let bytes = std::fs::read(dir.join(path)).unwrap();
+        assert_eq!(entry["bytes"].as_u64().unwrap(), bytes.len() as u64);
+        assert_eq!(entry["sha256"].as_str().unwrap(), sha256_hex(&bytes));
+    }
+    assert!(manifest["manifest"]["shards"].is_null());
+}
+
+#[test]
+fn sharded_snapshot_declares_count_digests_and_shard_labels() {
+    let (_p, data, host, _id) = tier1_fixture(Some(2));
+    let dir = data.path().join("snapshots/2025-08-09");
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+    let m = &manifest["manifest"];
+    assert_eq!(m["shards"]["count"], 2);
+    assert_eq!(m["shards"]["digests"].as_array().unwrap().len(), 2);
+
+    let digest_bytes = Sha256::digest(host.as_bytes());
+    let expected_shard = u64::from_be_bytes(digest_bytes[..8].try_into().unwrap()) % 2;
+    let files = m["files"].as_array().unwrap();
+    assert_eq!(files.len(), 6, "three files per shard, both shards emitted");
+    for f in files {
+        let shard = f["shard"].as_u64().unwrap();
+        assert!(shard < 2);
+        assert!(f["path"]
+            .as_str()
+            .unwrap()
+            .starts_with(&format!("shard-{shard}/")));
+    }
+    let count_rows = |shard: u64| -> i64 {
+        let conn =
+            rusqlite::Connection::open(dir.join(format!("shard-{shard}/tier0/index.sqlite")))
+                .unwrap();
+        conn.query_row("SELECT COUNT(*) FROM records", [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(count_rows(expected_shard), 1);
+    assert_eq!(count_rows(1 - expected_shard), 0);
+    let extracts =
+        read_parquet_rows(&dir.join(format!("shard-{expected_shard}/tier1/extracts.parquet")));
+    assert_eq!(extracts.len(), 1);
 }

@@ -1,8 +1,13 @@
 [licenses]
-allow = ["MIT", "Apache-2.0", "Unicode-3.0", "BSD-3-Clause", "ISC", "CDLA-Permissive-2.0"]
+allow = ["MIT", "Apache-2.0", "Unicode-3.0", "BSD-3-Clause", "ISC", "CDLA-Permissive-2.0", "CC0-1.0"]
 
 [advisories]
 yanked = "deny"
+ignore = [
+    # paste is a compile-time proc macro reachable only through parquet's
+    # build graph; unmaintained (RUSTSEC-2024-0436), not a runtime risk.
+    "RUSTSEC-2024-0436",
+]
 
 [bans]
 multiple-versions = "warn"

@@ -20,6 +20,151 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex_encode(&Sha256::digest(bytes))
 }
 
+/// WIST-3 §7: shard assignment is the first 8 octets of SHA-256 of the
+/// UTF-8 Publisher domain, read big-endian, mod count.
+pub fn shard_index(domain: &str, count: u64) -> u64 {
+    let digest = Sha256::digest(domain.as_bytes());
+    let prefix: [u8; 8] = digest[..8].try_into().expect("SHA-256 has 32 octets");
+    u64::from_be_bytes(prefix) % count
+}
+
+struct Tier1Row {
+    url: String,
+    publisher: String,
+    delta_id: String,
+    extract: String,
+    links: Vec<String>,
+}
+
+fn load_tier1_rows(data_dir: &Path, records: &[RecordRow]) -> Vec<Tier1Row> {
+    let mut rows = Vec::with_capacity(records.len());
+    for r in records {
+        let hex = r.delta_id.strip_prefix("sha256:").unwrap_or(&r.delta_id);
+        let Ok(bytes) = std::fs::read(data_dir.join("payloads").join(format!("{hex}.json"))) else {
+            continue;
+        };
+        let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            continue;
+        };
+        let extract = payload["content"]["extract"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let links = payload["content"]["links"]["urls"]
+            .as_array()
+            .map(|urls| {
+                urls.iter()
+                    .filter_map(|u| u.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        rows.push(Tier1Row {
+            url: r.url.clone(),
+            publisher: r.publisher.clone(),
+            delta_id: r.delta_id.clone(),
+            extract,
+            links,
+        });
+    }
+    rows
+}
+
+fn write_parquet_strings(
+    path: &Path,
+    message_type: &str,
+    columns: &[Vec<Vec<u8>>],
+    int_column: Option<&[i64]>,
+) -> Result<Vec<u8>> {
+    use parquet::data_type::{ByteArray, ByteArrayType, Int64Type};
+    use parquet::file::properties::WriterProperties;
+    use parquet::file::writer::SerializedFileWriter;
+    use parquet::schema::parser::parse_message_type;
+    use std::sync::Arc;
+
+    let schema = Arc::new(
+        parse_message_type(message_type)
+            .map_err(|e| Error::Snapshot(format!("parquet schema: {e}")))?,
+    );
+    let file = std::fs::File::create(path)?;
+    let mut writer =
+        SerializedFileWriter::new(file, schema, Arc::new(WriterProperties::builder().build()))
+            .map_err(|e| Error::Snapshot(format!("parquet writer: {e}")))?;
+    let mut rg = writer
+        .next_row_group()
+        .map_err(|e| Error::Snapshot(format!("parquet row group: {e}")))?;
+    for column in columns {
+        let mut col = rg
+            .next_column()
+            .map_err(|e| Error::Snapshot(format!("parquet column: {e}")))?
+            .ok_or_else(|| Error::Snapshot("parquet schema/column mismatch".into()))?;
+        let values: Vec<ByteArray> = column
+            .iter()
+            .map(|v| ByteArray::from(v.as_slice()))
+            .collect();
+        col.typed::<ByteArrayType>()
+            .write_batch(&values, None, None)
+            .map_err(|e| Error::Snapshot(format!("parquet write: {e}")))?;
+        col.close()
+            .map_err(|e| Error::Snapshot(format!("parquet close: {e}")))?;
+    }
+    if let Some(ints) = int_column {
+        let mut col = rg
+            .next_column()
+            .map_err(|e| Error::Snapshot(format!("parquet column: {e}")))?
+            .ok_or_else(|| Error::Snapshot("parquet schema/column mismatch".into()))?;
+        col.typed::<Int64Type>()
+            .write_batch(ints, None, None)
+            .map_err(|e| Error::Snapshot(format!("parquet write: {e}")))?;
+        col.close()
+            .map_err(|e| Error::Snapshot(format!("parquet close: {e}")))?;
+    }
+    rg.close()
+        .map_err(|e| Error::Snapshot(format!("parquet close: {e}")))?;
+    writer
+        .close()
+        .map_err(|e| Error::Snapshot(format!("parquet close: {e}")))?;
+    Ok(std::fs::read(path)?)
+}
+
+fn build_tier1(dir: &Path, rows: &[Tier1Row]) -> Result<(Vec<u8>, Vec<u8>)> {
+    std::fs::create_dir_all(dir)?;
+    let extracts_bytes = write_parquet_strings(
+        &dir.join("extracts.parquet"),
+        "message extracts { required binary url (UTF8); required binary publisher (UTF8); required binary delta_id (UTF8); required binary extract (UTF8); }",
+        &[
+            rows.iter().map(|r| r.url.clone().into_bytes()).collect(),
+            rows.iter()
+                .map(|r| r.publisher.clone().into_bytes())
+                .collect(),
+            rows.iter()
+                .map(|r| r.delta_id.clone().into_bytes())
+                .collect(),
+            rows.iter()
+                .map(|r| r.extract.clone().into_bytes())
+                .collect(),
+        ],
+        None,
+    )?;
+
+    let mut sources = Vec::new();
+    let mut targets = Vec::new();
+    let mut positions = Vec::new();
+    for r in rows {
+        for (i, target) in r.links.iter().enumerate() {
+            sources.push(r.url.clone().into_bytes());
+            targets.push(target.clone().into_bytes());
+            positions.push(i as i64);
+        }
+    }
+    let links_bytes = write_parquet_strings(
+        &dir.join("links.parquet"),
+        "message links { required binary source_url (UTF8); required binary target_url (UTF8); required int64 position; }",
+        &[sources, targets],
+        Some(&positions),
+    )?;
+    Ok((extracts_bytes, links_bytes))
+}
+
 fn record_projection(r: &RecordRow) -> Value {
     serde_json::json!({
         "url": r.url,
@@ -179,6 +324,7 @@ fn apply_sanctions(db: &Db, records: Vec<RecordRow>, at: &str) -> Result<Vec<Rec
     Ok(kept)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build(
     db: &Db,
     data_dir: &Path,
@@ -191,10 +337,49 @@ pub fn build(
     let records = apply_sanctions(db, db.list_records()?, sealed_at)?;
     let snapshot_dir = data_dir.join("snapshots").join(snapshot_date);
 
-    let sqlite_bytes = build_tier0(&snapshot_dir.join("tier0"), &records)?;
+    let shard_count = db.param("snapshot_shard_count").unwrap_or(1).max(1) as u64;
+    let sharded = shard_count > 1;
+    let mut partitions: Vec<Vec<RecordRow>> = (0..shard_count).map(|_| Vec::new()).collect();
+    let mut whole_projection = Vec::with_capacity(records.len());
+    for r in records {
+        whole_projection.push(record_projection(&r));
+        partitions[shard_index(&r.publisher, shard_count) as usize].push(r);
+    }
+    let content_digest_value = content_digest(&whole_projection)?;
 
-    let record_values: Vec<Value> = records.iter().map(record_projection).collect();
-    let content_digest_value = content_digest(&record_values)?;
+    let mut files = Vec::new();
+    let mut shard_digests = Vec::new();
+    let mut all_records = Vec::new();
+    for (i, shard_records) in partitions.into_iter().enumerate() {
+        let (prefix, shard_field) = if sharded {
+            (format!("shard-{i}/"), Some(i as u64))
+        } else {
+            (String::new(), None)
+        };
+        let shard_base = snapshot_dir.join(prefix.trim_end_matches('/'));
+        let sqlite_bytes = build_tier0(&shard_base.join("tier0"), &shard_records)?;
+        let tier1_rows = load_tier1_rows(data_dir, &shard_records);
+        let (extracts_bytes, links_bytes) = build_tier1(&shard_base.join("tier1"), &tier1_rows)?;
+        for (rel, bytes, tier) in [
+            ("tier0/index.sqlite", &sqlite_bytes, 0u8),
+            ("tier1/extracts.parquet", &extracts_bytes, 1),
+            ("tier1/links.parquet", &links_bytes, 1),
+        ] {
+            files.push(SnapshotFile {
+                path: format!("{prefix}{rel}"),
+                sha256: sha256_hex(bytes),
+                bytes: bytes.len() as u64,
+                tier,
+                shard: shard_field,
+            });
+        }
+        if sharded {
+            let projection: Vec<Value> = shard_records.iter().map(record_projection).collect();
+            shard_digests.push(content_digest(&projection)?);
+        }
+        all_records.extend(shard_records);
+    }
+    let records = all_records;
 
     let (state, state_digest_value) = build_state(db, data_dir, log_position, &records)?;
     let state_value = serde_json::to_value(&state)?;
@@ -214,14 +399,11 @@ pub fn build(
             bytes: state_bytes.len() as u64,
             state_digest: state_digest_value,
         },
-        shards: None,
-        files: vec![SnapshotFile {
-            path: "tier0/index.sqlite".to_string(),
-            sha256: sha256_hex(&sqlite_bytes),
-            bytes: sqlite_bytes.len() as u64,
-            tier: 0,
-            shard: None,
-        }],
+        shards: sharded.then_some(wist_core::objects::SnapshotShards {
+            count: shard_count,
+            digests: shard_digests,
+        }),
+        files,
     };
     let manifest_value = serde_json::to_value(&manifest)?;
     let manifest_envelope = sign_envelope(&manifest_value, "manifest", AGGREGATOR_KEY_ID, sk)?;
