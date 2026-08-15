@@ -354,6 +354,7 @@ mod tests {
                 value: 500,
                 effective_at: "2026-01-10T00:00:00Z",
             }],
+            &[],
         )
         .unwrap();
         assert_eq!(

@@ -222,6 +222,9 @@ pub fn run(
         return Ok(report);
     };
     let host = host.as_str();
+    if crate::sanctions::sanction_level(db, host, now)? >= 3 {
+        return Ok(report);
+    }
     let scheme = crate::fetch::scheme_for_host(host, client.allow_http());
     let base = format!("{scheme}://{host}/.well-known/wist/");
 

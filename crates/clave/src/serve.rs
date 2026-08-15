@@ -83,13 +83,19 @@ fn load_status(db: &Db, domain: &str) -> Result<Option<Status>> {
         return Ok(None);
     };
     let rejections = db.list_rejections(domain)?;
-    let quota_remaining = crate::quota::quota_remaining(db, domain, &now_utc())?.max(0) as u64;
+    let now = now_utc();
+    let quota_remaining = crate::quota::quota_remaining(db, domain, &now)?.max(0) as u64;
+    let state = match crate::sanctions::sanction_level(db, domain, &now)? {
+        4 => wist_core::objects::PublisherState::Delisted,
+        3 => wist_core::objects::PublisherState::SanctionedQuarantine,
+        _ => row.state,
+    };
     Ok(Some(Status {
         wist_version: WIST_VERSION.to_string(),
         domain: domain.to_string(),
         last_pull_at: row.last_pull_at,
         quota_remaining,
-        state: row.state,
+        state,
         rejections,
     }))
 }
@@ -118,12 +124,16 @@ async fn ingest_handler(State(state): State<AppState>, body: Bytes) -> axum::res
         let at = now.clone();
         tokio::task::spawn_blocking(move || {
             let db = db.lock().unwrap_or_else(PoisonError::into_inner);
-            crate::quota::quota_remaining(&db, &host, &at)
+            let level = crate::sanctions::sanction_level(&db, &host, &at)?;
+            crate::quota::quota_remaining(&db, &host, &at).map(|q| (level, q))
         })
         .await
     };
     match quota {
-        Ok(Ok(remaining)) if remaining <= 0 => {
+        Ok(Ok((level, _))) if level >= 3 => {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+        Ok(Ok((_, remaining))) if remaining <= 0 => {
             let retry_after = seconds_to_next_utc_day(&now);
             return (
                 StatusCode::TOO_MANY_REQUESTS,

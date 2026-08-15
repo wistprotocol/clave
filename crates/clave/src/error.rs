@@ -18,6 +18,8 @@ pub enum Error {
     Param(String),
     #[error("parameter change: {0}")]
     ParamChange(String),
+    #[error("governance: {0}")]
+    Governance(String),
     #[error("fetch: {0}")]
     Fetch(String),
     #[error("seal: {0}")]

@@ -157,6 +157,28 @@ fn update_index(
     Ok(())
 }
 
+fn apply_sanctions(db: &Db, records: Vec<RecordRow>, at: &str) -> Result<Vec<RecordRow>> {
+    let mut levels: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
+    let mut kept = Vec::with_capacity(records.len());
+    for mut r in records {
+        let level = match levels.get(&r.publisher) {
+            Some(l) => *l,
+            None => {
+                let l = crate::sanctions::sanction_level(db, &r.publisher, at)?;
+                levels.insert(r.publisher.clone(), l);
+                l
+            }
+        };
+        match level {
+            4 => continue,
+            2 => r.weight = "reduced".to_string(),
+            _ => {}
+        }
+        kept.push(r);
+    }
+    Ok(kept)
+}
+
 pub fn build(
     db: &Db,
     data_dir: &Path,
@@ -164,8 +186,9 @@ pub fn build(
     log_position: u64,
     anchor_block_hash: &str,
     snapshot_date: &str,
+    sealed_at: &str,
 ) -> Result<()> {
-    let records = db.list_records()?;
+    let records = apply_sanctions(db, db.list_records()?, sealed_at)?;
     let snapshot_dir = data_dir.join("snapshots").join(snapshot_date);
 
     let sqlite_bytes = build_tier0(&snapshot_dir.join("tier0"), &records)?;
