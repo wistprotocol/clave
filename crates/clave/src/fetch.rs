@@ -21,6 +21,16 @@ fn guard_scheme(parsed: &url::Url, allow_http: bool) -> Result<()> {
     }
 }
 
+pub fn scheme_for_host(host: &str, allow_http: bool) -> &'static str {
+    let bare = url::Url::parse(&format!("http://{host}/"))
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string));
+    match bare {
+        Some(h) if allow_http && is_loopback_host(&h) => "http",
+        _ => "https",
+    }
+}
+
 pub struct Client {
     allow_http: bool,
     inner: reqwest::blocking::Client,
@@ -87,6 +97,16 @@ mod tests {
         let url = url::Url::parse("http://example.com/x.json").unwrap();
         assert!(guard_scheme(&url, true).is_err());
         assert!(guard_scheme(&url, false).is_err());
+    }
+
+    #[test]
+    fn scheme_for_host_selects_http_only_for_loopback_under_allow_http() {
+        assert_eq!(scheme_for_host("127.0.0.1:8080", true), "http");
+        assert_eq!(scheme_for_host("localhost:9999", true), "http");
+        assert_eq!(scheme_for_host("localhost", true), "http");
+        assert_eq!(scheme_for_host("example.com", true), "https");
+        assert_eq!(scheme_for_host("127.0.0.1:8080", false), "https");
+        assert_eq!(scheme_for_host("example.com", false), "https");
     }
 
     #[test]

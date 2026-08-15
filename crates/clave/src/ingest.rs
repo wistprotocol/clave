@@ -164,7 +164,7 @@ pub fn run(
     if !is_bare_authority(host) {
         return Ok(report);
     }
-    let scheme = if client.allow_http() { "http" } else { "https" };
+    let scheme = crate::fetch::scheme_for_host(host, client.allow_http());
     let base = format!("{scheme}://{host}/.well-known/wist/");
 
     let (public_key_b64u, subdomain_scope) = match db.get_publisher(host)? {
