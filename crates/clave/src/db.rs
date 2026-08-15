@@ -148,6 +148,8 @@ pub struct Db {
 impl Db {
     pub fn open(path: &Path) -> Result<Db> {
         let conn = Connection::open(path)?;
+        conn.busy_timeout(std::time::Duration::from_millis(5000))?;
+        let _mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
         conn.execute_batch(SCHEMA)?;
         Ok(Db { conn })
     }
@@ -530,6 +532,40 @@ mod tests {
         let path = tmp.path().join("clave.sqlite");
         Db::open(&path).unwrap();
         Db::open(&path).unwrap();
+    }
+
+    #[test]
+    fn open_sets_wal_journal_and_busy_timeout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+        let mode: String = db
+            .conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+        let timeout: i64 = db
+            .conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(timeout, 5000);
+    }
+
+    #[test]
+    fn concurrent_writer_waits_out_a_held_write_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("clave.sqlite");
+        let db1 = Db::open(&path).unwrap();
+        db1.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        db1.conn
+            .execute("INSERT INTO params(name, value) VALUES ('a', 1)", [])
+            .unwrap();
+        let handle = std::thread::spawn(move || {
+            let db2 = Db::open(&path).unwrap();
+            db2.set_param("b", 2)
+        });
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        db1.conn.execute_batch("COMMIT").unwrap();
+        handle.join().unwrap().unwrap();
     }
 
     #[test]
