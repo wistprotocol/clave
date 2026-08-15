@@ -12,6 +12,8 @@ use wist_core::objects::{DeltaEnvelope, FeedEnvelope, Payload, PublisherEnvelope
 pub struct IngestReport {
     pub accepted: Vec<String>,
     pub rejected: Vec<(String, String)>,
+    pub noise: Option<&'static str>,
+    pub suspended: bool,
 }
 
 /// WIST-2 §4: `host` MUST be a bare authority (`host[:port]`) — no scheme,
@@ -153,6 +155,42 @@ fn onboard_publisher(
     )))
 }
 
+struct Meter<'a> {
+    db: &'a Db,
+    domain: &'a str,
+    day: &'a str,
+    budget: i64,
+}
+
+impl Meter<'_> {
+    fn get(&self, client: &Client, url: &str) -> Result<Option<(Vec<u8>, Value)>> {
+        if self.db.ingest_bytes(self.domain, self.day)? >= self.budget {
+            return Ok(None);
+        }
+        let (raw, value) = client.get_json(url)?;
+        self.db
+            .add_ingest_bytes(self.domain, self.day, raw.len() as i64)?;
+        Ok(Some((raw, value)))
+    }
+}
+
+/// WIST-2 §3.2: `next` MUST be an absolute URL whose authority is the
+/// Publisher's own. The scheme is re-derived per host so a loopback
+/// deployment can follow the https URLs a Publisher writes into sealed
+/// pages.
+fn next_page_url(next: &str, host: &str, allow_http: bool) -> Option<String> {
+    let parsed = url::Url::parse(next).ok()?;
+    let authority = match parsed.port() {
+        Some(port) => format!("{}:{port}", parsed.host_str()?),
+        None => parsed.host_str()?.to_string(),
+    };
+    if !authority.eq_ignore_ascii_case(host) {
+        return None;
+    }
+    let scheme = crate::fetch::scheme_for_host(host, allow_http);
+    Some(format!("{scheme}://{host}{}", parsed.path()))
+}
+
 pub fn run(
     db: &Db,
     client: &Client,
@@ -174,58 +212,120 @@ pub fn run(
         ),
         None => match onboard_publisher(db, client, &base, host, now)? {
             Some((_, public_key, scope)) => (public_key, scope),
-            None => return Ok(report),
+            None => {
+                report.noise = Some("WIST2-E04");
+                return Ok(report);
+            }
         },
     };
     let pubkey = match PublicKey::from_b64u(&public_key_b64u) {
         Ok(pk) => pk,
         Err(e) => {
             record_rejection(db, host, "WIST2-E04", now, None, &e.to_string())?;
+            report.noise = Some("WIST2-E04");
             return Ok(report);
         }
     };
 
-    let feed_url = format!("{base}feed.json");
-    let (_, feed_value) = match client.get_json(&feed_url) {
-        Ok(v) => v,
-        Err(e) => {
-            record_rejection(db, host, "WIST2-E01", now, None, &e.to_string())?;
-            return Ok(report);
-        }
-    };
-    if verify_envelope(&feed_value, "feed", &pubkey).is_err() {
-        record_rejection(
-            db,
-            host,
-            "WIST2-E01",
-            now,
-            None,
-            "signature verification failed",
-        )?;
-        return Ok(report);
-    }
-    let feed_parsed: FeedEnvelope = match serde_json::from_value(feed_value) {
-        Ok(f) => f,
-        Err(e) => {
-            record_rejection(db, host, "WIST2-E01", now, None, &e.to_string())?;
-            return Ok(report);
-        }
+    let day = now.get(..10).unwrap_or(now);
+    let budget = crate::registry::effective(db, "ingest_budget_bytes_day", now)?;
+    let meter = Meter {
+        db,
+        domain: host,
+        day,
+        budget,
     };
 
-    if feed_parsed.feed.domain != host {
-        record_rejection(
-            db,
-            host,
-            "WIST2-E01",
-            now,
-            None,
-            "feed domain does not match ping host",
-        )?;
-        return Ok(report);
+    let mut pages: Vec<FeedEnvelope> = Vec::new();
+    let mut page_url = format!("{base}feed.json");
+    let mut unseen_any = false;
+    let mut suspended = false;
+    loop {
+        let fetched = match meter.get(client, &page_url) {
+            Ok(Some(v)) => v,
+            Ok(None) => {
+                suspended = true;
+                break;
+            }
+            Err(e) => {
+                record_rejection(db, host, "WIST2-E01", now, None, &e.to_string())?;
+                return Ok(report);
+            }
+        };
+        let (_, feed_value) = fetched;
+        if verify_envelope(&feed_value, "feed", &pubkey).is_err() {
+            record_rejection(
+                db,
+                host,
+                "WIST2-E01",
+                now,
+                None,
+                "signature verification failed",
+            )?;
+            return Ok(report);
+        }
+        let feed_parsed: FeedEnvelope = match serde_json::from_value(feed_value) {
+            Ok(f) => f,
+            Err(e) => {
+                record_rejection(db, host, "WIST2-E01", now, None, &e.to_string())?;
+                return Ok(report);
+            }
+        };
+        if feed_parsed.feed.domain != host {
+            record_rejection(
+                db,
+                host,
+                "WIST2-E01",
+                now,
+                None,
+                "feed domain does not match ping host",
+            )?;
+            return Ok(report);
+        }
+
+        let mut page_has_unseen = false;
+        for id in &feed_parsed.feed.deltas {
+            if !db.is_delta_seen(id)? {
+                page_has_unseen = true;
+                break;
+            }
+        }
+        unseen_any |= page_has_unseen;
+        let next = feed_parsed.feed.next.clone();
+        pages.push(feed_parsed);
+        if !page_has_unseen {
+            break;
+        }
+        match next {
+            Some(n) => match next_page_url(&n, host, client.allow_http()) {
+                Some(u) => page_url = u,
+                None => {
+                    record_rejection(
+                        db,
+                        host,
+                        "WIST2-E01",
+                        now,
+                        None,
+                        "feed next is not a URL in the publisher's own authority",
+                    )?;
+                    return Ok(report);
+                }
+            },
+            None => break,
+        }
     }
 
     let mut chain_pos: i64 = 0;
-    for id in &feed_parsed.feed.deltas {
+    let delta_ids: Vec<String> = if suspended {
+        Vec::new()
+    } else {
+        pages
+            .iter()
+            .rev()
+            .flat_map(|p| p.feed.deltas.iter().cloned())
+            .collect()
+    };
+    'process: for id in &delta_ids {
         if db.is_delta_seen(id)? {
             continue;
         }
@@ -244,8 +344,12 @@ pub fn run(
         };
 
         let delta_url = format!("{base}deltas/{hex}.json");
-        let (_, delta_value) = match client.get_json(&delta_url) {
-            Ok(v) => v,
+        let (_, delta_value) = match meter.get(client, &delta_url) {
+            Ok(Some(v)) => v,
+            Ok(None) => {
+                suspended = true;
+                break 'process;
+            }
             Err(e) => {
                 record_rejection(
                     db,
@@ -343,8 +447,12 @@ pub fn run(
 
         if let Some(commitment) = &delta_env.delta.payload {
             let payload_url = format!("{base}payloads/{hex}.json");
-            let (payload_raw, payload_value) = match client.get_json(&payload_url) {
-                Ok(v) => v,
+            let (payload_raw, payload_value) = match meter.get(client, &payload_url) {
+                Ok(Some(v)) => v,
+                Ok(None) => {
+                    suspended = true;
+                    break 'process;
+                }
                 Err(e) => {
                     record_rejection(
                         db,
@@ -416,7 +524,14 @@ pub fn run(
         chain_pos += 1;
     }
 
-    db.set_publisher_pulled(host, now)?;
+    db.set_walk_suspended(host, suspended)?;
+    report.suspended = suspended;
+    if !suspended {
+        if !unseen_any && report.accepted.is_empty() && report.rejected.is_empty() {
+            report.noise = Some("WIST2-E02");
+        }
+        db.set_publisher_pulled(host, now)?;
+    }
 
     Ok(report)
 }

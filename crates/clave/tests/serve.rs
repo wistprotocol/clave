@@ -163,3 +163,67 @@ fn status_reports_last_pull_and_quota_after_ingest() {
     assert_eq!(body["state"], "active");
     assert_eq!(body["rejections"].as_array().unwrap().len(), 0);
 }
+
+#[test]
+fn ingest_ping_over_quota_gets_429_with_retry_after() {
+    let tmp = tempfile::tempdir().unwrap();
+    clave::init::run("127.0.0.1:0", tmp.path()).unwrap();
+    {
+        let db = clave::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+        db.set_param("quota_base", 0).unwrap();
+        db.set_param("quota_slope", 0).unwrap();
+    }
+    let addr = spawn_server(tmp.path());
+    let c = reqwest::blocking::Client::new();
+    let r = c
+        .post(format!("{addr}/ingest"))
+        .json(&serde_json::json!({"host": "127.0.0.1:9"}))
+        .send()
+        .unwrap();
+    assert_eq!(r.status(), 429);
+    let retry_after: i64 = r
+        .headers()
+        .get("retry-after")
+        .expect("429 must carry Retry-After")
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(retry_after > 0 && retry_after <= 86400);
+}
+
+#[test]
+fn noise_ping_decrements_quota() {
+    let (listener, host) = reserve_addr();
+    let empty = tempfile::tempdir().unwrap();
+    serve_static(listener, empty.path().to_path_buf());
+
+    let tmp = tempfile::tempdir().unwrap();
+    clave::init::run(&host, tmp.path()).unwrap();
+    let addr = spawn_server(tmp.path());
+    let c = reqwest::blocking::Client::new();
+    let r = c
+        .post(format!("{addr}/ingest"))
+        .json(&serde_json::json!({"host": host}))
+        .send()
+        .unwrap();
+    assert_eq!(r.status(), 202);
+    let day = {
+        let db = clave::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+        let mut n = 0;
+        for _ in 0..200 {
+            n = db
+                .noise_ping_count(&host, &jiff::Timestamp::now().to_string()[..10])
+                .unwrap();
+            if n > 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        n
+    };
+    assert_eq!(
+        day, 1,
+        "E04 first-contact failure must count as one noise ping"
+    );
+}

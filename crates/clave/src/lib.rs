@@ -7,6 +7,7 @@ pub mod ingest;
 pub mod init;
 pub mod keys;
 pub mod param_change;
+pub mod quota;
 pub mod registry;
 pub mod seal;
 pub mod serve;

@@ -93,17 +93,48 @@ fn load_status(db: &Db, domain: &str) -> Result<Option<Status>> {
     }))
 }
 
-async fn ingest_handler(State(state): State<AppState>, body: Bytes) -> StatusCode {
+fn seconds_to_next_utc_day(now: &str) -> i64 {
+    now.parse::<jiff::Timestamp>()
+        .map(|ts| 86400 - ts.as_second().rem_euclid(86400))
+        .unwrap_or(86400)
+}
+
+async fn ingest_handler(State(state): State<AppState>, body: Bytes) -> axum::response::Response {
+    use axum::response::IntoResponse;
     let payload: IngestRequest = match serde_json::from_slice(&body) {
         Ok(p) => p,
-        Err(_) => return StatusCode::BAD_REQUEST,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
     if !is_bare_authority(&payload.host) {
-        return StatusCode::BAD_REQUEST;
+        return StatusCode::BAD_REQUEST.into_response();
     }
     let now = now_utc();
+
+    let quota = {
+        let db = state.db.clone();
+        let host = payload.host.clone();
+        let at = now.clone();
+        tokio::task::spawn_blocking(move || {
+            let db = db.lock().unwrap_or_else(PoisonError::into_inner);
+            crate::quota::quota_remaining(&db, &host, &at)
+        })
+        .await
+    };
+    match quota {
+        Ok(Ok(remaining)) if remaining <= 0 => {
+            let retry_after = seconds_to_next_utc_day(&now);
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                [("Retry-After", retry_after.to_string())],
+            )
+                .into_response();
+        }
+        Ok(Ok(_)) => {}
+        _ => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+
     let Some(guard) = state.gate.begin(&payload.host) else {
-        return StatusCode::ACCEPTED;
+        return StatusCode::ACCEPTED.into_response();
     };
     let semaphore = state.gate.semaphore.clone();
     let db = state.db.clone();
@@ -116,11 +147,17 @@ async fn ingest_handler(State(state): State<AppState>, body: Bytes) -> StatusCod
         let _guard = guard;
         let _ = tokio::task::spawn_blocking(move || {
             let db = db.lock().unwrap_or_else(PoisonError::into_inner);
-            let _ = ingest::run(&db, &client, &data_dir, &payload.host, &now);
+            let report = ingest::run(&db, &client, &data_dir, &payload.host, &now);
+            if let Ok(report) = report {
+                if report.noise.is_some() {
+                    let day = now.get(..10).unwrap_or(&now);
+                    let _ = db.bump_noise_ping(&payload.host, day);
+                }
+            }
         })
         .await;
     });
-    StatusCode::ACCEPTED
+    StatusCode::ACCEPTED.into_response()
 }
 
 async fn status_handler(
