@@ -16,6 +16,8 @@ pub enum Error {
     Key(String),
     #[error("unknown param: {0}")]
     Param(String),
+    #[error("parameter change: {0}")]
+    ParamChange(String),
     #[error("fetch: {0}")]
     Fetch(String),
     #[error("seal: {0}")]

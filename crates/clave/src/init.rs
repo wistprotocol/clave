@@ -7,7 +7,6 @@ use wist_core::envelope::sign_envelope;
 use wist_core::objects::{Anchor, GenesisKey};
 
 const GENESIS_KEY_ID: &str = "log1";
-const DEFAULT_BLOCK_CADENCE_SECONDS: i64 = 3600;
 
 pub fn run(log_id: &str, data_dir: &Path) -> Result<()> {
     std::fs::create_dir_all(data_dir)?;
@@ -42,7 +41,11 @@ pub fn run(log_id: &str, data_dir: &Path) -> Result<()> {
     }
 
     let db = Db::open(&data_dir.join("clave.sqlite"))?;
-    db.set_param("block_cadence_seconds", DEFAULT_BLOCK_CADENCE_SECONDS)?;
+    for spec in crate::registry::PARAMS {
+        if let Some(default) = spec.default {
+            db.set_param(spec.name, default)?;
+        }
+    }
 
     Ok(())
 }
@@ -67,6 +70,18 @@ mod tests {
         }
         let db = crate::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
         assert_eq!(db.param("block_cadence_seconds").unwrap(), 3600);
+    }
+
+    #[test]
+    fn init_seeds_every_registry_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        run("example.com", tmp.path()).unwrap();
+        let db = crate::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+        for spec in crate::registry::PARAMS {
+            if let Some(default) = spec.default {
+                assert_eq!(db.param(spec.name).unwrap(), default, "{}", spec.name);
+            }
+        }
     }
 
     #[test]

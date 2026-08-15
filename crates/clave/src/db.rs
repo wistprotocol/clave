@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS blocks(block_number INTEGER PRIMARY KEY, block_hash T
 CREATE TABLE IF NOT EXISTS rejections(domain TEXT NOT NULL, code TEXT NOT NULL, at TEXT NOT NULL, delta_id TEXT, detail TEXT);
 CREATE TABLE IF NOT EXISTS params(name TEXT PRIMARY KEY, value INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS url_tips(url TEXT PRIMARY KEY, domain TEXT NOT NULL, tip TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS param_changes(parameter TEXT NOT NULL, value INTEGER NOT NULL, effective_at TEXT NOT NULL, block_number INTEGER NOT NULL);
 ";
 
 pub struct PublisherRow {
@@ -58,6 +59,12 @@ pub struct PendingEntryRow {
     pub entry_type: String,
     pub domain: String,
     pub entry_json: Value,
+}
+
+pub struct ParamChangeRow<'a> {
+    pub parameter: &'a str,
+    pub value: i64,
+    pub effective_at: &'a str,
 }
 
 pub struct RecordUpsert<'a> {
@@ -338,6 +345,7 @@ impl Db {
         block_hash: &str,
         sealed_at: &str,
         records: &[RecordUpsert],
+        param_changes: &[ParamChangeRow],
     ) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
@@ -351,8 +359,25 @@ impl Db {
         for r in records {
             exec_upsert_record(&tx, r)?;
         }
+        for c in param_changes {
+            tx.execute(
+                "INSERT INTO param_changes(parameter, value, effective_at, block_number) VALUES (?1, ?2, ?3, ?4)",
+                (c.parameter, c.value, c.effective_at, block_number as i64),
+            )?;
+        }
         tx.commit()?;
         Ok(())
+    }
+
+    pub fn latest_param_change(&self, name: &str, at: &str) -> Result<Option<i64>> {
+        self.conn
+            .query_row(
+                "SELECT value FROM param_changes WHERE parameter = ?1 AND effective_at <= ?2 ORDER BY effective_at DESC, block_number DESC LIMIT 1",
+                (name, at),
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Error::Db)
     }
 
     pub fn get_record(&self, url: &str, publisher: &str) -> Result<Option<RecordRow>> {
@@ -522,6 +547,58 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
         assert!(db.param("nope").is_err());
+    }
+
+    #[test]
+    fn commit_seal_records_param_changes_for_latest_lookup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+        db.commit_seal(
+            0,
+            0,
+            "sha256:h0",
+            "2026-01-01T00:00:00Z",
+            &[],
+            &[ParamChangeRow {
+                parameter: "feed_window",
+                value: 500,
+                effective_at: "2026-01-10T00:00:00Z",
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            db.latest_param_change("feed_window", "2026-01-09T23:59:59Z")
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            db.latest_param_change("feed_window", "2026-01-10T00:00:00Z")
+                .unwrap(),
+            Some(500)
+        );
+        db.commit_seal(
+            0,
+            1,
+            "sha256:h1",
+            "2026-01-02T00:00:00Z",
+            &[],
+            &[ParamChangeRow {
+                parameter: "feed_window",
+                value: 800,
+                effective_at: "2026-01-20T00:00:00Z",
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            db.latest_param_change("feed_window", "2026-01-15T00:00:00Z")
+                .unwrap(),
+            Some(500)
+        );
+        assert_eq!(
+            db.latest_param_change("feed_window", "2026-01-25T00:00:00Z")
+                .unwrap(),
+            Some(800)
+        );
     }
 
     #[test]
@@ -702,6 +779,7 @@ mod tests {
                 abstract_text: None,
                 lang: "en",
             }],
+            &[],
         )
         .unwrap();
 
@@ -734,8 +812,15 @@ mod tests {
         )
         .unwrap();
         let (peeked, up_to) = db.peek_pending_entries().unwrap();
-        db.commit_seal(up_to, 0, "sha256:blockhash0", "2026-08-09T00:00:00Z", &[])
-            .unwrap();
+        db.commit_seal(
+            up_to,
+            0,
+            "sha256:blockhash0",
+            "2026-08-09T00:00:00Z",
+            &[],
+            &[],
+        )
+        .unwrap();
         let _ = peeked;
 
         db.record_accepted_delta(
@@ -755,6 +840,7 @@ mod tests {
             0,
             "sha256:blockhash0-conflict",
             "2026-08-09T00:01:00Z",
+            &[],
             &[],
         );
         assert!(result.is_err());
