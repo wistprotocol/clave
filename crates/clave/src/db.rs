@@ -14,6 +14,9 @@ CREATE TABLE IF NOT EXISTS rejections(domain TEXT NOT NULL, code TEXT NOT NULL, 
 CREATE TABLE IF NOT EXISTS params(name TEXT PRIMARY KEY, value INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS url_tips(url TEXT PRIMARY KEY, domain TEXT NOT NULL, tip TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS param_changes(parameter TEXT NOT NULL, value INTEGER NOT NULL, effective_at TEXT NOT NULL, block_number INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS noise_pings(domain TEXT NOT NULL, day TEXT NOT NULL, count INTEGER NOT NULL, PRIMARY KEY(domain, day));
+CREATE TABLE IF NOT EXISTS ingest_meter(domain TEXT NOT NULL, day TEXT NOT NULL, bytes INTEGER NOT NULL, PRIMARY KEY(domain, day));
+CREATE TABLE IF NOT EXISTS walk_state(domain TEXT PRIMARY KEY, suspended INTEGER NOT NULL);
 ";
 
 pub struct PublisherRow {
@@ -369,6 +372,66 @@ impl Db {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    pub fn bump_noise_ping(&self, domain: &str, day: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO noise_pings(domain, day, count) VALUES (?1, ?2, 1) ON CONFLICT(domain, day) DO UPDATE SET count = count + 1",
+            (domain, day),
+        )?;
+        Ok(())
+    }
+
+    pub fn noise_ping_count(&self, domain: &str, day: &str) -> Result<i64> {
+        self.conn
+            .query_row(
+                "SELECT count FROM noise_pings WHERE domain = ?1 AND day = ?2",
+                (domain, day),
+                |row| row.get(0),
+            )
+            .optional()
+            .map(|v| v.unwrap_or(0))
+            .map_err(Error::Db)
+    }
+
+    pub fn add_ingest_bytes(&self, domain: &str, day: &str, bytes: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO ingest_meter(domain, day, bytes) VALUES (?1, ?2, ?3) ON CONFLICT(domain, day) DO UPDATE SET bytes = bytes + excluded.bytes",
+            (domain, day, bytes),
+        )?;
+        Ok(())
+    }
+
+    pub fn ingest_bytes(&self, domain: &str, day: &str) -> Result<i64> {
+        self.conn
+            .query_row(
+                "SELECT bytes FROM ingest_meter WHERE domain = ?1 AND day = ?2",
+                (domain, day),
+                |row| row.get(0),
+            )
+            .optional()
+            .map(|v| v.unwrap_or(0))
+            .map_err(Error::Db)
+    }
+
+    pub fn set_walk_suspended(&self, domain: &str, suspended: bool) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO walk_state(domain, suspended) VALUES (?1, ?2) ON CONFLICT(domain) DO UPDATE SET suspended = excluded.suspended",
+            (domain, suspended as i64),
+        )?;
+        Ok(())
+    }
+
+    pub fn walk_suspended(&self, domain: &str) -> Result<bool> {
+        self.conn
+            .query_row(
+                "SELECT suspended FROM walk_state WHERE domain = ?1",
+                [domain],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map(|v| v.unwrap_or(0) != 0)
+            .map_err(Error::Db)
     }
 
     pub fn latest_param_change(&self, name: &str, at: &str) -> Result<Option<i64>> {

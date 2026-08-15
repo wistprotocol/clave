@@ -71,13 +71,46 @@ pub fn add_delta(p: &TestPub, url: &str, extract: &str, prev: Option<&str>) -> S
 }
 
 pub fn write_feed(p: &TestPub, domain: &str, ids: &[String], generated_at: &str) {
-    let feed = serde_json::json!({"wist_version": "1.0.0", "domain": domain, "generated_at": generated_at, "deltas": ids, "next": null});
+    write_feed_with_next(p, domain, ids, generated_at, None);
+}
+
+pub fn write_feed_with_next(
+    p: &TestPub,
+    domain: &str,
+    ids: &[String],
+    generated_at: &str,
+    next: Option<&str>,
+) {
+    let feed = serde_json::json!({"wist_version": "1.0.0", "domain": domain, "generated_at": generated_at, "deltas": ids, "next": next});
     let env = wist_core::envelope::sign_envelope(&feed, "feed", "k1", &p.sk).unwrap();
     fs::write(
         p.dir.path().join(".well-known/wist/feed.json"),
         serde_json::to_vec(&env).unwrap(),
     )
     .unwrap();
+}
+
+pub fn write_feed_page(
+    p: &TestPub,
+    domain: &str,
+    number: u64,
+    ids: &[String],
+    generated_at: &str,
+    next: Option<&str>,
+) {
+    let feed = serde_json::json!({"wist_version": "1.0.0", "domain": domain, "generated_at": generated_at, "deltas": ids, "next": next});
+    let env = wist_core::envelope::sign_envelope(&feed, "feed", "k1", &p.sk).unwrap();
+    let dir = p.dir.path().join(".well-known/wist/feed");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join(format!("{number}.json")),
+        serde_json::to_vec(&env).unwrap(),
+    )
+    .unwrap();
+}
+
+pub fn page_url(domain: &str, number: u64) -> String {
+    format!("https://{domain}/.well-known/wist/feed/{number}.json")
 }
 
 /// Binds an ephemeral loopback port synchronously so its host:port is known

@@ -220,3 +220,114 @@ fn ingest_accepts_delta_url_within_subdomain_scope() {
 
     assert_eq!(report.accepted, vec![id1]);
 }
+
+#[test]
+fn ingest_walks_feed_pages_and_backfills_oldest_first() {
+    let (listener, host) = reserve_addr();
+    let p = make_publisher_with_scope(&host, &["example.com"]);
+    let id1 = add_delta(&p, "https://example.com/a", "first content", None);
+    let id2 = add_delta(&p, "https://example.com/a", "second content", Some(&id1));
+    let id3 = add_delta(&p, "https://example.com/b", "other page", None);
+    common::write_feed_page(
+        &p,
+        &host,
+        0,
+        std::slice::from_ref(&id1),
+        "2026-08-09T10:00:00Z",
+        None,
+    );
+    common::write_feed_page(
+        &p,
+        &host,
+        1,
+        std::slice::from_ref(&id2),
+        "2026-08-09T11:00:00Z",
+        Some(&common::page_url(&host, 0)),
+    );
+    common::write_feed_with_next(
+        &p,
+        &host,
+        std::slice::from_ref(&id3),
+        "2026-08-09T12:00:00Z",
+        Some(&common::page_url(&host, 1)),
+    );
+    serve_static(listener, p.dir.path().to_path_buf());
+
+    let tmp = tempfile::tempdir().unwrap();
+    clave::init::run(&host, tmp.path()).unwrap();
+    let db = clave::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+    let client = clave::fetch::Client::new(true);
+
+    let report =
+        clave::ingest::run(&db, &client, tmp.path(), &host, "2026-08-09T12:00:05Z").unwrap();
+    assert_eq!(report.accepted, vec![id1.clone(), id2.clone(), id3.clone()]);
+    assert!(report.rejected.is_empty());
+    assert!(!report.suspended);
+    assert_eq!(report.noise, None);
+    assert!(db.ingest_bytes(&host, "2026-08-09").unwrap() > 0);
+
+    let again =
+        clave::ingest::run(&db, &client, tmp.path(), &host, "2026-08-09T13:00:00Z").unwrap();
+    assert!(again.accepted.is_empty());
+    assert_eq!(again.noise, Some("WIST2-E02"));
+}
+
+#[test]
+fn ingest_budget_suspends_walk_and_resumes_when_budget_allows() {
+    let (listener, host) = reserve_addr();
+    let p = make_publisher_with_scope(&host, &["example.com"]);
+    let id1 = add_delta(&p, "https://example.com/a", "first content", None);
+    let id2 = add_delta(&p, "https://example.com/a", "second content", Some(&id1));
+    common::write_feed_page(
+        &p,
+        &host,
+        0,
+        std::slice::from_ref(&id1),
+        "2026-08-09T10:00:00Z",
+        None,
+    );
+    common::write_feed_with_next(
+        &p,
+        &host,
+        std::slice::from_ref(&id2),
+        "2026-08-09T12:00:00Z",
+        Some(&common::page_url(&host, 0)),
+    );
+    serve_static(listener, p.dir.path().to_path_buf());
+
+    let tmp = tempfile::tempdir().unwrap();
+    clave::init::run(&host, tmp.path()).unwrap();
+    let db = clave::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+    db.set_param("ingest_budget_bytes_day", 1).unwrap();
+    let client = clave::fetch::Client::new(true);
+
+    let report =
+        clave::ingest::run(&db, &client, tmp.path(), &host, "2026-08-09T12:00:05Z").unwrap();
+    assert!(report.suspended);
+    assert!(report.accepted.is_empty());
+    assert!(db.walk_suspended(&host).unwrap());
+
+    db.set_param("ingest_budget_bytes_day", 1_073_741_824)
+        .unwrap();
+    let resumed =
+        clave::ingest::run(&db, &client, tmp.path(), &host, "2026-08-10T00:00:05Z").unwrap();
+    assert_eq!(resumed.accepted, vec![id1.clone(), id2.clone()]);
+    assert!(!resumed.suspended);
+    assert!(!db.walk_suspended(&host).unwrap());
+}
+
+#[test]
+fn ingest_onboard_failure_is_e04_noise() {
+    let (listener, host) = reserve_addr();
+    let empty = tempfile::tempdir().unwrap();
+    serve_static(listener, empty.path().to_path_buf());
+
+    let tmp = tempfile::tempdir().unwrap();
+    clave::init::run(&host, tmp.path()).unwrap();
+    let db = clave::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+    let client = clave::fetch::Client::new(true);
+
+    let report =
+        clave::ingest::run(&db, &client, tmp.path(), &host, "2026-08-09T12:00:05Z").unwrap();
+    assert_eq!(report.noise, Some("WIST2-E04"));
+}
