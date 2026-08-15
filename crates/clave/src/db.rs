@@ -367,7 +367,7 @@ impl Db {
     #[allow(clippy::too_many_arguments)]
     pub fn commit_seal(
         &self,
-        up_to_rowid: i64,
+        sealed_rowids: &[i64],
         block_number: u64,
         block_hash: &str,
         sealed_at: &str,
@@ -376,10 +376,9 @@ impl Db {
         governance: &[GovernanceRow],
     ) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "DELETE FROM pending_entries WHERE rowid <= ?1",
-            [up_to_rowid],
-        )?;
+        for rowid in sealed_rowids {
+            tx.execute("DELETE FROM pending_entries WHERE rowid = ?1", [rowid])?;
+        }
         tx.execute(
             "INSERT INTO blocks(block_number, block_hash, sealed_at) VALUES (?1, ?2, ?3)",
             (block_number as i64, block_hash, sealed_at),
@@ -470,6 +469,16 @@ impl Db {
             .optional()
             .map(|v| v.unwrap_or(0) != 0)
             .map_err(Error::Db)
+    }
+
+    pub fn list_publisher_pull_times(&self) -> Result<Vec<(String, Option<String>)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT domain, last_pull_at FROM publishers ORDER BY domain")?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     pub fn delete_record_by_delta(&self, delta_id: &str) -> Result<()> {
@@ -739,7 +748,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
         db.commit_seal(
-            0,
+            &[],
             0,
             "sha256:h0",
             "2026-01-01T00:00:00Z",
@@ -763,7 +772,7 @@ mod tests {
             Some(500)
         );
         db.commit_seal(
-            0,
+            &[],
             1,
             "sha256:h1",
             "2026-01-02T00:00:00Z",
@@ -951,8 +960,9 @@ mod tests {
         let (peeked_again, _) = db.peek_pending_entries().unwrap();
         assert_eq!(peeked_again.len(), 2);
 
+        let sealed: Vec<i64> = peeked.iter().map(|e| e.rowid).collect();
         db.commit_seal(
-            up_to,
+            &sealed,
             0,
             "sha256:blockhash0",
             "2026-08-09T00:00:00Z",
@@ -999,9 +1009,10 @@ mod tests {
             "sha256:a",
         )
         .unwrap();
-        let (peeked, up_to) = db.peek_pending_entries().unwrap();
+        let (peeked, _up_to) = db.peek_pending_entries().unwrap();
+        let sealed: Vec<i64> = peeked.iter().map(|e| e.rowid).collect();
         db.commit_seal(
-            up_to,
+            &sealed,
             0,
             "sha256:blockhash0",
             "2026-08-09T00:00:00Z",
@@ -1010,7 +1021,6 @@ mod tests {
             &[],
         )
         .unwrap();
-        let _ = peeked;
 
         db.record_accepted_delta(
             "example.com",
@@ -1021,11 +1031,12 @@ mod tests {
             "sha256:b",
         )
         .unwrap();
-        let (peeked2, up_to2) = db.peek_pending_entries().unwrap();
+        let (peeked2, _up_to2) = db.peek_pending_entries().unwrap();
         assert_eq!(peeked2.len(), 1);
 
+        let sealed2: Vec<i64> = peeked2.iter().map(|e| e.rowid).collect();
         let result = db.commit_seal(
-            up_to2,
+            &sealed2,
             0,
             "sha256:blockhash0-conflict",
             "2026-08-09T00:01:00Z",

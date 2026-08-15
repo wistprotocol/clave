@@ -196,6 +196,7 @@ pub fn run(data_dir: PathBuf, db_path: PathBuf, bind: SocketAddr, allow_http: bo
         data_dir: data_dir.clone(),
         gate: IngestGate::new(MAX_CONCURRENT_INGESTS),
     };
+    let bg_state = state.clone();
     let app = Router::new()
         .route("/ingest", post(ingest_handler))
         .route("/status/:domain", get(status_handler))
@@ -205,8 +206,31 @@ pub fn run(data_dir: PathBuf, db_path: PathBuf, bind: SocketAddr, allow_http: bo
         .route_service("/anchor.json", ServeFile::new(data_dir.join("anchor.json")))
         .with_state(state);
 
+    let baseline_sk = crate::keys::load(&data_dir.join("keys/seed"))
+        .ok()
+        .map(Arc::new);
+    let bg_data = data_dir.clone();
+
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
+        if let Some(sk) = baseline_sk {
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+                loop {
+                    ticker.tick().await;
+                    let db = bg_state.db.clone();
+                    let client = bg_state.client.clone();
+                    let data = bg_data.clone();
+                    let sk = sk.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let db = db.lock().unwrap_or_else(PoisonError::into_inner);
+                        let now_epoch = jiff::Timestamp::now().as_second();
+                        let _ = crate::baseline::run_pass(&db, &client, &sk, &data, now_epoch);
+                    })
+                    .await;
+                }
+            });
+        }
         let listener = tokio::net::TcpListener::bind(bind).await?;
         let local_addr = listener.local_addr()?;
         println!("listening on http://{local_addr}");

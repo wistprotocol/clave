@@ -280,7 +280,7 @@ fn sanctioned_domain_ping_gets_403_and_status_shows_state() {
             .unwrap()
             .to_string();
         db.commit_seal(
-            0,
+            &[],
             0,
             "sha256:h0",
             &sealed,

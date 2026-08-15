@@ -124,7 +124,7 @@ mod tests {
 
     fn seal_gov(db: &Db, block: u64, sealed_epoch: i64, rows: &[GovernanceRow]) {
         db.commit_seal(
-            0,
+            &[],
             block,
             &format!("sha256:h{block}"),
             &ts(sealed_epoch),

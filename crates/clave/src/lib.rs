@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod appeals;
+pub mod baseline;
 pub mod db;
 pub mod error;
 pub mod fetch;
@@ -8,6 +9,7 @@ pub mod governance;
 pub mod ingest;
 pub mod init;
 pub mod keys;
+pub mod mirrors;
 pub mod param_change;
 pub mod quota;
 pub mod registry;

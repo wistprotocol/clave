@@ -45,6 +45,7 @@ struct GovernanceOutcome {
     governance: Vec<OwnedGovernanceRow>,
     withdrawals: Vec<String>,
     dropped: Vec<String>,
+    dropped_rowids: Vec<i64>,
 }
 
 const GOVERNANCE_ACTIONS: [&str; 6] = [
@@ -139,6 +140,7 @@ fn enforce_governance(
         governance: Vec::new(),
         withdrawals: Vec::new(),
         dropped: Vec::new(),
+        dropped_rowids: Vec::new(),
     };
     for e in entries {
         if e.entry_type != "registry_update" {
@@ -153,7 +155,10 @@ fn enforce_governance(
                     out.param_changes.push(change);
                     out.kept.push(e);
                 }
-                Err(reason) => out.dropped.push(reason),
+                Err(reason) => {
+                    out.dropped.push(reason);
+                    out.dropped_rowids.push(e.rowid);
+                }
             }
             continue;
         }
@@ -164,6 +169,7 @@ fn enforce_governance(
         if action == "appeal_ruling" && update["details"]["outcome"] == "unappealed" {
             if let Err(reason) = check_unappealed_ruling(db, &update, sealed_epoch) {
                 out.dropped.push(reason);
+                out.dropped_rowids.push(e.rowid);
                 continue;
             }
         }
@@ -213,7 +219,31 @@ fn enforce_governance(
     Ok(out)
 }
 
+/// WIST-3 §6 producer duty: never emit a Block whose decompressed size
+/// exceeds the cap. Entries that would push the JCS bytes past it stay
+/// pending and seal in a later Block; the overhead constant covers the
+/// header, signature and object framing around the entries array.
+const BLOCK_FRAMING_OVERHEAD_BYTES: usize = 512;
+
+fn fit_to_cap(entries: Vec<SealEntry>, cap: i64) -> Result<(Vec<SealEntry>, usize)> {
+    let budget = (cap.max(0) as usize).saturating_sub(BLOCK_FRAMING_OVERHEAD_BYTES);
+    let mut used = 0usize;
+    let mut kept = Vec::with_capacity(entries.len());
+    let mut deferred = 0usize;
+    for e in entries {
+        let size = serde_json::to_vec(&e.wrapped)?.len() + 1;
+        if used + size > budget {
+            deferred += 1;
+            continue;
+        }
+        used += size;
+        kept.push(e);
+    }
+    Ok((kept, deferred))
+}
+
 struct SealEntry {
+    rowid: i64,
     entry_type: String,
     domain: String,
     body: Value,
@@ -252,6 +282,7 @@ fn storage_order(peeked: Vec<PendingEntryRow>) -> Result<Vec<SealEntry>> {
             let wrapped = serde_json::json!({"type": p.entry_type, "body": p.entry_json});
             let leaf = merkle::leaf_hash(&jcs::canonicalize(&wrapped)?);
             Ok(SealEntry {
+                rowid: p.rowid,
                 entry_type: p.entry_type,
                 domain: p.domain,
                 body: p.entry_json,
@@ -368,8 +399,10 @@ pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<
         None => (0, "sha256:genesis".to_string()),
     };
 
-    let (peeked, up_to_rowid) = db.peek_pending_entries()?;
+    let (peeked, _up_to_rowid) = db.peek_pending_entries()?;
     let seal_entries = storage_order(peeked)?;
+    let cap = registry::effective(db, "block_decompressed_cap_bytes", &sealed_at)?;
+    let (seal_entries, _deferred) = fit_to_cap(seal_entries, cap)?;
     let outcome = enforce_governance(db, seal_entries, &sealed_at, sealed_epoch)?;
     let GovernanceOutcome {
         kept: seal_entries,
@@ -377,7 +410,13 @@ pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<
         governance,
         withdrawals,
         dropped,
+        dropped_rowids,
     } = outcome;
+    let sealed_rowids: Vec<i64> = seal_entries
+        .iter()
+        .map(|e| e.rowid)
+        .chain(dropped_rowids.iter().copied())
+        .collect();
     let entries: Vec<Value> = seal_entries.iter().map(|e| e.wrapped.clone()).collect();
     let leaves: Vec<[u8; 32]> = seal_entries.iter().map(|e| e.leaf).collect();
     let entry_count = entries.len() as u64;
@@ -415,7 +454,7 @@ pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<
     let blocks_dir = data_dir.join("log/blocks");
     std::fs::create_dir_all(&blocks_dir)?;
     let block_bytes = serde_json::to_vec(&block)?;
-    let compressed = zstd::encode_all(block_bytes.as_slice(), zstd::DEFAULT_COMPRESSION_LEVEL)?;
+    let compressed = zstd::bulk::compress(&block_bytes, zstd::DEFAULT_COMPRESSION_LEVEL)?;
     std::fs::write(
         blocks_dir.join(format!("{block_number:09}.json.zst")),
         &compressed,
@@ -471,7 +510,7 @@ pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<
         })
         .collect();
     db.commit_seal(
-        up_to_rowid,
+        &sealed_rowids,
         block_number,
         &block_hash,
         &sealed_at,
