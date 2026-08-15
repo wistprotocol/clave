@@ -33,6 +33,16 @@ enum Command {
         #[arg(long)]
         data: PathBuf,
     },
+    ParamChange {
+        #[arg(long)]
+        data: PathBuf,
+        #[arg(long)]
+        parameter: String,
+        #[arg(long)]
+        value: i64,
+        #[arg(long = "effective-at")]
+        effective_at: Option<String>,
+    },
 }
 
 fn main() -> Result<(), clave::Error> {
@@ -63,6 +73,31 @@ fn main() -> Result<(), clave::Error> {
             println!(
                 "sealed block {} with {} entries",
                 report.block_number, report.entry_count
+            );
+            for reason in &report.dropped {
+                println!("dropped parameter change: {reason}");
+            }
+        }
+        Command::ParamChange {
+            data,
+            parameter,
+            value,
+            effective_at,
+        } => {
+            let db = clave::db::Db::open(&data.join("clave.sqlite"))?;
+            let sk = clave::keys::load(&data.join("keys/seed"))?;
+            let now_epoch = jiff::Timestamp::now().as_second();
+            let report = clave::param_change::run(
+                &db,
+                &sk,
+                &parameter,
+                value,
+                effective_at.as_deref(),
+                now_epoch,
+            )?;
+            println!(
+                "queued parameter change {} = {value}, effective {} ({})",
+                parameter, report.effective_at, report.update_id
             );
         }
     }

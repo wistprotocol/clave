@@ -10,7 +10,12 @@ over HTTP for consumers to sync against.
 Subcommands: `init` (generate the log's genesis key and local store),
 `serve` (HTTP ingest + read endpoints), `seal` (cut the next Block from
 pending entries and chain it), `snapshot` (build a signed, verifiable
-point-in-time index for cold-start sync).
+point-in-time index for cold-start sync), `param-change` (queue a signed
+`parameter_change` Registry Update, WIST-4 §9: bounds and combination
+rules checked, `effective_at` held past the grace period, applied to the
+live parameter set once its Block seals and the effective instant passes;
+a change whose grace window lapses while queued is dropped from the Block
+and reported by `seal`).
 
 ## Build & test
 

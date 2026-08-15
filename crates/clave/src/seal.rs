@@ -1,5 +1,6 @@
-use crate::db::{Db, PendingEntryRow, RecordUpsert};
+use crate::db::{Db, ParamChangeRow, PendingEntryRow, RecordUpsert};
 use crate::error::{Error, Result};
+use crate::registry;
 use crate::WIST_VERSION;
 use serde_json::Value;
 use std::collections::HashSet;
@@ -20,6 +21,68 @@ const ENTRY_TYPE_ORDER: [&str; 4] = [
 pub struct SealReport {
     pub block_number: u64,
     pub entry_count: u64,
+    pub dropped: Vec<String>,
+}
+
+struct AcceptedParamChange {
+    parameter: String,
+    value: i64,
+    effective_at: String,
+}
+
+fn enforce_param_changes(
+    db: &Db,
+    entries: Vec<SealEntry>,
+    sealed_at: &str,
+    sealed_epoch: i64,
+) -> Result<(Vec<SealEntry>, Vec<AcceptedParamChange>, Vec<String>)> {
+    let grace_days = registry::effective(db, "param_grace_days", sealed_at)?;
+    let mut kept = Vec::with_capacity(entries.len());
+    let mut accepted = Vec::new();
+    let mut dropped = Vec::new();
+    for e in entries {
+        if e.entry_type != "registry_update" || e.body["update"]["action"] != "parameter_change" {
+            kept.push(e);
+            continue;
+        }
+        let details = &e.body["update"]["details"];
+        let verdict = (|| -> std::result::Result<AcceptedParamChange, String> {
+            let parameter = details["parameter"]
+                .as_str()
+                .ok_or("missing details.parameter")?;
+            let value = details["value"].as_i64().ok_or("missing details.value")?;
+            let effective_at = e.body["update"]["effective_at"]
+                .as_str()
+                .ok_or("missing effective_at")?;
+            let effective_epoch = effective_at
+                .parse::<jiff::Timestamp>()
+                .map_err(|_| format!("unparseable effective_at {effective_at:?}"))?
+                .as_second();
+            if effective_epoch < sealed_epoch + grace_days * 86400 {
+                return Err(format!(
+                    "{parameter}: effective_at {effective_at} is inside the {grace_days}-day grace period from sealed_at {sealed_at}"
+                ));
+            }
+            let lookup = |n: &str| {
+                registry::effective(db, n, effective_at)
+                    .unwrap_or_else(|_| registry::spec(n).and_then(|s| s.default).unwrap_or(0))
+            };
+            registry::validate(parameter, value, lookup).map_err(|err| err.to_string())?;
+            Ok(AcceptedParamChange {
+                parameter: parameter.to_string(),
+                value,
+                effective_at: effective_at.to_string(),
+            })
+        })();
+        match verdict {
+            Ok(change) => {
+                accepted.push(change);
+                kept.push(e);
+            }
+            Err(reason) => dropped.push(reason),
+        }
+    }
+    Ok((kept, accepted, dropped))
 }
 
 struct SealEntry {
@@ -149,7 +212,16 @@ fn resolve_record_updates(
 }
 
 pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<SealReport> {
-    let cadence = db.param("block_cadence_seconds")?;
+    let now_at = jiff::Timestamp::from_second(now_epoch)
+        .map_err(|_| Error::Seal("now out of range".into()))?
+        .to_string();
+    let prev = db.last_block()?;
+    let cadence = registry::effective(
+        db,
+        "block_cadence_seconds",
+        prev.as_ref()
+            .map_or(now_at.as_str(), |p| p.sealed_at.as_str()),
+    )?;
     if cadence <= 0 {
         return Err(Error::Seal("block_cadence_seconds must be positive".into()));
     }
@@ -158,7 +230,6 @@ pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<
         .map_err(|_| Error::Seal("sealed_at out of range".into()))?
         .to_string();
 
-    let prev = db.last_block()?;
     let (block_number, prev_block_hash) = match &prev {
         Some(p) => {
             if sealed_at.as_str() <= p.sealed_at.as_str() {
@@ -171,6 +242,8 @@ pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<
 
     let (peeked, up_to_rowid) = db.peek_pending_entries()?;
     let seal_entries = storage_order(peeked)?;
+    let (seal_entries, accepted_changes, dropped) =
+        enforce_param_changes(db, seal_entries, &sealed_at, sealed_epoch)?;
     let entries: Vec<Value> = seal_entries.iter().map(|e| e.wrapped.clone()).collect();
     let leaves: Vec<[u8; 32]> = seal_entries.iter().map(|e| e.leaf).collect();
     let entry_count = entries.len() as u64;
@@ -244,7 +317,22 @@ pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<
             lang: &r.lang,
         })
         .collect();
-    db.commit_seal(up_to_rowid, block_number, &block_hash, &sealed_at, &records)?;
+    let param_changes: Vec<ParamChangeRow> = accepted_changes
+        .iter()
+        .map(|c| ParamChangeRow {
+            parameter: &c.parameter,
+            value: c.value,
+            effective_at: &c.effective_at,
+        })
+        .collect();
+    db.commit_seal(
+        up_to_rowid,
+        block_number,
+        &block_hash,
+        &sealed_at,
+        &records,
+        &param_changes,
+    )?;
 
     let snapshot_date = sealed_at.get(..10).unwrap_or(&sealed_at).to_string();
     crate::snapshot::build(db, data_dir, sk, block_number, &block_hash, &snapshot_date)?;
@@ -252,5 +340,6 @@ pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<
     Ok(SealReport {
         block_number,
         entry_count,
+        dropped,
     })
 }
