@@ -93,6 +93,14 @@ enum Command {
         #[arg(long = "allow-http")]
         allow_http: bool,
     },
+    Mirror {
+        #[arg(long)]
+        data: PathBuf,
+        #[arg(long)]
+        add: Option<String>,
+        #[arg(long)]
+        remove: Option<String>,
+    },
 }
 
 fn main() -> Result<(), clave::Error> {
@@ -236,6 +244,31 @@ fn main() -> Result<(), clave::Error> {
             }
             for a in actions {
                 println!("{a}");
+            }
+        }
+        Command::Mirror { data, add, remove } => {
+            let now_epoch = jiff::Timestamp::now().as_second();
+            let urls = match (add, remove) {
+                (Some(url), None) => {
+                    let sk = clave::keys::load(&data.join("keys/seed"))?;
+                    clave::mirrors::add(&data, &sk, &url, now_epoch)?
+                }
+                (None, Some(url)) => {
+                    let sk = clave::keys::load(&data.join("keys/seed"))?;
+                    clave::mirrors::remove(&data, &sk, &url, now_epoch)?
+                }
+                (None, None) => clave::mirrors::list(&data)?,
+                (Some(_), Some(_)) => {
+                    return Err(clave::Error::Governance(
+                        "pass either --add or --remove, not both".into(),
+                    ));
+                }
+            };
+            if urls.is_empty() {
+                println!("no mirrors listed");
+            }
+            for u in urls {
+                println!("{u}");
             }
         }
     }
