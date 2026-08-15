@@ -83,11 +83,12 @@ fn load_status(db: &Db, domain: &str) -> Result<Option<Status>> {
         return Ok(None);
     };
     let rejections = db.list_rejections(domain)?;
+    let quota_remaining = crate::quota::quota_remaining(db, domain, &now_utc())?.max(0) as u64;
     Ok(Some(Status {
         wist_version: WIST_VERSION.to_string(),
         domain: domain.to_string(),
         last_pull_at: row.last_pull_at,
-        quota_remaining: 1100,
+        quota_remaining,
         state: row.state,
         rejections,
     }))

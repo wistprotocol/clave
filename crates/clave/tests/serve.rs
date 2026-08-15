@@ -227,3 +227,27 @@ fn noise_ping_decrements_quota() {
         "E04 first-contact failure must count as one noise ping"
     );
 }
+
+#[test]
+fn status_reports_real_quota_remaining() {
+    let tmp = tempfile::tempdir().unwrap();
+    clave::init::run("127.0.0.1:0", tmp.path()).unwrap();
+    {
+        let db = clave::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+        db.insert_publisher("example.com", b"{}", "k1", "pk").unwrap();
+        db.set_param("quota_base", 50).unwrap();
+        db.set_param("quota_slope", 0).unwrap();
+        let day = &jiff::Timestamp::now().to_string()[..10];
+        db.bump_noise_ping("example.com", day).unwrap();
+        db.bump_noise_ping("example.com", day).unwrap();
+    }
+    let addr = spawn_server(tmp.path());
+    let c = reqwest::blocking::Client::new();
+    let body: serde_json::Value = c
+        .get(format!("{addr}/status/example.com"))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(body["quota_remaining"], 48);
+}
