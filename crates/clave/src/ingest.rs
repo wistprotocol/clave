@@ -41,6 +41,26 @@ pub fn is_bare_authority(host: &str) -> bool {
         && parsed.fragment().is_none()
 }
 
+/// WIST-1 §2 Canonical Host over a bare `host[:port]` authority: the
+/// hostname is canonicalized (UTS #46, A-labels, lowercase), IP literals
+/// pass through, and the port is preserved as this implementation's
+/// loopback-deployment extension to §2's port-free Canonical Host.
+pub fn canonical_authority(host: &str) -> Option<String> {
+    if !is_bare_authority(host) {
+        return None;
+    }
+    let parsed = url::Url::parse(&format!("http://{host}/")).ok()?;
+    let canonical = match parsed.host()? {
+        url::Host::Domain(d) => wist_core::host::canonical_host(d).ok()?,
+        url::Host::Ipv4(a) => a.to_string(),
+        url::Host::Ipv6(a) => format!("[{a}]"),
+    };
+    Some(match parsed.port() {
+        Some(port) => format!("{canonical}:{port}"),
+        None => canonical,
+    })
+}
+
 fn url_authority(url: &str) -> Option<String> {
     let parsed = url::Url::parse(url).ok()?;
     let host = parsed.host_str()?;
@@ -50,16 +70,15 @@ fn url_authority(url: &str) -> Option<String> {
     })
 }
 
-/// WIST-1 §3.2 scope rule: a Delta's `url` authority must equal the
-/// Publisher's `domain` or one of its `subdomain_scope` hostnames.
+/// WIST-1 §3.2 scope rule, compared on Canonical Hosts (§2): a Delta's
+/// `url` authority must equal the Publisher's `domain` or one of its
+/// `subdomain_scope` hostnames.
 fn url_in_scope(url: &str, domain: &str, subdomain_scope: &[String]) -> bool {
-    let Some(authority) = url_authority(url) else {
+    let Some(authority) = url_authority(url).and_then(|a| canonical_authority(&a)) else {
         return false;
     };
-    authority.eq_ignore_ascii_case(domain)
-        || subdomain_scope
-            .iter()
-            .any(|s| authority.eq_ignore_ascii_case(s))
+    let matches = |declared: &str| canonical_authority(declared).as_deref() == Some(&authority);
+    matches(domain) || subdomain_scope.iter().any(|s| matches(s))
 }
 
 fn record_rejection(
@@ -126,7 +145,7 @@ fn onboard_publisher(
             return Ok(None);
         }
     };
-    if parsed.publisher.domain != host {
+    if canonical_authority(&parsed.publisher.domain).as_deref() != Some(host) {
         record_rejection(
             db,
             host,
@@ -199,9 +218,10 @@ pub fn run(
     now: &str,
 ) -> Result<IngestReport> {
     let mut report = IngestReport::default();
-    if !is_bare_authority(host) {
+    let Some(host) = canonical_authority(host) else {
         return Ok(report);
-    }
+    };
+    let host = host.as_str();
     let scheme = crate::fetch::scheme_for_host(host, client.allow_http());
     let base = format!("{scheme}://{host}/.well-known/wist/");
 
@@ -557,6 +577,50 @@ mod tests {
         assert!(!is_bare_authority("trusted.example@evil.example"));
         assert!(!is_bare_authority("example.com/../../etc/passwd"));
         assert!(!is_bare_authority("exa mple.com"));
+    }
+
+    #[test]
+    fn canonical_authority_normalizes_case_and_idn_and_keeps_port() {
+        assert_eq!(
+            canonical_authority("EXAMPLE.com").as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(
+            canonical_authority("BÜCHER.example:8080").as_deref(),
+            Some("xn--bcher-kva.example:8080")
+        );
+        assert_eq!(
+            canonical_authority("127.0.0.1:9").as_deref(),
+            Some("127.0.0.1:9")
+        );
+        assert_eq!(canonical_authority("under_score.example"), None);
+        assert_eq!(canonical_authority("https://example.com"), None);
+        assert_eq!(canonical_authority(""), None);
+    }
+
+    #[test]
+    fn url_in_scope_compares_canonical_hosts() {
+        assert!(url_in_scope(
+            "https://BÜCHER.example/a",
+            "xn--bcher-kva.example",
+            &[]
+        ));
+        assert!(url_in_scope(
+            "https://xn--bcher-kva.example/a",
+            "bücher.example",
+            &[]
+        ));
+        assert!(url_in_scope(
+            "https://sub.example.com/a",
+            "example.com",
+            &["SUB.EXAMPLE.COM".to_string()]
+        ));
+        assert!(url_in_scope("https://example.com/a", "EXAMPLE.COM", &[]));
+        assert!(!url_in_scope(
+            "https://bücher.example/a",
+            "example.com",
+            &[]
+        ));
     }
 
     #[test]

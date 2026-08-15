@@ -2106,6 +2106,7 @@ dependencies = [
  "curve25519-dalek",
  "ed25519-dalek",
  "hmac",
+ "idna",
  "serde",
  "serde_json",
  "sha2",
