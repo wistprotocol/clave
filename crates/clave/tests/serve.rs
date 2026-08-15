@@ -234,7 +234,8 @@ fn status_reports_real_quota_remaining() {
     clave::init::run("127.0.0.1:0", tmp.path()).unwrap();
     {
         let db = clave::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
-        db.insert_publisher("example.com", b"{}", "k1", "pk").unwrap();
+        db.insert_publisher("example.com", b"{}", "k1", "pk")
+            .unwrap();
         db.set_param("quota_base", 50).unwrap();
         db.set_param("quota_slope", 0).unwrap();
         let day = &jiff::Timestamp::now().to_string()[..10];
@@ -250,4 +251,18 @@ fn status_reports_real_quota_remaining() {
         .json()
         .unwrap();
     assert_eq!(body["quota_remaining"], 48);
+}
+
+#[test]
+fn ingest_rejects_host_with_no_canonicalization() {
+    let tmp = tempfile::tempdir().unwrap();
+    clave::init::run("127.0.0.1:0", tmp.path()).unwrap();
+    let addr = spawn_server(tmp.path());
+    let c = reqwest::blocking::Client::new();
+    let r = c
+        .post(format!("{addr}/ingest"))
+        .json(&serde_json::json!({"host": "under_score.example"}))
+        .send()
+        .unwrap();
+    assert_eq!(r.status(), 400);
 }

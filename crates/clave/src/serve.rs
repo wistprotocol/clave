@@ -1,7 +1,7 @@
 use crate::db::Db;
 use crate::error::{Error, Result};
 use crate::fetch::Client;
-use crate::ingest::{self, is_bare_authority};
+use crate::ingest::{self, canonical_authority};
 use crate::WIST_VERSION;
 use axum::body::Bytes;
 use axum::extract::{Path, State};
@@ -106,9 +106,10 @@ async fn ingest_handler(State(state): State<AppState>, body: Bytes) -> axum::res
         Ok(p) => p,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
-    if !is_bare_authority(&payload.host) {
+    let Some(host) = canonical_authority(&payload.host) else {
         return StatusCode::BAD_REQUEST.into_response();
-    }
+    };
+    let payload = IngestRequest { host };
     let now = now_utc();
 
     let quota = {
