@@ -43,6 +43,56 @@ enum Command {
         #[arg(long = "effective-at")]
         effective_at: Option<String>,
     },
+    Sanction {
+        #[arg(long)]
+        data: PathBuf,
+        #[arg(long)]
+        domain: String,
+        #[arg(long)]
+        level: i64,
+        #[arg(long)]
+        severity: i64,
+        #[arg(long, value_delimiter = ',')]
+        evidence: Vec<String>,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    Rule {
+        #[arg(long)]
+        data: PathBuf,
+        #[arg(long)]
+        domain: String,
+        #[arg(long)]
+        notice: String,
+        #[arg(long)]
+        outcome: String,
+        #[arg(long)]
+        reasoning: String,
+    },
+    Lift {
+        #[arg(long)]
+        data: PathBuf,
+        #[arg(long)]
+        domain: String,
+    },
+    Withdraw {
+        #[arg(long)]
+        data: PathBuf,
+        #[arg(long)]
+        domain: String,
+        #[arg(long = "delta-id")]
+        delta_id: String,
+        #[arg(long = "legal-basis")]
+        legal_basis: String,
+        #[arg(long)]
+        jurisdiction: String,
+    },
+    PollAppeals {
+        #[arg(long)]
+        data: PathBuf,
+        #[arg(long = "allow-http")]
+        allow_http: bool,
+    },
 }
 
 fn main() -> Result<(), clave::Error> {
@@ -99,6 +149,94 @@ fn main() -> Result<(), clave::Error> {
                 "queued parameter change {} = {value}, effective {} ({})",
                 parameter, report.effective_at, report.update_id
             );
+        }
+        Command::Sanction {
+            data,
+            domain,
+            level,
+            severity,
+            evidence,
+            reason,
+        } => {
+            let db = clave::db::Db::open(&data.join("clave.sqlite"))?;
+            let sk = clave::keys::load(&data.join("keys/seed"))?;
+            let report = clave::governance::sanction(
+                &db,
+                &sk,
+                &domain,
+                level,
+                severity,
+                &evidence,
+                reason.as_deref(),
+                jiff::Timestamp::now().as_second(),
+            )?;
+            match &report.notice_id {
+                Some(n) => println!(
+                    "queued level-{level} sanction {} with notice {n}",
+                    report.update_id
+                ),
+                None => println!("queued level-{level} sanction {}", report.update_id),
+            }
+        }
+        Command::Rule {
+            data,
+            domain,
+            notice,
+            outcome,
+            reasoning,
+        } => {
+            let db = clave::db::Db::open(&data.join("clave.sqlite"))?;
+            let sk = clave::keys::load(&data.join("keys/seed"))?;
+            let report = clave::governance::rule(
+                &db,
+                &sk,
+                &domain,
+                &notice,
+                &outcome,
+                &reasoning,
+                jiff::Timestamp::now().as_second(),
+            )?;
+            println!("queued {outcome} ruling {}", report.update_id);
+        }
+        Command::Lift { data, domain } => {
+            let db = clave::db::Db::open(&data.join("clave.sqlite"))?;
+            let sk = clave::keys::load(&data.join("keys/seed"))?;
+            let report =
+                clave::governance::lift(&db, &sk, &domain, jiff::Timestamp::now().as_second())?;
+            println!("queued sanction lift {}", report.update_id);
+        }
+        Command::Withdraw {
+            data,
+            domain,
+            delta_id,
+            legal_basis,
+            jurisdiction,
+        } => {
+            let db = clave::db::Db::open(&data.join("clave.sqlite"))?;
+            let sk = clave::keys::load(&data.join("keys/seed"))?;
+            let report = clave::governance::withdraw(
+                &db,
+                &sk,
+                &domain,
+                &delta_id,
+                &legal_basis,
+                &jurisdiction,
+                jiff::Timestamp::now().as_second(),
+            )?;
+            println!("queued payload withdrawal {}", report.update_id);
+        }
+        Command::PollAppeals { data, allow_http } => {
+            let db = clave::db::Db::open(&data.join("clave.sqlite"))?;
+            let sk = clave::keys::load(&data.join("keys/seed"))?;
+            let client = clave::fetch::Client::new(allow_http);
+            let actions =
+                clave::appeals::poll(&db, &client, &sk, jiff::Timestamp::now().as_second())?;
+            if actions.is_empty() {
+                println!("no appeal action needed");
+            }
+            for a in actions {
+                println!("{a}");
+            }
         }
     }
     Ok(())

@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS param_changes(parameter TEXT NOT NULL, value INTEGER 
 CREATE TABLE IF NOT EXISTS noise_pings(domain TEXT NOT NULL, day TEXT NOT NULL, count INTEGER NOT NULL, PRIMARY KEY(domain, day));
 CREATE TABLE IF NOT EXISTS ingest_meter(domain TEXT NOT NULL, day TEXT NOT NULL, bytes INTEGER NOT NULL, PRIMARY KEY(domain, day));
 CREATE TABLE IF NOT EXISTS walk_state(domain TEXT PRIMARY KEY, suspended INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS governance(update_id TEXT PRIMARY KEY, action TEXT NOT NULL, domain TEXT NOT NULL, level INTEGER, notice_id TEXT, outcome TEXT, sealed_at TEXT NOT NULL, block_number INTEGER NOT NULL);
 ";
 
 pub struct PublisherRow {
@@ -68,6 +69,26 @@ pub struct ParamChangeRow<'a> {
     pub parameter: &'a str,
     pub value: i64,
     pub effective_at: &'a str,
+}
+
+pub struct GovernanceRow<'a> {
+    pub update_id: &'a str,
+    pub action: &'a str,
+    pub domain: &'a str,
+    pub level: Option<i64>,
+    pub notice_id: Option<&'a str>,
+    pub outcome: Option<&'a str>,
+}
+
+pub struct GovernanceEntry {
+    pub update_id: String,
+    pub action: String,
+    pub domain: String,
+    pub level: Option<i64>,
+    pub notice_id: Option<String>,
+    pub outcome: Option<String>,
+    pub sealed_at: String,
+    pub block_number: u64,
 }
 
 pub struct RecordUpsert<'a> {
@@ -343,6 +364,7 @@ impl Db {
         Ok((entries, max_rowid))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn commit_seal(
         &self,
         up_to_rowid: i64,
@@ -351,6 +373,7 @@ impl Db {
         sealed_at: &str,
         records: &[RecordUpsert],
         param_changes: &[ParamChangeRow],
+        governance: &[GovernanceRow],
     ) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
@@ -368,6 +391,21 @@ impl Db {
             tx.execute(
                 "INSERT INTO param_changes(parameter, value, effective_at, block_number) VALUES (?1, ?2, ?3, ?4)",
                 (c.parameter, c.value, c.effective_at, block_number as i64),
+            )?;
+        }
+        for g in governance {
+            tx.execute(
+                "INSERT INTO governance(update_id, action, domain, level, notice_id, outcome, sealed_at, block_number) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                (
+                    g.update_id,
+                    g.action,
+                    g.domain,
+                    g.level,
+                    g.notice_id,
+                    g.outcome,
+                    sealed_at,
+                    block_number as i64,
+                ),
             )?;
         }
         tx.commit()?;
@@ -432,6 +470,54 @@ impl Db {
             .optional()
             .map(|v| v.unwrap_or(0) != 0)
             .map_err(Error::Db)
+    }
+
+    pub fn delete_record_by_delta(&self, delta_id: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM records WHERE delta_id = ?1", [delta_id])?;
+        Ok(())
+    }
+
+    pub fn governance_by_action(&self, action: &str) -> Result<Vec<GovernanceEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT update_id, action, domain, level, notice_id, outcome, sealed_at, block_number FROM governance WHERE action = ?1 ORDER BY sealed_at ASC, block_number ASC",
+        )?;
+        let rows = stmt
+            .query_map([action], |row| {
+                Ok(GovernanceEntry {
+                    update_id: row.get(0)?,
+                    action: row.get(1)?,
+                    domain: row.get(2)?,
+                    level: row.get(3)?,
+                    notice_id: row.get(4)?,
+                    outcome: row.get(5)?,
+                    sealed_at: row.get(6)?,
+                    block_number: row.get::<_, i64>(7)? as u64,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn governance_for_domain(&self, domain: &str) -> Result<Vec<GovernanceEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT update_id, action, domain, level, notice_id, outcome, sealed_at, block_number FROM governance WHERE domain = ?1 ORDER BY sealed_at ASC, block_number ASC",
+        )?;
+        let rows = stmt
+            .query_map([domain], |row| {
+                Ok(GovernanceEntry {
+                    update_id: row.get(0)?,
+                    action: row.get(1)?,
+                    domain: row.get(2)?,
+                    level: row.get(3)?,
+                    notice_id: row.get(4)?,
+                    outcome: row.get(5)?,
+                    sealed_at: row.get(6)?,
+                    block_number: row.get::<_, i64>(7)? as u64,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     pub fn latest_param_change(&self, name: &str, at: &str) -> Result<Option<i64>> {
@@ -663,6 +749,7 @@ mod tests {
                 value: 500,
                 effective_at: "2026-01-10T00:00:00Z",
             }],
+            &[],
         )
         .unwrap();
         assert_eq!(
@@ -686,6 +773,7 @@ mod tests {
                 value: 800,
                 effective_at: "2026-01-20T00:00:00Z",
             }],
+            &[],
         )
         .unwrap();
         assert_eq!(
@@ -879,6 +967,7 @@ mod tests {
                 lang: "en",
             }],
             &[],
+            &[],
         )
         .unwrap();
 
@@ -918,6 +1007,7 @@ mod tests {
             "2026-08-09T00:00:00Z",
             &[],
             &[],
+            &[],
         )
         .unwrap();
         let _ = peeked;
@@ -939,6 +1029,7 @@ mod tests {
             0,
             "sha256:blockhash0-conflict",
             "2026-08-09T00:01:00Z",
+            &[],
             &[],
             &[],
         );

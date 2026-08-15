@@ -266,3 +266,60 @@ fn ingest_rejects_host_with_no_canonicalization() {
         .unwrap();
     assert_eq!(r.status(), 400);
 }
+
+#[test]
+fn sanctioned_domain_ping_gets_403_and_status_shows_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    clave::init::run("127.0.0.1:0", tmp.path()).unwrap();
+    {
+        let db = clave::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+        db.insert_publisher("example.com", b"{}", "k1", "pk")
+            .unwrap();
+        let now = jiff::Timestamp::now().as_second();
+        let sealed = jiff::Timestamp::from_second(now - 3600)
+            .unwrap()
+            .to_string();
+        db.commit_seal(
+            0,
+            0,
+            "sha256:h0",
+            &sealed,
+            &[],
+            &[],
+            &[
+                clave::db::GovernanceRow {
+                    update_id: "sha256:n1",
+                    action: "notice",
+                    domain: "example.com",
+                    level: None,
+                    notice_id: None,
+                    outcome: None,
+                },
+                clave::db::GovernanceRow {
+                    update_id: "sha256:s1",
+                    action: "sanction",
+                    domain: "example.com",
+                    level: Some(3),
+                    notice_id: Some("sha256:n1"),
+                    outcome: None,
+                },
+            ],
+        )
+        .unwrap();
+    }
+    let addr = spawn_server(tmp.path());
+    let c = reqwest::blocking::Client::new();
+    let r = c
+        .post(format!("{addr}/ingest"))
+        .json(&serde_json::json!({"host": "example.com"}))
+        .send()
+        .unwrap();
+    assert_eq!(r.status(), 403);
+    let body: serde_json::Value = c
+        .get(format!("{addr}/status/example.com"))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(body["state"], "sanctioned_quarantine");
+}
