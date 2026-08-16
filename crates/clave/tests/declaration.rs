@@ -65,7 +65,7 @@ fn base() -> Value {
 fn unchanged_when_same_seq_and_content() {
     let stored = base();
     assert_eq!(
-        evaluate(&stored, &stored.clone(), false).unwrap(),
+        evaluate(&stored, &stored.clone()).unwrap(),
         Decision::Unchanged
     );
 }
@@ -80,7 +80,7 @@ fn same_seq_different_content_is_rejected() {
         Some(vec![key_json("r1", &R1, "2026-08-01T00:00:00Z")]),
         ("k1", &K1),
     );
-    assert!(evaluate(&stored, &mutated, false).is_err());
+    assert!(evaluate(&stored, &mutated).is_err());
 }
 
 #[test]
@@ -99,7 +99,7 @@ fn lower_seq_is_rejected() {
         None,
         ("k1", &K1),
     );
-    assert!(evaluate(&stored, &stale, false).is_err());
+    assert!(evaluate(&stored, &stale).is_err());
 }
 
 #[test]
@@ -115,7 +115,7 @@ fn prev_declaration_mismatch_is_rejected() {
         Some(vec![key_json("r1", &R1, "2026-08-01T00:00:00Z")]),
         ("k1", &K1),
     );
-    assert!(evaluate(&stored, &next, false).is_err());
+    assert!(evaluate(&stored, &next).is_err());
 }
 
 #[test]
@@ -131,7 +131,7 @@ fn ordinary_rotation_signed_by_stored_key() {
         Some(vec![key_json("r1", &R1, "2026-08-01T00:00:00Z")]),
         ("k1", &K1),
     );
-    assert_eq!(evaluate(&stored, &next, false).unwrap(), Decision::Ordinary);
+    assert_eq!(evaluate(&stored, &next).unwrap(), Decision::Ordinary);
 }
 
 #[test]
@@ -144,7 +144,7 @@ fn signature_not_matching_named_key_is_rejected() {
         Some(vec![key_json("r1", &R1, "2026-08-01T00:00:00Z")]),
         ("k1", &K2),
     );
-    assert!(evaluate(&stored, &next, false).is_err());
+    assert!(evaluate(&stored, &next).is_err());
 }
 
 #[test]
@@ -157,7 +157,7 @@ fn recovery_rotation_signed_by_stored_recovery_key() {
         Some(vec![key_json("r1", &R1, "2026-08-01T00:00:00Z")]),
         ("r1", &R1),
     );
-    assert_eq!(evaluate(&stored, &next, false).unwrap(), Decision::Recovery);
+    assert_eq!(evaluate(&stored, &next).unwrap(), Decision::Recovery);
 }
 
 #[test]
@@ -170,7 +170,7 @@ fn recovery_signed_declaration_may_replace_recovery_keys() {
         Some(vec![key_json("r2", &X1, "2026-08-10T00:00:00Z")]),
         ("r1", &R1),
     );
-    assert_eq!(evaluate(&stored, &next, false).unwrap(), Decision::Recovery);
+    assert_eq!(evaluate(&stored, &next).unwrap(), Decision::Recovery);
 }
 
 #[test]
@@ -189,10 +189,7 @@ fn fresh_identity_signed_by_own_new_key() {
         None,
         ("kx", &X1),
     );
-    assert_eq!(
-        evaluate(&stored, &next, false).unwrap(),
-        Decision::FreshIdentity
-    );
+    assert_eq!(evaluate(&stored, &next).unwrap(), Decision::FreshIdentity);
 }
 
 #[test]
@@ -205,7 +202,7 @@ fn unknown_signer_is_rejected() {
         Some(vec![key_json("r1", &R1, "2026-08-01T00:00:00Z")]),
         ("nope", &X1),
     );
-    assert!(evaluate(&stored, &next, false).is_err());
+    assert!(evaluate(&stored, &next).is_err());
 }
 
 #[test]
@@ -218,7 +215,7 @@ fn altering_recovery_keys_without_recovery_signature_is_rejected() {
         Some(vec![key_json("r2", &X1, "2026-08-10T00:00:00Z")]),
         ("k1", &K1),
     );
-    assert!(evaluate(&stored, &next, false).is_err());
+    assert!(evaluate(&stored, &next).is_err());
 }
 
 #[test]
@@ -231,7 +228,7 @@ fn dropping_recovery_keys_without_recovery_signature_is_rejected() {
         None,
         ("k1", &K1),
     );
-    assert!(evaluate(&stored, &next, false).is_err());
+    assert!(evaluate(&stored, &next).is_err());
 }
 
 #[test]
@@ -250,7 +247,7 @@ fn establishing_recovery_keys_with_ordinary_signature_is_allowed() {
         Some(vec![key_json("r1", &R1, "2026-08-10T00:00:00Z")]),
         ("k1", &K1),
     );
-    assert_eq!(evaluate(&stored, &next, false).unwrap(), Decision::Ordinary);
+    assert_eq!(evaluate(&stored, &next).unwrap(), Decision::Ordinary);
 }
 
 #[test]
@@ -263,11 +260,11 @@ fn fresh_identity_must_carry_recovery_keys_byte_identical() {
         None,
         ("kx", &X1),
     );
-    assert!(evaluate(&stored, &next, false).is_err());
+    assert!(evaluate(&stored, &next).is_err());
 }
 
 #[test]
-fn fresh_identity_is_rejected_while_recovery_window_open() {
+fn fresh_identity_is_accepted_and_left_to_the_windows_settlement() {
     let stored = declaration(
         1,
         Some("sha256:aa"),
@@ -282,8 +279,11 @@ fn fresh_identity_is_rejected_while_recovery_window_open() {
         Some(vec![key_json("r1", &R1, "2026-08-01T00:00:00Z")]),
         ("kx", &X1),
     );
-    assert!(evaluate(&stored, &thief, true).is_err());
-    assert!(evaluate(&stored, &thief, false).is_ok());
+    assert_eq!(
+        evaluate(&stored, &thief).unwrap(),
+        Decision::FreshIdentity,
+        "an open window does not change acceptance; supersession happens at its end"
+    );
 }
 
 #[test]
@@ -298,7 +298,7 @@ fn domain_change_is_rejected() {
         wist_core::envelope::sign_envelope(&publisher, "publisher", "k1", &sk).unwrap(),
     )
     .unwrap();
-    assert!(evaluate(&stored, &next, false).is_err());
+    assert!(evaluate(&stored, &next).is_err());
 }
 
 fn spec_dir() -> std::path::PathBuf {
@@ -313,12 +313,11 @@ fn spec_dir() -> std::path::PathBuf {
 fn spec_declaration_sequence_vector() {
     let path = spec_dir().join("vectors/wist1/declaration-sequence.json");
     let vector: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    let window_open = vector["recovery_window_open"].as_bool().unwrap();
     let cases = vector["cases"].as_array().unwrap();
     assert!(!cases.is_empty());
     for case in cases {
         let name = case["name"].as_str().unwrap();
-        let got = evaluate(&case["stored"], &case["fetched"], window_open);
+        let got = evaluate(&case["stored"], &case["fetched"]);
         match case["expected"].as_str().unwrap() {
             "idempotent" => assert_eq!(got.as_ref().ok(), Some(&Decision::Unchanged), "{name}"),
             "ordinary_rotation" => {
