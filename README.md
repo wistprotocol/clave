@@ -29,7 +29,20 @@ Retry-After; only WIST2-E02/E04 pings count as noise), rejects quarantined
 and delisted domains with 403, and runs a baseline pass every minute that
 re-pulls stale or budget-suspended publishers without a Ping. Ingest
 follows feed pages (WIST-2 §3.2) under the per-domain daily byte budget,
-suspending and resuming across days. Snapshots carry tier0 SQLite and
+suspending and resuming across days.
+
+Ingest re-fetches each known publisher's Declaration and validates the
+chain (WIST-1 §5.2: `seq`/`prev_declaration` monotonicity, recovery-keys
+protection, signer classification into ordinary rotation, recovery
+rotation, or fresh identity — WIST1-E08 otherwise), and verifies every
+delta against the full declared key set (`sig.key_id` membership and
+`valid_from`; WIST1-E01/E02). A recovery rotation opens the WIST-1 §5.2
+recovery window at its sealing Block (a `notice` with `details.kind`
+`"recovery"` is sealed alongside, and the open window appears in snapshot
+state): the domain's deltas queue instead of sealing, declarations signed
+by superseded keys are rejected, and the first Block at or past the
+window's end settles the queue — survivors seal in acceptance order,
+failures surface as WIST1-E13 on the status endpoint. Snapshots carry tier0 SQLite and
 tier1 Parquet (extracts + link graph), optionally sharded
 (`snapshot_shard_count` in the local params table).
 

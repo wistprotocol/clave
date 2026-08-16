@@ -370,6 +370,44 @@ fn resolve_record_updates(
     Ok(updates)
 }
 
+/// WIST-1 §5.2 queue settlement: at the first Block whose `sealed_at` is at
+/// or after a recovery window's end, revalidate each queued Delta against
+/// the Key Set then in effect; failures are WIST1-E13, survivors become
+/// pending entries in their original acceptance order.
+fn settle_recovery_windows(db: &Db, sealed_at: &str) -> Result<()> {
+    for (domain, window_declaration) in db.list_due_recovery_windows(sealed_at)? {
+        let declaration_raw = db
+            .get_publisher_declaration(&domain)?
+            .unwrap_or(window_declaration);
+        let doc: Value = serde_json::from_slice(&declaration_raw)?;
+        let publisher: wist_core::objects::Publisher =
+            serde_json::from_value(doc["publisher"].clone())
+                .map_err(|e| Error::Seal(format!("stored declaration unparsable: {e}")))?;
+        let keys: Vec<&wist_core::objects::PublisherKey> = publisher.keys.iter().collect();
+        for q in db.drain_queued_deltas(&domain)? {
+            let observed_at = q.entry_json["delta"]["observed_at"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            match crate::declaration::verify_signed(&keys, &q.entry_json, "delta", Some(&observed_at))
+            {
+                Ok(()) => {
+                    db.insert_pending_entry("publisher_delta", &domain, &q.entry_json, q.chain_pos)?
+                }
+                Err(_) => db.insert_rejection(
+                    &domain,
+                    "WIST1-E13",
+                    sealed_at,
+                    Some(&q.delta_id),
+                    Some("queued delta does not verify against the key set at the recovery window's end"),
+                )?,
+            }
+        }
+        db.close_recovery_window(&domain)?;
+    }
+    Ok(())
+}
+
 pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<SealReport> {
     let now_at = jiff::Timestamp::from_second(now_epoch)
         .map_err(|_| Error::Seal("now out of range".into()))?
@@ -398,6 +436,8 @@ pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<
         }
         None => (0, "sha256:genesis".to_string()),
     };
+
+    settle_recovery_windows(db, &sealed_at)?;
 
     let (peeked, _up_to_rowid) = db.peek_pending_entries()?;
     let seal_entries = storage_order(peeked)?;
@@ -518,6 +558,29 @@ pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<
         &param_changes,
         &governance_rows,
     )?;
+
+    for domain in db.list_pending_recovery_windows()? {
+        let sealed_here = seal_entries
+            .iter()
+            .any(|e| e.entry_type == "publisher_declaration" && e.domain == domain);
+        if !sealed_here {
+            continue;
+        }
+        let days = registry::effective(db, "recovery_window_days", &sealed_at)?;
+        let window_end = jiff::Timestamp::from_second(sealed_epoch + days * 86400)
+            .map_err(|_| Error::Seal("recovery window end out of range".into()))?
+            .to_string();
+        db.activate_recovery_window(&domain, block_number as i64, &window_end)?;
+        let update = serde_json::json!({
+            "wist_version": WIST_VERSION,
+            "action": "notice",
+            "subject": domain,
+            "details": {"kind": "recovery"},
+            "effective_at": sealed_at,
+        });
+        let envelope = sign_envelope(&update, "update", GENESIS_KEY_ID, sk)?;
+        db.insert_pending_entry("registry_update", "", &envelope, 0)?;
+    }
 
     if !withdrawals.is_empty() {
         for delta_id in &withdrawals {

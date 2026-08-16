@@ -18,6 +18,8 @@ CREATE TABLE IF NOT EXISTS noise_pings(domain TEXT NOT NULL, day TEXT NOT NULL, 
 CREATE TABLE IF NOT EXISTS ingest_meter(domain TEXT NOT NULL, day TEXT NOT NULL, bytes INTEGER NOT NULL, PRIMARY KEY(domain, day));
 CREATE TABLE IF NOT EXISTS walk_state(domain TEXT PRIMARY KEY, suspended INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS governance(update_id TEXT PRIMARY KEY, action TEXT NOT NULL, domain TEXT NOT NULL, level INTEGER, notice_id TEXT, outcome TEXT, sealed_at TEXT NOT NULL, block_number INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS recovery_windows(domain TEXT PRIMARY KEY, declaration_json BLOB NOT NULL, prior_declaration_json BLOB NOT NULL, opened_block INTEGER, window_end TEXT);
+CREATE TABLE IF NOT EXISTS queued_deltas(rowid INTEGER PRIMARY KEY AUTOINCREMENT, domain TEXT NOT NULL, delta_id TEXT NOT NULL, entry_json BLOB NOT NULL, url TEXT NOT NULL, chain_pos INTEGER NOT NULL);
 ";
 
 pub struct PublisherRow {
@@ -89,6 +91,20 @@ pub struct GovernanceEntry {
     pub outcome: Option<String>,
     pub sealed_at: String,
     pub block_number: u64,
+}
+
+pub struct RecoveryWindowRow {
+    pub declaration_json: Vec<u8>,
+    pub prior_declaration_json: Vec<u8>,
+    pub opened_block: Option<i64>,
+    pub window_end: Option<String>,
+}
+
+pub struct QueuedDeltaRow {
+    pub delta_id: String,
+    pub entry_json: Value,
+    pub url: String,
+    pub chain_pos: i64,
 }
 
 pub struct RecordUpsert<'a> {
@@ -256,6 +272,163 @@ impl Db {
         exec_insert_pending_entry(&tx, "publisher_declaration", domain, entry_json, 0)?;
         tx.commit()?;
         Ok(())
+    }
+
+    pub fn update_publisher_declaration(
+        &self,
+        domain: &str,
+        declaration_json: &[u8],
+        key_id: &str,
+        public_key: &str,
+        entry_json: &Value,
+    ) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE publishers SET declaration_json = ?2, key_id = ?3, public_key = ?4 WHERE domain = ?1",
+            (domain, declaration_json, key_id, public_key),
+        )?;
+        exec_insert_pending_entry(&tx, "publisher_declaration", domain, entry_json, 0)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn get_publisher_declaration(&self, domain: &str) -> Result<Option<Vec<u8>>> {
+        self.conn
+            .query_row(
+                "SELECT declaration_json FROM publishers WHERE domain = ?1",
+                [domain],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Error::Db)
+    }
+
+    pub fn open_recovery_window(
+        &self,
+        domain: &str,
+        declaration_json: &[u8],
+        prior_declaration_json: &[u8],
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO recovery_windows(domain, declaration_json, prior_declaration_json) VALUES (?1, ?2, ?3)",
+            (domain, declaration_json, prior_declaration_json),
+        )?;
+        Ok(())
+    }
+
+    pub fn get_recovery_window(&self, domain: &str) -> Result<Option<RecoveryWindowRow>> {
+        self.conn
+            .query_row(
+                "SELECT declaration_json, prior_declaration_json, opened_block, window_end FROM recovery_windows WHERE domain = ?1",
+                [domain],
+                |row| {
+                    Ok(RecoveryWindowRow {
+                        declaration_json: row.get(0)?,
+                        prior_declaration_json: row.get(1)?,
+                        opened_block: row.get(2)?,
+                        window_end: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Error::Db)
+    }
+
+    pub fn list_pending_recovery_windows(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT domain FROM recovery_windows WHERE opened_block IS NULL ORDER BY domain",
+        )?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<String>>>()
+            .map_err(Error::Db)
+    }
+
+    pub fn activate_recovery_window(
+        &self,
+        domain: &str,
+        opened_block: i64,
+        window_end: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE recovery_windows SET opened_block = ?2, window_end = ?3 WHERE domain = ?1 AND opened_block IS NULL",
+            (domain, opened_block, window_end),
+        )?;
+        Ok(())
+    }
+
+    pub fn list_due_recovery_windows(&self, now: &str) -> Result<Vec<(String, Vec<u8>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT domain, declaration_json FROM recovery_windows WHERE window_end IS NOT NULL AND window_end <= ?1 ORDER BY domain",
+        )?;
+        let rows = stmt.query_map([now], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Error::Db)
+    }
+
+    pub fn list_open_recovery_windows(&self) -> Result<Vec<(String, i64, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT domain, opened_block, window_end FROM recovery_windows WHERE opened_block IS NOT NULL ORDER BY domain",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Error::Db)
+    }
+
+    pub fn close_recovery_window(&self, domain: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM recovery_windows WHERE domain = ?1", [domain])?;
+        Ok(())
+    }
+
+    pub fn queue_delta(
+        &self,
+        domain: &str,
+        delta_id: &str,
+        entry_json: &Value,
+        url: &str,
+        tip: &str,
+        chain_pos: i64,
+    ) -> Result<()> {
+        let bytes = serde_json::to_vec(entry_json)?;
+        let tx = self.conn.unchecked_transaction()?;
+        exec_insert_seen_delta(&tx, delta_id, domain)?;
+        tx.execute(
+            "INSERT INTO queued_deltas(domain, delta_id, entry_json, url, chain_pos) VALUES (?1, ?2, ?3, ?4, ?5)",
+            (domain, delta_id, bytes, url, chain_pos),
+        )?;
+        exec_set_url_tip(&tx, url, domain, tip)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn drain_queued_deltas(&self, domain: &str) -> Result<Vec<QueuedDeltaRow>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let rows = {
+            let mut stmt = tx.prepare(
+                "SELECT delta_id, entry_json, url, chain_pos FROM queued_deltas WHERE domain = ?1 ORDER BY rowid",
+            )?;
+            let mapped = stmt.query_map([domain], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?;
+            mapped.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        tx.execute("DELETE FROM queued_deltas WHERE domain = ?1", [domain])?;
+        tx.commit()?;
+        rows.into_iter()
+            .map(|(delta_id, blob, url, chain_pos)| {
+                Ok(QueuedDeltaRow {
+                    delta_id,
+                    entry_json: serde_json::from_slice(&blob)?,
+                    url,
+                    chain_pos,
+                })
+            })
+            .collect()
     }
 
     pub fn set_publisher_pulled(&self, domain: &str, now: &str) -> Result<()> {
@@ -683,6 +856,117 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_window_lifecycle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+        assert!(db.get_recovery_window("example.com").unwrap().is_none());
+
+        db.open_recovery_window("example.com", b"{\"new\":1}", b"{\"old\":1}")
+            .unwrap();
+        let w = db.get_recovery_window("example.com").unwrap().unwrap();
+        assert_eq!(w.declaration_json, b"{\"new\":1}");
+        assert_eq!(w.prior_declaration_json, b"{\"old\":1}");
+        assert!(w.opened_block.is_none());
+        assert!(w.window_end.is_none());
+        assert_eq!(db.list_pending_recovery_windows().unwrap(), ["example.com"]);
+
+        db.activate_recovery_window("example.com", 4, "2026-08-23T12:00:00Z")
+            .unwrap();
+        let w = db.get_recovery_window("example.com").unwrap().unwrap();
+        assert_eq!(w.opened_block, Some(4));
+        assert_eq!(w.window_end.as_deref(), Some("2026-08-23T12:00:00Z"));
+        assert!(db.list_pending_recovery_windows().unwrap().is_empty());
+
+        assert!(db
+            .list_due_recovery_windows("2026-08-23T11:59:59Z")
+            .unwrap()
+            .is_empty());
+        let due = db
+            .list_due_recovery_windows("2026-08-23T12:00:00Z")
+            .unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].0, "example.com");
+
+        db.close_recovery_window("example.com").unwrap();
+        assert!(db.get_recovery_window("example.com").unwrap().is_none());
+    }
+
+    #[test]
+    fn open_recovery_window_refuses_second_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+        db.open_recovery_window("example.com", b"a", b"b").unwrap();
+        assert!(db.open_recovery_window("example.com", b"c", b"d").is_err());
+    }
+
+    #[test]
+    fn queue_delta_marks_seen_sets_tip_and_drains_in_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+        db.queue_delta(
+            "example.com",
+            "sha256:d1",
+            &serde_json::json!({"n": 1}),
+            "https://example.com/a",
+            "sha256:d1",
+            0,
+        )
+        .unwrap();
+        db.queue_delta(
+            "example.com",
+            "sha256:d2",
+            &serde_json::json!({"n": 2}),
+            "https://example.com/a",
+            "sha256:d2",
+            1,
+        )
+        .unwrap();
+        assert!(db.is_delta_seen("sha256:d1").unwrap());
+        assert_eq!(
+            db.url_tip("https://example.com/a").unwrap().as_deref(),
+            Some("sha256:d2")
+        );
+        assert_eq!(db.count_pending_entries("publisher_delta").unwrap(), 0);
+
+        let drained = db.drain_queued_deltas("example.com").unwrap();
+        assert_eq!(drained.len(), 2);
+        assert_eq!(drained[0].delta_id, "sha256:d1");
+        assert_eq!(drained[0].entry_json, serde_json::json!({"n": 1}));
+        assert_eq!(drained[0].chain_pos, 0);
+        assert_eq!(drained[1].delta_id, "sha256:d2");
+        assert!(db.drain_queued_deltas("example.com").unwrap().is_empty());
+    }
+
+    #[test]
+    fn update_publisher_declaration_updates_row_and_enqueues_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+        db.record_publisher_declaration("example.com", b"{\"v\":0}", "k1", "pk1", &Value::Null)
+            .unwrap();
+        db.update_publisher_declaration(
+            "example.com",
+            b"{\"v\":1}",
+            "k2",
+            "pk2",
+            &serde_json::json!({"seq": 1}),
+        )
+        .unwrap();
+        let row = db.get_publisher("example.com").unwrap().unwrap();
+        assert_eq!(row.key_id, "k2");
+        assert_eq!(row.public_key, "pk2");
+        assert_eq!(
+            db.get_publisher_declaration("example.com")
+                .unwrap()
+                .unwrap(),
+            b"{\"v\":1}"
+        );
+        assert_eq!(
+            db.count_pending_entries("publisher_declaration").unwrap(),
+            2
+        );
+    }
 
     #[test]
     fn open_applies_schema_idempotently() {
