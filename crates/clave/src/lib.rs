@@ -3,6 +3,7 @@
 pub mod appeals;
 pub mod baseline;
 pub mod db;
+pub mod declaration;
 pub mod error;
 pub mod fetch;
 pub mod governance;

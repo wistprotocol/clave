@@ -9,8 +9,9 @@ use std::path::Path;
 use wist_core::crypto::{hex_encode, SigningKey};
 use wist_core::envelope::sign_envelope;
 use wist_core::objects::{
-    AggregatorKeyEntry, DeclarationEntry, ParameterEntry, RecordEntry, SnapshotFile, SnapshotIndex,
-    SnapshotIndexEntry, SnapshotManifest, SnapshotState, SnapshotStateFile, StateEntry,
+    AggregatorKeyEntry, DeclarationEntry, ParameterEntry, RecordEntry, RecoveryWindowEntry,
+    SnapshotFile, SnapshotIndex, SnapshotIndexEntry, SnapshotManifest, SnapshotState,
+    SnapshotStateFile, StateEntry,
 };
 use wist_core::snapshot::{content_digest, state_digest};
 
@@ -229,6 +230,13 @@ fn build_state(
             domain: p.domain.clone(),
             declaration,
             sealing_height: 0,
+        }));
+    }
+    for (domain, opened_block, window_end) in db.list_open_recovery_windows()? {
+        entries.push(StateEntry::RecoveryWindow(RecoveryWindowEntry {
+            domain,
+            declaration_height: opened_block as u64,
+            window_end,
         }));
     }
     for r in records {

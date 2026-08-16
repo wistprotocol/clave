@@ -6,11 +6,14 @@ use std::path::Path;
 use wist_core::crypto::PublicKey;
 use wist_core::delta::{content_bytes, delta_id, verify_commitment};
 use wist_core::envelope::verify_envelope;
-use wist_core::objects::{DeltaEnvelope, FeedEnvelope, Payload, PublisherEnvelope};
+use wist_core::objects::{DeltaEnvelope, FeedEnvelope, Payload, Publisher, PublisherEnvelope};
+
+use crate::declaration::{self, Decision};
 
 #[derive(Debug, Default)]
 pub struct IngestReport {
     pub accepted: Vec<String>,
+    pub queued: Vec<String>,
     pub rejected: Vec<(String, String)>,
     pub noise: Option<&'static str>,
     pub suspended: bool,
@@ -98,7 +101,7 @@ fn onboard_publisher(
     base: &str,
     host: &str,
     now: &str,
-) -> Result<Option<(String, String, Vec<String>)>> {
+) -> Result<Option<()>> {
     let publisher_url = format!("{base}publisher.json");
     let (raw, value) = match client.get_json(&publisher_url) {
         Ok(v) => v,
@@ -108,9 +111,16 @@ fn onboard_publisher(
         }
     };
 
+    let sig_key_id = value.pointer("/sig/key_id").and_then(Value::as_str);
     let embedded_key = value
-        .pointer("/publisher/keys/0/public_key")
-        .and_then(Value::as_str);
+        .pointer("/publisher/keys")
+        .and_then(Value::as_array)
+        .zip(sig_key_id)
+        .and_then(|(keys, key_id)| {
+            keys.iter()
+                .find(|k| k["key_id"].as_str() == Some(key_id))
+                .and_then(|k| k["public_key"].as_str())
+        });
     let pk = match embedded_key.and_then(|s| PublicKey::from_b64u(s).ok()) {
         Some(pk) => pk,
         None => {
@@ -167,11 +177,7 @@ fn onboard_publisher(
 
     db.record_publisher_declaration(host, &raw, &key.key_id, &key.public_key, &value)?;
 
-    Ok(Some((
-        key.key_id.clone(),
-        key.public_key.clone(),
-        parsed.publisher.subdomain_scope.clone().unwrap_or_default(),
-    )))
+    Ok(Some(()))
 }
 
 struct Meter<'a> {
@@ -228,28 +234,6 @@ pub fn run(
     let scheme = crate::fetch::scheme_for_host(host, client.allow_http());
     let base = format!("{scheme}://{host}/.well-known/wist/");
 
-    let (public_key_b64u, subdomain_scope) = match db.get_publisher(host)? {
-        Some(row) => (
-            row.public_key,
-            db.get_publisher_scope(host)?.unwrap_or_default(),
-        ),
-        None => match onboard_publisher(db, client, &base, host, now)? {
-            Some((_, public_key, scope)) => (public_key, scope),
-            None => {
-                report.noise = Some("WIST2-E04");
-                return Ok(report);
-            }
-        },
-    };
-    let pubkey = match PublicKey::from_b64u(&public_key_b64u) {
-        Ok(pk) => pk,
-        Err(e) => {
-            record_rejection(db, host, "WIST2-E04", now, None, &e.to_string())?;
-            report.noise = Some("WIST2-E04");
-            return Ok(report);
-        }
-    };
-
     let day = now.get(..10).unwrap_or(now);
     let budget = crate::registry::effective(db, "ingest_budget_bytes_day", now)?;
     let meter = Meter {
@@ -258,6 +242,73 @@ pub fn run(
         day,
         budget,
     };
+
+    let known = db.get_publisher(host)?.is_some();
+    if !known && onboard_publisher(db, client, &base, host, now)?.is_none() {
+        report.noise = Some("WIST2-E04");
+        return Ok(report);
+    }
+
+    let stored_raw = db
+        .get_publisher_declaration(host)?
+        .ok_or_else(|| crate::error::Error::Fetch("publisher row lost mid-ingest".into()))?;
+    let mut current_doc: Value = serde_json::from_slice(&stored_raw)?;
+
+    if known {
+        let publisher_url = format!("{base}publisher.json");
+        if let Ok(Some((raw, value))) = meter.get(client, &publisher_url) {
+            let window_open = db.get_recovery_window(host)?.is_some();
+            match declaration::evaluate(&current_doc, &value, window_open) {
+                Ok(Decision::Unchanged) => {}
+                Ok(decision) => {
+                    let (key_id, public_key) = value
+                        .pointer("/publisher/keys/0")
+                        .map(|k| {
+                            (
+                                k["key_id"].as_str().unwrap_or_default().to_string(),
+                                k["public_key"].as_str().unwrap_or_default().to_string(),
+                            )
+                        })
+                        .unwrap_or_default();
+                    db.update_publisher_declaration(host, &raw, &key_id, &public_key, &value)?;
+                    if decision == Decision::Recovery && !window_open {
+                        db.open_recovery_window(host, &raw, &stored_raw)?;
+                    }
+                    current_doc = value;
+                }
+                Err(detail) => {
+                    record_rejection(db, host, "WIST1-E08", now, None, &detail)?;
+                }
+            }
+        }
+    }
+
+    let current_p: Publisher = match declaration::publisher_of(&current_doc) {
+        Ok(p) => p,
+        Err(e) => {
+            record_rejection(db, host, "WIST2-E04", now, None, &e)?;
+            report.noise = Some("WIST2-E04");
+            return Ok(report);
+        }
+    };
+    let window = db.get_recovery_window(host)?;
+    let window_open = window.is_some();
+    let prior_p: Option<Publisher> = match &window {
+        Some(w) => {
+            let doc: Value = serde_json::from_slice(&w.prior_declaration_json)?;
+            declaration::publisher_of(&doc).ok()
+        }
+        None => None,
+    };
+    let mut key_set: Vec<&wist_core::objects::PublisherKey> = current_p.keys.iter().collect();
+    if let Some(pp) = prior_p.as_ref() {
+        for k in &pp.keys {
+            if !key_set.iter().any(|c| c.key_id == k.key_id) {
+                key_set.push(k);
+            }
+        }
+    }
+    let subdomain_scope = current_p.subdomain_scope.clone().unwrap_or_default();
 
     let mut pages: Vec<FeedEnvelope> = Vec::new();
     let mut page_url = format!("{base}feed.json");
@@ -276,7 +327,7 @@ pub fn run(
             }
         };
         let (_, feed_value) = fetched;
-        if verify_envelope(&feed_value, "feed", &pubkey).is_err() {
+        if declaration::verify_signed(&key_set, &feed_value, "feed", None).is_err() {
             record_rejection(
                 db,
                 host,
@@ -386,16 +437,21 @@ pub fn run(
                 continue;
             }
         };
-        if verify_envelope(&delta_value, "delta", &pubkey).is_err() {
+        let observed_at = delta_value["delta"]["observed_at"]
+            .as_str()
+            .unwrap_or_default();
+        if let Err(code) =
+            declaration::verify_signed(&key_set, &delta_value, "delta", Some(observed_at))
+        {
             record_rejection(
                 db,
                 host,
-                "WIST2-E03",
+                code,
                 now,
                 Some(id.as_str()),
-                "signature verification failed",
+                "key set validation failed",
             )?;
-            report.rejected.push((id.clone(), "WIST2-E03".to_string()));
+            report.rejected.push((id.clone(), code.to_string()));
             continue;
         }
         let delta_env: DeltaEnvelope = match serde_json::from_value(delta_value.clone()) {
@@ -542,15 +598,24 @@ pub fn run(
             std::fs::write(payloads_dir.join(format!("{hex}.json")), &payload_raw)?;
         }
 
-        db.record_accepted_delta(host, id, &delta_value, chain_pos, &delta_env.delta.url, id)?;
-        report.accepted.push(id.clone());
+        if window_open {
+            db.queue_delta(host, id, &delta_value, &delta_env.delta.url, id, chain_pos)?;
+            report.queued.push(id.clone());
+        } else {
+            db.record_accepted_delta(host, id, &delta_value, chain_pos, &delta_env.delta.url, id)?;
+            report.accepted.push(id.clone());
+        }
         chain_pos += 1;
     }
 
     db.set_walk_suspended(host, suspended)?;
     report.suspended = suspended;
     if !suspended {
-        if !unseen_any && report.accepted.is_empty() && report.rejected.is_empty() {
+        if !unseen_any
+            && report.accepted.is_empty()
+            && report.queued.is_empty()
+            && report.rejected.is_empty()
+        {
             report.noise = Some("WIST2-E02");
         }
         db.set_publisher_pulled(host, now)?;
