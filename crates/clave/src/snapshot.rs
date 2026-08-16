@@ -225,8 +225,8 @@ fn build_state(
     for (name, value, effective_at) in db.in_force_param_changes(&head_sealed_at)? {
         entries.push(StateEntry::Parameter(ParameterEntry {
             name,
-            value,
             effective_at,
+            value,
         }));
     }
     for p in &publishers {

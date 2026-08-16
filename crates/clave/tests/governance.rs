@@ -386,3 +386,62 @@ fn appeal_poll_seals_unappealed_ruling_after_window_close() {
             && g.notice_id.as_deref() == Some(notice_id.as_str())
     }));
 }
+
+#[test]
+fn late_appeal_is_recorded_but_discharges_nothing() {
+    let (p, data, db, sk, host, _id) = ingested_publisher();
+    let report = clave::governance::sanction(
+        &db,
+        &sk,
+        &host,
+        3,
+        2,
+        &evidence(),
+        Some("confirmed inconsistency"),
+        NOW + DAY,
+    )
+    .unwrap();
+    let notice_id = report.notice_id.unwrap();
+    clave::seal::run(&db, data.path(), &sk, NOW + DAY).unwrap();
+
+    // The window closes at day 15 and T falls at day 22; the Aggregator
+    // discharges T on time with an "unappealed" ruling.
+    let client = clave::fetch::Client::new(true);
+    let actions = clave::appeals::poll(&db, &client, &sk, NOW + 16 * DAY).unwrap();
+    assert_eq!(actions.len(), 1);
+    clave::seal::run(&db, data.path(), &sk, NOW + 16 * DAY).unwrap();
+    assert_eq!(
+        clave::sanctions::sanction_level(&db, &host, &ts(NOW + 23 * DAY)).unwrap(),
+        3
+    );
+
+    // The Publisher serves an appeal weeks after the window closed. It is
+    // sealed as the fact it is, and changes nothing.
+    let appeal_update = serde_json::json!({
+        "wist_version": "1.0.0",
+        "action": "appeal",
+        "subject": host,
+        "details": {"notice": notice_id, "grounds": "served long after the window"},
+        "effective_at": ts(NOW + 40 * DAY),
+    });
+    let envelope =
+        wist_core::envelope::sign_envelope(&appeal_update, "update", "k1", &p.sk).unwrap();
+    db.insert_pending_entry("registry_update", "", &envelope, 0)
+        .unwrap();
+    clave::seal::run(&db, data.path(), &sk, NOW + 40 * DAY).unwrap();
+
+    let gov = db.governance_for_domain(&host).unwrap();
+    assert!(gov
+        .iter()
+        .any(|g| g.action == "appeal" && g.notice_id.as_deref() == Some(notice_id.as_str())));
+    assert_eq!(
+        clave::sanctions::sanction_level(&db, &host, &ts(NOW + 41 * DAY)).unwrap(),
+        3,
+        "a late appeal starts no ruling deadline, so the state stands"
+    );
+    assert_eq!(
+        clave::sanctions::sanction_level(&db, &host, &ts(NOW + 80 * DAY)).unwrap(),
+        3,
+        "and no ruling deadline lapses later either"
+    );
+}

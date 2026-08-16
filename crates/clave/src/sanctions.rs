@@ -23,9 +23,13 @@ fn appeal_process_alive(
     let window_close = notice_epoch + window_days * DAY;
     let t_instant = window_close + seal_days * DAY;
 
-    let appeal = entries
-        .iter()
-        .find(|e| e.action == "appeal" && e.notice_id.as_deref() == Some(notice_id));
+    // WIST-4 §7: only an appeal sealed by T counts. A late one is recorded
+    // but discharges nothing and starts no ruling deadline.
+    let appeal = entries.iter().find(|e| {
+        e.action == "appeal"
+            && e.notice_id.as_deref() == Some(notice_id)
+            && epoch(&e.sealed_at) <= t_instant
+    });
     let ruling_for = |outcome_filter: Option<&str>| {
         entries.iter().find(|e| {
             e.action == "appeal_ruling"

@@ -64,12 +64,32 @@ pub fn poll(db: &Db, client: &Client, sk: &SigningKey, now_epoch: i64) -> Result
             valid.then_some(doc)
         });
 
+        let late = now_epoch >= window_close;
         match served {
             Some(doc) => {
                 db.insert_pending_entry("registry_update", "", &doc, 0)?;
                 actions.push(format!("appeal enqueued for {}", notice.update_id));
+                // WIST-4 §7: an appeal served after the window closed is
+                // recorded, but it discharges no T — the window still closed
+                // with nothing served in time, and that is what the ruling
+                // reports.
+                if late {
+                    crate::governance::rule(
+                        db,
+                        sk,
+                        &notice.domain,
+                        &notice.update_id,
+                        "unappealed",
+                        "appeal window closed with no appeal served; a later appeal is recorded",
+                        now_epoch,
+                    )?;
+                    actions.push(format!(
+                        "unappealed ruling enqueued for {} alongside a late appeal",
+                        notice.update_id
+                    ));
+                }
             }
-            None if now_epoch >= window_close => {
+            None if late => {
                 crate::governance::rule(
                     db,
                     sk,

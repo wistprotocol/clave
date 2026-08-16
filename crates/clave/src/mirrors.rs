@@ -49,6 +49,13 @@ pub fn add(data_dir: &Path, sk: &SigningKey, url: &str, now_epoch: i64) -> Resul
             "mirror base URL must be https, got {url:?}"
         )));
     }
+    // WIST-3 §5: a base URL, ending in `/`, so a Consumer resolves Log paths
+    // against it by concatenation.
+    if parsed.path() != "/" || parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(Error::Governance(format!(
+            "mirror base URL must be a bare origin ending in '/', got {url:?}"
+        )));
+    }
     let mut urls = list(data_dir)?;
     if !urls.iter().any(|u| u == url) {
         urls.push(url.to_string());
@@ -114,5 +121,7 @@ mod tests {
         assert_eq!(urls.len(), 1);
         assert!(add(tmp.path(), &sk, "not a url", NOW).is_err());
         assert!(add(tmp.path(), &sk, "ftp://mirror.example/", NOW).is_err());
+        assert!(add(tmp.path(), &sk, "https://mirror.example/log/", NOW).is_err());
+        assert!(add(tmp.path(), &sk, "https://mirror.example/?x=1", NOW).is_err());
     }
 }
