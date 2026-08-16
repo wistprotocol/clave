@@ -316,7 +316,7 @@ fn recovery_flow_queues_settles_and_rejects_superseded_deltas() {
 }
 
 #[test]
-fn superseded_key_declaration_during_window_is_rejected() {
+fn declaration_outside_the_recovery_chain_is_superseded_at_the_windows_end() {
     let r = rig(make_publisher_with_recovery);
     write_feed(&r.p, &r.host, &[], "2026-08-09T12:00:00Z");
     ingest(&r, "2026-08-09T12:00:05Z");
@@ -345,11 +345,48 @@ fn superseded_key_declaration_during_window_is_rejected() {
     });
     write_declaration(&r.p, &thief, "kx", &X1_SEED);
     ingest(&r, "2026-08-09T16:00:05Z");
-    assert!(rejection_codes(&r).contains(&"WIST1-E08".to_string()));
+    assert!(
+        !rejection_codes(&r).contains(&"WIST1-E08".to_string()),
+        "a Declaration sealed inside the window is accepted, not rejected"
+    );
+    let accepted = r.db.get_publisher_declaration(&r.host).unwrap().unwrap();
+    let accepted: serde_json::Value = serde_json::from_slice(&accepted).unwrap();
+    assert_eq!(accepted["publisher"]["seq"], 2);
 
-    let stored_after = r.db.get_publisher_declaration(&r.host).unwrap().unwrap();
-    let stored_after: serde_json::Value = serde_json::from_slice(&stored_after).unwrap();
-    assert_eq!(stored_after["publisher"]["seq"], 1);
+    let d_thief = add_delta_signed(
+        &r.p,
+        "https://example.com/t",
+        "tau",
+        None,
+        "2026-08-09T17:00:00Z",
+        "kx",
+        &X1_SEED,
+    );
+    write_feed_signed(
+        &r.p,
+        &r.host,
+        std::slice::from_ref(&d_thief),
+        "2026-08-09T17:00:00Z",
+        "kx",
+        &X1_SEED,
+    );
+    ingest(&r, "2026-08-09T17:00:05Z");
+
+    clave::seal::run(&r.db, r.data.path(), &r.sk, T0 + 7 * DAY + 7200).unwrap();
+    assert!(r.db.get_recovery_window(&r.host).unwrap().is_none());
+
+    let settled = r.db.get_publisher_declaration(&r.host).unwrap().unwrap();
+    let settled: serde_json::Value = serde_json::from_slice(&settled).unwrap();
+    assert_eq!(
+        settled["publisher"]["seq"], 1,
+        "the window's end supersedes everything outside the recovery chain"
+    );
+    assert!(
+        r.db.get_record("https://example.com/t", &r.host)
+            .unwrap()
+            .is_none(),
+        "a Delta signed by the superseded key never seals"
+    );
 }
 
 #[test]

@@ -38,6 +38,27 @@ fn find_key<'a>(keys: &'a [PublisherKey], key_id: &str) -> Option<&'a PublisherK
     keys.iter().find(|k| k.key_id == key_id)
 }
 
+/// WIST-1 §5.2: the two key sets are disjoint by `key_id` and by
+/// `public_key`. A recovery key that is also a signing key is stolen with it.
+fn disjoint_key_sets(p: &Publisher) -> Result<(), String> {
+    let Some(recovery) = p.recovery_keys.as_deref() else {
+        return Ok(());
+    };
+    for r in recovery {
+        if let Some(clash) = p
+            .keys
+            .iter()
+            .find(|k| k.key_id == r.key_id || k.public_key == r.public_key)
+        {
+            return Err(format!(
+                "key {} is named in both keys and recovery_keys",
+                clash.key_id
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn verify_with(doc: &Value, key: &PublisherKey) -> bool {
     PublicKey::from_b64u(&key.public_key)
         .ok()
@@ -77,12 +98,14 @@ pub fn verify_signed(
 }
 
 /// WIST-1 §5.2: evaluate a fetched Declaration against the previously
-/// accepted one. `window_open` marks an open recovery window, during which
-/// the recovery Declaration supersedes anything signed by keys outside its
-/// own sets. Err carries a WIST1-E08 detail.
-pub fn evaluate(stored: &Value, fetched: &Value, window_open: bool) -> Result<Decision, String> {
+/// accepted one. An open recovery window does not change acceptance — a
+/// Declaration sealed inside one is superseded at the window's end, and
+/// rejecting it here would leave the attempt invisible on replay. Err
+/// carries a WIST1-E08 detail.
+pub fn evaluate(stored: &Value, fetched: &Value) -> Result<Decision, String> {
     let stored_p = parse(stored)?;
     let fetched_p = parse(fetched)?;
+    disjoint_key_sets(&fetched_p)?;
 
     if fetched_p.domain != stored_p.domain {
         return Err("declaration domain changed".into());
@@ -144,9 +167,22 @@ pub fn evaluate(stored: &Value, fetched: &Value, window_open: bool) -> Result<De
         }
     }
 
-    if window_open && decision == Decision::FreshIdentity {
-        return Err("declaration signed by superseded keys during an open recovery window".into());
-    }
-
     Ok(decision)
+}
+
+/// WIST-1 §5.2: a Declaration legitimately follows the recovery chain when
+/// its signer is named in the chain head's `keys` or `recovery_keys`.
+/// Anything else sealed inside the window is superseded at its end.
+pub fn follows_chain_head(head: &Value, candidate: &Value) -> bool {
+    let Ok(head_p) = parse(head) else {
+        return false;
+    };
+    let key_id = candidate["sig"]["key_id"].as_str().unwrap_or_default();
+    let signer = find_key(&head_p.keys, key_id).or_else(|| {
+        head_p
+            .recovery_keys
+            .as_deref()
+            .and_then(|keys| find_key(keys, key_id))
+    });
+    signer.is_some_and(|key| verify_with(candidate, key))
 }

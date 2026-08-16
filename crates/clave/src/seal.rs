@@ -372,14 +372,13 @@ fn resolve_record_updates(
 
 /// WIST-1 §5.2 queue settlement: at the first Block whose `sealed_at` is at
 /// or after a recovery window's end, revalidate each queued Delta against
-/// the Key Set then in effect; failures are WIST1-E13, survivors become
-/// pending entries in their original acceptance order.
+/// the Key Set of the recovery chain's newest Declaration; failures are
+/// WIST1-E13, survivors become pending entries in their original acceptance
+/// order. Everything else sealed inside the window is superseded, so the
+/// domain resumes under the chain head whatever was accepted meanwhile.
 fn settle_recovery_windows(db: &Db, sealed_at: &str) -> Result<()> {
-    for (domain, window_declaration) in db.list_due_recovery_windows(sealed_at)? {
-        let declaration_raw = db
-            .get_publisher_declaration(&domain)?
-            .unwrap_or(window_declaration);
-        let doc: Value = serde_json::from_slice(&declaration_raw)?;
+    for (domain, chain_head) in db.list_due_recovery_windows(sealed_at)? {
+        let doc: Value = serde_json::from_slice(&chain_head)?;
         let publisher: wist_core::objects::Publisher =
             serde_json::from_value(doc["publisher"].clone())
                 .map_err(|e| Error::Seal(format!("stored declaration unparsable: {e}")))?;
@@ -403,6 +402,16 @@ fn settle_recovery_windows(db: &Db, sealed_at: &str) -> Result<()> {
                 )?,
             }
         }
+        let (key_id, public_key) = doc
+            .pointer("/publisher/keys/0")
+            .map(|k| {
+                (
+                    k["key_id"].as_str().unwrap_or_default().to_string(),
+                    k["public_key"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .unwrap_or_default();
+        db.update_publisher_declaration(&domain, &chain_head, &key_id, &public_key, &doc)?;
         db.close_recovery_window(&domain)?;
     }
     Ok(())

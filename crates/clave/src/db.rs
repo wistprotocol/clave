@@ -334,6 +334,17 @@ impl Db {
             .map_err(Error::Db)
     }
 
+    /// WIST-1 §5.2: the window's chain head — the recovery Declaration, or
+    /// the newest Declaration that legitimately follows it. Settlement
+    /// revalidates against this and the domain resumes under it.
+    pub fn update_recovery_chain_head(&self, domain: &str, declaration_json: &[u8]) -> Result<()> {
+        self.conn.execute(
+            "UPDATE recovery_windows SET declaration_json = ?2 WHERE domain = ?1",
+            (domain, declaration_json),
+        )?;
+        Ok(())
+    }
+
     pub fn list_pending_recovery_windows(&self) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare(
             "SELECT domain FROM recovery_windows WHERE opened_block IS NULL ORDER BY domain",

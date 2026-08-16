@@ -257,8 +257,8 @@ pub fn run(
     if known {
         let publisher_url = format!("{base}publisher.json");
         if let Ok(Some((raw, value))) = meter.get(client, &publisher_url) {
-            let window_open = db.get_recovery_window(host)?.is_some();
-            match declaration::evaluate(&current_doc, &value, window_open) {
+            let open_window = db.get_recovery_window(host)?;
+            match declaration::evaluate(&current_doc, &value) {
                 Ok(Decision::Unchanged) => {}
                 Ok(decision) => {
                     let (key_id, public_key) = value
@@ -271,8 +271,18 @@ pub fn run(
                         })
                         .unwrap_or_default();
                     db.update_publisher_declaration(host, &raw, &key_id, &public_key, &value)?;
-                    if decision == Decision::Recovery && !window_open {
-                        db.open_recovery_window(host, &raw, &stored_raw)?;
+                    match &open_window {
+                        None => {
+                            if decision == Decision::Recovery {
+                                db.open_recovery_window(host, &raw, &stored_raw)?;
+                            }
+                        }
+                        Some(window) => {
+                            let head: Value = serde_json::from_slice(&window.declaration_json)?;
+                            if declaration::follows_chain_head(&head, &value) {
+                                db.update_recovery_chain_head(host, &raw)?;
+                            }
+                        }
                     }
                     current_doc = value;
                 }
