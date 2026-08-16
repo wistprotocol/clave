@@ -349,11 +349,12 @@ pub fn run(
             record_rejection(
                 db,
                 host,
-                "WIST2-E01",
+                "WIST2-E04",
                 now,
                 None,
-                "feed domain does not match ping host",
+                "feed domain does not match the host it was fetched from",
             )?;
+            report.noise = Some("WIST2-E04");
             return Ok(report);
         }
 

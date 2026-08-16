@@ -148,7 +148,6 @@ fn snapshot_build_produces_verifiable_tier0_state_and_signed_artifacts() {
     let expected_pubkey = clave::keys::public_b64u(&seed_bytes);
 
     let mut saw_key = false;
-    let mut saw_param = false;
     let mut saw_declaration = false;
     let mut saw_record = false;
     for e in &state.entries {
@@ -159,12 +158,6 @@ fn snapshot_build_produces_verifiable_tier0_state_and_signed_artifacts() {
                 assert_eq!(k.public_key, expected_pubkey);
                 assert_eq!(k.added_height, 0);
                 assert_eq!(k.removed_height, None);
-            }
-            StateEntry::Parameter(pa) => {
-                saw_param = true;
-                assert_eq!(pa.name, "block_cadence_seconds");
-                assert_eq!(pa.value, 1);
-                assert_eq!(pa.effective_height, 0);
             }
             StateEntry::Declaration(d) => {
                 saw_declaration = true;
@@ -182,8 +175,12 @@ fn snapshot_build_produces_verifiable_tier0_state_and_signed_artifacts() {
             other => panic!("unexpected state entry in this slice: {other:?}"),
         }
     }
-    assert!(saw_key && saw_param && saw_declaration && saw_record);
-    assert_eq!(state.entries.len(), 4);
+    assert!(saw_key && saw_declaration && saw_record);
+    assert_eq!(
+        state.entries.len(),
+        3,
+        "no parameter is amended here, and WIST-3 §7 does not restate Registry defaults"
+    );
 }
 
 #[test]

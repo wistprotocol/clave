@@ -209,8 +209,11 @@ fn build_state(
         .try_into()
         .map_err(|_| Error::Key("seed file must be exactly 32 bytes".into()))?;
     let aggregator_public_key = keys::public_b64u(&seed);
-    let cadence = db.param("block_cadence_seconds")?;
     let publishers = db.list_publishers()?;
+    let head_sealed_at = db
+        .last_block()?
+        .map(|b| b.sealed_at)
+        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
 
     let mut entries = Vec::with_capacity(2 + publishers.len() + records.len());
     entries.push(StateEntry::AggregatorKey(AggregatorKeyEntry {
@@ -219,11 +222,13 @@ fn build_state(
         added_height: 0,
         removed_height: None,
     }));
-    entries.push(StateEntry::Parameter(ParameterEntry {
-        name: "block_cadence_seconds".to_string(),
-        value: cadence,
-        effective_height: 0,
-    }));
+    for (name, value, effective_at) in db.in_force_param_changes(&head_sealed_at)? {
+        entries.push(StateEntry::Parameter(ParameterEntry {
+            name,
+            value,
+            effective_at,
+        }));
+    }
     for p in &publishers {
         let declaration: Value = serde_json::from_slice(&p.declaration_json)?;
         entries.push(StateEntry::Declaration(DeclarationEntry {
