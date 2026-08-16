@@ -713,6 +713,27 @@ impl Db {
             .map_err(Error::Db)
     }
 
+    /// WIST-3 §7: one tuple per parameter amended since genesis, carrying the
+    /// amendment in force at `at` — Registry defaults are constants of the
+    /// suite and are never restated in a state artifact.
+    pub fn in_force_param_changes(&self, at: &str) -> Result<Vec<(String, i64, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT parameter, value, effective_at FROM param_changes p
+             WHERE effective_at <= ?1
+               AND NOT EXISTS (
+                 SELECT 1 FROM param_changes q
+                 WHERE q.parameter = p.parameter AND q.effective_at <= ?1
+                   AND (q.effective_at > p.effective_at
+                        OR (q.effective_at = p.effective_at AND q.block_number > p.block_number))
+               )
+             ORDER BY parameter ASC",
+        )?;
+        let rows = stmt
+            .query_map([at], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     pub fn get_record(&self, url: &str, publisher: &str) -> Result<Option<RecordRow>> {
         self.conn
             .query_row(

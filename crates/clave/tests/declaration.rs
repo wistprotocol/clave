@@ -300,3 +300,38 @@ fn domain_change_is_rejected() {
     .unwrap();
     assert!(evaluate(&stored, &next, false).is_err());
 }
+
+fn spec_dir() -> std::path::PathBuf {
+    std::env::var_os("WIST_SPEC_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../spec")
+        })
+}
+
+#[test]
+fn spec_declaration_sequence_vector() {
+    let path = spec_dir().join("vectors/wist1/declaration-sequence.json");
+    let vector: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let window_open = vector["recovery_window_open"].as_bool().unwrap();
+    let cases = vector["cases"].as_array().unwrap();
+    assert!(!cases.is_empty());
+    for case in cases {
+        let name = case["name"].as_str().unwrap();
+        let got = evaluate(&case["stored"], &case["fetched"], window_open);
+        match case["expected"].as_str().unwrap() {
+            "idempotent" => assert_eq!(got.as_ref().ok(), Some(&Decision::Unchanged), "{name}"),
+            "ordinary_rotation" => {
+                assert_eq!(got.as_ref().ok(), Some(&Decision::Ordinary), "{name}")
+            }
+            "recovery_rotation" => {
+                assert_eq!(got.as_ref().ok(), Some(&Decision::Recovery), "{name}")
+            }
+            "fresh_identity" => {
+                assert_eq!(got.as_ref().ok(), Some(&Decision::FreshIdentity), "{name}")
+            }
+            "WIST1-E08" => assert!(got.is_err(), "{name}: expected WIST1-E08, got {got:?}"),
+            other => panic!("{name}: unknown expected outcome {other}"),
+        }
+    }
+}

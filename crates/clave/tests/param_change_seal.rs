@@ -106,3 +106,43 @@ fn seal_reads_cadence_in_force_at_previous_block_sealed_at() {
         "previous block sealed at effective_at puts this block on the new 60-second grid"
     );
 }
+
+#[test]
+fn snapshot_state_carries_amended_parameters_with_their_effective_instant() {
+    let (data, db, sk) = setup();
+    let effective_at = ts(NOW + 7 * DAY);
+    clave::param_change::run(&db, &sk, "feed_window", 500, Some(&effective_at), NOW).unwrap();
+    clave::seal::run(&db, data.path(), &sk, NOW).unwrap();
+    clave::seal::run(&db, data.path(), &sk, NOW + 7 * DAY).unwrap();
+
+    let snapdir = std::fs::read_dir(data.path().join("snapshots"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .find(|e| e.path().is_dir())
+        .expect("a snapshot directory")
+        .path();
+    let state_bytes = std::fs::read(snapdir.join("state.json")).unwrap();
+    let state_env: serde_json::Value = serde_json::from_slice(&state_bytes).unwrap();
+    let state: wist_core::objects::SnapshotState =
+        serde_json::from_value(state_env["state"].clone()).unwrap();
+
+    let params: Vec<_> = state
+        .entries
+        .iter()
+        .filter_map(|e| match e {
+            wist_core::objects::StateEntry::Parameter(p) => Some(p),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        params.len(),
+        1,
+        "only the amended parameter gets a tuple (WIST-3 §7)"
+    );
+    assert_eq!(params[0].name, "feed_window");
+    assert_eq!(params[0].value, 500);
+    assert_eq!(
+        params[0].effective_at, effective_at,
+        "the tuple restates the Registry Update's instant, not a height"
+    );
+}

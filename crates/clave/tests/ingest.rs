@@ -169,7 +169,8 @@ fn ingest_rejects_feed_domain_mismatch() {
         "onboarding itself succeeds; only the feed pull is rejected"
     );
     let rejections = db.list_rejections(&host).unwrap();
-    assert_eq!(rejections[0].code, "WIST2-E01");
+    assert_eq!(rejections[0].code, "WIST2-E04");
+    assert_eq!(report.noise, Some("WIST2-E04"));
 }
 
 #[test]
