@@ -7,6 +7,10 @@ hash-chained, append-only log — the Certificate Transparency model applied
 to a web index. It also serves the log, checkpoints, and periodic snapshots
 over HTTP for consumers to sync against.
 
+Developed with generative-AI assistance — provenance record in
+[AI-USAGE.md](AI-USAGE.md), per-commit `Assisted-by:` trailers from its
+introduction onward.
+
 Subcommands: `init` (generate the log's genesis key and local store),
 `serve` (HTTP ingest + read endpoints), `seal` (cut the next Block from
 pending entries and chain it), `snapshot` (build a signed, verifiable
