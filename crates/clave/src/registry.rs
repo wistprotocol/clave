@@ -56,8 +56,7 @@ pub const PARAMS: &[ParamSpec] = &[
     p("confirm_window_hours", Some(72), Some(1), None),
     p("coverage_deadline_hours", Some(72), Some(1), None),
     p("age_norm_days", Some(730), Some(1), None),
-    p("decay_constant_days", Some(180), Some(1), None),
-    p("decay_horizon_days", Some(1825), Some(1), None),
+    p("decay_horizon_days", Some(1825), Some(1), Some(1825)),
     p("penalty_weight", Some(5), Some(1), None),
     p("c_cap", Some(500), Some(1), None),
     p("provisional_age_days", Some(30), None, None),
@@ -152,6 +151,11 @@ const COMBO_RULES: &[ComboRule] = &[
         participants: &["confirm_window_hours", "block_cadence_seconds"],
         description: "confirm_window_hours / 2 must not be shorter than block_cadence_seconds",
         holds: |eff| (eff("confirm_window_hours") / 2) * 3600 >= eff("block_cadence_seconds"),
+    },
+    ComboRule {
+        participants: &["confirm_window_hours", "coverage_deadline_hours"],
+        description: "confirm_window_hours / 2 must not exceed coverage_deadline_hours",
+        holds: |eff| eff("confirm_window_hours") / 2 <= eff("coverage_deadline_hours"),
     },
     ComboRule {
         participants: &[
@@ -278,6 +282,13 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_half_confirm_window_longer_than_coverage_deadline() {
+        assert!(validate("confirm_window_hours", 200, defaults).is_err());
+        assert!(validate("coverage_deadline_hours", 35, defaults).is_err());
+        assert!(validate("coverage_deadline_hours", 36, defaults).is_ok());
+    }
+
+    #[test]
     fn validate_rejects_c_cap_below_provisional_audits() {
         assert!(validate("c_cap", 9, defaults).is_err());
     }
@@ -399,6 +410,13 @@ mod tests {
             .collect();
         for ident in &idents {
             assert!(spec(ident).is_some(), "missing identifier {ident}");
+        }
+        for s in PARAMS {
+            assert!(
+                idents.contains(&s.name),
+                "{} is not amendable in the schema",
+                s.name
+            );
         }
         for clause in details["allOf"].as_array().unwrap() {
             let ident = clause["if"]["properties"]["parameter"]["const"]
