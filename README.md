@@ -57,6 +57,21 @@ Conformance tests read the spec repo's schemas/vectors from `../spec`
 (sibling checkout) by default, or from `WIST_SPEC_DIR` if set. Building also
 resolves `wist-core` from `../core` — both must be sibling checkouts.
 
+## Known deviations
+
+Two departures from the specification, both confined to running the
+stack on one machine and neither reachable in a deployment:
+
+- **Publisher identity carries a port.** WIST-1 §2's Canonical Host has
+  no port, and this codebase treats a Publisher's identity as a bare
+  `host[:port]` authority throughout, so several publishers can be
+  served from loopback at once. On a public deployment every identity
+  is portless and the two readings coincide.
+- **Plain HTTP to loopback.** `--allow-http` lets pulls and pings use
+  `http` when the host is a loopback address, which WIST-2 §8 forbids
+  for any `wist` resource. Without the flag every fetch is HTTPS, and
+  the flag never relaxes the scheme for a non-loopback host.
+
 ## Verification
 
 ```bash
