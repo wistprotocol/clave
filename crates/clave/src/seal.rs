@@ -1,4 +1,6 @@
-use crate::db::{Db, GovernanceRow, ParamChangeRow, PendingEntryRow, RecordUpsert};
+use crate::db::{
+    Db, GovernanceRow, ParamChangeRow, PendingEntryRow, RecordUpsert, SealedDeclarationRow,
+};
 use crate::error::{Error, Result};
 use crate::registry;
 use crate::WIST_VERSION;
@@ -606,6 +608,24 @@ pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<
             kind: g.kind.as_deref(),
         })
         .collect();
+    let sealed_declarations: Vec<(String, u64, Vec<u8>)> = seal_entries
+        .iter()
+        .filter(|e| e.entry_type == "publisher_declaration")
+        .filter_map(|e| {
+            let publisher = e.body.get("publisher")?;
+            let domain = publisher["domain"].as_str()?.to_string();
+            let seq = publisher["seq"].as_u64()?;
+            Some((domain, seq, serde_json::to_vec(&e.body).ok()?))
+        })
+        .collect();
+    let declaration_rows: Vec<SealedDeclarationRow> = sealed_declarations
+        .iter()
+        .map(|(domain, seq, json)| SealedDeclarationRow {
+            domain,
+            seq: *seq,
+            declaration_json: json,
+        })
+        .collect();
     db.commit_seal(
         &sealed_rowids,
         block_number,
@@ -614,6 +634,7 @@ pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<
         &records,
         &param_changes,
         &governance_rows,
+        &declaration_rows,
     )?;
 
     for domain in db.list_pending_recovery_windows()? {

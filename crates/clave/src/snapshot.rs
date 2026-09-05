@@ -470,6 +470,7 @@ mod tests {
             }],
             &[],
             &[],
+            &[],
         )
         .unwrap();
     }
@@ -495,6 +496,7 @@ mod tests {
                 outcome: None,
                 kind: None,
             }],
+            &[],
         )
         .unwrap();
         seal_record(&db, 2, T0 + 2 * DAY, "https://example.com/after");

@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS ingest_meter(domain TEXT NOT NULL, day TEXT NOT NULL,
 CREATE TABLE IF NOT EXISTS walk_state(domain TEXT PRIMARY KEY, suspended INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS governance(update_id TEXT PRIMARY KEY, action TEXT NOT NULL, domain TEXT NOT NULL, level INTEGER, notice_id TEXT, outcome TEXT, sealed_at TEXT NOT NULL, block_number INTEGER NOT NULL, kind TEXT);
 CREATE TABLE IF NOT EXISTS recovery_windows(domain TEXT PRIMARY KEY, declaration_json BLOB NOT NULL, prior_declaration_json BLOB NOT NULL, opened_block INTEGER, window_end TEXT);
+CREATE TABLE IF NOT EXISTS sealed_declarations(domain TEXT NOT NULL, seq INTEGER NOT NULL, block_number INTEGER NOT NULL, sealed_at TEXT NOT NULL, declaration_json BLOB NOT NULL, PRIMARY KEY(domain, seq));
 CREATE TABLE IF NOT EXISTS queued_deltas(rowid INTEGER PRIMARY KEY AUTOINCREMENT, domain TEXT NOT NULL, delta_id TEXT NOT NULL, entry_json BLOB NOT NULL, url TEXT NOT NULL, chain_pos INTEGER NOT NULL);
 ";
 
@@ -111,6 +112,19 @@ pub struct GovernanceEntry {
     pub sealed_at: String,
     pub block_number: u64,
     pub kind: Option<String>,
+}
+
+pub struct SealedDeclarationRow<'a> {
+    pub domain: &'a str,
+    pub seq: u64,
+    pub declaration_json: &'a [u8],
+}
+
+pub struct SealedDeclarationEntry {
+    pub seq: u64,
+    pub block_number: u64,
+    pub sealed_at: String,
+    pub declaration_json: Vec<u8>,
 }
 
 pub struct RecoveryWindowRow {
@@ -334,6 +348,26 @@ impl Db {
             (domain, at),
         )?;
         Ok(())
+    }
+
+    /// Every Declaration of a domain the Log has sealed, oldest first,
+    /// so a Key Set can be resolved at the height a rule names rather
+    /// than only at the present.
+    pub fn sealed_declarations(&self, domain: &str) -> Result<Vec<SealedDeclarationEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT seq, block_number, sealed_at, declaration_json FROM sealed_declarations WHERE domain = ?1 ORDER BY seq ASC",
+        )?;
+        let rows = stmt
+            .query_map([domain], |row| {
+                Ok(SealedDeclarationEntry {
+                    seq: row.get::<_, i64>(0)? as u64,
+                    block_number: row.get::<_, i64>(1)? as u64,
+                    sealed_at: row.get(2)?,
+                    declaration_json: row.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     pub fn get_publisher_declaration(&self, domain: &str) -> Result<Option<Vec<u8>>> {
@@ -602,6 +636,7 @@ impl Db {
         records: &[RecordUpsert],
         param_changes: &[ParamChangeRow],
         governance: &[GovernanceRow],
+        declarations: &[SealedDeclarationRow],
     ) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         for rowid in sealed_rowids {
@@ -613,6 +648,19 @@ impl Db {
         )?;
         for r in records {
             exec_upsert_record(&tx, r, sealed_at)?;
+        }
+        for d in declarations {
+            tx.execute(
+                "INSERT INTO sealed_declarations(domain, seq, block_number, sealed_at, declaration_json) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(domain, seq) DO NOTHING",
+                (
+                    d.domain,
+                    d.seq as i64,
+                    block_number as i64,
+                    sealed_at,
+                    d.declaration_json,
+                ),
+            )?;
         }
         for c in param_changes {
             tx.execute(
@@ -1124,6 +1172,7 @@ mod tests {
                 effective_at: "2026-01-10T00:00:00Z",
             }],
             &[],
+            &[],
         )
         .unwrap();
         assert_eq!(
@@ -1147,6 +1196,7 @@ mod tests {
                 value: 800,
                 effective_at: "2026-01-20T00:00:00Z",
             }],
+            &[],
             &[],
         )
         .unwrap();
@@ -1343,6 +1393,7 @@ mod tests {
             }],
             &[],
             &[],
+            &[],
         )
         .unwrap();
 
@@ -1384,6 +1435,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
         )
         .unwrap();
 
@@ -1405,6 +1457,7 @@ mod tests {
             0,
             "sha256:blockhash0-conflict",
             "2026-08-09T00:01:00Z",
+            &[],
             &[],
             &[],
             &[],

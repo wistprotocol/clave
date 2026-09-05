@@ -173,6 +173,7 @@ mod tests {
             &[],
             &[],
             rows,
+            &[],
         )
         .unwrap();
     }

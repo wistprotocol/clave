@@ -11,6 +11,30 @@ fn epoch(ts: &str) -> Option<i64> {
     ts.parse::<jiff::Timestamp>().ok().map(|t| t.as_second())
 }
 
+/// WIST-4 §7: an appeal MUST verify against the Key Set current at the
+/// `notice`'s Block, not the present one, so a domain that has since
+/// rotated or reset can still appeal. WIST-1 §5.2 resolves that set as
+/// the highest-seq Declaration sealed at a height at or below the
+/// notice's.
+fn notice_era_key_set(
+    db: &Db,
+    domain: &str,
+    notice_block: u64,
+) -> Result<Vec<wist_core::objects::PublisherKey>> {
+    let sealed = db.sealed_declarations(domain)?;
+    let Some(current) = sealed
+        .iter()
+        .filter(|d| d.block_number <= notice_block)
+        .max_by_key(|d| d.seq)
+    else {
+        return Ok(Vec::new());
+    };
+    let doc: serde_json::Value = serde_json::from_slice(&current.declaration_json)?;
+    Ok(crate::declaration::publisher_of(&doc)
+        .map(|p| p.keys)
+        .unwrap_or_default())
+}
+
 fn pending_touches_notice(db: &Db, notice_id: &str) -> Result<bool> {
     let (pending, _) = db.peek_pending_entries()?;
     Ok(pending.iter().any(|p| {
@@ -55,12 +79,13 @@ pub fn poll(db: &Db, client: &Client, sk: &SigningKey, now_epoch: i64) -> Result
             "{scheme}://{}/.well-known/wist/appeals/{hex}.json",
             notice.domain
         );
+        let notice_era_keys = notice_era_key_set(db, &notice.domain, notice.block_number)?;
         let served = client.get_json(&url).ok().and_then(|(_, doc)| {
-            let pk = db
-                .get_publisher(&notice.domain)
-                .ok()
-                .flatten()
-                .and_then(|row| PublicKey::from_b64u(&row.public_key).ok())?;
+            let key_id = doc["sig"]["key_id"].as_str()?;
+            let pk = notice_era_keys
+                .iter()
+                .find(|k| k.key_id == key_id)
+                .and_then(|k| PublicKey::from_b64u(&k.public_key).ok())?;
             let update = &doc["update"];
             let valid = verify_envelope(&doc, "update", &pk).is_ok()
                 && update["action"] == "appeal"

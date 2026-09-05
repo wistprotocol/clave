@@ -503,3 +503,66 @@ fn a_sanction_notice_restates_the_deadline_from_the_block_that_seals_it() {
 
     wist_core::envelope::verify_envelope(&notice["body"], "update", &sk.public()).unwrap();
 }
+
+#[test]
+fn a_rotated_domains_appeal_verifies_under_the_notice_era_key_set() {
+    let (p, data, db, sk, host, _id) = ingested_publisher();
+    clave::governance::sanction(
+        &db,
+        &sk,
+        &host,
+        3,
+        2,
+        &evidence(),
+        Some("confirmed inconsistency"),
+        NOW + DAY,
+    )
+    .unwrap();
+    clave::seal::run(&db, data.path(), &sk, NOW + DAY).unwrap();
+    let notice_id = sealed_notice_id(&db, &host);
+
+    // T falls 21 days after the notice; past it the level-3 state voids
+    // and the domain is pulled again.
+    let after_t = NOW + 23 * DAY;
+    let stored = common::current_declaration(&p);
+    let rotated = serde_json::json!({
+        "wist_version": "1.0.0", "domain": host,
+        "subdomain_scope": ["example.com"],
+        "keys": [common::key_entry("k2", &common::K2_SEED, &ts(after_t))],
+        "seq": 1,
+        "prev_declaration": common::declaration_hash(&stored),
+    });
+    common::write_declaration(&p, &rotated, "k1", &common::K1_SEED);
+    let client = clave::fetch::Client::new(true);
+    clave::ingest::run(&db, &client, data.path(), &host, &ts(after_t)).unwrap();
+    clave::seal::run(&db, data.path(), &sk, after_t).unwrap();
+    assert_eq!(
+        db.get_publisher(&host).unwrap().unwrap().key_id,
+        "k2",
+        "the rotation must be the Aggregator's present declaration"
+    );
+
+    let notice_hex = notice_id.strip_prefix("sha256:").unwrap();
+    let appeal_update = serde_json::json!({
+        "wist_version": "1.0.0",
+        "action": "appeal",
+        "subject": host,
+        "details": {"notice": notice_id, "grounds": "the finding is wrong"},
+        "effective_at": ts(after_t),
+    });
+    let envelope =
+        wist_core::envelope::sign_envelope(&appeal_update, "update", "k1", &p.sk).unwrap();
+    let appeals_dir = p.dir.path().join(".well-known/wist/appeals");
+    std::fs::create_dir_all(&appeals_dir).unwrap();
+    std::fs::write(
+        appeals_dir.join(format!("{notice_hex}.json")),
+        serde_json::to_vec(&envelope).unwrap(),
+    )
+    .unwrap();
+
+    let actions = clave::appeals::poll(&db, &client, &sk, after_t).unwrap();
+    assert!(
+        actions.iter().any(|a| a.starts_with("appeal enqueued")),
+        "actions {actions:?}"
+    );
+}
