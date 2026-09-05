@@ -541,3 +541,72 @@ fn a_delta_pending_when_the_window_opens_is_queued_not_sealed() {
         rejection_codes(&r)
     );
 }
+
+#[test]
+fn a_sealed_page_signed_by_a_since_retired_key_still_verifies() {
+    let r = rig(make_publisher);
+    write_feed(&r.p, &r.host, &[], "2026-08-09T11:00:00Z");
+    ingest(&r, "2026-08-09T11:00:05Z");
+    clave::seal::run(&r.db, r.data.path(), &r.sk, T0).unwrap();
+
+    let stored = current_declaration(&r.p);
+    let rotated = serde_json::json!({
+        "wist_version": "1.0.0", "domain": r.host,
+        "keys": [key_entry("k2", &K2_SEED, "2026-08-09T14:00:00Z")],
+        "seq": 1,
+        "prev_declaration": declaration_hash(&stored),
+    });
+    write_declaration(&r.p, &rotated, "k1", &K1_SEED);
+
+    let paged = add_delta_signed(
+        &r.p,
+        &format!("https://{}/a", r.host),
+        "alpha body",
+        None,
+        "2026-08-09T15:00:00Z",
+        "k2",
+        &K2_SEED,
+    );
+    let live = add_delta_signed(
+        &r.p,
+        &format!("https://{}/b", r.host),
+        "beta body",
+        None,
+        "2026-08-09T15:00:00Z",
+        "k2",
+        &K2_SEED,
+    );
+    // The Page was cut before the rotation and is never re-signed, so it
+    // still carries k1's signature.
+    write_feed_page_signed(
+        &r.p,
+        &r.host,
+        1,
+        std::slice::from_ref(&paged),
+        "2026-08-09T13:00:00Z",
+        None,
+        "k1",
+        &K1_SEED,
+    );
+    let feed = serde_json::json!({
+        "wist_version": "1.0.0", "domain": r.host,
+        "generated_at": "2026-08-09T15:00:00Z",
+        "deltas": [live],
+        "next": page_url(&r.host, 1),
+    });
+    let sk2 = wist_core::crypto::SigningKey::from_seed(&K2_SEED);
+    let env = wist_core::envelope::sign_envelope(&feed, "feed", "k2", &sk2).unwrap();
+    std::fs::write(
+        r.p.dir.path().join(".well-known/wist/feed.json"),
+        serde_json::to_vec(&env).unwrap(),
+    )
+    .unwrap();
+
+    let report = ingest(&r, "2026-08-09T15:00:05Z");
+    assert!(
+        report.accepted.contains(&paged),
+        "accepted {:?}, codes {:?}",
+        report.accepted,
+        rejection_codes(&r)
+    );
+}

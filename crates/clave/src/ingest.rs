@@ -96,6 +96,73 @@ fn record_rejection(
     db.insert_rejection(domain, code, now, id, Some(detail))
 }
 
+/// WIST-2 §3.2: a sealed Page is verified against the Key Set current at
+/// its `generated_at`, or, where that set does not hold the signing key,
+/// against the Key Set of the first Declaration sealed after it. A Page
+/// verifying under neither is `WIST2-E04`; one MUST NOT be rejected
+/// merely because its key has since been retired, because Pages are
+/// immutable and never re-signed on rotation.
+fn page_declarations(
+    db: &Db,
+    host: &str,
+    current: &Value,
+) -> Result<Vec<(i64, u64, Vec<wist_core::objects::PublisherKey>)>> {
+    let mut out = Vec::new();
+    for d in db.sealed_declarations(host)? {
+        let Ok(at) = d.sealed_at.parse::<jiff::Timestamp>() else {
+            continue;
+        };
+        let doc: Value = serde_json::from_slice(&d.declaration_json)?;
+        if let Ok(publisher) = declaration::publisher_of(&doc) {
+            out.push((at.as_second(), d.seq, publisher.keys));
+        }
+    }
+    // A Declaration the Aggregator has accepted but not yet sealed seals
+    // after every Page already cut, so it is the last candidate for
+    // §3.2's second resolution.
+    if let Ok(publisher) = declaration::publisher_of(current) {
+        if !out.iter().any(|(_, seq, _)| *seq == publisher.seq) {
+            out.push((i64::MAX, publisher.seq, publisher.keys));
+        }
+    }
+    Ok(out)
+}
+
+fn verify_sealed_page(
+    declarations: &[(i64, u64, Vec<wist_core::objects::PublisherKey>)],
+    doc: &Value,
+    generated_at: &str,
+) -> bool {
+    let Ok(cut) = generated_at.parse::<jiff::Timestamp>() else {
+        return false;
+    };
+    let cut = cut.as_second();
+    let entries: Vec<wist_core::keyset::DeclarationAtInstant> = declarations
+        .iter()
+        .map(|(at, seq, keys)| wist_core::keyset::DeclarationAtInstant {
+            seq: *seq,
+            sealed_at_s: *at,
+            keys: keys.iter().map(|k| k.key_id.clone()).collect(),
+        })
+        .collect();
+    let signer = doc["sig"]["key_id"].as_str().unwrap_or_default();
+    let resolved = match wist_core::keyset::page_resolution(&entries, cut, signer) {
+        Some(wist_core::keyset::PageResolution::Current) => {
+            wist_core::keyset::page_key_set_current(&entries, cut)
+        }
+        Some(wist_core::keyset::PageResolution::Next) => {
+            wist_core::keyset::page_key_set_next(&entries, cut)
+        }
+        None => return false,
+    };
+    let keys: Vec<&wist_core::objects::PublisherKey> = declarations
+        .iter()
+        .flat_map(|(_, _, keys)| keys.iter())
+        .filter(|k| resolved.contains(&k.key_id))
+        .collect();
+    declaration::verify_signed(&keys, doc, "feed", None).is_ok()
+}
+
 fn key_set_cache_expired(db: &Db, host: &str, now: &str) -> Result<bool> {
     let ttl = registry::effective(db, "keyset_cache_ttl_seconds", now)?;
     let Some(fetched_at) = db.declaration_fetched_at(host)? else {
@@ -366,6 +433,7 @@ pub fn run(
     }
     let subdomain_scope = current_p.subdomain_scope.clone().unwrap_or_default();
 
+    let page_key_sets = page_declarations(db, host, &current_doc)?;
     let mut pages: Vec<FeedEnvelope> = Vec::new();
     let mut page_url = format!("{base}feed.json");
     let mut unseen_any = false;
@@ -383,7 +451,17 @@ pub fn run(
             }
         };
         let (_, feed_value) = fetched;
-        if declaration::verify_signed(&key_set, &feed_value, "feed", None).is_err() {
+        let live_page = pages.is_empty();
+        let verified = if live_page {
+            declaration::verify_signed(&key_set, &feed_value, "feed", None).is_ok()
+        } else {
+            let generated_at = feed_value["feed"]["generated_at"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            verify_sealed_page(&page_key_sets, &feed_value, &generated_at)
+        };
+        if !verified {
             record_rejection(
                 db,
                 host,

@@ -119,6 +119,29 @@ pub fn write_feed_page(
     .unwrap();
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn write_feed_page_signed(
+    p: &TestPub,
+    domain: &str,
+    number: u64,
+    ids: &[String],
+    generated_at: &str,
+    next: Option<&str>,
+    key_id: &str,
+    signer_seed: &[u8; 32],
+) {
+    let feed = serde_json::json!({"wist_version": "1.0.0", "domain": domain, "generated_at": generated_at, "deltas": ids, "next": next});
+    let sk = wist_core::crypto::SigningKey::from_seed(signer_seed);
+    let env = wist_core::envelope::sign_envelope(&feed, "feed", key_id, &sk).unwrap();
+    let dir = p.dir.path().join(".well-known/wist/feed");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join(format!("{number}.json")),
+        serde_json::to_vec(&env).unwrap(),
+    )
+    .unwrap();
+}
+
 pub fn page_url(domain: &str, number: u64) -> String {
     format!("https://{domain}/.well-known/wist/feed/{number}.json")
 }
