@@ -231,6 +231,37 @@ fn roster_act_of(update: &Value) -> Option<(RosterAction, String, String, String
 /// every replaying party ignores it, so the Aggregator MUST NOT seal one.
 /// The roster is replayed from the acts already accepted, then this
 /// Block's are applied against it.
+/// WIST-1 §5.2: the recovery window opens at the `sealed_at` of the
+/// Block sealing the recovery Declaration, so a Delta already accepted
+/// and pending when that Block seals is inside the window too and is
+/// queued rather than sealed.
+fn divert_deltas_into_opening_windows(db: &Db, entries: Vec<SealEntry>) -> Result<Vec<SealEntry>> {
+    let opening: HashSet<String> = db
+        .list_pending_recovery_windows()?
+        .into_iter()
+        .filter(|domain| {
+            entries
+                .iter()
+                .any(|e| e.entry_type == "publisher_declaration" && e.domain == *domain)
+        })
+        .collect();
+    if opening.is_empty() {
+        return Ok(entries);
+    }
+    let mut kept = Vec::with_capacity(entries.len());
+    for e in entries {
+        if e.entry_type != "publisher_delta" || !opening.contains(&e.domain) {
+            kept.push(e);
+            continue;
+        }
+        let delta = &e.body["delta"];
+        let delta_id = wist_core::delta::delta_id(delta).unwrap_or_default();
+        let url = delta["url"].as_str().unwrap_or_default().to_string();
+        db.requeue_pending_delta(e.rowid, &e.domain, &delta_id, &e.body, &url, 0)?;
+    }
+    Ok(kept)
+}
+
 fn check_roster_acts(
     db: &Db,
     entries: Vec<SealEntry>,
@@ -777,6 +808,7 @@ pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<
     let seal_entries = storage_order(peeked)?;
     let cap = registry::effective(db, "block_decompressed_cap_bytes", &sealed_at)?;
     let (seal_entries, _deferred) = fit_to_cap(seal_entries, cap)?;
+    let seal_entries = divert_deltas_into_opening_windows(db, seal_entries)?;
     let (seal_entries, retired_rowids, retired) =
         revalidate_queued_deltas(db, seal_entries, &sealed_at)?;
     let (seal_entries, roster_rowids, roster_dropped) = check_roster_acts(

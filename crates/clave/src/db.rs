@@ -559,6 +559,29 @@ impl Db {
         Ok(())
     }
 
+    /// A Delta already accepted and pending when its domain's recovery
+    /// window opens: it is moved into the queue rather than sealed, and
+    /// its `seen` and chain-tip state is already recorded.
+    pub fn requeue_pending_delta(
+        &self,
+        rowid: i64,
+        domain: &str,
+        delta_id: &str,
+        entry_json: &Value,
+        url: &str,
+        chain_pos: i64,
+    ) -> Result<()> {
+        let bytes = serde_json::to_vec(entry_json)?;
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM pending_entries WHERE rowid = ?1", [rowid])?;
+        tx.execute(
+            "INSERT INTO queued_deltas(domain, delta_id, entry_json, url, chain_pos) VALUES (?1, ?2, ?3, ?4, ?5)",
+            (domain, delta_id, bytes, url, chain_pos),
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn drain_queued_deltas(&self, domain: &str) -> Result<Vec<QueuedDeltaRow>> {
         let tx = self.conn.unchecked_transaction()?;
         let rows = {

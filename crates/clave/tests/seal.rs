@@ -328,7 +328,12 @@ fn a_delta_held_past_the_inclusion_ceiling_is_reported() {
     assert!(!late.is_empty(), "no late inclusion reported");
 }
 
-fn roster_update(action: &str, auditor_id: &str, key_id: &str, public_key: &str) -> serde_json::Value {
+fn roster_update(
+    action: &str,
+    auditor_id: &str,
+    key_id: &str,
+    public_key: &str,
+) -> serde_json::Value {
     serde_json::json!({
         "wist_version": "1.0.0",
         "action": action,

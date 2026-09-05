@@ -490,3 +490,54 @@ fn a_queued_delta_whose_key_the_sealing_blocks_key_set_retired_is_not_sealed() {
         rejection_codes(&r)
     );
 }
+
+#[test]
+fn a_delta_pending_when_the_window_opens_is_queued_not_sealed() {
+    let r = rig(make_publisher_with_recovery);
+    let id = add_delta(&r.p, &format!("https://{}/a", r.host), "alpha body", None);
+    write_feed(
+        &r.p,
+        &r.host,
+        std::slice::from_ref(&id),
+        "2026-08-09T12:00:00Z",
+    );
+    ingest(&r, "2026-08-09T12:00:05Z");
+
+    let stored = current_declaration(&r.p);
+    let recovery = serde_json::json!({
+        "wist_version": "1.0.0", "domain": r.host,
+        "keys": [key_entry("k2", &K2_SEED, "2026-08-09T13:00:00Z")],
+        "recovery_keys": [key_entry("r1", &R1_SEED, "2026-08-01T00:00:00Z")],
+        "seq": 1,
+        "prev_declaration": declaration_hash(&stored),
+    });
+    write_declaration(&r.p, &recovery, "r1", &R1_SEED);
+    ingest(&r, "2026-08-09T14:00:05Z");
+
+    clave::seal::run(&r.db, r.data.path(), &r.sk, T0).unwrap();
+
+    let raw = std::fs::read(r.data.path().join("log/blocks/000000000.json.zst")).unwrap();
+    let block: serde_json::Value =
+        serde_json::from_slice(&zstd::decode_all(&raw[..]).unwrap()).unwrap();
+    let deltas = block["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["type"] == "publisher_delta")
+        .count();
+    assert_eq!(deltas, 0, "the Block that opens the window sealed a Delta");
+    assert!(
+        !rejection_codes(&r).contains(&"WIST1-E02".to_string()),
+        "the Delta belongs in the window queue, not rejected at sealing: {:?}",
+        rejection_codes(&r)
+    );
+
+    // The window settles against the recovery chain head, which is where
+    // a Delta under the superseded key is rejected in the open.
+    clave::seal::run(&r.db, r.data.path(), &r.sk, T0 + 8 * DAY).unwrap();
+    assert!(
+        rejection_codes(&r).contains(&"WIST1-E13".to_string()),
+        "codes {:?}",
+        rejection_codes(&r)
+    );
+}
