@@ -2,6 +2,14 @@
 
 use std::fs;
 
+pub fn spec_dir() -> std::path::PathBuf {
+    std::env::var_os("WIST_SPEC_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../spec")
+        })
+}
+
 pub struct TestPub {
     pub sk: wist_core::crypto::SigningKey,
     pub dir: tempfile::TempDir,

@@ -113,6 +113,9 @@ pub fn spec(name: &str) -> Option<&'static ParamSpec> {
     PARAMS.iter().find(|s| s.name == name)
 }
 
+const COVERAGE_FAILURES_MAX: i64 = 24;
+const COVERAGE_COUNT_WINDOW_S: i64 = 30 * 86400;
+
 type EffLookup<'a> = &'a dyn Fn(&str) -> i64;
 
 struct ComboRule {
@@ -156,6 +159,20 @@ const COMBO_RULES: &[ComboRule] = &[
         participants: &["confirm_window_hours", "coverage_deadline_hours"],
         description: "confirm_window_hours / 2 must not exceed coverage_deadline_hours",
         holds: |eff| eff("confirm_window_hours") / 2 <= eff("coverage_deadline_hours"),
+    },
+    ComboRule {
+        participants: &[
+            "coverage_deadline_hours",
+            "record_seal_blocks",
+            "block_cadence_seconds",
+        ],
+        description: "coverage_deadline_hours + (record_seal_blocks + coverage_failures_max) blocks must be shorter than 30 whole days",
+        holds: |eff| {
+            eff("coverage_deadline_hours") * 3600
+                + (eff("record_seal_blocks") + COVERAGE_FAILURES_MAX)
+                    * eff("block_cadence_seconds")
+                < COVERAGE_COUNT_WINDOW_S
+        },
     },
     ComboRule {
         participants: &[

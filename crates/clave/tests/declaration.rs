@@ -1,3 +1,4 @@
+mod common;
 use clave::declaration::{evaluate, Decision};
 use serde_json::{json, Value};
 use wist_core::crypto::SigningKey;
@@ -301,17 +302,9 @@ fn domain_change_is_rejected() {
     assert!(evaluate(&stored, &next).is_err());
 }
 
-fn spec_dir() -> std::path::PathBuf {
-    std::env::var_os("WIST_SPEC_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../spec")
-        })
-}
-
 #[test]
 fn spec_declaration_sequence_vector() {
-    let path = spec_dir().join("vectors/wist1/declaration-sequence.json");
+    let path = common::spec_dir().join("vectors/wist1/declaration-sequence.json");
     let vector: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     let cases = vector["cases"].as_array().unwrap();
     assert!(!cases.is_empty());

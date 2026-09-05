@@ -1,3 +1,4 @@
+mod common;
 use std::path::Path;
 
 const NOW: i64 = 1_800_000_000;
@@ -145,4 +146,27 @@ fn snapshot_state_carries_amended_parameters_with_their_effective_instant() {
         params[0].effective_at, effective_at,
         "the tuple restates the Registry Update's instant, not a height"
     );
+}
+
+#[test]
+fn spec_coverage_countability_vector() {
+    let path = common::spec_dir().join("vectors/wist4/parameter-combinations.json");
+    let vector: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let cases = vector["cases"].as_array().unwrap();
+    assert!(!cases.is_empty());
+    for case in cases {
+        let label = case["label"].as_str().unwrap();
+        let at = |name: &str| case[name].as_i64().unwrap();
+        let lookup = |name: &str| match name {
+            "block_cadence_seconds" | "coverage_deadline_hours" | "record_seal_blocks" => at(name),
+            other => clave::registry::spec(other).unwrap().default.unwrap(),
+        };
+        let changed = case["changed"].as_str().unwrap();
+        let got = clave::registry::validate(changed, at(changed), lookup);
+        assert_eq!(
+            got.is_ok(),
+            case["rule_holds"].as_bool().unwrap(),
+            "{label}: {got:?}"
+        );
+    }
 }
