@@ -327,3 +327,41 @@ fn a_delta_held_past_the_inclusion_ceiling_is_reported() {
     }
     assert!(!late.is_empty(), "no late inclusion reported");
 }
+
+fn roster_update(action: &str, auditor_id: &str, key_id: &str, public_key: &str) -> serde_json::Value {
+    serde_json::json!({
+        "wist_version": "1.0.0",
+        "action": action,
+        "subject": auditor_id,
+        "details": {"key_id": key_id, "public_key": public_key},
+        "effective_at": "2026-08-09T12:00:00Z",
+    })
+}
+
+#[test]
+fn a_roster_act_the_e07_rules_reject_is_not_sealed() {
+    let data = tempfile::tempdir().unwrap();
+    clave::init::run("log.example.org", data.path()).unwrap();
+    let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
+    db.set_param("block_cadence_seconds", 1).unwrap();
+    let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
+
+    let admit = roster_update("auditor_admit", "audit.example.net", "a1", "pk-a1");
+    let envelope = wist_core::envelope::sign_envelope(&admit, "update", "log1", &sk).unwrap();
+    db.insert_pending_entry("registry_update", "", &envelope, 0)
+        .unwrap();
+    let first = clave::seal::run(&db, data.path(), &sk, 1_754_740_800).unwrap();
+    assert_eq!(first.entry_count, 1, "dropped {:?}", first.dropped);
+
+    let again = roster_update("auditor_admit", "audit.example.net", "a2", "pk-a2");
+    let envelope = wist_core::envelope::sign_envelope(&again, "update", "log1", &sk).unwrap();
+    db.insert_pending_entry("registry_update", "", &envelope, 0)
+        .unwrap();
+    let second = clave::seal::run(&db, data.path(), &sk, 1_754_740_801).unwrap();
+    assert_eq!(second.entry_count, 0, "dropped {:?}", second.dropped);
+    assert!(
+        second.dropped.iter().any(|d| d.contains("WIST4-E07")),
+        "dropped {:?}",
+        second.dropped
+    );
+}

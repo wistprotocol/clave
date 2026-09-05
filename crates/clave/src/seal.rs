@@ -10,6 +10,7 @@ use std::path::Path;
 use wist_core::crypto::{hex_encode, SigningKey};
 use wist_core::envelope::sign_envelope;
 use wist_core::objects::{Block, BlockHeader, ChangeType, Checkpoint, Payload, Sig};
+use wist_core::roster::{Roster, RosterAct, RosterAction};
 use wist_core::{jcs, merkle};
 
 const DAY_SECONDS: i64 = 86400;
@@ -189,6 +190,153 @@ fn late_inclusions(entries: &[SealEntry], block_number: u64, ceiling: i64) -> Ve
             })
         })
         .collect()
+}
+
+fn log_id(data_dir: &Path) -> Result<String> {
+    let doc: Value = serde_json::from_slice(&std::fs::read(data_dir.join("anchor.json"))?)?;
+    doc["anchor"]["log_id"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| Error::Seal("anchor.json carries no log_id".into()))
+}
+
+fn roster_act_of(update: &Value) -> Option<(RosterAction, String, String, String)> {
+    let action = update["action"].as_str()?;
+    let details = &update["details"];
+    let auditor_id = update["subject"].as_str()?.to_string();
+    let key_id = details["key_id"].as_str()?.to_string();
+    let public_key = details["public_key"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let action = match action {
+        "auditor_admit" => RosterAction::Admit,
+        "auditor_remove" => {
+            let evidence: Vec<String> = update["evidence"]
+                .as_array()
+                .map(|ids| {
+                    ids.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            RosterAction::remove_with(Some(&evidence))
+        }
+        _ => return None,
+    };
+    Some((action, auditor_id, key_id, public_key))
+}
+
+/// WIST-4 §4: a roster act the §3/§4 rules reject is `WIST4-E07` and
+/// every replaying party ignores it, so the Aggregator MUST NOT seal one.
+/// The roster is replayed from the acts already accepted, then this
+/// Block's are applied against it.
+fn check_roster_acts(
+    db: &Db,
+    entries: Vec<SealEntry>,
+    sealed_at: &str,
+    sealed_epoch: i64,
+    block_number: u64,
+    log_id: &str,
+) -> Result<(Vec<SealEntry>, Vec<i64>, Vec<String>)> {
+    let candidates: Vec<(usize, RosterAction, String, String, String)> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.entry_type == "registry_update")
+        .filter_map(|(i, e)| {
+            roster_act_of(&e.body["update"]).map(|(action, auditor_id, key_id, public_key)| {
+                (i, action, auditor_id, key_id, public_key)
+            })
+        })
+        .collect();
+    if candidates.is_empty() {
+        return Ok((entries, Vec::new(), Vec::new()));
+    }
+
+    let mut roster = Roster::new(log_id);
+    let stored = db.accepted_roster_acts()?;
+    let mut by_block: Vec<(u64, i64, Vec<RosterAct<'_>>)> = Vec::new();
+    for row in &stored {
+        let act = RosterAct {
+            action: match row.action.as_str() {
+                "auditor_admit" => RosterAction::Admit,
+                _ => RosterAction::Remove {
+                    for_cause: row.for_cause,
+                },
+            },
+            auditor_id: &row.auditor_id,
+            key_id: &row.key_id,
+            public_key: &row.public_key,
+        };
+        let at = row
+            .sealed_at
+            .parse::<jiff::Timestamp>()
+            .map_err(|e| Error::Seal(format!("stored roster act has an unparsable instant: {e}")))?
+            .as_second();
+        match by_block.last_mut() {
+            Some((block, _, acts)) if *block == row.block_number => acts.push(act),
+            _ => by_block.push((row.block_number, at, vec![act])),
+        }
+    }
+    for (_, at, acts) in &by_block {
+        roster
+            .apply_block(*at, acts)
+            .map_err(|e| Error::Seal(format!("replaying the roster failed: {e}")))?;
+    }
+
+    let acts: Vec<RosterAct<'_>> = candidates
+        .iter()
+        .map(|(_, action, auditor_id, key_id, public_key)| RosterAct {
+            action: *action,
+            auditor_id,
+            key_id,
+            public_key,
+        })
+        .collect();
+    let rejected = roster
+        .apply_block(sealed_epoch, &acts)
+        .map_err(|e| Error::Seal(format!("applying this Block's roster acts failed: {e}")))?;
+    let rejected_positions: HashSet<usize> = rejected.iter().map(|(i, _)| *i).collect();
+
+    let mut dropped = Vec::new();
+    let mut dropped_rowids = Vec::new();
+    let mut accepted = Vec::new();
+    for (position, (entry_index, action, auditor_id, key_id, public_key)) in
+        candidates.iter().enumerate()
+    {
+        if let Some((_, reason)) = rejected.iter().find(|(i, _)| *i == position) {
+            dropped.push(format!("{auditor_id}: WIST4-E07 {reason}"));
+            dropped_rowids.push(entries[*entry_index].rowid);
+            continue;
+        }
+        accepted.push(crate::db::RosterActRow {
+            block_number,
+            sealed_at: sealed_at.to_string(),
+            action: match action {
+                RosterAction::Admit => "auditor_admit".to_string(),
+                RosterAction::Remove { .. } => "auditor_remove".to_string(),
+            },
+            auditor_id: auditor_id.clone(),
+            key_id: key_id.clone(),
+            public_key: public_key.clone(),
+            for_cause: matches!(action, RosterAction::Remove { for_cause: true }),
+        });
+    }
+    db.record_roster_acts(&accepted)?;
+
+    let rejected_entries: HashSet<usize> = candidates
+        .iter()
+        .enumerate()
+        .filter(|(position, _)| rejected_positions.contains(position))
+        .map(|(_, (entry_index, ..))| *entry_index)
+        .collect();
+    let kept = entries
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| !rejected_entries.contains(i))
+        .map(|(_, e)| e)
+        .collect();
+    Ok((kept, dropped_rowids, dropped))
 }
 
 fn revalidate_queued_deltas(
@@ -631,11 +779,21 @@ pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<
     let (seal_entries, _deferred) = fit_to_cap(seal_entries, cap)?;
     let (seal_entries, retired_rowids, retired) =
         revalidate_queued_deltas(db, seal_entries, &sealed_at)?;
+    let (seal_entries, roster_rowids, roster_dropped) = check_roster_acts(
+        db,
+        seal_entries,
+        &sealed_at,
+        sealed_epoch,
+        block_number,
+        &log_id(data_dir)?,
+    )?;
     let ceiling = registry::effective(db, "max_inclusion_blocks", &sealed_at)?;
     let late = late_inclusions(&seal_entries, block_number, ceiling);
     let mut outcome = enforce_governance(db, seal_entries, &sealed_at, sealed_epoch)?;
     outcome.dropped.extend(retired);
     outcome.dropped_rowids.extend(retired_rowids);
+    outcome.dropped.extend(roster_dropped);
+    outcome.dropped_rowids.extend(roster_rowids);
     let GovernanceOutcome {
         kept: seal_entries,
         param_changes: accepted_changes,

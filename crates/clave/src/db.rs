@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS walk_state(domain TEXT PRIMARY KEY, suspended INTEGER
 CREATE TABLE IF NOT EXISTS governance(update_id TEXT PRIMARY KEY, action TEXT NOT NULL, domain TEXT NOT NULL, level INTEGER, notice_id TEXT, outcome TEXT, sealed_at TEXT NOT NULL, block_number INTEGER NOT NULL, kind TEXT);
 CREATE TABLE IF NOT EXISTS recovery_windows(domain TEXT PRIMARY KEY, declaration_json BLOB NOT NULL, prior_declaration_json BLOB NOT NULL, opened_block INTEGER, window_end TEXT);
 CREATE TABLE IF NOT EXISTS sealed_declarations(domain TEXT NOT NULL, seq INTEGER NOT NULL, block_number INTEGER NOT NULL, sealed_at TEXT NOT NULL, declaration_json BLOB NOT NULL, PRIMARY KEY(domain, seq));
+CREATE TABLE IF NOT EXISTS roster_acts(block_number INTEGER NOT NULL, act_index INTEGER NOT NULL, sealed_at TEXT NOT NULL, action TEXT NOT NULL, auditor_id TEXT NOT NULL, key_id TEXT NOT NULL, public_key TEXT NOT NULL, for_cause INTEGER NOT NULL, PRIMARY KEY(block_number, act_index));
 CREATE TABLE IF NOT EXISTS queued_deltas(rowid INTEGER PRIMARY KEY AUTOINCREMENT, domain TEXT NOT NULL, delta_id TEXT NOT NULL, entry_json BLOB NOT NULL, url TEXT NOT NULL, chain_pos INTEGER NOT NULL);
 ";
 
@@ -117,6 +118,16 @@ pub struct GovernanceEntry {
     pub sealed_at: String,
     pub block_number: u64,
     pub kind: Option<String>,
+}
+
+pub struct RosterActRow {
+    pub block_number: u64,
+    pub sealed_at: String,
+    pub action: String,
+    pub auditor_id: String,
+    pub key_id: String,
+    pub public_key: String,
+    pub for_cause: bool,
 }
 
 pub struct SealedDeclarationRow<'a> {
@@ -373,6 +384,51 @@ impl Db {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// Every roster act the Log has accepted, in Log order, so the
+    /// WIST-4 §4 roster can be replayed before the next Block's acts are
+    /// checked against it.
+    pub fn accepted_roster_acts(&self) -> Result<Vec<RosterActRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT block_number, sealed_at, action, auditor_id, key_id, public_key, for_cause FROM roster_acts ORDER BY block_number ASC, act_index ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(RosterActRow {
+                    block_number: row.get::<_, i64>(0)? as u64,
+                    sealed_at: row.get(1)?,
+                    action: row.get(2)?,
+                    auditor_id: row.get(3)?,
+                    key_id: row.get(4)?,
+                    public_key: row.get(5)?,
+                    for_cause: row.get::<_, i64>(6)? != 0,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn record_roster_acts(&self, acts: &[RosterActRow]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        for (i, a) in acts.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO roster_acts(block_number, act_index, sealed_at, action, auditor_id, key_id, public_key, for_cause) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(block_number, act_index) DO NOTHING",
+                (
+                    a.block_number as i64,
+                    i as i64,
+                    &a.sealed_at,
+                    &a.action,
+                    &a.auditor_id,
+                    &a.key_id,
+                    &a.public_key,
+                    i64::from(a.for_cause),
+                ),
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn set_turn_block(&self, rowid: i64, block_number: u64) -> Result<()> {
