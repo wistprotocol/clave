@@ -441,3 +441,35 @@ fn a_stale_key_set_cache_with_a_failed_rediscovery_fails_closed() {
         .collect();
     assert!(codes.contains(&"WIST1-E02".to_string()), "codes {codes:?}");
 }
+
+#[test]
+fn an_unsealed_prev_is_retrieved_before_the_delta_naming_it() {
+    let (listener, host) = reserve_addr();
+    let p = make_publisher(&host);
+    let url = format!("https://{host}/a");
+    let first = add_delta(&p, &url, "alpha body", None);
+    let second = add_delta(&p, &url, "beta body", Some(&first));
+    // The Feed lists only the newer Delta; the older one is reachable at
+    // its own deltas/<id>.json.
+    write_feed(
+        &p,
+        &host,
+        std::slice::from_ref(&second),
+        "2026-08-09T12:00:00Z",
+    );
+    serve_static(listener, p.dir.path().to_path_buf());
+
+    let tmp = tempfile::tempdir().unwrap();
+    clave::init::run(&host, tmp.path()).unwrap();
+    let db = clave::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+    let client = clave::fetch::Client::new(true);
+
+    let report =
+        clave::ingest::run(&db, &client, tmp.path(), &host, "2026-08-09T12:00:05Z").unwrap();
+    assert_eq!(
+        report.accepted,
+        vec![first, second],
+        "rejected {:?}",
+        report.rejected
+    );
+}

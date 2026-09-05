@@ -102,6 +102,61 @@ fn record_rejection(
 /// verifying under neither is `WIST2-E04`; one MUST NOT be rejected
 /// merely because its key has since been retired, because Pages are
 /// immutable and never re-signed on rotation.
+enum PrevChain {
+    Resolved(Vec<String>),
+    Unresolved,
+    BudgetExhausted,
+}
+
+/// WIST-2 §5 step 3 with WIST-1 §3.5: walk back from a Delta's `prev`
+/// through Deltas the Aggregator has not sealed until the chain reaches
+/// the tip it holds, fetching each under the per-domain budget. The
+/// bodies are kept so the caller validates each in chain order without
+/// paying for the fetch twice.
+#[allow(clippy::too_many_arguments)]
+fn retrieve_prev_chain(
+    db: &Db,
+    client: &Client,
+    meter: &Meter<'_>,
+    base: &str,
+    prev: Option<&str>,
+    tip: Option<&str>,
+    prefetched: &mut std::collections::HashMap<String, Value>,
+) -> Result<PrevChain> {
+    let mut chain = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut cursor = prev.map(str::to_string);
+    loop {
+        let Some(id) = cursor else {
+            // A chain that starts here links up only when the Aggregator
+            // holds no tip for the URL; otherwise it is a fork.
+            if tip.is_some() {
+                return Ok(PrevChain::Unresolved);
+            }
+            break;
+        };
+        if Some(id.as_str()) == tip || db.is_delta_seen(&id)? {
+            break;
+        }
+        if !seen.insert(id.clone()) {
+            return Ok(PrevChain::Unresolved);
+        }
+        let Some(hex) = id.strip_prefix("sha256:") else {
+            return Ok(PrevChain::Unresolved);
+        };
+        let fetched = match meter.get(client, &format!("{base}deltas/{hex}.json")) {
+            Ok(Some((_, value))) => value,
+            Ok(None) => return Ok(PrevChain::BudgetExhausted),
+            Err(_) => return Ok(PrevChain::Unresolved),
+        };
+        cursor = fetched["delta"]["prev"].as_str().map(str::to_string);
+        prefetched.insert(id.clone(), fetched);
+        chain.push(id);
+    }
+    chain.reverse();
+    Ok(PrevChain::Resolved(chain))
+}
+
 fn page_declarations(
     db: &Db,
     host: &str,
@@ -535,7 +590,13 @@ pub fn run(
             .flat_map(|p| p.feed.deltas.iter().cloned())
             .collect()
     };
-    'process: for id in &delta_ids {
+    let mut delta_ids = delta_ids;
+    let mut prefetched: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+    let mut resolved_prev: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut position = 0usize;
+    'process: while position < delta_ids.len() {
+        let id = &delta_ids[position].clone();
+        position += 1;
         if db.is_delta_seen(id)? {
             continue;
         }
@@ -554,24 +615,27 @@ pub fn run(
         };
 
         let delta_url = format!("{base}deltas/{hex}.json");
-        let (_, delta_value) = match meter.get(client, &delta_url) {
-            Ok(Some(v)) => v,
-            Ok(None) => {
-                suspended = true;
-                break 'process;
-            }
-            Err(e) => {
-                record_rejection(
-                    db,
-                    host,
-                    "WIST2-E03",
-                    now,
-                    Some(id.as_str()),
-                    &e.to_string(),
-                )?;
-                report.rejected.push((id.clone(), "WIST2-E03".to_string()));
-                continue;
-            }
+        let delta_value = match prefetched.remove(id) {
+            Some(v) => v,
+            None => match meter.get(client, &delta_url) {
+                Ok(Some((_, v))) => v,
+                Ok(None) => {
+                    suspended = true;
+                    break 'process;
+                }
+                Err(e) => {
+                    record_rejection(
+                        db,
+                        host,
+                        "WIST2-E03",
+                        now,
+                        Some(id.as_str()),
+                        &e.to_string(),
+                    )?;
+                    report.rejected.push((id.clone(), "WIST2-E03".to_string()));
+                    continue;
+                }
+            },
         };
         let observed_at = delta_value["delta"]["observed_at"]
             .as_str()
@@ -648,15 +712,41 @@ pub fn run(
 
         let expected_prev = db.url_tip(&delta_env.delta.url)?;
         if delta_env.delta.prev != expected_prev {
+            // WIST-2 §5 step 3: retrieve and validate any `prev` not yet
+            // sealed, in chain order, before the Delta naming it.
+            if resolved_prev.insert(id.clone()) {
+                match retrieve_prev_chain(
+                    db,
+                    client,
+                    &meter,
+                    &base,
+                    delta_env.delta.prev.as_deref(),
+                    expected_prev.as_deref(),
+                    &mut prefetched,
+                )? {
+                    PrevChain::Resolved(ancestors) if !ancestors.is_empty() => {
+                        let at = position - 1;
+                        prefetched.insert(id.clone(), delta_value);
+                        delta_ids.splice(at..at, ancestors);
+                        position = at;
+                        continue;
+                    }
+                    PrevChain::BudgetExhausted => {
+                        suspended = true;
+                        break 'process;
+                    }
+                    _ => {}
+                }
+            }
             record_rejection(
                 db,
                 host,
-                "WIST2-E03",
+                "WIST1-E07",
                 now,
                 Some(id.as_str()),
-                "prev does not match chain tip",
+                "prev does not match the chain tip and could not be retrieved",
             )?;
-            report.rejected.push((id.clone(), "WIST2-E03".to_string()));
+            report.rejected.push((id.clone(), "WIST1-E07".to_string()));
             continue;
         }
 
