@@ -178,12 +178,13 @@ fn main() -> Result<(), clave::Error> {
                 reason.as_deref(),
                 jiff::Timestamp::now().as_second(),
             )?;
-            match &report.notice_id {
-                Some(n) => println!(
-                    "queued level-{level} sanction {} with notice {n}",
+            if report.notice_queued {
+                println!(
+                    "queued level-{level} sanction {} with a notice; the notice takes its ID from the Block that seals it",
                     report.update_id
-                ),
-                None => println!("queued level-{level} sanction {}", report.update_id),
+                );
+            } else {
+                println!("queued level-{level} sanction {}", report.update_id);
             }
         }
         Command::Rule {

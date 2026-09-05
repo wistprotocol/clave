@@ -5,6 +5,16 @@ use common::{add_delta, make_publisher_with_scope, reserve_addr, serve_static, w
 const NOW: i64 = 1_800_000_000;
 const DAY: i64 = 86400;
 
+fn sealed_notice_id(db: &clave::db::Db, domain: &str) -> String {
+    db.governance_for_domain(domain)
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|e| e.action == "notice")
+        .map(|e| e.update_id.clone())
+        .expect("a sealed notice for the domain")
+}
+
 fn ts(epoch: i64) -> String {
     jiff::Timestamp::from_second(epoch).unwrap().to_string()
 }
@@ -40,12 +50,10 @@ fn sanction_level3_seals_notice_then_sanction_and_derives_in_force_state() {
         NOW,
     )
     .unwrap();
-    let notice_id = report
-        .notice_id
-        .clone()
-        .expect("level 3 must seal a notice");
+    assert!(report.notice_queued, "level 3 must seal a notice");
 
     let seal = clave::seal::run(&db, data.path(), &sk, NOW).unwrap();
+    let notice_id = sealed_notice_id(&db, "example.com");
     assert_eq!(seal.entry_count, 2);
     assert!(seal.dropped.is_empty());
 
@@ -73,7 +81,7 @@ fn level1_sanction_needs_no_notice() {
     ];
     let report =
         clave::governance::sanction(&db, &sk, "example.com", 1, 1, &evidence, None, NOW).unwrap();
-    assert!(report.notice_id.is_none());
+    assert!(!report.notice_queued);
     let seal = clave::seal::run(&db, data.path(), &sk, NOW).unwrap();
     assert_eq!(seal.entry_count, 1);
     assert_eq!(
@@ -89,7 +97,7 @@ fn premature_unappealed_ruling_is_dropped_at_seal() {
         format!("sha256:{}", "1".repeat(64)),
         format!("sha256:{}", "2".repeat(64)),
     ];
-    let report = clave::governance::sanction(
+    clave::governance::sanction(
         &db,
         &sk,
         "example.com",
@@ -100,8 +108,8 @@ fn premature_unappealed_ruling_is_dropped_at_seal() {
         NOW,
     )
     .unwrap();
-    let notice_id = report.notice_id.unwrap();
     clave::seal::run(&db, data.path(), &sk, NOW).unwrap();
+    let notice_id = sealed_notice_id(&db, "example.com");
 
     clave::governance::rule(
         &db,
@@ -300,7 +308,7 @@ fn level3_suspends_ingestion() {
 #[test]
 fn appeal_poll_fetches_and_enqueues_a_served_appeal() {
     let (p, data, db, sk, host, _id) = ingested_publisher();
-    let report = clave::governance::sanction(
+    clave::governance::sanction(
         &db,
         &sk,
         &host,
@@ -311,8 +319,8 @@ fn appeal_poll_fetches_and_enqueues_a_served_appeal() {
         NOW + DAY,
     )
     .unwrap();
-    let notice_id = report.notice_id.unwrap();
     clave::seal::run(&db, data.path(), &sk, NOW + DAY).unwrap();
+    let notice_id = sealed_notice_id(&db, &host);
 
     let notice_hex = notice_id.strip_prefix("sha256:").unwrap();
     let appeal_update = serde_json::json!({
@@ -352,7 +360,7 @@ fn appeal_poll_fetches_and_enqueues_a_served_appeal() {
 #[test]
 fn appeal_poll_seals_unappealed_ruling_after_window_close() {
     let (_p, data, db, sk, host, _id) = ingested_publisher();
-    let report = clave::governance::sanction(
+    clave::governance::sanction(
         &db,
         &sk,
         &host,
@@ -363,8 +371,8 @@ fn appeal_poll_seals_unappealed_ruling_after_window_close() {
         NOW + DAY,
     )
     .unwrap();
-    let notice_id = report.notice_id.unwrap();
     clave::seal::run(&db, data.path(), &sk, NOW + DAY).unwrap();
+    let notice_id = sealed_notice_id(&db, &host);
 
     let client = clave::fetch::Client::new(true);
     let during_window = clave::appeals::poll(&db, &client, &sk, NOW + 2 * DAY).unwrap();
@@ -390,7 +398,7 @@ fn appeal_poll_seals_unappealed_ruling_after_window_close() {
 #[test]
 fn late_appeal_is_recorded_but_discharges_nothing() {
     let (p, data, db, sk, host, _id) = ingested_publisher();
-    let report = clave::governance::sanction(
+    clave::governance::sanction(
         &db,
         &sk,
         &host,
@@ -401,8 +409,8 @@ fn late_appeal_is_recorded_but_discharges_nothing() {
         NOW + DAY,
     )
     .unwrap();
-    let notice_id = report.notice_id.unwrap();
     clave::seal::run(&db, data.path(), &sk, NOW + DAY).unwrap();
+    let notice_id = sealed_notice_id(&db, &host);
 
     // The window closes at day 15 and T falls at day 22; the Aggregator
     // discharges T on time with an "unappealed" ruling.
@@ -444,4 +452,54 @@ fn late_appeal_is_recorded_but_discharges_nothing() {
         3,
         "and no ruling deadline lapses later either"
     );
+}
+
+#[test]
+fn a_sanction_notice_restates_the_deadline_from_the_block_that_seals_it() {
+    let data = tempfile::tempdir().unwrap();
+    clave::init::run("example-log.test", data.path()).unwrap();
+    let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
+    let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
+
+    let evidence = vec![
+        format!("sha256:{}", "1".repeat(64)),
+        format!("sha256:{}", "2".repeat(64)),
+    ];
+    let enqueued_at = NOW + 1800;
+    clave::governance::sanction(
+        &db,
+        &sk,
+        "example.com",
+        3,
+        2,
+        &evidence,
+        Some("confirmed inconsistency"),
+        enqueued_at,
+    )
+    .unwrap();
+
+    let seal = clave::seal::run(&db, data.path(), &sk, enqueued_at).unwrap();
+    let raw = std::fs::read(
+        data.path()
+            .join(format!("log/blocks/{:09}.json.zst", seal.block_number)),
+    )
+    .unwrap();
+    let block: serde_json::Value =
+        serde_json::from_slice(&zstd::stream::decode_all(&raw[..]).unwrap()).unwrap();
+    let sealed_at = block["header"]["sealed_at"].as_str().unwrap();
+    assert_ne!(sealed_at, ts(enqueued_at));
+
+    let notice = block["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["body"]["update"]["action"] == "notice")
+        .expect("the Block seals the notice");
+    let expected = ts(sealed_at.parse::<jiff::Timestamp>().unwrap().as_second() + 14 * DAY);
+    assert_eq!(
+        notice["body"]["update"]["details"]["appeal_deadline"],
+        serde_json::Value::from(expected)
+    );
+
+    wist_core::envelope::verify_envelope(&notice["body"], "update", &sk.public()).unwrap();
 }

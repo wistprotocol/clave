@@ -12,7 +12,11 @@ const DAY: i64 = 86400;
 
 pub struct GovernanceReport {
     pub update_id: String,
-    pub notice_id: Option<String>,
+    /// A level-3/4 sanction queues a notice alongside it. The notice has
+    /// no Registry Update ID yet: WIST-4 §9.1 has its `appeal_deadline`
+    /// restate the sealing Block's `sealed_at`, which the Block that
+    /// seals it fixes, and the ID follows the bytes.
+    pub notice_queued: bool,
 }
 
 fn whole_second(epoch: i64) -> Result<String> {
@@ -66,7 +70,7 @@ pub fn sanction(
     }
     let now = whole_second(now_epoch)?;
 
-    let notice_id = if level >= 3 {
+    let notice_queued = if level >= 3 {
         let reason = reason.ok_or_else(|| {
             Error::Governance(
                 "a level 3/4 sanction notice requires --reason (WIST-4 \u{a7}7)".into(),
@@ -82,9 +86,10 @@ pub fn sanction(
             "evidence": evidence,
             "effective_at": now,
         });
-        Some(enqueue(db, sk, notice)?)
+        enqueue(db, sk, notice)?;
+        true
     } else {
-        None
+        false
     };
 
     let sanction = serde_json::json!({
@@ -98,7 +103,7 @@ pub fn sanction(
     let id = enqueue(db, sk, sanction)?;
     Ok(GovernanceReport {
         update_id: id,
-        notice_id,
+        notice_queued,
     })
 }
 
@@ -125,7 +130,7 @@ pub fn rule(
     let id = enqueue(db, sk, update)?;
     Ok(GovernanceReport {
         update_id: id,
-        notice_id: Some(notice_id.to_string()),
+        notice_queued: false,
     })
 }
 
@@ -141,7 +146,7 @@ pub fn lift(db: &Db, sk: &SigningKey, domain: &str, now_epoch: i64) -> Result<Go
     let id = enqueue(db, sk, update)?;
     Ok(GovernanceReport {
         update_id: id,
-        notice_id: None,
+        notice_queued: false,
     })
 }
 
@@ -175,6 +180,6 @@ pub fn withdraw(
     let id = enqueue(db, sk, update)?;
     Ok(GovernanceReport {
         update_id: id,
-        notice_id: None,
+        notice_queued: false,
     })
 }

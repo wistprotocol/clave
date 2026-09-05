@@ -10,6 +10,8 @@ use wist_core::envelope::sign_envelope;
 use wist_core::objects::{Block, BlockHeader, ChangeType, Checkpoint, Payload, Sig};
 use wist_core::{jcs, merkle};
 
+const DAY_SECONDS: i64 = 86400;
+
 const GENESIS_KEY_ID: &str = "log1";
 const ENTRY_TYPE_ORDER: [&str; 4] = [
     "publisher_declaration",
@@ -275,6 +277,48 @@ fn entry_type_rank(entry_type: &str) -> usize {
         .unwrap_or(ENTRY_TYPE_ORDER.len())
 }
 
+/// WIST-4 §9.1: a sanction notice's `appeal_deadline` restates the
+/// `sealed_at` of the Block sealing it plus `appeal_window_days`, which
+/// is not knowable when the notice is enqueued. The value is restated
+/// here and the update re-signed, so the notice a Consumer reads and
+/// §7's own derivation agree.
+fn restate_appeal_deadlines(
+    db: &Db,
+    sk: &SigningKey,
+    peeked: Vec<PendingEntryRow>,
+    sealed_at: &str,
+    sealed_epoch: i64,
+) -> Result<Vec<PendingEntryRow>> {
+    let mut window_days = None;
+    peeked
+        .into_iter()
+        .map(|mut p| {
+            let update = &p.entry_json["update"];
+            if p.entry_type != "registry_update"
+                || update["action"] != "notice"
+                || update["details"]["kind"] != "sanction"
+            {
+                return Ok(p);
+            }
+            let days = match window_days {
+                Some(days) => days,
+                None => {
+                    let days = registry::effective(db, "appeal_window_days", sealed_at)?;
+                    window_days = Some(days);
+                    days
+                }
+            };
+            let deadline = jiff::Timestamp::from_second(sealed_epoch + days * DAY_SECONDS)
+                .map_err(|_| Error::Seal("appeal_deadline out of range".into()))?
+                .to_string();
+            let mut update = update.clone();
+            update["details"]["appeal_deadline"] = deadline.into();
+            p.entry_json = sign_envelope(&update, "update", GENESIS_KEY_ID, sk)?;
+            Ok(p)
+        })
+        .collect()
+}
+
 fn storage_order(peeked: Vec<PendingEntryRow>) -> Result<Vec<SealEntry>> {
     let mut entries = peeked
         .into_iter()
@@ -449,6 +493,7 @@ pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<
     settle_recovery_windows(db, &sealed_at)?;
 
     let (peeked, _up_to_rowid) = db.peek_pending_entries()?;
+    let peeked = restate_appeal_deadlines(db, sk, peeked, &sealed_at, sealed_epoch)?;
     let seal_entries = storage_order(peeked)?;
     let cap = registry::effective(db, "block_decompressed_cap_bytes", &sealed_at)?;
     let (seal_entries, _deferred) = fit_to_cap(seal_entries, cap)?;
