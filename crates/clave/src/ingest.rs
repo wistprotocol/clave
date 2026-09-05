@@ -201,6 +201,7 @@ struct Meter<'a> {
     domain: &'a str,
     day: &'a str,
     budget: i64,
+    subdomain_scope: Vec<String>,
 }
 
 impl Meter<'_> {
@@ -208,7 +209,7 @@ impl Meter<'_> {
         if self.db.ingest_bytes(self.domain, self.day)? >= self.budget {
             return Ok(None);
         }
-        let (raw, value) = client.get_json(url)?;
+        let (raw, value) = client.get_json_in_scope(url, &self.subdomain_scope)?;
         self.db
             .add_ingest_bytes(self.domain, self.day, raw.len() as i64)?;
         Ok(Some((raw, value)))
@@ -252,11 +253,18 @@ pub fn run(
 
     let day = now.get(..10).unwrap_or(now);
     let budget = crate::registry::effective(db, "ingest_budget_bytes_day", now)?;
+    let stored_scope = db
+        .get_publisher_declaration(host)?
+        .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
+        .and_then(|doc| declaration::publisher_of(&doc).ok())
+        .and_then(|p| p.subdomain_scope)
+        .unwrap_or_default();
     let meter = Meter {
         db,
         domain: host,
         day,
         budget,
+        subdomain_scope: stored_scope,
     };
 
     let known = db.get_publisher(host)?.is_some();
