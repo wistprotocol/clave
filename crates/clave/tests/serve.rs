@@ -294,6 +294,7 @@ fn sanctioned_domain_ping_gets_403_and_status_shows_state() {
                     level: None,
                     notice_id: None,
                     outcome: None,
+                    kind: None,
                 },
                 clave::db::GovernanceRow {
                     update_id: "sha256:s1",
@@ -302,6 +303,7 @@ fn sanctioned_domain_ping_gets_403_and_status_shows_state() {
                     level: Some(3),
                     notice_id: Some("sha256:n1"),
                     outcome: None,
+                    kind: None,
                 },
             ],
         )

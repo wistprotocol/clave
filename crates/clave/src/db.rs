@@ -17,10 +17,22 @@ CREATE TABLE IF NOT EXISTS param_changes(parameter TEXT NOT NULL, value INTEGER 
 CREATE TABLE IF NOT EXISTS noise_pings(domain TEXT NOT NULL, day TEXT NOT NULL, count INTEGER NOT NULL, PRIMARY KEY(domain, day));
 CREATE TABLE IF NOT EXISTS ingest_meter(domain TEXT NOT NULL, day TEXT NOT NULL, bytes INTEGER NOT NULL, PRIMARY KEY(domain, day));
 CREATE TABLE IF NOT EXISTS walk_state(domain TEXT PRIMARY KEY, suspended INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS governance(update_id TEXT PRIMARY KEY, action TEXT NOT NULL, domain TEXT NOT NULL, level INTEGER, notice_id TEXT, outcome TEXT, sealed_at TEXT NOT NULL, block_number INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS governance(update_id TEXT PRIMARY KEY, action TEXT NOT NULL, domain TEXT NOT NULL, level INTEGER, notice_id TEXT, outcome TEXT, sealed_at TEXT NOT NULL, block_number INTEGER NOT NULL, kind TEXT);
 CREATE TABLE IF NOT EXISTS recovery_windows(domain TEXT PRIMARY KEY, declaration_json BLOB NOT NULL, prior_declaration_json BLOB NOT NULL, opened_block INTEGER, window_end TEXT);
 CREATE TABLE IF NOT EXISTS queued_deltas(rowid INTEGER PRIMARY KEY AUTOINCREMENT, domain TEXT NOT NULL, delta_id TEXT NOT NULL, entry_json BLOB NOT NULL, url TEXT NOT NULL, chain_pos INTEGER NOT NULL);
 ";
+
+fn add_missing_columns(conn: &Connection) -> Result<()> {
+    for statement in ["ALTER TABLE governance ADD COLUMN kind TEXT"] {
+        match conn.execute(statement, []) {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(_, Some(ref m)))
+                if m.contains("duplicate column") => {}
+            Err(e) => return Err(Error::Db(e)),
+        }
+    }
+    Ok(())
+}
 
 pub struct PublisherRow {
     pub key_id: String,
@@ -80,6 +92,7 @@ pub struct GovernanceRow<'a> {
     pub level: Option<i64>,
     pub notice_id: Option<&'a str>,
     pub outcome: Option<&'a str>,
+    pub kind: Option<&'a str>,
 }
 
 pub struct GovernanceEntry {
@@ -91,6 +104,7 @@ pub struct GovernanceEntry {
     pub outcome: Option<String>,
     pub sealed_at: String,
     pub block_number: u64,
+    pub kind: Option<String>,
 }
 
 pub struct RecoveryWindowRow {
@@ -191,6 +205,7 @@ impl Db {
         conn.busy_timeout(std::time::Duration::from_millis(5000))?;
         let _mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
         conn.execute_batch(SCHEMA)?;
+        add_missing_columns(&conn)?;
         Ok(Db { conn })
     }
 
@@ -578,7 +593,7 @@ impl Db {
         }
         for g in governance {
             tx.execute(
-                "INSERT INTO governance(update_id, action, domain, level, notice_id, outcome, sealed_at, block_number) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT INTO governance(update_id, action, domain, level, notice_id, outcome, sealed_at, block_number, kind) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 (
                     g.update_id,
                     g.action,
@@ -588,6 +603,7 @@ impl Db {
                     g.outcome,
                     sealed_at,
                     block_number as i64,
+                    g.kind,
                 ),
             )?;
         }
@@ -673,7 +689,7 @@ impl Db {
 
     pub fn governance_by_action(&self, action: &str) -> Result<Vec<GovernanceEntry>> {
         let mut stmt = self.conn.prepare(
-            "SELECT update_id, action, domain, level, notice_id, outcome, sealed_at, block_number FROM governance WHERE action = ?1 ORDER BY sealed_at ASC, block_number ASC",
+            "SELECT update_id, action, domain, level, notice_id, outcome, sealed_at, block_number, kind FROM governance WHERE action = ?1 ORDER BY sealed_at ASC, block_number ASC",
         )?;
         let rows = stmt
             .query_map([action], |row| {
@@ -686,6 +702,7 @@ impl Db {
                     outcome: row.get(5)?,
                     sealed_at: row.get(6)?,
                     block_number: row.get::<_, i64>(7)? as u64,
+                    kind: row.get(8)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -694,7 +711,7 @@ impl Db {
 
     pub fn governance_for_domain(&self, domain: &str) -> Result<Vec<GovernanceEntry>> {
         let mut stmt = self.conn.prepare(
-            "SELECT update_id, action, domain, level, notice_id, outcome, sealed_at, block_number FROM governance WHERE domain = ?1 ORDER BY sealed_at ASC, block_number ASC",
+            "SELECT update_id, action, domain, level, notice_id, outcome, sealed_at, block_number, kind FROM governance WHERE domain = ?1 ORDER BY sealed_at ASC, block_number ASC",
         )?;
         let rows = stmt
             .query_map([domain], |row| {
@@ -707,6 +724,7 @@ impl Db {
                     outcome: row.get(5)?,
                     sealed_at: row.get(6)?,
                     block_number: row.get::<_, i64>(7)? as u64,
+                    kind: row.get(8)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;

@@ -39,6 +39,7 @@ struct OwnedGovernanceRow {
     level: Option<i64>,
     notice_id: Option<String>,
     outcome: Option<String>,
+    kind: Option<String>,
 }
 
 struct GovernanceOutcome {
@@ -182,6 +183,7 @@ fn enforce_governance(
             level: update["details"]["level"].as_i64(),
             notice_id: update["details"]["notice"].as_str().map(str::to_string),
             outcome: update["details"]["outcome"].as_str().map(str::to_string),
+            kind: update["details"]["kind"].as_str().map(str::to_string),
         };
         if action == "payload_withdrawal" {
             if let Some(delta_id) = update["details"]["delta_id"].as_str() {
@@ -601,6 +603,7 @@ pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<
             level: g.level,
             notice_id: g.notice_id.as_deref(),
             outcome: g.outcome.as_deref(),
+            kind: g.kind.as_deref(),
         })
         .collect();
     db.commit_seal(

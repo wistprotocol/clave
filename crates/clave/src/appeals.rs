@@ -27,6 +27,11 @@ fn pending_touches_notice(db: &Db, notice_id: &str) -> Result<bool> {
 pub fn poll(db: &Db, client: &Client, sk: &SigningKey, now_epoch: i64) -> Result<Vec<String>> {
     let mut actions = Vec::new();
     for notice in db.governance_by_action("notice")? {
+        // WIST-4 §7: a `"recovery"` notice records WIST-1 §5.2's window
+        // and is not subject to the appeal process.
+        if notice.kind.as_deref() == Some("recovery") {
+            continue;
+        }
         let entries = db.governance_for_domain(&notice.domain)?;
         let settled = entries.iter().any(|e| {
             (e.action == "appeal" || e.action == "appeal_ruling")

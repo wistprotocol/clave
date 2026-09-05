@@ -423,3 +423,28 @@ fn recovery_notice_is_sealed_with_kind_recovery() {
         serde_json::json!(r.host)
     );
 }
+
+#[test]
+fn a_recovery_notice_is_never_polled_for_an_appeal() {
+    let r = rig(make_publisher_with_recovery);
+    write_feed(&r.p, &r.host, &[], "2026-08-09T12:00:00Z");
+    ingest(&r, "2026-08-09T12:00:05Z");
+
+    let stored = current_declaration(&r.p);
+    let recovery = serde_json::json!({
+        "wist_version": "1.0.0", "domain": r.host,
+        "subdomain_scope": ["example.com"],
+        "keys": [key_entry("k2", &K2_SEED, "2026-08-09T13:00:00Z")],
+        "recovery_keys": [key_entry("r1", &R1_SEED, "2026-08-01T00:00:00Z")],
+        "seq": 1,
+        "prev_declaration": declaration_hash(&stored),
+    });
+    write_declaration(&r.p, &recovery, "r1", &R1_SEED);
+    ingest(&r, "2026-08-09T14:00:05Z");
+    clave::seal::run(&r.db, r.data.path(), &r.sk, T0).unwrap();
+    clave::seal::run(&r.db, r.data.path(), &r.sk, T0 + 7200).unwrap();
+
+    let client = clave::fetch::Client::new(true);
+    let actions = clave::appeals::poll(&r.db, &client, &r.sk, T0 + 100 * 86400).unwrap();
+    assert!(actions.is_empty(), "actions {actions:?}");
+}

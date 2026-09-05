@@ -151,6 +151,7 @@ mod tests {
             level: Some(level),
             notice_id,
             outcome: None,
+            kind: None,
         }
     }
 
@@ -186,6 +187,7 @@ mod tests {
                 level: None,
                 notice_id: None,
                 outcome: None,
+                kind: None,
             }],
         );
         assert_eq!(sanction_level(&db, "example.com", &ts(T0 + 50)).unwrap(), 2);
@@ -203,6 +205,7 @@ mod tests {
             level: None,
             notice_id: None,
             outcome: None,
+            kind: None,
         }
     }
 
@@ -252,6 +255,7 @@ mod tests {
                 level: None,
                 notice_id: Some("sha256:n1"),
                 outcome: Some("unappealed"),
+                kind: None,
             }],
         );
         let t_instant = T0 + (14 + 7) * DAY;
@@ -285,6 +289,7 @@ mod tests {
                 level: None,
                 notice_id: Some("sha256:n1"),
                 outcome: None,
+                kind: None,
             }],
         );
         let deadline = appeal_sealed + 30 * DAY;
@@ -331,6 +336,7 @@ mod tests {
                     level: None,
                     notice_id: Some(notice),
                     outcome: None,
+                    kind: None,
                 }],
             );
             seal_gov(
@@ -344,6 +350,7 @@ mod tests {
                     level: None,
                     notice_id: Some(notice),
                     outcome: Some(outcome),
+                    kind: None,
                 }],
             );
             let probe = appeal_sealed + 2 * DAY;
