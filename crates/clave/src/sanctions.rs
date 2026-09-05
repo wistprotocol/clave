@@ -70,17 +70,46 @@ fn appeal_process_alive(
 /// In-force sanction ladder level for a domain at instant `at`, derived
 /// from sealed governance Entries under WIST-4 §7's void rules: a lapsed
 /// T (window + sealing deadline), a lapsed ruling deadline, and an
-/// "overturned" ruling each void the state; a lift clears it.
+/// "overturned" ruling each void the level-3 rejection or the level-4
+/// exclusion and nothing below them; a lift clears the state.
+///
+/// The rungs are read from the sanctions the Log carries rather than
+/// recomputed from Audit Records, so a voided level 3 or 4 falls back to
+/// the highest rung at or below 2 that a sanction recorded, and to level
+/// 1 otherwise: every sanction names evidence establishing at least one
+/// Confirmed Inconsistency, which is §7's level-1 criterion.
 pub fn sanction_level(db: &Db, domain: &str, at: &str) -> Result<u8> {
+    Ok(sanction_state(db, domain, at)?.level)
+}
+
+/// The in-force level and the instant it took effect — the `sealed_at`
+/// of the Block sealing the sanction that carries it, which WIST-3 §7
+/// reads as the height from which level 3 stops materialization.
+pub struct SanctionState {
+    pub level: u8,
+    pub effective_at: Option<String>,
+}
+
+pub fn sanction_state(db: &Db, domain: &str, at: &str) -> Result<SanctionState> {
     let entries = db.governance_for_domain(domain)?;
     let at_epoch = epoch(at);
 
-    let latest_sanction = entries
-        .iter()
-        .rfind(|e| e.action == "sanction" && epoch(&e.sealed_at) <= at_epoch);
+    let in_force = |e: &&GovernanceEntry| e.action == "sanction" && epoch(&e.sealed_at) <= at_epoch;
+    let latest_sanction = entries.iter().rfind(in_force);
     let Some(sanction) = latest_sanction else {
-        return Ok(0);
+        return Ok(SanctionState {
+            level: 0,
+            effective_at: None,
+        });
     };
+    let lower_rung = entries
+        .iter()
+        .filter(in_force)
+        .filter_map(|e| e.level)
+        .filter(|l| *l <= 2)
+        .max()
+        .unwrap_or(1)
+        .clamp(1, 2) as u8;
     let level = sanction.level.unwrap_or(0).clamp(0, 4) as u8;
 
     let lifted = entries.iter().any(|e| {
@@ -89,7 +118,10 @@ pub fn sanction_level(db: &Db, domain: &str, at: &str) -> Result<u8> {
             && epoch(&e.sealed_at) <= at_epoch
     });
     if lifted {
-        return Ok(0);
+        return Ok(SanctionState {
+            level: 0,
+            effective_at: None,
+        });
     }
 
     if level >= 3 {
@@ -100,11 +132,17 @@ pub fn sanction_level(db: &Db, domain: &str, at: &str) -> Result<u8> {
                 .map(|e| e.sealed_at.clone())
                 .unwrap_or_else(|| sanction.sealed_at.clone());
             if !appeal_process_alive(db, &entries, notice_id, &notice_sealed_at, at_epoch)? {
-                return Ok(0);
+                return Ok(SanctionState {
+                    level: lower_rung,
+                    effective_at: Some(sanction.sealed_at.clone()),
+                });
             }
         }
     }
-    Ok(level)
+    Ok(SanctionState {
+        level,
+        effective_at: Some(sanction.sealed_at.clone()),
+    })
 }
 
 #[cfg(test)]
@@ -197,6 +235,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_voided_level_three_falls_back_to_the_rungs_below_it() {
+        let (_tmp, db) = open_db();
+        seal_gov(&db, 0, T0, &[sanction_row("sha256:s1", 2, None)]);
+        seal_gov(&db, 1, T0 + 100, &[notice_row("sha256:n1")]);
+        seal_gov(
+            &db,
+            2,
+            T0 + 200,
+            &[sanction_row("sha256:s2", 3, Some("sha256:n1"))],
+        );
+        assert_eq!(
+            sanction_level(&db, "example.com", &ts(T0 + 300)).unwrap(),
+            3
+        );
+        let after_t = T0 + 100 + 22 * DAY;
+        assert_eq!(sanction_level(&db, "example.com", &ts(after_t)).unwrap(), 2);
+    }
+
+    #[test]
+    fn a_voided_level_three_with_no_lower_rung_filed_keeps_level_one() {
+        let (_tmp, db) = open_db();
+        seal_gov(&db, 0, T0, &[notice_row("sha256:n1")]);
+        seal_gov(
+            &db,
+            1,
+            T0 + 100,
+            &[sanction_row("sha256:s1", 3, Some("sha256:n1"))],
+        );
+        let after_t = T0 + 22 * DAY;
+        assert_eq!(sanction_level(&db, "example.com", &ts(after_t)).unwrap(), 1);
+    }
+
     fn notice_row(update_id: &str) -> GovernanceRow<'_> {
         GovernanceRow {
             update_id,
@@ -210,7 +281,7 @@ mod tests {
     }
 
     #[test]
-    fn level_three_voids_at_t_when_nothing_discharges_it() {
+    fn level_three_voids_to_the_rung_below_at_t_when_nothing_discharges_it() {
         let (_tmp, db) = open_db();
         seal_gov(
             &db,
@@ -228,7 +299,7 @@ mod tests {
         );
         assert_eq!(
             sanction_level(&db, "example.com", &ts(t_instant)).unwrap(),
-            0
+            1
         );
     }
 
@@ -266,7 +337,7 @@ mod tests {
     }
 
     #[test]
-    fn appeal_without_ruling_voids_at_the_ruling_deadline() {
+    fn appeal_without_ruling_voids_to_the_rung_below_at_the_ruling_deadline() {
         let (_tmp, db) = open_db();
         seal_gov(
             &db,
@@ -299,12 +370,12 @@ mod tests {
         );
         assert_eq!(
             sanction_level(&db, "example.com", &ts(deadline)).unwrap(),
-            0
+            1
         );
     }
 
     #[test]
-    fn overturned_ruling_voids_and_upheld_keeps_the_state() {
+    fn overturned_ruling_voids_to_the_rung_below_and_upheld_keeps_the_state() {
         let (_tmp, db) = open_db();
         for (notice, sanction, ruling, outcome, block_base, dom_epoch) in [
             ("sha256:n1", "sha256:s1", "sha256:r1", "overturned", 0, T0),
@@ -354,7 +425,7 @@ mod tests {
                 }],
             );
             let probe = appeal_sealed + 2 * DAY;
-            let expected = if outcome == "overturned" { 0 } else { 3 };
+            let expected = if outcome == "overturned" { 1 } else { 3 };
             assert_eq!(
                 sanction_level(&db, "example.com", &ts(probe)).unwrap(),
                 expected,

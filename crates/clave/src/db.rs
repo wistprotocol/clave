@@ -8,7 +8,7 @@ const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS publishers(domain TEXT PRIMARY KEY, declaration_json BLOB NOT NULL, key_id TEXT NOT NULL, public_key TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'new', last_pull_at TEXT);
 CREATE TABLE IF NOT EXISTS seen_deltas(delta_id TEXT PRIMARY KEY, domain TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS pending_entries(rowid INTEGER PRIMARY KEY AUTOINCREMENT, entry_type TEXT NOT NULL, domain TEXT NOT NULL, entry_json BLOB NOT NULL, chain_pos INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS records(url TEXT NOT NULL, publisher TEXT NOT NULL, delta_id TEXT NOT NULL, observed_at TEXT NOT NULL, weight TEXT NOT NULL, title TEXT NOT NULL, abstract TEXT, lang TEXT NOT NULL, PRIMARY KEY(url, publisher));
+CREATE TABLE IF NOT EXISTS records(url TEXT NOT NULL, publisher TEXT NOT NULL, delta_id TEXT NOT NULL, observed_at TEXT NOT NULL, weight TEXT NOT NULL, title TEXT NOT NULL, abstract TEXT, lang TEXT NOT NULL, sealed_at TEXT NOT NULL DEFAULT '', PRIMARY KEY(url, publisher));
 CREATE TABLE IF NOT EXISTS blocks(block_number INTEGER PRIMARY KEY, block_hash TEXT NOT NULL, sealed_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS rejections(domain TEXT NOT NULL, code TEXT NOT NULL, at TEXT NOT NULL, delta_id TEXT, detail TEXT);
 CREATE TABLE IF NOT EXISTS params(name TEXT PRIMARY KEY, value INTEGER NOT NULL);
@@ -23,7 +23,10 @@ CREATE TABLE IF NOT EXISTS queued_deltas(rowid INTEGER PRIMARY KEY AUTOINCREMENT
 ";
 
 fn add_missing_columns(conn: &Connection) -> Result<()> {
-    for statement in ["ALTER TABLE governance ADD COLUMN kind TEXT"] {
+    for statement in [
+        "ALTER TABLE governance ADD COLUMN kind TEXT",
+        "ALTER TABLE records ADD COLUMN sealed_at TEXT NOT NULL DEFAULT ''",
+    ] {
         match conn.execute(statement, []) {
             Ok(_) => {}
             Err(rusqlite::Error::SqliteFailure(_, Some(ref m)))
@@ -65,6 +68,8 @@ pub struct RecordRow {
     pub title: String,
     pub abstract_text: Option<String>,
     pub lang: String,
+    /// `sealed_at` of the Block that sealed the Delta this record holds.
+    pub sealed_at: String,
 }
 
 pub struct PublisherListRow {
@@ -177,10 +182,10 @@ fn exec_set_url_tip(conn: &Connection, url: &str, domain: &str, tip: &str) -> Re
     Ok(())
 }
 
-fn exec_upsert_record(conn: &Connection, r: &RecordUpsert) -> Result<()> {
+fn exec_upsert_record(conn: &Connection, r: &RecordUpsert, sealed_at: &str) -> Result<()> {
     conn.execute(
-        "INSERT INTO records(url, publisher, delta_id, observed_at, weight, title, abstract, lang) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-         ON CONFLICT(url, publisher) DO UPDATE SET delta_id = excluded.delta_id, observed_at = excluded.observed_at, weight = excluded.weight, title = excluded.title, abstract = excluded.abstract, lang = excluded.lang",
+        "INSERT INTO records(url, publisher, delta_id, observed_at, weight, title, abstract, lang, sealed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT(url, publisher) DO UPDATE SET delta_id = excluded.delta_id, observed_at = excluded.observed_at, weight = excluded.weight, title = excluded.title, abstract = excluded.abstract, lang = excluded.lang, sealed_at = excluded.sealed_at",
         (
             r.url,
             r.publisher,
@@ -190,6 +195,7 @@ fn exec_upsert_record(conn: &Connection, r: &RecordUpsert) -> Result<()> {
             r.title,
             r.abstract_text,
             r.lang,
+            sealed_at,
         ),
     )?;
     Ok(())
@@ -583,7 +589,7 @@ impl Db {
             (block_number as i64, block_hash, sealed_at),
         )?;
         for r in records {
-            exec_upsert_record(&tx, r)?;
+            exec_upsert_record(&tx, r, sealed_at)?;
         }
         for c in param_changes {
             tx.execute(
@@ -766,7 +772,7 @@ impl Db {
     pub fn get_record(&self, url: &str, publisher: &str) -> Result<Option<RecordRow>> {
         self.conn
             .query_row(
-                "SELECT url, publisher, delta_id, observed_at, weight, title, abstract, lang FROM records WHERE url = ?1 AND publisher = ?2",
+                "SELECT url, publisher, delta_id, observed_at, weight, title, abstract, lang, sealed_at FROM records WHERE url = ?1 AND publisher = ?2",
                 (url, publisher),
                 |row| {
                     Ok(RecordRow {
@@ -778,6 +784,7 @@ impl Db {
                         title: row.get(5)?,
                         abstract_text: row.get(6)?,
                         lang: row.get(7)?,
+                        sealed_at: row.get(8)?,
                     })
                 },
             )
@@ -787,7 +794,7 @@ impl Db {
 
     pub fn list_records(&self) -> Result<Vec<RecordRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT url, publisher, delta_id, observed_at, weight, title, abstract, lang FROM records ORDER BY publisher, url",
+            "SELECT url, publisher, delta_id, observed_at, weight, title, abstract, lang, sealed_at FROM records ORDER BY publisher, url",
         )?;
         let rows = stmt
             .query_map([], |row| {
@@ -800,6 +807,7 @@ impl Db {
                     title: row.get(5)?,
                     abstract_text: row.get(6)?,
                     lang: row.get(7)?,
+                    sealed_at: row.get(8)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;

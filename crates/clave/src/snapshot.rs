@@ -315,21 +315,27 @@ fn update_index(
     Ok(())
 }
 
+/// WIST-3 §7: level 2 marks the domain's records reduced-weight, level 3
+/// stops its later Deltas from being materialized at all from the height
+/// it takes effect, and level 4 removes its records entirely.
 fn apply_sanctions(db: &Db, records: Vec<RecordRow>, at: &str) -> Result<Vec<RecordRow>> {
-    let mut levels: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
+    let mut states: std::collections::HashMap<String, (u8, Option<String>)> =
+        std::collections::HashMap::new();
     let mut kept = Vec::with_capacity(records.len());
     for mut r in records {
-        let level = match levels.get(&r.publisher) {
-            Some(l) => *l,
+        let state = match states.get(&r.publisher) {
+            Some(state) => state.clone(),
             None => {
-                let l = crate::sanctions::sanction_level(db, &r.publisher, at)?;
-                levels.insert(r.publisher.clone(), l);
-                l
+                let s = crate::sanctions::sanction_state(db, &r.publisher, at)?;
+                let state = (s.level, s.effective_at);
+                states.insert(r.publisher.clone(), state.clone());
+                state
             }
         };
-        match level {
-            4 => continue,
-            2 => r.weight = "reduced".to_string(),
+        match state {
+            (4, _) => continue,
+            (3, Some(effective_at)) if r.sealed_at >= effective_at => continue,
+            (2, _) => r.weight = "reduced".to_string(),
             _ => {}
         }
         kept.push(r);
@@ -432,4 +438,69 @@ pub fn build(
         &content_digest_value,
         sk,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{GovernanceRow, RecordUpsert};
+
+    const DAY: i64 = 86400;
+    const T0: i64 = 1_800_000_000;
+
+    fn ts(epoch: i64) -> String {
+        jiff::Timestamp::from_second(epoch).unwrap().to_string()
+    }
+
+    fn seal_record(db: &Db, block: u64, sealed_epoch: i64, url: &str) {
+        db.commit_seal(
+            &[],
+            block,
+            &format!("sha256:h{block}"),
+            &ts(sealed_epoch),
+            &[RecordUpsert {
+                url,
+                publisher: "example.com",
+                delta_id: &format!("sha256:{:064x}", block),
+                observed_at: &ts(sealed_epoch),
+                weight: "full",
+                title: "t",
+                abstract_text: None,
+                lang: "en",
+            }],
+            &[],
+            &[],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn level_three_stops_materialization_from_its_effective_height() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+        seal_record(&db, 0, T0, "https://example.com/before");
+        db.commit_seal(
+            &[],
+            1,
+            "sha256:h1",
+            &ts(T0 + DAY),
+            &[],
+            &[],
+            &[GovernanceRow {
+                update_id: "sha256:s1",
+                action: "sanction",
+                domain: "example.com",
+                level: Some(3),
+                notice_id: None,
+                outcome: None,
+                kind: None,
+            }],
+        )
+        .unwrap();
+        seal_record(&db, 2, T0 + 2 * DAY, "https://example.com/after");
+
+        let kept = apply_sanctions(&db, db.list_records().unwrap(), &ts(T0 + 3 * DAY)).unwrap();
+        let urls: Vec<&str> = kept.iter().map(|r| r.url.as_str()).collect();
+        assert_eq!(urls, ["https://example.com/before"]);
+    }
 }
