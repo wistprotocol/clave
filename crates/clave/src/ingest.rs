@@ -9,6 +9,7 @@ use wist_core::envelope::verify_envelope;
 use wist_core::objects::{DeltaEnvelope, FeedEnvelope, Payload, Publisher, PublisherEnvelope};
 
 use crate::declaration::{self, Decision};
+use crate::registry;
 
 #[derive(Debug, Default)]
 pub struct IngestReport {
@@ -95,6 +96,20 @@ fn record_rejection(
     db.insert_rejection(domain, code, now, id, Some(detail))
 }
 
+fn key_set_cache_expired(db: &Db, host: &str, now: &str) -> Result<bool> {
+    let ttl = registry::effective(db, "keyset_cache_ttl_seconds", now)?;
+    let Some(fetched_at) = db.declaration_fetched_at(host)? else {
+        return Ok(true);
+    };
+    let (Ok(fetched), Ok(now_ts)) = (
+        fetched_at.parse::<jiff::Timestamp>(),
+        now.parse::<jiff::Timestamp>(),
+    ) else {
+        return Ok(true);
+    };
+    Ok(now_ts.as_second() - fetched.as_second() > ttl)
+}
+
 fn onboard_publisher(
     db: &Db,
     client: &Client,
@@ -176,6 +191,7 @@ fn onboard_publisher(
     };
 
     db.record_publisher_declaration(host, &raw, &key.key_id, &key.public_key, &value)?;
+    db.mark_declaration_fetched(host, now)?;
 
     Ok(Some(()))
 }
@@ -256,38 +272,60 @@ pub fn run(
 
     if known {
         let publisher_url = format!("{base}publisher.json");
-        if let Ok(Some((raw, value))) = meter.get(client, &publisher_url) {
-            let open_window = db.get_recovery_window(host)?;
-            match declaration::evaluate(&current_doc, &value) {
-                Ok(Decision::Unchanged) => {}
-                Ok(decision) => {
-                    let (key_id, public_key) = value
-                        .pointer("/publisher/keys/0")
-                        .map(|k| {
-                            (
-                                k["key_id"].as_str().unwrap_or_default().to_string(),
-                                k["public_key"].as_str().unwrap_or_default().to_string(),
-                            )
-                        })
-                        .unwrap_or_default();
-                    db.update_publisher_declaration(host, &raw, &key_id, &public_key, &value)?;
-                    match &open_window {
-                        None => {
-                            if decision == Decision::Recovery {
-                                db.open_recovery_window(host, &raw, &stored_raw)?;
+        match meter.get(client, &publisher_url) {
+            Ok(Some((raw, value))) => {
+                let open_window = db.get_recovery_window(host)?;
+                match declaration::evaluate(&current_doc, &value) {
+                    Ok(Decision::Unchanged) => {}
+                    Ok(decision) => {
+                        let (key_id, public_key) = value
+                            .pointer("/publisher/keys/0")
+                            .map(|k| {
+                                (
+                                    k["key_id"].as_str().unwrap_or_default().to_string(),
+                                    k["public_key"].as_str().unwrap_or_default().to_string(),
+                                )
+                            })
+                            .unwrap_or_default();
+                        db.update_publisher_declaration(host, &raw, &key_id, &public_key, &value)?;
+                        match &open_window {
+                            None => {
+                                if decision == Decision::Recovery {
+                                    db.open_recovery_window(host, &raw, &stored_raw)?;
+                                }
+                            }
+                            Some(window) => {
+                                let head: Value = serde_json::from_slice(&window.declaration_json)?;
+                                if declaration::follows_chain_head(&head, &value) {
+                                    db.update_recovery_chain_head(host, &raw)?;
+                                }
                             }
                         }
-                        Some(window) => {
-                            let head: Value = serde_json::from_slice(&window.declaration_json)?;
-                            if declaration::follows_chain_head(&head, &value) {
-                                db.update_recovery_chain_head(host, &raw)?;
-                            }
-                        }
+                        current_doc = value;
                     }
-                    current_doc = value;
+                    Err((code, detail)) => {
+                        record_rejection(db, host, code, now, None, &detail)?;
+                    }
                 }
-                Err(detail) => {
-                    record_rejection(db, host, "WIST1-E08", now, None, &detail)?;
+                db.mark_declaration_fetched(host, now)?;
+            }
+            // WIST-1 §5.1: a cached Key Set is valid for at most
+            // keyset_cache_ttl_seconds. Past that, a discovery failure
+            // leaves no Key Set to validate against and the pull fails
+            // closed with WIST1-E02 rather than sealing under a
+            // declaration of any age.
+            Ok(None) => {}
+            Err(e) => {
+                if key_set_cache_expired(db, host, now)? {
+                    record_rejection(
+                        db,
+                        host,
+                        "WIST1-E02",
+                        now,
+                        None,
+                        &format!("Key Set cache expired and rediscovery failed: {e}"),
+                    )?;
+                    return Ok(report);
                 }
             }
         }

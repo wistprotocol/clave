@@ -5,7 +5,7 @@ use std::path::Path;
 use wist_core::objects::{PublisherState, StatusRejection};
 
 const SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS publishers(domain TEXT PRIMARY KEY, declaration_json BLOB NOT NULL, key_id TEXT NOT NULL, public_key TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'new', last_pull_at TEXT);
+CREATE TABLE IF NOT EXISTS publishers(domain TEXT PRIMARY KEY, declaration_json BLOB NOT NULL, key_id TEXT NOT NULL, public_key TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'new', last_pull_at TEXT, declaration_fetched_at TEXT);
 CREATE TABLE IF NOT EXISTS seen_deltas(delta_id TEXT PRIMARY KEY, domain TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS pending_entries(rowid INTEGER PRIMARY KEY AUTOINCREMENT, entry_type TEXT NOT NULL, domain TEXT NOT NULL, entry_json BLOB NOT NULL, chain_pos INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS records(url TEXT NOT NULL, publisher TEXT NOT NULL, delta_id TEXT NOT NULL, observed_at TEXT NOT NULL, weight TEXT NOT NULL, title TEXT NOT NULL, abstract TEXT, lang TEXT NOT NULL, sealed_at TEXT NOT NULL DEFAULT '', PRIMARY KEY(url, publisher));
@@ -26,6 +26,7 @@ fn add_missing_columns(conn: &Connection) -> Result<()> {
     for statement in [
         "ALTER TABLE governance ADD COLUMN kind TEXT",
         "ALTER TABLE records ADD COLUMN sealed_at TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE publishers ADD COLUMN declaration_fetched_at TEXT",
     ] {
         match conn.execute(statement, []) {
             Ok(_) => {}
@@ -310,6 +311,28 @@ impl Db {
         )?;
         exec_insert_pending_entry(&tx, "publisher_declaration", domain, entry_json, 0)?;
         tx.commit()?;
+        Ok(())
+    }
+
+    /// WIST-1 §5.1: the instant the stored Key Set was last discovered,
+    /// against which `keyset_cache_ttl_seconds` is measured.
+    pub fn declaration_fetched_at(&self, domain: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT declaration_fetched_at FROM publishers WHERE domain = ?1",
+                [domain],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    pub fn mark_declaration_fetched(&self, domain: &str, at: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE publishers SET declaration_fetched_at = ?2 WHERE domain = ?1",
+            (domain, at),
+        )?;
         Ok(())
     }
 

@@ -101,43 +101,57 @@ pub fn verify_signed(
 /// accepted one. An open recovery window does not change acceptance — a
 /// Declaration sealed inside one is superseded at the window's end, and
 /// rejecting it here would leave the attempt invisible on replay. Err
-/// carries a WIST1-E08 detail.
-pub fn evaluate(stored: &Value, fetched: &Value) -> Result<Decision, String> {
-    let stored_p = parse(stored)?;
-    let fetched_p = parse(fetched)?;
-    disjoint_key_sets(&fetched_p)?;
+/// carries the WIST-1 §7 code for the failure and its detail.
+pub fn evaluate(stored: &Value, fetched: &Value) -> Result<Decision, (&'static str, String)> {
+    let stored_p = parse(stored).map_err(|e| ("WIST2-E04", e))?;
+    let fetched_p = parse(fetched).map_err(|e| ("WIST2-E04", e))?;
+    disjoint_key_sets(&fetched_p).map_err(|e| ("WIST1-E08", e))?;
 
     if fetched_p.domain != stored_p.domain {
-        return Err("declaration domain changed".into());
+        return Err(("WIST2-E04", "declaration domain changed".into()));
     }
 
     if fetched_p.seq < stored_p.seq {
-        return Err(format!(
-            "stale declaration: seq {} below accepted {}",
-            fetched_p.seq, stored_p.seq
+        return Err((
+            "WIST1-E08",
+            format!(
+                "stale declaration: seq {} below accepted {}",
+                fetched_p.seq, stored_p.seq
+            ),
         ));
     }
     if fetched_p.seq == stored_p.seq {
-        if inner_hash(fetched)? == inner_hash(stored)? {
+        if inner_hash(fetched).map_err(|e| ("WIST2-E04", e))?
+            == inner_hash(stored).map_err(|e| ("WIST2-E04", e))?
+        {
             return Ok(Decision::Unchanged);
         }
-        return Err(format!(
-            "declaration replayed seq {} with different content",
-            fetched_p.seq
+        return Err((
+            "WIST1-E08",
+            format!(
+                "declaration replayed seq {} with different content",
+                fetched_p.seq
+            ),
         ));
     }
 
-    if fetched_p.prev_declaration.as_deref() != Some(inner_hash(stored)?.as_str()) {
-        return Err(
+    if fetched_p.prev_declaration.as_deref()
+        != Some(inner_hash(stored).map_err(|e| ("WIST2-E04", e))?.as_str())
+    {
+        return Err((
+            "WIST1-E08",
             "prev_declaration does not equal the hash of the previously accepted declaration"
                 .into(),
-        );
+        ));
     }
 
     let key_id = fetched["sig"]["key_id"].as_str().unwrap_or_default();
     let decision = if let Some(key) = find_key(&stored_p.keys, key_id) {
         if !verify_with(fetched, key) {
-            return Err("declaration signature verification failed".into());
+            return Err((
+                "WIST1-E01",
+                "declaration signature verification failed".into(),
+            ));
         }
         Decision::Ordinary
     } else if let Some(key) = stored_p
@@ -146,24 +160,36 @@ pub fn evaluate(stored: &Value, fetched: &Value) -> Result<Decision, String> {
         .and_then(|keys| find_key(keys, key_id))
     {
         if !verify_with(fetched, key) {
-            return Err("declaration signature verification failed".into());
+            return Err((
+                "WIST1-E01",
+                "declaration signature verification failed".into(),
+            ));
         }
         Decision::Recovery
     } else if let Some(key) = find_key(&fetched_p.keys, key_id) {
         if !verify_with(fetched, key) {
-            return Err("declaration signature verification failed".into());
+            return Err((
+                "WIST1-E01",
+                "declaration signature verification failed".into(),
+            ));
         }
         Decision::FreshIdentity
     } else {
-        return Err(format!("sig.key_id {key_id} matches no known key"));
+        return Err((
+            "WIST1-E02",
+            format!("sig.key_id {key_id} matches no known key"),
+        ));
     };
 
     if decision != Decision::Recovery {
-        let stored_recovery = recovery_keys_bytes(&stored_p)?;
-        if !stored_recovery.is_empty() && recovery_keys_bytes(&fetched_p)? != stored_recovery {
-            return Err(
+        let stored_recovery = recovery_keys_bytes(&stored_p).map_err(|e| ("WIST2-E04", e))?;
+        if !stored_recovery.is_empty()
+            && recovery_keys_bytes(&fetched_p).map_err(|e| ("WIST2-E04", e))? != stored_recovery
+        {
+            return Err((
+                "WIST1-E08",
                 "recovery_keys altered by a declaration not signed by a recovery key".into(),
-            );
+            ));
         }
     }
 

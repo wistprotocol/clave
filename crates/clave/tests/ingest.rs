@@ -364,3 +364,80 @@ fn a_feed_whose_signature_does_not_verify_is_e04_noise() {
     assert!(codes.contains(&"WIST2-E04".to_string()), "codes {codes:?}");
     assert!(!codes.contains(&"WIST2-E01".to_string()), "codes {codes:?}");
 }
+
+#[test]
+fn a_declaration_that_fails_verification_is_e01_and_an_unknown_key_is_e02() {
+    let (listener, host) = reserve_addr();
+    let p = make_publisher(&host);
+    let id = add_delta(&p, &format!("https://{host}/a"), "alpha body", None);
+    write_feed(&p, &host, &[id], "2026-08-09T12:00:00Z");
+    serve_static(listener, p.dir.path().to_path_buf());
+
+    let tmp = tempfile::tempdir().unwrap();
+    clave::init::run(&host, tmp.path()).unwrap();
+    let db = clave::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+    let client = clave::fetch::Client::new(true);
+    clave::ingest::run(&db, &client, tmp.path(), &host, "2026-08-09T12:00:05Z").unwrap();
+
+    let path = p.dir.path().join(".well-known/wist/publisher.json");
+    let stored: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+
+    let mut tampered = stored.clone();
+    tampered["publisher"]["seq"] = 1.into();
+    tampered["publisher"]["prev_declaration"] = common::declaration_hash(&stored).as_str().into();
+    fs::write(&path, serde_json::to_vec(&tampered).unwrap()).unwrap();
+    clave::ingest::run(&db, &client, tmp.path(), &host, "2026-08-09T13:00:05Z").unwrap();
+    let codes: Vec<String> = db
+        .list_rejections(&host)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.code)
+        .collect();
+    assert!(codes.contains(&"WIST1-E01".to_string()), "codes {codes:?}");
+
+    let mut unknown = tampered.clone();
+    unknown["sig"]["key_id"] = "kX".into();
+    fs::write(&path, serde_json::to_vec(&unknown).unwrap()).unwrap();
+    clave::ingest::run(&db, &client, tmp.path(), &host, "2026-08-09T14:00:05Z").unwrap();
+    let codes: Vec<String> = db
+        .list_rejections(&host)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.code)
+        .collect();
+    assert!(codes.contains(&"WIST1-E02".to_string()), "codes {codes:?}");
+}
+
+#[test]
+fn a_stale_key_set_cache_with_a_failed_rediscovery_fails_closed() {
+    let (listener, host) = reserve_addr();
+    let p = make_publisher(&host);
+    let id = add_delta(&p, &format!("https://{host}/a"), "alpha body", None);
+    write_feed(&p, &host, &[id], "2026-08-09T12:00:00Z");
+    serve_static(listener, p.dir.path().to_path_buf());
+
+    let tmp = tempfile::tempdir().unwrap();
+    clave::init::run(&host, tmp.path()).unwrap();
+    let db = clave::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+    let client = clave::fetch::Client::new(true);
+    clave::ingest::run(&db, &client, tmp.path(), &host, "2026-08-09T12:00:05Z").unwrap();
+
+    fs::remove_file(p.dir.path().join(".well-known/wist/publisher.json")).unwrap();
+
+    let inside =
+        clave::ingest::run(&db, &client, tmp.path(), &host, "2026-08-09T20:00:00Z").unwrap();
+    assert_eq!(inside.rejected, Vec::new());
+
+    let id2 = add_delta(&p, &format!("https://{host}/b"), "beta body", None);
+    write_feed(&p, &host, &[id2], "2026-08-11T12:00:00Z");
+    let stale =
+        clave::ingest::run(&db, &client, tmp.path(), &host, "2026-08-11T12:00:05Z").unwrap();
+    assert!(stale.accepted.is_empty(), "accepted {:?}", stale.accepted);
+    let codes: Vec<String> = db
+        .list_rejections(&host)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.code)
+        .collect();
+    assert!(codes.contains(&"WIST1-E02".to_string()), "codes {codes:?}");
+}
