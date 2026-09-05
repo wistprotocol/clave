@@ -120,6 +120,9 @@ pub struct GovernanceEntry {
     pub kind: Option<String>,
 }
 
+/// `(auditor_id, key_id, public_key, admitted height, removed height)`
+pub type RosterTenure = (String, String, String, u64, Option<u64>);
+
 pub struct RosterActRow {
     pub block_number: u64,
     pub sealed_at: String,
@@ -998,6 +1001,54 @@ impl Db {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// Every domain the Log carries a `sanction` for, so §7's derived
+    /// state can be read for each.
+    pub fn sanctioned_domains(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT domain FROM governance WHERE action = 'sanction' ORDER BY domain",
+        )?;
+        let rows = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(rows)
+    }
+
+    pub fn list_url_tips(&self) -> Result<Vec<(String, String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT domain, url, tip FROM url_tips ORDER BY domain, url")?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// WIST-3 §7 `auditor` tuples: each admitted key with the height that
+    /// admitted it and the height that removed it, if any.
+    pub fn roster_state(&self) -> Result<Vec<RosterTenure>> {
+        let mut admitted: Vec<RosterTenure> = Vec::new();
+        for act in self.accepted_roster_acts()? {
+            match act.action.as_str() {
+                "auditor_admit" => admitted.push((
+                    act.auditor_id,
+                    act.key_id,
+                    act.public_key,
+                    act.block_number,
+                    None,
+                )),
+                _ => {
+                    if let Some(row) = admitted
+                        .iter_mut()
+                        .find(|(a, k, ..)| *a == act.auditor_id && *k == act.key_id)
+                    {
+                        row.4 = Some(act.block_number);
+                    }
+                }
+            }
+        }
+        Ok(admitted)
     }
 
     pub fn url_tip(&self, url: &str) -> Result<Option<String>> {

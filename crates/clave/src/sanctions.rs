@@ -1,6 +1,7 @@
 use crate::db::{Db, GovernanceEntry};
 use crate::error::Result;
 use crate::registry;
+use wist_core::objects::SanctionDeadlineLabel;
 
 const DAY: i64 = 86400;
 
@@ -88,6 +89,10 @@ pub fn sanction_level(db: &Db, domain: &str, at: &str) -> Result<u8> {
 pub struct SanctionState {
     pub level: u8,
     pub effective_at: Option<String>,
+    /// The Registry Update IDs establishing the state, and each deadline
+    /// still open against it (WIST-3 §7's `sanction_state` tuple).
+    pub evidence: Vec<String>,
+    pub deadlines: Vec<(SanctionDeadlineLabel, String)>,
 }
 
 pub fn sanction_state(db: &Db, domain: &str, at: &str) -> Result<SanctionState> {
@@ -100,6 +105,8 @@ pub fn sanction_state(db: &Db, domain: &str, at: &str) -> Result<SanctionState> 
         return Ok(SanctionState {
             level: 0,
             effective_at: None,
+            evidence: Vec::new(),
+            deadlines: Vec::new(),
         });
     };
     let lower_rung = entries
@@ -121,6 +128,8 @@ pub fn sanction_state(db: &Db, domain: &str, at: &str) -> Result<SanctionState> 
         return Ok(SanctionState {
             level: 0,
             effective_at: None,
+            evidence: Vec::new(),
+            deadlines: Vec::new(),
         });
     }
 
@@ -135,14 +144,56 @@ pub fn sanction_state(db: &Db, domain: &str, at: &str) -> Result<SanctionState> 
                 return Ok(SanctionState {
                     level: lower_rung,
                     effective_at: Some(sanction.sealed_at.clone()),
+                    evidence: vec![sanction.update_id.clone()],
+                    deadlines: Vec::new(),
                 });
+            }
+        }
+    }
+    let mut deadlines = Vec::new();
+    if level >= 3 {
+        if let Some(notice_id) = sanction.notice_id.as_deref() {
+            if let Some(notice) = entries.iter().find(|e| e.update_id == notice_id) {
+                let window_days = registry::effective(db, "appeal_window_days", &notice.sealed_at)?;
+                let seal_days = registry::effective(db, "appeal_seal_days", &notice.sealed_at)?;
+                let opened = epoch(&notice.sealed_at);
+                for (label, at) in [
+                    (SanctionDeadlineLabel::Appeal, opened + window_days * DAY),
+                    (
+                        SanctionDeadlineLabel::AppealSealing,
+                        opened + (window_days + seal_days) * DAY,
+                    ),
+                ] {
+                    if at > at_epoch {
+                        deadlines.push((label, instant(at)?));
+                    }
+                }
+                if let Some(appeal) = entries
+                    .iter()
+                    .find(|e| e.action == "appeal" && e.notice_id.as_deref() == Some(notice_id))
+                {
+                    let ruling_days =
+                        registry::effective(db, "ruling_deadline_days", &appeal.sealed_at)?;
+                    let due = epoch(&appeal.sealed_at) + ruling_days * DAY;
+                    if due > at_epoch {
+                        deadlines.push((SanctionDeadlineLabel::Ruling, instant(due)?));
+                    }
+                }
             }
         }
     }
     Ok(SanctionState {
         level,
         effective_at: Some(sanction.sealed_at.clone()),
+        evidence: vec![sanction.update_id.clone()],
+        deadlines,
     })
+}
+
+fn instant(epoch: i64) -> Result<String> {
+    jiff::Timestamp::from_second(epoch)
+        .map(|t| t.to_string())
+        .map_err(|_| crate::error::Error::Governance("deadline instant out of range".into()))
 }
 
 #[cfg(test)]

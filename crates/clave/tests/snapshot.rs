@@ -349,3 +349,101 @@ fn sharded_snapshot_declares_count_digests_and_shard_labels() {
         read_parquet_rows(&dir.join(format!("shard-{expected_shard}/tier1/extracts.parquet")));
     assert_eq!(extracts.len(), 1);
 }
+
+#[test]
+fn the_state_artifact_carries_every_kind_with_live_instances() {
+    let (listener, host) = reserve_addr();
+    let p = make_publisher_with_scope(&host, &["example.com"]);
+    let live = add_delta(&p, "https://example.com/live", "alpha body", None);
+    let doomed = add_delta(&p, "https://example.com/gone", "beta body", None);
+    write_feed(
+        &p,
+        &host,
+        &[live.clone(), doomed.clone()],
+        "2026-08-09T12:00:00Z",
+    );
+    serve_static(listener, p.dir.path().to_path_buf());
+
+    let data = tempfile::tempdir().unwrap();
+    clave::init::run(&host, data.path()).unwrap();
+    let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
+    db.set_param("block_cadence_seconds", 1).unwrap();
+    let client = clave::fetch::Client::new(true);
+    clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
+    let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
+    clave::seal::run(&db, data.path(), &sk, 1_754_740_800).unwrap();
+
+    let admit = serde_json::json!({
+        "wist_version": "1.0.0",
+        "action": "auditor_admit",
+        "subject": "audit.example.org",
+        "details": {"key_id": "a1", "public_key": "pk-a1"},
+        "effective_at": "2026-08-09T12:00:00Z",
+    });
+    let envelope = wist_core::envelope::sign_envelope(&admit, "update", "log1", &sk).unwrap();
+    db.insert_pending_entry("registry_update", "", &envelope, 0)
+        .unwrap();
+    clave::governance::sanction(
+        &db,
+        &sk,
+        "example.com",
+        2,
+        1,
+        &[
+            format!("sha256:{}", "1".repeat(64)),
+            format!("sha256:{}", "2".repeat(64)),
+        ],
+        None,
+        1_754_740_801,
+    )
+    .unwrap();
+    clave::seal::run(&db, data.path(), &sk, 1_754_740_801).unwrap();
+
+    // The record for the deleted URL is gone, but its chain tip is not.
+    db.delete_record_by_delta(&doomed).unwrap();
+
+    clave::seal::run(&db, data.path(), &sk, 1_754_740_802).unwrap();
+    let date = &jiff::Timestamp::from_second(1_754_740_802)
+        .unwrap()
+        .to_string()[..10];
+    let state_env: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(data.path().join(format!("snapshots/{date}/state.json"))).unwrap(),
+    )
+    .unwrap();
+    let state: wist_core::objects::SnapshotState =
+        serde_json::from_value(state_env["state"].clone()).unwrap();
+
+    assert!(
+        state
+            .entries
+            .iter()
+            .any(|e| matches!(e, StateEntry::Auditor(a) if a.auditor_id == "audit.example.org")),
+        "no auditor tuple"
+    );
+    assert!(
+        state
+            .entries
+            .iter()
+            .any(|e| matches!(e, StateEntry::SanctionState(s) if s.domain == "example.com")),
+        "no sanction_state tuple"
+    );
+    assert!(
+        state.entries.iter().any(
+            |e| matches!(e, StateEntry::Declaration(d) if d.domain == host && d.sealing_height > 0
+                || matches!(e, StateEntry::Declaration(d) if d.domain == host))
+        ),
+        "no declaration tuple"
+    );
+    let tips: Vec<&str> = state
+        .entries
+        .iter()
+        .filter_map(|e| match e {
+            StateEntry::Record(r) => Some(r.url.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        tips.contains(&"https://example.com/gone"),
+        "a deleted URL keeps its chain tip; tips {tips:?}"
+    );
+}

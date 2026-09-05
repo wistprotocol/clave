@@ -9,9 +9,9 @@ use std::path::Path;
 use wist_core::crypto::{hex_encode, SigningKey};
 use wist_core::envelope::sign_envelope;
 use wist_core::objects::{
-    AggregatorKeyEntry, DeclarationEntry, ParameterEntry, RecordEntry, RecoveryWindowEntry,
-    SnapshotFile, SnapshotIndex, SnapshotIndexEntry, SnapshotManifest, SnapshotState,
-    SnapshotStateFile, StateEntry,
+    AggregatorKeyEntry, AuditorEntry, DeclarationEntry, ParameterEntry, RecordEntry,
+    RecoveryWindowEntry, SanctionStateEntry, SnapshotFile, SnapshotIndex, SnapshotIndexEntry,
+    SnapshotManifest, SnapshotState, SnapshotStateFile, StateEntry,
 };
 use wist_core::snapshot::{content_digest, state_digest};
 
@@ -231,10 +231,38 @@ fn build_state(
     }
     for p in &publishers {
         let declaration: Value = serde_json::from_slice(&p.declaration_json)?;
+        let seq = declaration["publisher"]["seq"].as_u64();
+        let sealing_height = db
+            .sealed_declarations(&p.domain)?
+            .into_iter()
+            .find(|d| Some(d.seq) == seq)
+            .map(|d| d.block_number)
+            .unwrap_or(0);
         entries.push(StateEntry::Declaration(DeclarationEntry {
             domain: p.domain.clone(),
             declaration,
-            sealing_height: 0,
+            sealing_height,
+        }));
+    }
+    for (auditor_id, key_id, public_key, admitted_height, removed_height) in db.roster_state()? {
+        entries.push(StateEntry::Auditor(AuditorEntry {
+            auditor_id,
+            key_id,
+            public_key,
+            admitted_height,
+            removed_height,
+        }));
+    }
+    for domain in db.sanctioned_domains()? {
+        let state = crate::sanctions::sanction_state(db, &domain, &head_sealed_at)?;
+        if state.level == 0 {
+            continue;
+        }
+        entries.push(StateEntry::SanctionState(SanctionStateEntry {
+            domain,
+            level: state.level as u64,
+            evidence: state.evidence,
+            deadlines: state.deadlines,
         }));
     }
     for (domain, opened_block, window_end) in db.list_open_recovery_windows()? {
@@ -244,11 +272,14 @@ fn build_state(
             window_end,
         }));
     }
-    for r in records {
+    // WIST-3 §7: a `record` tuple exists for every key the chain-tip
+    // table holds, a deleted URL included — a chain never restarts, so a
+    // resuming Consumer needs the tip to reject a fork of it.
+    for (publisher, url, tip) in db.list_url_tips()? {
         entries.push(StateEntry::Record(RecordEntry {
-            publisher: r.publisher.clone(),
-            url: r.url.clone(),
-            delta_id: r.delta_id.clone(),
+            publisher,
+            url,
+            delta_id: tip,
         }));
     }
 
