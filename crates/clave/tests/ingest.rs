@@ -332,3 +332,35 @@ fn ingest_onboard_failure_is_e04_noise() {
         clave::ingest::run(&db, &client, tmp.path(), &host, "2026-08-09T12:00:05Z").unwrap();
     assert_eq!(report.noise, Some("WIST2-E04"));
 }
+
+#[test]
+fn a_feed_whose_signature_does_not_verify_is_e04_noise() {
+    let (listener, host) = reserve_addr();
+    let p = make_publisher(&host);
+    let id = add_delta(&p, &format!("https://{host}/a"), "alpha body", None);
+    write_feed(&p, &host, &[id], "2026-08-09T12:00:00Z");
+
+    let path = p.dir.path().join(".well-known/wist/feed.json");
+    let mut env: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    env["feed"]["generated_at"] = "2026-08-09T12:00:01Z".into();
+    fs::write(&path, serde_json::to_vec(&env).unwrap()).unwrap();
+    serve_static(listener, p.dir.path().to_path_buf());
+
+    let tmp = tempfile::tempdir().unwrap();
+    clave::init::run(&host, tmp.path()).unwrap();
+    let db = clave::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+    let client = clave::fetch::Client::new(true);
+
+    let report =
+        clave::ingest::run(&db, &client, tmp.path(), &host, "2026-08-09T12:00:05Z").unwrap();
+
+    assert_eq!(report.noise, Some("WIST2-E04"));
+    let codes: Vec<String> = db
+        .list_rejections(&host)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.code)
+        .collect();
+    assert!(codes.contains(&"WIST2-E04".to_string()), "codes {codes:?}");
+    assert!(!codes.contains(&"WIST2-E01".to_string()), "codes {codes:?}");
+}

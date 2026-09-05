@@ -341,11 +341,12 @@ pub fn run(
             record_rejection(
                 db,
                 host,
-                "WIST2-E01",
+                "WIST2-E04",
                 now,
                 None,
-                "signature verification failed",
+                "feed signature does not verify against the domain's Key Set",
             )?;
+            report.noise = Some("WIST2-E04");
             return Ok(report);
         }
         let feed_parsed: FeedEnvelope = match serde_json::from_value(feed_value) {
