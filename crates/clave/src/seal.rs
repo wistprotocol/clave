@@ -26,6 +26,9 @@ pub struct SealReport {
     pub block_number: u64,
     pub entry_count: u64,
     pub dropped: Vec<String>,
+    /// Deltas sealed past WIST-4 §6.4's inclusion ceiling, counted from
+    /// the Block each one's turn arrived in.
+    pub late: Vec<String>,
 }
 
 struct AcceptedParamChange {
@@ -138,6 +141,56 @@ fn check_unappealed_ruling(
 /// Block's own Declarations included (WIST-3 §3.2 applies them first).
 /// One whose signing key a Declaration accepted since the pull has
 /// retired is WIST1-E02, reported and not sealed.
+/// WIST-3 §3.2: a Block MUST NOT carry more than
+/// `domain_block_entries_max` `publisher_delta` Entries for one domain.
+/// The surplus waits its turn in acceptance order, and WIST-4 §6.4's
+/// inclusion ceiling runs from the Block a Delta's turn arrives in — the
+/// first with room for it — which is recorded here.
+fn fit_to_domain_cap(
+    db: &Db,
+    peeked: Vec<PendingEntryRow>,
+    cap: i64,
+    block_number: u64,
+) -> Result<Vec<PendingEntryRow>> {
+    let cap = cap.max(0) as usize;
+    let mut taken: HashMap<String, usize> = HashMap::new();
+    let mut kept = Vec::with_capacity(peeked.len());
+    for p in peeked {
+        if p.entry_type != "publisher_delta" {
+            kept.push(p);
+            continue;
+        }
+        let count = taken.entry(p.domain.clone()).or_insert(0);
+        if *count >= cap {
+            continue;
+        }
+        *count += 1;
+        db.set_turn_block(p.rowid, block_number)?;
+        kept.push(p);
+    }
+    Ok(kept)
+}
+
+/// WIST-4 §6.4: an accepted Delta MUST be sealed no later than
+/// `max_inclusion_blocks` Blocks after the Block its turn arrived in.
+fn late_inclusions(entries: &[SealEntry], block_number: u64, ceiling: i64) -> Vec<String> {
+    let ceiling = ceiling.max(0) as u64;
+    entries
+        .iter()
+        .filter(|e| e.entry_type == "publisher_delta")
+        .filter_map(|e| {
+            let turn = e.turn_block?;
+            (block_number > turn + ceiling).then(|| {
+                format!(
+                    "{}: sealed at Block {block_number}, {} Blocks after its turn at {turn}",
+                    e.domain,
+                    block_number - turn
+                )
+            })
+        })
+        .collect()
+}
+
 fn revalidate_queued_deltas(
     db: &Db,
     entries: Vec<SealEntry>,
@@ -326,6 +379,7 @@ struct SealEntry {
     body: Value,
     wrapped: Value,
     leaf: [u8; 32],
+    turn_block: Option<u64>,
 }
 
 struct DeltaApply {
@@ -407,6 +461,7 @@ fn storage_order(peeked: Vec<PendingEntryRow>) -> Result<Vec<SealEntry>> {
                 body: p.entry_json,
                 wrapped,
                 leaf,
+                turn_block: p.turn_block,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -569,11 +624,15 @@ pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<
 
     let (peeked, _up_to_rowid) = db.peek_pending_entries()?;
     let peeked = restate_appeal_deadlines(db, sk, peeked, &sealed_at, sealed_epoch)?;
+    let domain_cap = registry::effective(db, "domain_block_entries_max", &sealed_at)?;
+    let peeked = fit_to_domain_cap(db, peeked, domain_cap, block_number)?;
     let seal_entries = storage_order(peeked)?;
     let cap = registry::effective(db, "block_decompressed_cap_bytes", &sealed_at)?;
     let (seal_entries, _deferred) = fit_to_cap(seal_entries, cap)?;
     let (seal_entries, retired_rowids, retired) =
         revalidate_queued_deltas(db, seal_entries, &sealed_at)?;
+    let ceiling = registry::effective(db, "max_inclusion_blocks", &sealed_at)?;
+    let late = late_inclusions(&seal_entries, block_number, ceiling);
     let mut outcome = enforce_governance(db, seal_entries, &sealed_at, sealed_epoch)?;
     outcome.dropped.extend(retired);
     outcome.dropped_rowids.extend(retired_rowids);
@@ -769,5 +828,6 @@ pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<
         block_number,
         entry_count,
         dropped,
+        late,
     })
 }

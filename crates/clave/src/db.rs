@@ -7,7 +7,7 @@ use wist_core::objects::{PublisherState, StatusRejection};
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS publishers(domain TEXT PRIMARY KEY, declaration_json BLOB NOT NULL, key_id TEXT NOT NULL, public_key TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'new', last_pull_at TEXT, declaration_fetched_at TEXT);
 CREATE TABLE IF NOT EXISTS seen_deltas(delta_id TEXT PRIMARY KEY, domain TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS pending_entries(rowid INTEGER PRIMARY KEY AUTOINCREMENT, entry_type TEXT NOT NULL, domain TEXT NOT NULL, entry_json BLOB NOT NULL, chain_pos INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS pending_entries(rowid INTEGER PRIMARY KEY AUTOINCREMENT, entry_type TEXT NOT NULL, domain TEXT NOT NULL, entry_json BLOB NOT NULL, chain_pos INTEGER NOT NULL, turn_block INTEGER);
 CREATE TABLE IF NOT EXISTS records(url TEXT NOT NULL, publisher TEXT NOT NULL, delta_id TEXT NOT NULL, observed_at TEXT NOT NULL, weight TEXT NOT NULL, title TEXT NOT NULL, abstract TEXT, lang TEXT NOT NULL, sealed_at TEXT NOT NULL DEFAULT '', PRIMARY KEY(url, publisher));
 CREATE TABLE IF NOT EXISTS blocks(block_number INTEGER PRIMARY KEY, block_hash TEXT NOT NULL, sealed_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS rejections(domain TEXT NOT NULL, code TEXT NOT NULL, at TEXT NOT NULL, delta_id TEXT, detail TEXT);
@@ -28,6 +28,7 @@ fn add_missing_columns(conn: &Connection) -> Result<()> {
         "ALTER TABLE governance ADD COLUMN kind TEXT",
         "ALTER TABLE records ADD COLUMN sealed_at TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE publishers ADD COLUMN declaration_fetched_at TEXT",
+        "ALTER TABLE pending_entries ADD COLUMN turn_block INTEGER",
     ] {
         match conn.execute(statement, []) {
             Ok(_) => {}
@@ -84,6 +85,10 @@ pub struct PendingEntryRow {
     pub entry_type: String,
     pub domain: String,
     pub entry_json: Value,
+    /// WIST-4 §6.4: the Block at which this Delta's turn arrived — the
+    /// first with room for it under WIST-3 §3.2's per-domain capacity.
+    /// The inclusion ceiling runs from here.
+    pub turn_block: Option<u64>,
 }
 
 pub struct ParamChangeRow<'a> {
@@ -370,6 +375,14 @@ impl Db {
         Ok(rows)
     }
 
+    pub fn set_turn_block(&self, rowid: i64, block_number: u64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE pending_entries SET turn_block = ?2 WHERE rowid = ?1 AND turn_block IS NULL",
+            (rowid, block_number as i64),
+        )?;
+        Ok(())
+    }
+
     pub fn get_publisher_declaration(&self, domain: &str) -> Result<Option<Vec<u8>>> {
         self.conn
             .query_row(
@@ -604,22 +617,30 @@ impl Db {
 
     pub fn peek_pending_entries(&self) -> Result<(Vec<PendingEntryRow>, i64)> {
         let mut stmt = self.conn.prepare(
-            "SELECT rowid, entry_type, domain, entry_json FROM pending_entries ORDER BY rowid ASC",
+            "SELECT rowid, entry_type, domain, entry_json, turn_block FROM pending_entries ORDER BY rowid ASC",
         )?;
-        let rows: Vec<(i64, String, String, Vec<u8>)> = stmt
+        type PendingRow = (i64, String, String, Vec<u8>, Option<i64>);
+        let rows: Vec<PendingRow> = stmt
             .query_map([], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
             })?
             .collect::<rusqlite::Result<_>>()?;
         let max_rowid = rows.iter().map(|(rowid, ..)| *rowid).max().unwrap_or(0);
         let entries = rows
             .into_iter()
-            .map(|(rowid, entry_type, domain, blob)| {
+            .map(|(rowid, entry_type, domain, blob, turn_block)| {
                 Ok(PendingEntryRow {
                     rowid,
                     entry_type,
                     domain,
                     entry_json: serde_json::from_slice(&blob)?,
+                    turn_block: turn_block.map(|b| b as u64),
                 })
             })
             .collect::<Result<_>>()?;

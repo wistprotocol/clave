@@ -133,7 +133,10 @@ fn main() -> Result<(), clave::Error> {
                 report.block_number, report.entry_count
             );
             for reason in &report.dropped {
-                println!("dropped parameter change: {reason}");
+                println!("dropped: {reason}");
+            }
+            for late in &report.late {
+                println!("late inclusion: {late}");
             }
         }
         Command::ParamChange {

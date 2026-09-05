@@ -250,3 +250,80 @@ fn oversize_block_defers_entries_to_the_next_seal() {
         .unwrap()
         .is_some());
 }
+
+#[test]
+fn the_per_domain_block_cap_defers_the_surplus_in_acceptance_order() {
+    let (listener, host) = reserve_addr();
+    let p = make_publisher_with_scope(&host, &["example.com"]);
+    let ids: Vec<String> = (0..5)
+        .map(|i| add_delta(&p, &format!("https://example.com/p{i}"), "body", None))
+        .collect();
+    write_feed(&p, &host, &ids, "2026-08-09T12:00:00Z");
+    serve_static(listener, p.dir.path().to_path_buf());
+
+    let data = tempfile::tempdir().unwrap();
+    clave::init::run(&host, data.path()).unwrap();
+    let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
+    db.set_param("block_cadence_seconds", 1).unwrap();
+    db.set_param("domain_block_entries_max", 2).unwrap();
+    let client = clave::fetch::Client::new(true);
+    clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
+    let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
+
+    let mut sealed: Vec<String> = Vec::new();
+    for (i, at) in [1_754_740_800i64, 1_754_740_801, 1_754_740_802]
+        .into_iter()
+        .enumerate()
+    {
+        let report = clave::seal::run(&db, data.path(), &sk, at).unwrap();
+        let raw = std::fs::read(
+            data.path()
+                .join(format!("log/blocks/{:09}.json.zst", report.block_number)),
+        )
+        .unwrap();
+        let block: serde_json::Value =
+            serde_json::from_slice(&zstd::decode_all(&raw[..]).unwrap()).unwrap();
+        let deltas: Vec<String> = block["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["type"] == "publisher_delta")
+            .map(|e| wist_core::delta::delta_id(&e["body"]["delta"]).unwrap())
+            .collect();
+        assert!(
+            deltas.len() <= 2,
+            "block {i} carried {} deltas",
+            deltas.len()
+        );
+        sealed.extend(deltas);
+    }
+    assert_eq!(sealed, ids, "sealed order {sealed:?}");
+}
+
+#[test]
+fn a_delta_held_past_the_inclusion_ceiling_is_reported() {
+    let (listener, host) = reserve_addr();
+    let p = make_publisher_with_scope(&host, &["example.com"]);
+    let ids: Vec<String> = (0..3)
+        .map(|i| add_delta(&p, &format!("https://example.com/p{i}"), "body", None))
+        .collect();
+    write_feed(&p, &host, &ids, "2026-08-09T12:00:00Z");
+    serve_static(listener, p.dir.path().to_path_buf());
+
+    let data = tempfile::tempdir().unwrap();
+    clave::init::run(&host, data.path()).unwrap();
+    let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
+    db.set_param("block_cadence_seconds", 1).unwrap();
+    db.set_param("max_inclusion_blocks", 1).unwrap();
+    db.set_param("block_decompressed_cap_bytes", 1100).unwrap();
+    let client = clave::fetch::Client::new(true);
+    clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
+    let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
+
+    let mut late = Vec::new();
+    for at in 1_754_740_800i64..1_754_740_806 {
+        let report = clave::seal::run(&db, data.path(), &sk, at).unwrap();
+        late.extend(report.late);
+    }
+    assert!(!late.is_empty(), "no late inclusion reported");
+}
