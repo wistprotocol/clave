@@ -448,3 +448,45 @@ fn a_recovery_notice_is_never_polled_for_an_appeal() {
     let actions = clave::appeals::poll(&r.db, &client, &r.sk, T0 + 100 * 86400).unwrap();
     assert!(actions.is_empty(), "actions {actions:?}");
 }
+
+#[test]
+fn a_queued_delta_whose_key_the_sealing_blocks_key_set_retired_is_not_sealed() {
+    let r = rig(make_publisher);
+    let id = add_delta(&r.p, &format!("https://{}/a", r.host), "alpha body", None);
+    write_feed(
+        &r.p,
+        &r.host,
+        std::slice::from_ref(&id),
+        "2026-08-09T12:00:00Z",
+    );
+    ingest(&r, "2026-08-09T12:00:05Z");
+
+    let stored = current_declaration(&r.p);
+    let rotated = serde_json::json!({
+        "wist_version": "1.0.0", "domain": r.host,
+        "keys": [key_entry("k2", &K2_SEED, "2026-08-09T13:00:00Z")],
+        "seq": 1,
+        "prev_declaration": declaration_hash(&stored),
+    });
+    write_declaration(&r.p, &rotated, "k1", &K1_SEED);
+    ingest(&r, "2026-08-09T14:00:05Z");
+
+    clave::seal::run(&r.db, r.data.path(), &r.sk, T0).unwrap();
+
+    let raw = std::fs::read(r.data.path().join("log/blocks/000000000.json.zst")).unwrap();
+    let block: serde_json::Value =
+        serde_json::from_slice(&zstd::decode_all(&raw[..]).unwrap()).unwrap();
+    let deltas: Vec<&str> = block["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["type"] == "publisher_delta")
+        .map(|e| e["body"]["sig"]["key_id"].as_str().unwrap())
+        .collect();
+    assert!(deltas.is_empty(), "sealed deltas signed by {deltas:?}");
+    assert!(
+        rejection_codes(&r).contains(&"WIST1-E02".to_string()),
+        "codes {:?}",
+        rejection_codes(&r)
+    );
+}

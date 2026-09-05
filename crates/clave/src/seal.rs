@@ -5,7 +5,7 @@ use crate::error::{Error, Result};
 use crate::registry;
 use crate::WIST_VERSION;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use wist_core::crypto::{hex_encode, SigningKey};
 use wist_core::envelope::sign_envelope;
@@ -130,6 +130,77 @@ fn check_unappealed_ruling(
         ));
     }
     Ok(())
+}
+
+/// WIST-2 §5 step 4: a queued Delta is sealed only where it verifies
+/// under the Key Set WIST-1 §5.2 resolves at the sealing Block — the
+/// highest-`seq` Declaration sealed at a height at or below it, this
+/// Block's own Declarations included (WIST-3 §3.2 applies them first).
+/// One whose signing key a Declaration accepted since the pull has
+/// retired is WIST1-E02, reported and not sealed.
+fn revalidate_queued_deltas(
+    db: &Db,
+    entries: Vec<SealEntry>,
+    sealed_at: &str,
+) -> Result<(Vec<SealEntry>, Vec<i64>, Vec<String>)> {
+    let mut key_sets: HashMap<String, Vec<wist_core::objects::PublisherKey>> = HashMap::new();
+    for e in entries.iter().filter(|e| e.entry_type == "publisher_delta") {
+        if key_sets.contains_key(&e.domain) {
+            continue;
+        }
+        let in_block = entries
+            .iter()
+            .filter(|d| d.entry_type == "publisher_declaration" && d.domain == e.domain)
+            .filter_map(|d| {
+                let seq = d.body["publisher"]["seq"].as_u64()?;
+                Some((seq, d.body.clone()))
+            });
+        let sealed = db
+            .sealed_declarations(&e.domain)?
+            .into_iter()
+            .filter_map(|d| {
+                serde_json::from_slice::<Value>(&d.declaration_json)
+                    .ok()
+                    .map(|doc| (d.seq, doc))
+            });
+        let newest = in_block.chain(sealed).max_by_key(|(seq, _)| *seq);
+        let keys = newest
+            .and_then(|(_, doc)| crate::declaration::publisher_of(&doc).ok())
+            .map(|p| p.keys)
+            .unwrap_or_default();
+        key_sets.insert(e.domain.clone(), keys);
+    }
+
+    let mut kept = Vec::with_capacity(entries.len());
+    let mut dropped_rowids = Vec::new();
+    let mut dropped = Vec::new();
+    for e in entries {
+        if e.entry_type != "publisher_delta" {
+            kept.push(e);
+            continue;
+        }
+        let keys: Vec<&wist_core::objects::PublisherKey> =
+            key_sets.get(&e.domain).into_iter().flatten().collect();
+        let observed_at = e.body["delta"]["observed_at"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if crate::declaration::verify_signed(&keys, &e.body, "delta", Some(&observed_at)).is_ok() {
+            kept.push(e);
+            continue;
+        }
+        let delta_id = wist_core::delta::delta_id(&e.body["delta"]).unwrap_or_default();
+        db.insert_rejection(
+            &e.domain,
+            "WIST1-E02",
+            sealed_at,
+            Some(&delta_id),
+            Some("signing key retired by the Key Set the sealing Block resolves"),
+        )?;
+        dropped.push(format!("{delta_id}: WIST1-E02 at sealing"));
+        dropped_rowids.push(e.rowid);
+    }
+    Ok((kept, dropped_rowids, dropped))
 }
 
 fn enforce_governance(
@@ -501,7 +572,11 @@ pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<
     let seal_entries = storage_order(peeked)?;
     let cap = registry::effective(db, "block_decompressed_cap_bytes", &sealed_at)?;
     let (seal_entries, _deferred) = fit_to_cap(seal_entries, cap)?;
-    let outcome = enforce_governance(db, seal_entries, &sealed_at, sealed_epoch)?;
+    let (seal_entries, retired_rowids, retired) =
+        revalidate_queued_deltas(db, seal_entries, &sealed_at)?;
+    let mut outcome = enforce_governance(db, seal_entries, &sealed_at, sealed_epoch)?;
+    outcome.dropped.extend(retired);
+    outcome.dropped_rowids.extend(retired_rowids);
     let GovernanceOutcome {
         kept: seal_entries,
         param_changes: accepted_changes,
