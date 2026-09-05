@@ -3,9 +3,8 @@ use std::time::Duration;
 
 const REQUEST_TIMEOUT_SECS: u64 = 30;
 
-/// WIST-2 §8 constrains a redirect's target, not the length of a chain
-/// of them. This bound only stops a loop between hosts that are all in
-/// scope.
+/// WIST-2 §8: a chain runs no more than five hops and never revisits a
+/// URL it has already fetched.
 const MAX_REDIRECTS: usize = 5;
 
 fn is_loopback_host(host: &str) -> bool {
@@ -89,6 +88,8 @@ impl Client {
         guard_scheme(&parsed, self.allow_http)?;
 
         let mut hops = 0usize;
+        let mut fetched = std::collections::HashSet::new();
+        fetched.insert(parsed.clone());
         let resp = loop {
             let resp = self
                 .inner
@@ -112,6 +113,11 @@ impl Client {
             if !redirect_allowed(&parsed, &target, subdomain_scope, self.allow_http) {
                 return Err(Error::Fetch(format!(
                     "refusing redirect from {parsed} to {target}: outside the Publisher's authority"
+                )));
+            }
+            if !fetched.insert(target.clone()) {
+                return Err(Error::Fetch(format!(
+                    "refusing redirect to {target}: already fetched in this chain"
                 )));
             }
             parsed = target;

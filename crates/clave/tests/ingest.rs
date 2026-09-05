@@ -473,3 +473,48 @@ fn an_unsealed_prev_is_retrieved_before_the_delta_naming_it() {
         report.rejected
     );
 }
+
+#[test]
+fn a_redirect_chain_that_revisits_a_url_stops_at_the_repeat() {
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let served = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&served);
+
+    let server = std::thread::spawn(move || {
+        listener
+            .set_nonblocking(false)
+            .expect("blocking accept loop");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            let Ok((mut stream, _)) = listener.accept() else {
+                break;
+            };
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            counter.fetch_add(1, Ordering::SeqCst);
+            let body = format!("HTTP/1.1 302 Found\r\nLocation: http://{addr}/loop.json\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            let _ = stream.write_all(body.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    let client = clave::fetch::Client::new(true);
+    let err = client
+        .get_json(&format!("http://{addr}/loop.json"))
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("already fetched"),
+        "unexpected error {err}"
+    );
+    assert_eq!(
+        served.load(Ordering::SeqCst),
+        1,
+        "the chain must stop at the repeat, not run to the hop bound"
+    );
+    drop(server);
+}
