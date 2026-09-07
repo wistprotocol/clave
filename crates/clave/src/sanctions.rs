@@ -225,6 +225,7 @@ mod tests {
             &[],
             rows,
             &[],
+            0,
         )
         .unwrap();
     }

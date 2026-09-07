@@ -1,6 +1,5 @@
 use crate::db::Db;
 use crate::error::{Error, Result};
-use crate::registry;
 use crate::WIST_VERSION;
 use sha2::{Digest, Sha256};
 use wist_core::crypto::{hex_encode, SigningKey};
@@ -27,16 +26,12 @@ pub fn run(
     effective_at: Option<&str>,
     now_epoch: i64,
 ) -> Result<ParamChangeReport> {
-    let now = whole_second(now_epoch)?;
-    let lookup = |n: &str| {
-        registry::effective(db, n, &now)
-            .unwrap_or_else(|_| registry::spec(n).and_then(|s| s.default).unwrap_or(0))
-    };
-    registry::validate(parameter, value, lookup)?;
-
-    let grace_days = registry::effective(db, "param_grace_days", &now)?;
-    let cadence = registry::effective(db, "block_cadence_seconds", &now)?;
-    let earliest_epoch = now_epoch + grace_days * 86400;
+    let schedule = db.parameter_schedule(now_epoch)?;
+    let grace_days = schedule.value_at("param_grace_days", now_epoch).unwrap();
+    let cadence = schedule
+        .value_at("block_cadence_seconds", now_epoch)
+        .unwrap();
+    let earliest_epoch = i128::from(now_epoch) + i128::from(grace_days) * 86400;
     let effective_at = match effective_at {
         Some(given) => {
             let ts: jiff::Timestamp = given
@@ -48,14 +43,17 @@ pub fn run(
                     "effective_at must be whole-second UTC with trailing Z, got {given:?}"
                 )));
             }
-            if ts.as_second() < earliest_epoch {
+            if i128::from(ts.as_second()) < earliest_epoch {
                 return Err(Error::ParamChange(format!(
                     "effective_at {given} is inside the {grace_days}-day grace period"
                 )));
             }
             canonical
         }
-        None => whole_second(earliest_epoch + cadence)?,
+        None => whole_second(
+            i64::try_from(earliest_epoch + i128::from(cadence))
+                .map_err(|_| Error::ParamChange("effective_at out of range".into()))?,
+        )?,
     };
 
     let update = serde_json::json!({
@@ -65,6 +63,7 @@ pub fn run(
         "details": {"parameter": parameter, "value": value},
         "effective_at": effective_at,
     });
+    crate::seal::validate_pending_parameter(db, &update, sk, now_epoch)?;
     let update_id = format!(
         "sha256:{}",
         hex_encode(&Sha256::digest(wist_core::jcs::canonicalize(&update)?))

@@ -30,6 +30,8 @@ fn add_missing_columns(conn: &Connection) -> Result<()> {
         "ALTER TABLE records ADD COLUMN sealed_at TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE publishers ADD COLUMN declaration_fetched_at TEXT",
         "ALTER TABLE pending_entries ADD COLUMN turn_block INTEGER",
+        "ALTER TABLE param_changes ADD COLUMN entry_index INTEGER",
+        "ALTER TABLE blocks ADD COLUMN decompressed_bytes INTEGER",
     ] {
         match conn.execute(statement, []) {
             Ok(_) => {}
@@ -93,6 +95,7 @@ pub struct PendingEntryRow {
 }
 
 pub struct ParamChangeRow<'a> {
+    pub entry_index: u64,
     pub parameter: &'a str,
     pub value: i64,
     pub effective_at: &'a str,
@@ -246,7 +249,10 @@ impl Db {
         let _mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
         conn.execute_batch(SCHEMA)?;
         add_missing_columns(&conn)?;
-        Ok(Db { conn })
+        let db = Db { conn };
+        db.restore_block_sizes(path)?;
+        db.parameter_schedule(0)?;
+        Ok(db)
     }
 
     pub fn param(&self, name: &str) -> Result<i64> {
@@ -740,14 +746,15 @@ impl Db {
         param_changes: &[ParamChangeRow],
         governance: &[GovernanceRow],
         declarations: &[SealedDeclarationRow],
+        decompressed_bytes: u64,
     ) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         for rowid in sealed_rowids {
             tx.execute("DELETE FROM pending_entries WHERE rowid = ?1", [rowid])?;
         }
         tx.execute(
-            "INSERT INTO blocks(block_number, block_hash, sealed_at) VALUES (?1, ?2, ?3)",
-            (block_number as i64, block_hash, sealed_at),
+            "INSERT INTO blocks(block_number, block_hash, sealed_at, decompressed_bytes) VALUES (?1, ?2, ?3, ?4)",
+            (block_number as i64, block_hash, sealed_at, decompressed_bytes),
         )?;
         for r in records {
             exec_upsert_record(&tx, r, sealed_at)?;
@@ -767,8 +774,8 @@ impl Db {
         }
         for c in param_changes {
             tx.execute(
-                "INSERT INTO param_changes(parameter, value, effective_at, block_number) VALUES (?1, ?2, ?3, ?4)",
-                (c.parameter, c.value, c.effective_at, block_number as i64),
+                "INSERT INTO param_changes(parameter, value, effective_at, block_number, entry_index) VALUES (?1, ?2, ?3, ?4, ?5)",
+                (c.parameter, c.value, c.effective_at, block_number as i64, c.entry_index),
             )?;
         }
         for g in governance {
@@ -911,36 +918,260 @@ impl Db {
         Ok(rows)
     }
 
-    pub fn latest_param_change(&self, name: &str, at: &str) -> Result<Option<i64>> {
-        self.conn
-            .query_row(
-                "SELECT value FROM param_changes WHERE parameter = ?1 AND effective_at <= ?2 ORDER BY effective_at DESC, block_number DESC LIMIT 1",
-                (name, at),
-                |row| row.get(0),
+    fn restore_block_sizes(&self, path: &Path) -> Result<()> {
+        let missing: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM blocks WHERE decompressed_bytes IS NULL) OR EXISTS(SELECT 1 FROM param_changes WHERE entry_index IS NULL)",
+            [], |row| row.get(0),
+        )?;
+        if !missing {
+            return Ok(());
+        }
+        let directory = path.parent().unwrap_or_else(|| Path::new("."));
+        let anchor: Value = serde_json::from_slice(&std::fs::read(directory.join("anchor.json"))?)?;
+        let public_key = anchor["anchor"]["genesis_key"]["public_key"]
+            .as_str()
+            .ok_or_else(|| Error::Key("stored Log Anchor has no genesis public key".into()))?;
+        let key = wist_core::crypto::PublicKey::from_b64u(public_key)?;
+        wist_core::envelope::verify_envelope(&anchor, "anchor", &key)?;
+        let mut stmt = self.conn.prepare(
+            "SELECT block_number, block_hash, sealed_at FROM blocks ORDER BY block_number",
+        )?;
+        let blocks = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, u64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let first = blocks
+            .first()
+            .map(|b| crate::registry::epoch(&b.2))
+            .transpose()?
+            .unwrap_or(0);
+        let mut schedule = wist_core::parameters::Schedule::new(first);
+        let mut largest = 0;
+        let mut prior_at = None;
+        let mut prior_hash = "sha256:genesis".to_string();
+        let tx = self.conn.unchecked_transaction()?;
+        for (index, (height, hash, sealed_at)) in blocks.into_iter().enumerate() {
+            let bound = prior_at.map_or(
+                crate::registry::spec("block_decompressed_cap_bytes")
+                    .unwrap()
+                    .default
+                    .unwrap() as u64,
+                |at| schedule.block_size_bounds(at).1,
+            );
+            let file = directory.join(format!("log/blocks/{height:09}.json.zst"));
+            let raw = std::fs::read(&file)?;
+            let declared = zstd::zstd_safe::get_frame_content_size(&raw)
+                .map_err(|_| Error::Seal("WIST3-E03 invalid Block frame".into()))?
+                .filter(|&n| n <= bound)
+                .ok_or_else(|| {
+                    Error::Seal("WIST3-E03 missing or excessive Block frame size".into())
+                })?;
+            let bytes = zstd::bulk::decompress(
+                &raw,
+                usize::try_from(declared)
+                    .map_err(|_| Error::Seal("Block frame size is not addressable".into()))?,
             )
-            .optional()
-            .map_err(Error::Db)
+            .map_err(|e| Error::Seal(format!("WIST3-E03 invalid compressed Block: {e}")))?;
+            if bytes.len() as u64 != declared {
+                return Err(Error::Seal("WIST3-E03 false Block frame size".into()));
+            }
+            let block: Value = serde_json::from_slice(&bytes)?;
+            wist_core::block::verify_block(&block, &key)?;
+            wist_core::block::verify_chain_link(&block["header"], &prior_hash)?;
+            if height != index as u64
+                || block["header"]["block_number"] != height
+                || block["header"]["sealed_at"] != sealed_at
+                || wist_core::block::block_hash(&block["header"])? != hash
+            {
+                return Err(Error::Seal(
+                    "stored Block does not match its history row".into(),
+                ));
+            }
+            let at = crate::registry::epoch(&sealed_at)?;
+            if prior_at.is_some_and(|prior| at <= prior) {
+                return Err(Error::Seal(
+                    "stored Block timestamps are not increasing".into(),
+                ));
+            }
+            let canonical = wist_core::jcs::canonicalize(&block)?;
+            let size = canonical.len() as u64;
+            largest = largest.max(size);
+            tx.execute(
+                "DELETE FROM param_changes WHERE block_number = ?1",
+                [height],
+            )?;
+            for (entry_index, entry) in block["entries"].as_array().unwrap().iter().enumerate() {
+                let update = &entry["body"]["update"];
+                if entry["type"] != "registry_update" || update["action"] != "parameter_change" {
+                    continue;
+                }
+                wist_core::envelope::verify_envelope(&entry["body"], "update", &key)?;
+                let Some(parameter) = update["details"]["parameter"].as_str() else {
+                    continue;
+                };
+                let Some(value) = update["details"]["value"].as_i64() else {
+                    continue;
+                };
+                let Some(effective_at) = update["effective_at"].as_str() else {
+                    continue;
+                };
+                let Ok(effective_at_s) = crate::registry::epoch(effective_at) else {
+                    continue;
+                };
+                let amendment = wist_core::parameters::Amendment {
+                    parameter: parameter.into(),
+                    value,
+                    block_number: height,
+                    entry_index: entry_index as u64,
+                    sealed_at_s: at,
+                    effective_at_s,
+                };
+                let _ = crate::registry::accept(&mut schedule, amendment, largest);
+                tx.execute(
+                    "INSERT INTO param_changes(parameter, value, effective_at, block_number, entry_index) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    (parameter, value, effective_at, height, entry_index as u64),
+                )?;
+            }
+            if largest > schedule.block_size_bounds(at).0 {
+                return Err(Error::Seal(format!(
+                    "WIST3-E03 Block {height} exceeds the accepted size schedule"
+                )));
+            }
+            if bytes != canonical {
+                use std::io::Write;
+                let temporary = file.with_extension("zst.tmp");
+                let compressed = zstd::bulk::compress(&canonical, zstd::DEFAULT_COMPRESSION_LEVEL)?;
+                let mut output = std::fs::File::create(&temporary)?;
+                output.write_all(&compressed)?;
+                output.sync_all()?;
+                std::fs::rename(&temporary, &file)?;
+                std::fs::File::open(file.parent().unwrap())?.sync_all()?;
+            }
+            tx.execute(
+                "UPDATE blocks SET decompressed_bytes = ?1 WHERE block_number = ?2",
+                (size, height),
+            )?;
+            prior_at = Some(at);
+            prior_hash = hash;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
-    /// WIST-3 §7: one tuple per parameter amended since genesis, carrying the
-    /// amendment in force at `at` — Registry defaults are constants of the
-    /// suite and are never restated in a state artifact.
-    pub fn in_force_param_changes(&self, at: &str) -> Result<Vec<(String, i64, String)>> {
+    pub fn largest_block_bytes(&self) -> Result<u64> {
+        Ok(self.conn.query_row(
+            "SELECT COALESCE(MAX(decompressed_bytes), 0) FROM blocks",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn parameter_schedule(
+        &self,
+        first_block_s: i64,
+    ) -> Result<wist_core::parameters::Schedule> {
         let mut stmt = self.conn.prepare(
-            "SELECT parameter, value, effective_at FROM param_changes p
-             WHERE effective_at <= ?1
-               AND NOT EXISTS (
-                 SELECT 1 FROM param_changes q
-                 WHERE q.parameter = p.parameter AND q.effective_at <= ?1
-                   AND (q.effective_at > p.effective_at
-                        OR (q.effective_at = p.effective_at AND q.block_number > p.block_number))
-               )
-             ORDER BY parameter ASC",
+            "SELECT block_number, sealed_at, decompressed_bytes FROM blocks ORDER BY block_number",
         )?;
-        let rows = stmt
-            .query_map([at], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        let blocks = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, u64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, u64>(2)?,
+                ))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
+        let first = blocks
+            .first()
+            .map(|b| crate::registry::epoch(&b.1))
+            .transpose()?
+            .unwrap_or(first_block_s);
+        let mut schedule = wist_core::parameters::Schedule::new(first);
+        let mut stmt = self.conn.prepare(
+            "SELECT parameter, value, block_number, entry_index, effective_at FROM param_changes ORDER BY block_number, entry_index",
+        )?;
+        let changes = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, u64>(2)?,
+                    row.get::<_, u64>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut changes = changes.into_iter().peekable();
+        let mut largest = 0;
+        for (height, sealed_at, bytes) in blocks {
+            largest = largest.max(bytes);
+            let at = crate::registry::epoch(&sealed_at)?;
+            while changes.peek().is_some_and(|c| c.2 == height) {
+                let (parameter, value, block_number, entry_index, effective_at) =
+                    changes.next().unwrap();
+                let amendment = wist_core::parameters::Amendment {
+                    parameter,
+                    value,
+                    block_number,
+                    entry_index,
+                    sealed_at_s: at,
+                    effective_at_s: crate::registry::epoch(&effective_at)?,
+                };
+                let _ = crate::registry::accept(&mut schedule, amendment, largest);
+            }
+            if largest > schedule.block_size_bounds(at).0 {
+                return Err(Error::Seal(format!(
+                    "WIST3-E03 Block {height} exceeds the accepted size schedule"
+                )));
+            }
+        }
+        if changes.next().is_some() {
+            return Err(Error::Seal(
+                "parameter history names a missing Block".into(),
+            ));
+        }
+        Ok(schedule)
+    }
+
+    pub fn latest_param_change(&self, name: &str, at: &str) -> Result<Option<i64>> {
+        let at = crate::registry::epoch(at)?;
+        let schedule = self.parameter_schedule(at)?;
+        Ok(schedule
+            .accepted()
+            .iter()
+            .filter(|a| a.parameter == name && a.effective_at_s <= at)
+            .max_by_key(|a| (a.effective_at_s, a.block_number, a.entry_index))
+            .map(|a| a.value))
+    }
+
+    pub fn parameter_state(&self, at: &str) -> Result<Vec<(String, i64, String)>> {
+        let at = crate::registry::epoch(at)?;
+        let schedule = self.parameter_schedule(at)?;
+        let mut latest = std::collections::BTreeMap::new();
+        for amendment in schedule.accepted().iter().filter(|a| a.sealed_at_s <= at) {
+            latest.insert(
+                (amendment.parameter.clone(), amendment.effective_at_s),
+                amendment.value,
+            );
+        }
+        latest
+            .into_iter()
+            .map(|((name, effective_at), value)| {
+                Ok((
+                    name,
+                    value,
+                    jiff::Timestamp::from_second(effective_at)
+                        .map_err(|e| Error::ParamChange(e.to_string()))?
+                        .to_string(),
+                ))
+            })
+            .collect()
     }
 
     pub fn get_record(&self, url: &str, publisher: &str) -> Result<Option<RecordRow>> {
@@ -1318,12 +1549,14 @@ mod tests {
             "2026-01-01T00:00:00Z",
             &[],
             &[ParamChangeRow {
+                entry_index: 0,
                 parameter: "feed_window",
                 value: 500,
                 effective_at: "2026-01-10T00:00:00Z",
             }],
             &[],
             &[],
+            0,
         )
         .unwrap();
         assert_eq!(
@@ -1343,12 +1576,14 @@ mod tests {
             "2026-01-02T00:00:00Z",
             &[],
             &[ParamChangeRow {
+                entry_index: 0,
                 parameter: "feed_window",
                 value: 800,
                 effective_at: "2026-01-20T00:00:00Z",
             }],
             &[],
             &[],
+            0,
         )
         .unwrap();
         assert_eq!(
@@ -1545,6 +1780,7 @@ mod tests {
             &[],
             &[],
             &[],
+            0,
         )
         .unwrap();
 
@@ -1587,6 +1823,7 @@ mod tests {
             &[],
             &[],
             &[],
+            0,
         )
         .unwrap();
 
@@ -1612,6 +1849,7 @@ mod tests {
             &[],
             &[],
             &[],
+            0,
         );
         assert!(result.is_err());
 

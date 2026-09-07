@@ -307,6 +307,7 @@ fn sanctioned_domain_ping_gets_403_and_status_shows_state() {
                 },
             ],
             &[],
+            0,
         )
         .unwrap();
     }

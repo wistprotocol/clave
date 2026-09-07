@@ -222,7 +222,7 @@ fn build_state(
         added_height: 0,
         removed_height: None,
     }));
-    for (name, value, effective_at) in db.in_force_param_changes(&head_sealed_at)? {
+    for (name, value, effective_at) in db.parameter_state(&head_sealed_at)? {
         entries.push(StateEntry::Parameter(ParameterEntry {
             name,
             effective_at,
@@ -502,6 +502,7 @@ mod tests {
             &[],
             &[],
             &[],
+            0,
         )
         .unwrap();
     }
@@ -528,6 +529,7 @@ mod tests {
                 kind: None,
             }],
             &[],
+            0,
         )
         .unwrap();
         seal_record(&db, 2, T0 + 2 * DAY, "https://example.com/after");

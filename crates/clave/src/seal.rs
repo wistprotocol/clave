@@ -33,6 +33,7 @@ pub struct SealReport {
 }
 
 struct AcceptedParamChange {
+    rowid: i64,
     parameter: String,
     value: i64,
     effective_at: String,
@@ -67,39 +68,80 @@ const GOVERNANCE_ACTIONS: [&str; 6] = [
 ];
 
 fn check_param_change(
-    db: &Db,
+    schedule: &mut wist_core::parameters::Schedule,
     update: &Value,
-    sealed_at: &str,
     sealed_epoch: i64,
-    grace_days: i64,
+    block_number: u64,
+    entry_index: u64,
+    largest_block: u64,
 ) -> std::result::Result<AcceptedParamChange, String> {
-    let details = &update["details"];
-    let parameter = details["parameter"]
+    let parameter = update["details"]["parameter"]
         .as_str()
         .ok_or("missing details.parameter")?;
-    let value = details["value"].as_i64().ok_or("missing details.value")?;
+    let value = update["details"]["value"]
+        .as_i64()
+        .ok_or("missing details.value")?;
     let effective_at = update["effective_at"]
         .as_str()
         .ok_or("missing effective_at")?;
-    let effective_epoch = effective_at
-        .parse::<jiff::Timestamp>()
-        .map_err(|_| format!("unparseable effective_at {effective_at:?}"))?
-        .as_second();
-    if effective_epoch < sealed_epoch + grace_days * 86400 {
-        return Err(format!(
-            "{parameter}: effective_at {effective_at} is inside the {grace_days}-day grace period from sealed_at {sealed_at}"
-        ));
-    }
-    let lookup = |n: &str| {
-        registry::effective(db, n, effective_at)
-            .unwrap_or_else(|_| registry::spec(n).and_then(|s| s.default).unwrap_or(0))
-    };
-    registry::validate(parameter, value, lookup).map_err(|err| err.to_string())?;
-    Ok(AcceptedParamChange {
-        parameter: parameter.to_string(),
+    let amendment = wist_core::parameters::Amendment {
+        parameter: parameter.into(),
         value,
-        effective_at: effective_at.to_string(),
+        block_number,
+        entry_index,
+        sealed_at_s: sealed_epoch,
+        effective_at_s: registry::epoch(effective_at).map_err(|e| e.to_string())?,
+    };
+    registry::accept(schedule, amendment, largest_block)
+        .map_err(|e| format!("{parameter}: {e}"))?;
+    Ok(AcceptedParamChange {
+        rowid: 0,
+        parameter: parameter.into(),
+        value,
+        effective_at: effective_at.into(),
     })
+}
+
+pub(crate) fn validate_pending_parameter(
+    db: &Db,
+    update: &Value,
+    sk: &SigningKey,
+    at: i64,
+) -> Result<()> {
+    let mut schedule = db.parameter_schedule(at)?;
+    let height = db.last_block()?.map_or(0, |b| b.block_number + 1);
+    let largest = db.largest_block_bytes()?;
+    let (mut pending, _) = db.peek_pending_entries()?;
+    let rowid = pending.iter().map(|p| p.rowid).max().unwrap_or(0) + 1;
+    pending.push(PendingEntryRow {
+        rowid,
+        entry_type: "registry_update".into(),
+        domain: String::new(),
+        entry_json: sign_envelope(update, "update", GENESIS_KEY_ID, sk)?,
+        turn_block: None,
+    });
+    for (index, entry) in storage_order(pending)?.iter().enumerate() {
+        if entry.entry_type != "registry_update"
+            || entry.body["update"]["action"] != "parameter_change"
+        {
+            continue;
+        }
+        let result = check_param_change(
+            &mut schedule,
+            &entry.body["update"],
+            at,
+            height,
+            index as u64,
+            largest,
+        );
+        if entry.rowid == rowid {
+            result.map_err(Error::ParamChange)?;
+            return Ok(());
+        }
+    }
+    Err(Error::ParamChange(
+        "candidate is missing from pending entries".into(),
+    ))
 }
 
 /// WIST-4 §7: an "unappealed" ruling discharges T only when its Block's
@@ -439,10 +481,12 @@ fn revalidate_queued_deltas(
 fn enforce_governance(
     db: &Db,
     entries: Vec<SealEntry>,
-    sealed_at: &str,
     sealed_epoch: i64,
+    block_number: u64,
+    block_bytes: u64,
 ) -> Result<GovernanceOutcome> {
-    let grace_days = registry::effective(db, "param_grace_days", sealed_at)?;
+    let mut schedule = db.parameter_schedule(sealed_epoch)?;
+    let largest = db.largest_block_bytes()?.max(block_bytes);
     let mut out = GovernanceOutcome {
         kept: Vec::with_capacity(entries.len()),
         param_changes: Vec::new(),
@@ -451,7 +495,7 @@ fn enforce_governance(
         dropped: Vec::new(),
         dropped_rowids: Vec::new(),
     };
-    for e in entries {
+    for (index, e) in entries.into_iter().enumerate() {
         if e.entry_type != "registry_update" {
             out.kept.push(e);
             continue;
@@ -459,8 +503,16 @@ fn enforce_governance(
         let update = e.body["update"].clone();
         let action = update["action"].as_str().unwrap_or_default().to_string();
         if action == "parameter_change" {
-            match check_param_change(db, &update, sealed_at, sealed_epoch, grace_days) {
-                Ok(change) => {
+            match check_param_change(
+                &mut schedule,
+                &update,
+                sealed_epoch,
+                block_number,
+                index as u64,
+                largest,
+            ) {
+                Ok(mut change) => {
+                    change.rowid = e.rowid;
                     out.param_changes.push(change);
                     out.kept.push(e);
                 }
@@ -529,20 +581,25 @@ fn enforce_governance(
     Ok(out)
 }
 
-/// WIST-3 §6 producer duty: never emit a Block whose decompressed size
-/// exceeds the cap. Entries that would push the JCS bytes past it stay
-/// pending and seal in a later Block; the overhead constant covers the
-/// header, signature and object framing around the entries array.
-const BLOCK_FRAMING_OVERHEAD_BYTES: usize = 512;
-
-fn fit_to_cap(entries: Vec<SealEntry>, cap: i64) -> Result<(Vec<SealEntry>, usize)> {
-    let budget = (cap.max(0) as usize).saturating_sub(BLOCK_FRAMING_OVERHEAD_BYTES);
-    let mut used = 0usize;
+fn fit_to_cap(
+    entries: Vec<SealEntry>,
+    cap: i64,
+    empty_block_bytes: usize,
+) -> Result<(Vec<SealEntry>, usize)> {
+    let cap = usize::try_from(cap).map_err(|_| Error::Seal("invalid Block cap".into()))?;
+    if empty_block_bytes > cap {
+        return Err(Error::Seal(
+            "empty Block exceeds the decompressed cap".into(),
+        ));
+    }
+    let mut used = empty_block_bytes;
     let mut kept = Vec::with_capacity(entries.len());
     let mut deferred = 0usize;
     for e in entries {
-        let size = serde_json::to_vec(&e.wrapped)?.len() + 1;
-        if used + size > budget {
+        let count_bytes = (kept.len() + 1).to_string().len() - kept.len().to_string().len();
+        let size =
+            jcs::canonicalize(&e.wrapped)?.len() + usize::from(!kept.is_empty()) + count_bytes;
+        if size > cap - used {
             deferred += 1;
             continue;
         }
@@ -550,6 +607,34 @@ fn fit_to_cap(entries: Vec<SealEntry>, cap: i64) -> Result<(Vec<SealEntry>, usiz
         kept.push(e);
     }
     Ok((kept, deferred))
+}
+
+fn encoded_block(
+    block_number: u64,
+    prev_block_hash: &str,
+    sealed_at: &str,
+    entries: Vec<Value>,
+    merkle_root: [u8; 32],
+    sk: &SigningKey,
+) -> Result<Block> {
+    let header = BlockHeader {
+        wist_version: WIST_VERSION.into(),
+        block_number,
+        prev_block_hash: prev_block_hash.into(),
+        sealed_at: sealed_at.into(),
+        merkle_root: format!("sha256:{}", hex_encode(&merkle_root)),
+        entry_count: entries.len() as u64,
+    };
+    let sig_value = sk.sign(&jcs::canonicalize(&serde_json::to_value(&header)?)?);
+    Ok(Block {
+        header,
+        entries,
+        sig: Sig {
+            key_id: GENESIS_KEY_ID.into(),
+            alg: "Ed25519".into(),
+            value: sig_value,
+        },
+    })
 }
 
 struct SealEntry {
@@ -807,8 +892,41 @@ pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<
     let domain_cap = registry::effective(db, "domain_block_entries_max", &sealed_at)?;
     let peeked = fit_to_domain_cap(db, peeked, domain_cap, block_number)?;
     let seal_entries = storage_order(peeked)?;
-    let cap = registry::effective(db, "block_decompressed_cap_bytes", &sealed_at)?;
-    let (seal_entries, _deferred) = fit_to_cap(seal_entries, cap)?;
+    let schedule = db.parameter_schedule(sealed_epoch)?;
+    let mut cap = registry::block_cap(&schedule, sealed_epoch).min(registry::effective(
+        db,
+        "block_decompressed_cap_bytes",
+        &sealed_at,
+    )?);
+    let mut tentative = schedule.clone();
+    let largest = db.largest_block_bytes()?;
+    for (index, entry) in seal_entries.iter().enumerate() {
+        let update = &entry.body["update"];
+        if entry.entry_type == "registry_update"
+            && update["action"] == "parameter_change"
+            && check_param_change(
+                &mut tentative,
+                update,
+                sealed_epoch,
+                block_number,
+                index as u64,
+                largest,
+            )
+            .is_ok()
+        {
+            cap = cap.min(registry::block_cap(&tentative, sealed_epoch));
+        }
+    }
+    let empty = encoded_block(
+        block_number,
+        &prev_block_hash,
+        &sealed_at,
+        Vec::new(),
+        merkle::leaf_hash(&[]),
+        sk,
+    )?;
+    let framing = jcs::canonicalize(&serde_json::to_value(&empty)?)?.len();
+    let (seal_entries, _deferred) = fit_to_cap(seal_entries, cap, framing)?;
     let seal_entries = divert_deltas_into_opening_windows(db, seal_entries)?;
     let (seal_entries, retired_rowids, retired) =
         revalidate_queued_deltas(db, seal_entries, &sealed_at)?;
@@ -822,7 +940,22 @@ pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<
     )?;
     let ceiling = registry::effective(db, "max_inclusion_blocks", &sealed_at)?;
     let late = late_inclusions(&seal_entries, block_number, ceiling);
-    let mut outcome = enforce_governance(db, seal_entries, &sealed_at, sealed_epoch)?;
+    let candidate = encoded_block(
+        block_number,
+        &prev_block_hash,
+        &sealed_at,
+        seal_entries.iter().map(|e| e.wrapped.clone()).collect(),
+        merkle::leaf_hash(&[]),
+        sk,
+    )?;
+    let candidate_bytes = jcs::canonicalize(&serde_json::to_value(&candidate)?)?.len() as u64;
+    let mut outcome = enforce_governance(
+        db,
+        seal_entries,
+        sealed_epoch,
+        block_number,
+        candidate_bytes,
+    )?;
     outcome.dropped.extend(retired);
     outcome.dropped_rowids.extend(retired_rowids);
     outcome.dropped.extend(roster_dropped);
@@ -849,34 +982,26 @@ pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<
         merkle::merkle_root(&leaves)?
     };
 
-    let header = BlockHeader {
-        wist_version: WIST_VERSION.into(),
+    let block = encoded_block(
         block_number,
-        prev_block_hash,
-        sealed_at: sealed_at.clone(),
-        merkle_root: format!("sha256:{}", hex_encode(&merkle_root)),
-        entry_count,
-    };
-    let header_value = serde_json::to_value(&header)?;
-    let canonical_header = jcs::canonicalize(&header_value)?;
-    let sig_value = sk.sign(&canonical_header);
-    let block_hash = wist_core::block::block_hash(&header_value)?;
-
-    let block = Block {
-        header,
+        &prev_block_hash,
+        &sealed_at,
         entries,
-        sig: Sig {
-            key_id: GENESIS_KEY_ID.into(),
-            alg: "Ed25519".into(),
-            value: sig_value,
-        },
-    };
+        merkle_root,
+        sk,
+    )?;
+    let block_hash = wist_core::block::block_hash(&serde_json::to_value(&block.header)?)?;
 
     let record_updates = resolve_record_updates(data_dir, &seal_entries)?;
 
     let blocks_dir = data_dir.join("log/blocks");
     std::fs::create_dir_all(&blocks_dir)?;
-    let block_bytes = serde_json::to_vec(&block)?;
+    let block_bytes = jcs::canonicalize(&serde_json::to_value(&block)?)?;
+    if block_bytes.len() as u64 > cap as u64 {
+        return Err(Error::Seal(
+            "serialized Block exceeds the decompressed cap".into(),
+        ));
+    }
     let compressed = zstd::bulk::compress(&block_bytes, zstd::DEFAULT_COMPRESSION_LEVEL)?;
     std::fs::write(
         blocks_dir.join(format!("{block_number:09}.json.zst")),
@@ -916,6 +1041,10 @@ pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<
     let param_changes: Vec<ParamChangeRow> = accepted_changes
         .iter()
         .map(|c| ParamChangeRow {
+            entry_index: seal_entries
+                .iter()
+                .position(|e| e.rowid == c.rowid)
+                .expect("accepted parameter entry is retained") as u64,
             parameter: &c.parameter,
             value: c.value,
             effective_at: &c.effective_at,
@@ -960,6 +1089,7 @@ pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<
         &param_changes,
         &governance_rows,
         &declaration_rows,
+        block_bytes.len() as u64,
     )?;
 
     for domain in db.list_pending_recovery_windows()? {
@@ -1021,4 +1151,64 @@ pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<
         dropped,
         late,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packing_accounts_for_entry_count_digits_at_exact_jcs_size() {
+        let sk = SigningKey::from_seed(&[42; 32]);
+        let at = "2026-09-07T00:00:00Z";
+        let entries = |count| {
+            storage_order(
+                (0..count)
+                    .map(|i| {
+                        let update = serde_json::json!({"wist_version":WIST_VERSION,
+                    "action":"parameter_change","subject":"clock_skew_seconds",
+                    "details":{"parameter":"clock_skew_seconds","value":i},
+                    "effective_at":"2026-09-17T00:00:00Z"});
+                        PendingEntryRow {
+                            rowid: i + 1,
+                            entry_type: "registry_update".into(),
+                            domain: String::new(),
+                            entry_json: sign_envelope(&update, "update", GENESIS_KEY_ID, &sk)
+                                .unwrap(),
+                            turn_block: None,
+                        }
+                    })
+                    .collect(),
+            )
+            .unwrap()
+        };
+        for count in [9, 10, 99, 100] {
+            let all = entries(count);
+            let values = all.iter().map(|e| e.wrapped.clone()).collect();
+            let root =
+                merkle::merkle_root(&all.iter().map(|e| e.leaf).collect::<Vec<_>>()).unwrap();
+            let block = encoded_block(10, "sha256:previous", at, values, root, &sk).unwrap();
+            let size = jcs::canonicalize(&serde_json::to_value(block).unwrap())
+                .unwrap()
+                .len();
+            let empty = encoded_block(
+                10,
+                "sha256:previous",
+                at,
+                Vec::new(),
+                merkle::leaf_hash(&[]),
+                &sk,
+            )
+            .unwrap();
+            let framing = jcs::canonicalize(&serde_json::to_value(empty).unwrap())
+                .unwrap()
+                .len();
+            let (fit, deferred) = fit_to_cap(all, size as i64, framing).unwrap();
+            assert_eq!(fit.len(), count as usize);
+            assert_eq!(deferred, 0);
+            let (fit, deferred) = fit_to_cap(entries(count), size as i64 - 1, framing).unwrap();
+            assert_eq!(fit.len(), count as usize - 1);
+            assert_eq!(deferred, 1);
+        }
+    }
 }

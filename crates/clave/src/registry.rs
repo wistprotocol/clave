@@ -19,6 +19,37 @@ pub fn validate(name: &str, value: i64, lookup: impl Fn(&str) -> i64) -> Result<
         .map_err(|err| Error::ParamChange(err.to_string()))
 }
 
+pub(crate) fn epoch(at: &str) -> Result<i64> {
+    let timestamp = at
+        .parse::<jiff::Timestamp>()
+        .map_err(|e| Error::ParamChange(e.to_string()))?;
+    if at.len() != 20
+        || jiff::Timestamp::from_second(timestamp.as_second())
+            .map_err(|e| Error::ParamChange(e.to_string()))?
+            .to_string()
+            != at
+    {
+        return Err(Error::ParamChange(
+            "timestamp must be whole-second UTC with trailing Z".into(),
+        ));
+    }
+    Ok(timestamp.as_second())
+}
+
+pub(crate) fn accept(
+    schedule: &mut wist_core::parameters::Schedule,
+    amendment: wist_core::parameters::Amendment,
+    largest_block: u64,
+) -> Result<()> {
+    schedule
+        .try_accept_with_block_size(amendment, largest_block)
+        .map_err(|e| Error::ParamChange(format!("WIST4-E03 {e}")))
+}
+
+pub(crate) fn block_cap(schedule: &wist_core::parameters::Schedule, at: i64) -> i64 {
+    schedule.block_size_bounds(at).0 as i64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,12 +263,14 @@ mod tests {
             "2026-01-01T00:00:00Z",
             &[],
             &[crate::db::ParamChangeRow {
+                entry_index: 0,
                 parameter: "feed_window",
                 value: 500,
                 effective_at: "2026-01-10T00:00:00Z",
             }],
             &[],
             &[],
+            0,
         )
         .unwrap();
         assert_eq!(

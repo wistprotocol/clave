@@ -46,6 +46,34 @@ failures surface as WIST1-E13 on the status endpoint. Snapshots carry tier0 SQLi
 tier1 Parquet (extracts + link graph), optionally sharded
 (`snapshot_shard_count` in the local params table).
 
+## Parameter schedules and Block sizes
+
+Parameter admission checks the accepted schedule and queued amendments in
+canonical Entry order. Sealing repeats validation at the actual Block
+instant: delayed or conflicting amendments are dropped with WIST4-E03.
+Every prospective map is checked, including grace changes and cadence
+transitions that could outlive an older extension window.
+
+Caps cover the largest complete JCS Block through each amendment's own
+height. Pending reductions constrain packing immediately; deferred Entries
+remain queued. SQLite stores actual Block sizes and canonical Entry
+positions with the sealed changes. Restart replays the accepted schedule
+using each historical size maximum, and rejects a history containing a
+Block that exceeded its accepted schedule. Snapshot parameter tuples
+include pending amendments and omit superseded equal-effective-time values.
+
+Opening an older store reconstructs missing sizes and positions from its
+Block files, checking the stored chain commitments and signatures. Verified
+legacy files are re-encoded as canonical JCS without changing Block objects,
+hashes or signatures. Missing or invalid history stops migration; restore
+the original Blocks before reopening the store. Migration verifies
+signatures against the stored Log Anchor's genesis public key; it requires
+no private key.
+
+Schedule validation uses the protocol's Registry defaults. Direct local
+parameter overrides, including the accelerated `--cadence` setting, do not
+amend that schedule and must not be used to assert protocol conformance.
+
 ## Build & test
 
 ```bash
@@ -59,8 +87,7 @@ resolves `wist-core` from `../core` — both must be sibling checkouts.
 
 ## Known deviations
 
-Two departures from the specification, both confined to running the
-stack on one machine and neither reachable in a deployment:
+The following settings support local integration tests:
 
 - **Publisher identity carries a port.** WIST-1 §2's Canonical Host has
   no port, and this codebase treats a Publisher's identity as a bare

@@ -16,9 +16,6 @@ fn setup() -> (
     let data = tempfile::tempdir().unwrap();
     clave::init::run("example-log.test", data.path()).unwrap();
     let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
-    db.set_param("block_cadence_seconds", 1).unwrap();
-    db.set_param("canary_reveal_min_blocks", 259272).unwrap();
-    db.set_param("canary_lifetime_blocks", 300000).unwrap();
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
     (data, db, sk)
 }
@@ -86,7 +83,7 @@ fn seal_reads_cadence_in_force_at_previous_block_sealed_at() {
         &db,
         &sk,
         "block_cadence_seconds",
-        60,
+        3500,
         Some(&effective_at),
         NOW,
     )
@@ -98,15 +95,15 @@ fn seal_reads_cadence_in_force_at_previous_block_sealed_at() {
     assert_eq!(
         db.last_block().unwrap().unwrap().sealed_at,
         ts(NOW + 7 * DAY),
-        "previous block sealed before effective_at keeps the old one-second grid"
+        "the activation Block still uses the prior hourly grid"
     );
 
-    let b2 = clave::seal::run(&db, data.path(), &sk, NOW + 7 * DAY + 90).unwrap();
+    let b2 = clave::seal::run(&db, data.path(), &sk, NOW + 7 * DAY + 3600).unwrap();
     assert_eq!(b2.block_number, 2);
     assert_eq!(
         db.last_block().unwrap().unwrap().sealed_at,
-        ts(NOW + 7 * DAY + 60),
-        "previous block sealed at effective_at puts this block on the new 60-second grid"
+        ts((NOW + 7 * DAY + 3600).div_euclid(3500) * 3500),
+        "the following Block uses the new 3500-second grid"
     );
 }
 
@@ -212,8 +209,8 @@ fn observer_and_canary_amendments_survive_sealing_and_reopening() {
         ("canary_lead_blocks", 12),
         ("canary_leaves_max", 512),
         ("canary_commitments_max", 4),
-        ("canary_reveal_min_blocks", 259273),
-        ("canary_lifetime_blocks", 300001),
+        ("canary_reveal_min_blocks", 169),
+        ("canary_lifetime_blocks", 1441),
     ] {
         let (data, db, sk) = setup();
         let report = clave::param_change::run(&db, &sk, name, value, None, NOW).unwrap();
@@ -238,9 +235,9 @@ fn observer_and_canary_amendments_survive_sealing_and_reopening() {
 fn admission_rejects_invalid_canary_combination_without_queueing() {
     let (_data, db, sk) = setup();
     for (name, value) in [
-        ("epoch_blocks", 25),
-        ("canary_reveal_min_blocks", 259271),
-        ("canary_lifetime_blocks", 259296),
+        ("epoch_blocks", 37),
+        ("canary_reveal_min_blocks", 143),
+        ("canary_lifetime_blocks", 192),
         ("contradictions_max", 2),
     ] {
         assert!(
