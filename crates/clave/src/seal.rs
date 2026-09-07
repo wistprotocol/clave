@@ -345,6 +345,7 @@ fn check_roster_acts(
             sealed_at: sealed_at.to_string(),
             action: match action {
                 RosterAction::Admit => "auditor_admit".to_string(),
+                RosterAction::Register => "observer_register".to_string(),
                 RosterAction::Remove { .. } => "auditor_remove".to_string(),
             },
             auditor_id: auditor_id.clone(),
