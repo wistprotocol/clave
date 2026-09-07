@@ -17,6 +17,8 @@ fn setup() -> (
     clave::init::run("example-log.test", data.path()).unwrap();
     let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
     db.set_param("block_cadence_seconds", 1).unwrap();
+    db.set_param("canary_reveal_min_blocks", 259272).unwrap();
+    db.set_param("canary_lifetime_blocks", 300000).unwrap();
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
     (data, db, sk)
 }
@@ -149,7 +151,7 @@ fn snapshot_state_carries_amended_parameters_with_their_effective_instant() {
 }
 
 #[test]
-fn spec_coverage_countability_vector() {
+fn spec_coverage_countability_vectors_respect_extension_window() {
     let path = common::spec_dir().join("vectors/wist4/parameter-combinations.json");
     let vector: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     let cases = vector["cases"].as_array().unwrap();
@@ -163,10 +165,91 @@ fn spec_coverage_countability_vector() {
         };
         let changed = case["changed"].as_str().unwrap();
         let got = clave::registry::validate(changed, at(changed), lookup);
+        if label == "the last seal deadline the rule admits" {
+            assert!(case["rule_holds"].as_bool().unwrap());
+            assert!(got
+                .unwrap_err()
+                .to_string()
+                .contains("extension publication and sealing must fit the confirmation window"));
+            continue;
+        }
         assert_eq!(
             got.is_ok(),
             case["rule_holds"].as_bool().unwrap(),
             "{label}: {got:?}"
         );
+    }
+}
+
+#[test]
+fn spec_extension_window_vectors() {
+    let path = common::spec_dir().join("vectors/wist4/parameter-combinations.json");
+    let vector: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    let cases = vector["extension_window_cases"].as_array().unwrap();
+    assert!(!cases.is_empty());
+    for case in cases {
+        let lookup = |name: &str| {
+            case[name]
+                .as_i64()
+                .unwrap_or_else(|| clave::registry::spec(name).unwrap().default.unwrap())
+        };
+        let changed = case["changed"].as_str().unwrap();
+        let got = clave::registry::validate(changed, lookup(changed), lookup);
+        assert_eq!(
+            got.is_ok(),
+            case["rule_holds"].as_bool().unwrap(),
+            "{}: {got:?}",
+            case["label"]
+        );
+    }
+}
+
+#[test]
+fn observer_and_canary_amendments_survive_sealing_and_reopening() {
+    for (name, value) in [
+        ("epoch_blocks", 12),
+        ("observer_checkpoint_budget", 512),
+        ("canary_lead_blocks", 12),
+        ("canary_leaves_max", 512),
+        ("canary_commitments_max", 4),
+        ("canary_reveal_min_blocks", 259273),
+        ("canary_lifetime_blocks", 300001),
+    ] {
+        let (data, db, sk) = setup();
+        let report = clave::param_change::run(&db, &sk, name, value, None, NOW).unwrap();
+        let sealed = clave::seal::run(&db, data.path(), &sk, NOW).unwrap();
+        assert_eq!(sealed.entry_count, 1, "{name}: {:?}", sealed.dropped);
+        assert!(sealed.dropped.is_empty(), "{name}");
+        let block = read_block(data.path(), 0);
+        let details = &block["entries"][0]["body"]["update"]["details"];
+        assert_eq!(details["parameter"], name);
+        assert_eq!(details["value"], value);
+        drop(db);
+        let reopened = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
+        assert_eq!(
+            clave::registry::effective(&reopened, name, &report.effective_at).unwrap(),
+            value,
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn admission_rejects_invalid_canary_combination_without_queueing() {
+    let (_data, db, sk) = setup();
+    for (name, value) in [
+        ("epoch_blocks", 25),
+        ("canary_reveal_min_blocks", 259271),
+        ("canary_lifetime_blocks", 259296),
+        ("contradictions_max", 2),
+    ] {
+        assert!(
+            matches!(
+                clave::param_change::run(&db, &sk, name, value, None, NOW),
+                Err(clave::error::Error::ParamChange(_))
+            ),
+            "{name}"
+        );
+        assert!(db.peek_pending_entries().unwrap().0.is_empty(), "{name}");
     }
 }
