@@ -17,51 +17,62 @@ fn vector(name: &str) -> Value {
 }
 
 #[test]
-fn canonical_encoding_rejection_preserves_the_complete_declaration_prefix() {
-    let vector = vector("wist1/base64url");
-    for case in vector["block_cases"].as_array().unwrap() {
-        let mut blocks = vector["prefixes"][case["prefix"].as_str().unwrap()]
-            .as_array()
-            .unwrap()
-            .clone();
-        let prefix_length = blocks.len();
-        blocks.push(case["block"].clone());
-        assert_eq!(
-            digest(&blocks.last().unwrap()["header"]),
-            case["pinned_head"]
-        );
-        let fixture = Fixture::new(&blocks);
-        let mut reader = fixture.reader();
-        let mut state = Declarations::default();
-        for _ in 0..prefix_length {
-            state.apply(&reader.next_block().unwrap().unwrap()).unwrap();
-        }
-        let before = format!("{state:?}");
-        let result = state.apply(&reader.next_block().unwrap().unwrap());
-        if case["expected"] == "accepted" {
-            assert!(result.is_ok(), "{}: {result:?}", case["name"]);
-            assert_eq!(state.domains().len(), 2);
+fn field_rejection_preserves_the_complete_declaration_prefix() {
+    for name in [
+        "wist1/base64url",
+        "wist1/declaration-fields",
+        "wist1/declaration-hosts",
+    ] {
+        let vector = vector(name);
+        for case in vector["block_cases"].as_array().unwrap() {
+            let mut blocks = vector["prefixes"][case["prefix"].as_str().unwrap()]
+                .as_array()
+                .unwrap()
+                .clone();
+            let prefix_length = blocks.len();
+            blocks.push(case["block"].clone());
             assert_eq!(
-                state.head().unwrap().1,
-                case["pinned_head"].as_str().unwrap()
+                digest(&blocks.last().unwrap()["header"]),
+                case["pinned_head"]
             );
-            assert_eq!(
-                format!("{:?}", fixture.restore().unwrap()),
-                format!("{state:?}")
-            );
-        } else {
-            let error = result.unwrap_err().to_string();
-            assert!(
-                error.contains(case["expected"].as_str().unwrap()),
-                "{}: {error}",
-                case["name"]
-            );
-            assert_eq!(format!("{state:?}"), before, "{}", case["name"]);
-            assert!(fixture
-                .restore()
-                .unwrap_err()
-                .to_string()
-                .contains("WIST1-E14"));
+            let fixture = Fixture::new(&blocks);
+            let mut reader = fixture.reader();
+            let mut state = Declarations::default();
+            for _ in 0..prefix_length {
+                state.apply(&reader.next_block().unwrap().unwrap()).unwrap();
+            }
+            let before = format!("{state:?}");
+            let result = state.apply(&reader.next_block().unwrap().unwrap());
+            if case["expected"] == "accepted" {
+                assert!(result.is_ok(), "{}: {result:?}", case["name"]);
+                if let Some(domains) = case.get("expected_domains") {
+                    assert_eq!(
+                        serde_json::to_value(state.domains().keys().collect::<Vec<_>>()).unwrap(),
+                        *domains
+                    );
+                }
+                assert_eq!(
+                    state.head().unwrap().1,
+                    case["pinned_head"].as_str().unwrap()
+                );
+                assert_eq!(
+                    format!("{:?}", fixture.restore().unwrap()),
+                    format!("{state:?}")
+                );
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(
+                    error.contains(case["expected"].as_str().unwrap()),
+                    "{}: {error}",
+                    case["name"]
+                );
+                assert_eq!(format!("{state:?}"), before, "{}", case["name"]);
+                assert!(fixture
+                    .restore()
+                    .unwrap_err()
+                    .to_string()
+                    .contains(case["expected"].as_str().unwrap()));
+            }
         }
     }
 }

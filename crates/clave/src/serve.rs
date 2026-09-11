@@ -189,10 +189,19 @@ async fn status_handler(
 }
 
 pub fn run(data_dir: PathBuf, db_path: PathBuf, bind: SocketAddr, allow_http: bool) -> Result<()> {
+    run_with_client(data_dir, db_path, bind, Client::new(allow_http))
+}
+
+pub fn run_with_client(
+    data_dir: PathBuf,
+    db_path: PathBuf,
+    bind: SocketAddr,
+    client: Client,
+) -> Result<()> {
     let db = Db::open(&db_path)?;
     let state = AppState {
         db: Arc::new(Mutex::new(db)),
-        client: Arc::new(Client::new(allow_http)),
+        client: Arc::new(client),
         data_dir: data_dir.clone(),
         gate: IngestGate::new(MAX_CONCURRENT_INGESTS),
     };

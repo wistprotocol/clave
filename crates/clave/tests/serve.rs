@@ -13,11 +13,15 @@ fn free_addr() -> SocketAddr {
 }
 
 fn spawn_server(data_dir: &Path) -> String {
+    spawn_server_with_client(data_dir, clave::fetch::Client::new(true))
+}
+
+fn spawn_server_with_client(data_dir: &Path, transport: clave::fetch::Client) -> String {
     let bind = free_addr();
     let data_dir = data_dir.to_path_buf();
     let db_path = data_dir.join("clave.sqlite");
     std::thread::spawn(move || {
-        clave::serve::run(data_dir, db_path, bind, true).unwrap();
+        clave::serve::run_with_client(data_dir, db_path, bind, transport).unwrap();
     });
     let addr = format!("http://{bind}");
     let client = reqwest::blocking::Client::new();
@@ -123,7 +127,7 @@ fn ingest_rejects_unknown_fields() {
 
 #[test]
 fn status_reports_last_pull_and_quota_after_ingest() {
-    let (listener, host) = reserve_addr();
+    let (listener, host, client) = reserve_addr();
     let p = make_publisher_with_scope(&host, &["example.com"]);
     let id1 = add_delta(&p, "https://example.com/a", "alpha body", None);
     write_feed(
@@ -136,7 +140,7 @@ fn status_reports_last_pull_and_quota_after_ingest() {
 
     let tmp = tempfile::tempdir().unwrap();
     clave::init::run("127.0.0.1:0", tmp.path()).unwrap();
-    let addr = spawn_server(tmp.path());
+    let addr = spawn_server_with_client(tmp.path(), client);
     let c = reqwest::blocking::Client::new();
 
     let r = c
@@ -194,13 +198,13 @@ fn ingest_ping_over_quota_gets_429_with_retry_after() {
 
 #[test]
 fn noise_ping_decrements_quota() {
-    let (listener, host) = reserve_addr();
+    let (listener, host, client) = reserve_addr();
     let empty = tempfile::tempdir().unwrap();
     serve_static(listener, empty.path().to_path_buf());
 
     let tmp = tempfile::tempdir().unwrap();
     clave::init::run(&host, tmp.path()).unwrap();
-    let addr = spawn_server(tmp.path());
+    let addr = spawn_server_with_client(tmp.path(), client);
     let c = reqwest::blocking::Client::new();
     let r = c
         .post(format!("{addr}/ingest"))

@@ -148,7 +148,7 @@ fn premature_unappealed_ruling_is_dropped_at_seal() {
 
 #[test]
 fn payload_withdrawal_removes_payload_record_and_stale_snapshots() {
-    let (listener, host) = reserve_addr();
+    let (listener, host, client) = reserve_addr();
     let p = make_publisher_with_scope(&host, &["example.com"]);
     let id = add_delta(&p, "https://example.com/a", "withdrawable body", None);
     write_feed(&p, &host, std::slice::from_ref(&id), "2026-08-09T12:00:00Z");
@@ -158,7 +158,6 @@ fn payload_withdrawal_removes_payload_record_and_stale_snapshots() {
     clave::init::run(&host, data.path()).unwrap();
     let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
     db.set_param("block_cadence_seconds", 1).unwrap();
-    let client = clave::fetch::Client::new(true);
     clave::ingest::run(&db, &client, data.path(), &host, &ts(NOW)).unwrap();
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
     clave::seal::run(&db, data.path(), &sk, NOW).unwrap();
@@ -215,8 +214,9 @@ fn ingested_publisher() -> (
     wist_core::crypto::SigningKey,
     String,
     String,
+    clave::fetch::Client,
 ) {
-    let (listener, host) = reserve_addr();
+    let (listener, host, client) = reserve_addr();
     let p = make_publisher_with_scope(&host, &["example.com"]);
     let id = add_delta(&p, "https://example.com/a", "some body", None);
     write_feed(&p, &host, std::slice::from_ref(&id), "2026-08-09T12:00:00Z");
@@ -225,11 +225,10 @@ fn ingested_publisher() -> (
     clave::init::run(&host, data.path()).unwrap();
     let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
     db.set_param("block_cadence_seconds", 1).unwrap();
-    let client = clave::fetch::Client::new(true);
     clave::ingest::run(&db, &client, data.path(), &host, &ts(NOW)).unwrap();
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
     clave::seal::run(&db, data.path(), &sk, NOW).unwrap();
-    (p, data, db, sk, host, id)
+    (p, data, db, sk, host, id, client)
 }
 
 fn snapshot_weights(data: &std::path::Path, date: &str) -> Vec<(String, String)> {
@@ -249,7 +248,7 @@ fn snapshot_weights(data: &std::path::Path, date: &str) -> Vec<(String, String)>
 
 #[test]
 fn level2_marks_snapshot_records_reduced_weight() {
-    let (_p, data, db, sk, host, _id) = ingested_publisher();
+    let (_p, data, db, sk, host, _id, _client) = ingested_publisher();
     clave::governance::sanction(&db, &sk, &host, 2, 1, &evidence(), None, NOW + DAY).unwrap();
     clave::seal::run(&db, data.path(), &sk, NOW + DAY).unwrap();
     let date = &ts(NOW + DAY)[..10];
@@ -261,7 +260,7 @@ fn level2_marks_snapshot_records_reduced_weight() {
 
 #[test]
 fn level4_excludes_domain_from_snapshots() {
-    let (_p, data, db, sk, host, _id) = ingested_publisher();
+    let (_p, data, db, sk, host, _id, _client) = ingested_publisher();
     clave::governance::sanction(
         &db,
         &sk,
@@ -280,7 +279,7 @@ fn level4_excludes_domain_from_snapshots() {
 
 #[test]
 fn level3_suspends_ingestion() {
-    let (_p, data, db, sk, host, _id) = ingested_publisher();
+    let (_p, data, db, sk, host, _id, client) = ingested_publisher();
     clave::governance::sanction(
         &db,
         &sk,
@@ -293,7 +292,6 @@ fn level3_suspends_ingestion() {
     )
     .unwrap();
     clave::seal::run(&db, data.path(), &sk, NOW + DAY).unwrap();
-    let client = clave::fetch::Client::new(true);
     let before = db.ingest_bytes(&host, &ts(NOW + DAY)[..10]).unwrap();
     let report =
         clave::ingest::run(&db, &client, data.path(), &host, &ts(NOW + DAY + 100)).unwrap();
@@ -307,7 +305,7 @@ fn level3_suspends_ingestion() {
 
 #[test]
 fn appeal_poll_fetches_and_enqueues_a_served_appeal() {
-    let (p, data, db, sk, host, _id) = ingested_publisher();
+    let (p, data, db, sk, host, _id, client) = ingested_publisher();
     clave::governance::sanction(
         &db,
         &sk,
@@ -340,7 +338,6 @@ fn appeal_poll_fetches_and_enqueues_a_served_appeal() {
     )
     .unwrap();
 
-    let client = clave::fetch::Client::new(true);
     let actions = clave::appeals::poll(&db, &client, &sk, NOW + 2 * DAY).unwrap();
     assert_eq!(actions.len(), 1);
 
@@ -359,7 +356,7 @@ fn appeal_poll_fetches_and_enqueues_a_served_appeal() {
 
 #[test]
 fn appeal_poll_seals_unappealed_ruling_after_window_close() {
-    let (_p, data, db, sk, host, _id) = ingested_publisher();
+    let (_p, data, db, sk, host, _id, client) = ingested_publisher();
     clave::governance::sanction(
         &db,
         &sk,
@@ -374,7 +371,6 @@ fn appeal_poll_seals_unappealed_ruling_after_window_close() {
     clave::seal::run(&db, data.path(), &sk, NOW + DAY).unwrap();
     let notice_id = sealed_notice_id(&db, &host);
 
-    let client = clave::fetch::Client::new(true);
     let during_window = clave::appeals::poll(&db, &client, &sk, NOW + 2 * DAY).unwrap();
     assert!(
         during_window.is_empty(),
@@ -397,7 +393,7 @@ fn appeal_poll_seals_unappealed_ruling_after_window_close() {
 
 #[test]
 fn late_appeal_is_recorded_but_discharges_nothing() {
-    let (p, data, db, sk, host, _id) = ingested_publisher();
+    let (p, data, db, sk, host, _id, client) = ingested_publisher();
     clave::governance::sanction(
         &db,
         &sk,
@@ -414,7 +410,6 @@ fn late_appeal_is_recorded_but_discharges_nothing() {
 
     // The window closes at day 15 and T falls at day 22; the Aggregator
     // discharges T on time with an "unappealed" ruling.
-    let client = clave::fetch::Client::new(true);
     let actions = clave::appeals::poll(&db, &client, &sk, NOW + 16 * DAY).unwrap();
     assert_eq!(actions.len(), 1);
     clave::seal::run(&db, data.path(), &sk, NOW + 16 * DAY).unwrap();
@@ -506,7 +501,7 @@ fn a_sanction_notice_restates_the_deadline_from_the_block_that_seals_it() {
 
 #[test]
 fn a_rotated_domains_appeal_verifies_under_the_notice_era_key_set() {
-    let (p, data, db, sk, host, _id) = ingested_publisher();
+    let (p, data, db, sk, host, _id, client) = ingested_publisher();
     clave::governance::sanction(
         &db,
         &sk,
@@ -533,7 +528,6 @@ fn a_rotated_domains_appeal_verifies_under_the_notice_era_key_set() {
         "prev_declaration": common::declaration_hash(&stored),
     });
     common::write_declaration(&p, &rotated, "k1", &common::K1_SEED);
-    let client = clave::fetch::Client::new(true);
     clave::ingest::run(&db, &client, data.path(), &host, &ts(after_t)).unwrap();
     clave::seal::run(&db, data.path(), &sk, after_t).unwrap();
     assert_eq!(

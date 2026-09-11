@@ -20,7 +20,7 @@ fn record_projection(r: &clave::db::RecordRow) -> serde_json::Value {
 
 #[test]
 fn snapshot_build_produces_verifiable_tier0_state_and_signed_artifacts() {
-    let (listener, host) = reserve_addr();
+    let (listener, host, client) = reserve_addr();
     let p = make_publisher_with_scope(&host, &["example.com"]);
     let id1 = add_delta(&p, "https://example.com/alpha", "alpha body", None);
     write_feed(
@@ -35,7 +35,6 @@ fn snapshot_build_produces_verifiable_tier0_state_and_signed_artifacts() {
     clave::init::run(&host, data.path()).unwrap();
     let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
     db.set_param("block_cadence_seconds", 1).unwrap();
-    let client = clave::fetch::Client::new(true);
     clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
 
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
@@ -185,7 +184,7 @@ fn snapshot_build_produces_verifiable_tier0_state_and_signed_artifacts() {
 
 #[test]
 fn snapshot_index_replaces_same_date_entry_on_reseal() {
-    let (listener, host) = reserve_addr();
+    let (listener, host, client) = reserve_addr();
     let p = make_publisher_with_scope(&host, &["example.com"]);
     let id1 = add_delta(&p, "https://example.com/alpha", "alpha body", None);
     write_feed(
@@ -200,7 +199,6 @@ fn snapshot_index_replaces_same_date_entry_on_reseal() {
     clave::init::run(&host, data.path()).unwrap();
     let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
     db.set_param("block_cadence_seconds", 1).unwrap();
-    let client = clave::fetch::Client::new(true);
     clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
 
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
@@ -223,7 +221,7 @@ fn snapshot_index_replaces_same_date_entry_on_reseal() {
 }
 
 fn tier1_fixture(shards: Option<i64>) -> (common::TestPub, tempfile::TempDir, String, String) {
-    let (listener, host) = reserve_addr();
+    let (listener, host, client) = reserve_addr();
     let p = make_publisher_with_scope(&host, &["example.com"]);
     let id = common::add_delta_with_links(
         &p,
@@ -242,7 +240,6 @@ fn tier1_fixture(shards: Option<i64>) -> (common::TestPub, tempfile::TempDir, St
     if let Some(n) = shards {
         db.set_param("snapshot_shard_count", n).unwrap();
     }
-    let client = clave::fetch::Client::new(true);
     clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
     clave::seal::run(&db, data.path(), &sk, 1_754_740_800).unwrap();
@@ -352,7 +349,7 @@ fn sharded_snapshot_declares_count_digests_and_shard_labels() {
 
 #[test]
 fn the_state_artifact_carries_every_kind_with_live_instances() {
-    let (listener, host) = reserve_addr();
+    let (listener, host, client) = reserve_addr();
     let p = make_publisher_with_scope(&host, &["example.com"]);
     let live = add_delta(&p, "https://example.com/live", "alpha body", None);
     let doomed = add_delta(&p, "https://example.com/gone", "beta body", None);
@@ -368,7 +365,6 @@ fn the_state_artifact_carries_every_kind_with_live_instances() {
     clave::init::run(&host, data.path()).unwrap();
     let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
     db.set_param("block_cadence_seconds", 1).unwrap();
-    let client = clave::fetch::Client::new(true);
     clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
     clave::seal::run(&db, data.path(), &sk, 1_754_740_800).unwrap();

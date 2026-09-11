@@ -154,15 +154,14 @@ pub fn page_url(domain: &str, number: u64) -> String {
     format!("https://{domain}/.well-known/wist/feed/{number}.json")
 }
 
-/// Binds an ephemeral loopback port synchronously so its host:port is known
-/// before any fixture file (which must embed that same host:port as its
-/// `domain`) is written. Pass the listener to `serve_static` once the
-/// fixture directory is fully populated.
-pub fn reserve_addr() -> (std::net::TcpListener, String) {
+pub fn reserve_addr() -> (std::net::TcpListener, String, clave::fetch::Client) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
-    (listener, addr)
+    let builder = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .resolve("localhost", listener.local_addr().unwrap());
+    let client = clave::fetch::Client::with_builder(true, builder);
+    (listener, "localhost".into(), client)
 }
 
 pub fn serve_static(listener: std::net::TcpListener, dir: std::path::PathBuf) {

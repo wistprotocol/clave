@@ -60,13 +60,14 @@ First-contact pulls apply the same checks before storing a Declaration. An
 invalid first Declaration remains a WIST2-E04 pull rejection, with its specific
 Declaration validation reason in the rejection detail.
 
-Admission and Declaration history replay require canonical unpadded base64url
-for every declared public key and detached signature, including unused keys
-and current re-serves. Malformed encoding is WIST1-E14 before sequencing,
-conflict comparison or cryptographic checks. All Declaration Entries in a
-candidate Block receive these checks before replay can install any group;
-failure preserves the entire accepted Declaration state, including due recovery
-settlement. Typed Envelope failures also report WIST1-E14.
+Admission and Declaration history replay validate complete Envelope fields
+before sequencing, conflicts, idempotence or signer resolution (WIST1-E14).
+Checks include required and unknown members, optional nulls, safe integer
+bounds, string lengths, release-version syntax, predecessor hashes, exact
+Unicode 16 Canonical Host spelling, Publisher timestamps and canonical
+unpadded base64url. Signed fields remain unchanged. All Declaration Entries
+in a candidate Block receive these checks before any group installs; rejection
+preserves the complete accepted state, including due recovery settlement.
 
 Canonically encoded public bytes that do not decode to an eligible Ed25519
 point are excluded from usable signing and recovery sets. Unused excluded keys
@@ -75,9 +76,8 @@ checks every usable named Declaration binding; no usable binding is WIST1-E02,
 while usable bindings without a valid signature are WIST1-E01. Original entries
 still determine identifier uniqueness, disjointness, hashes and recovery-set
 protection. Shared Delta/Feed verification also rejects malformed key/signature
-encoding and excludes unusable keys. These checks do not establish complete
-Declaration field validation, authenticated recovery-union resolution, sealed
-Feed key provenance or notice-era appeal authority.
+encoding and excludes unusable keys. Authenticated recovery-union resolution,
+sealed Feed key provenance and notice-era appeal authority remain incomplete.
 
 Delta key-time checks compare `observed_at` and `valid_from` as instants,
 including numeric UTC offsets and decimal fractions of arbitrary precision.
@@ -86,13 +86,13 @@ fraction lengths or offsets satisfy the inclusive key bound. Ingest, sealing
 and recovery settlement share this comparison. Timestamp strings remain
 unchanged in signed Envelopes.
 
-The comparison preserves a represented leap second between the preceding
-second and the following midnight. It does not establish that a leap second
-was actually inserted on that date. Full timestamp eligibility, Declaration
-field validation and schema-error classification remain incomplete; an
-unparseable key-time comparison currently fails with WIST1-E02. This diagnostic
-is not a specified general syntax-error code. Log timestamps retain their
-separate whole-second profile.
+Publisher timestamps use the specified Gregorian clock: seconds 00–59, year
+zero, arbitrary decimal fractions and numeric offsets, including arithmetic
+beyond the written year range. Every leap-second label rejects with WIST1-E14;
+validation needs no external leap table. Missing or malformed Delta
+`observed_at` also rejects with WIST1-E14 before shared key verification.
+Full Delta chain ordering and live clock/skew validation remain separate
+requirements. Log timestamps retain their distinct whole-second profile.
 
 ## Parameter schedules and Block sizes
 
@@ -197,10 +197,8 @@ Block’s Declaration stage. Callers must separately establish notice eligibilit
 and freeze that notice’s complete key bindings; this accessor does not validate
 notices, appeals or appeal processes.
 
-This API is a Declaration sequencing and author-authentication layer. Typed
-Envelope parsing and key-binding checks do not establish full field/schema
-validation, including hostname and RFC 3339 field profiles. Deltas, Audit
-Records and non-parameter Registry Updates receive no eligibility checks here.
+This API validates Declaration fields, sequencing and author authentication.
+Deltas, Audit Records and non-parameter Registry Updates receive no eligibility checks here.
 Live admission, sealing and SQLite restoration do not yet consume this state;
 `verify-history` retains its Block/parameter verification scope. Snapshot
 recovery state also requires the protocol’s unresolved Snapshot representation
@@ -226,17 +224,19 @@ resolves `wist-core` from `../core` — both must be sibling checkouts.
 
 ## Known deviations
 
-The following settings support local integration tests:
+The following transport setting supports integration tests:
 
-- **Publisher identity carries a port.** WIST-1 §2's Canonical Host has
-  no port, and this codebase treats a Publisher's identity as a bare
-  `host[:port]` authority throughout, so several publishers can be
-  served from loopback at once. On a public deployment every identity
-  is portless and the two readings coincide.
 - **Plain HTTP to loopback.** `--allow-http` lets pulls and pings use
   `http` when the host is a loopback address, which WIST-2 §8 forbids
   for any `wist` resource. Without the flag every fetch is HTTPS, and
   the flag never relaxes the scheme for a non-loopback host.
+
+Declaration identities are port-free Canonical Hosts. Integration fixtures
+use signed `localhost` identities with an explicit DNS override to each
+HTTP server's ephemeral socket. `fetch::Client::with_builder` and
+`serve::run_with_client` allow transport configuration while retaining the
+fetcher's timeout and redirect checks. A port-bearing signed Declaration
+rejects with WIST1-E14 even when loopback HTTP is enabled.
 
 ## Verification
 

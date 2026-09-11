@@ -3,7 +3,6 @@ use std::cmp::Ordering;
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Instant<'a> {
     second: i64,
-    leap: bool,
     fraction: &'a str,
 }
 
@@ -25,7 +24,7 @@ fn parse(value: &str) -> Option<Instant<'_>> {
         return None;
     }
     let second = digits(&bytes[17..19])?;
-    if second > 60 {
+    if second > 59 {
         return None;
     }
     let civil = jiff::civil::DateTime::new(
@@ -34,7 +33,7 @@ fn parse(value: &str) -> Option<Instant<'_>> {
         digits(&bytes[8..10])?.try_into().ok()?,
         digits(&bytes[11..13])?.try_into().ok()?,
         digits(&bytes[14..16])?.try_into().ok()?,
-        second.min(59).try_into().ok()?,
+        second.try_into().ok()?,
         0,
     )
     .ok()?;
@@ -79,9 +78,12 @@ fn parse(value: &str) -> Option<Instant<'_>> {
             + i64::from(civil.minute()) * 60
             + i64::from(civil.second())
             - offset,
-        leap: second == 60,
         fraction,
     })
+}
+
+pub(super) fn valid(value: &str) -> bool {
+    parse(value).is_some()
 }
 
 pub(super) fn compare(left: &str, right: &str) -> Option<Ordering> {

@@ -62,7 +62,11 @@ pub struct Client {
 
 impl Client {
     pub fn new(allow_http: bool) -> Client {
-        let inner = reqwest::blocking::Client::builder()
+        Self::with_builder(allow_http, reqwest::blocking::Client::builder())
+    }
+
+    pub fn with_builder(allow_http: bool, builder: reqwest::blocking::ClientBuilder) -> Client {
+        let inner = builder
             .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
             .redirect(reqwest::redirect::Policy::none())
             .build()

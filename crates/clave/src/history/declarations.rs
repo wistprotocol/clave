@@ -1,6 +1,6 @@
 use super::{History, VerifiedBlock};
 use crate::db::BlockRow;
-use crate::declaration::{evaluate, evaluate_initial, inner_hash, validate_encoding, Decision};
+use crate::declaration::{evaluate, evaluate_initial, inner_hash, validate_fields, Decision};
 use crate::error::{Error, Result};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -184,7 +184,7 @@ impl Declarations {
             if entry["type"] != "publisher_declaration" {
                 continue;
             }
-            let envelope = validate_encoding(&entry["body"]).map_err(rejection)?;
+            let envelope = validate_fields(&entry["body"]).map_err(rejection)?;
             if envelope.publisher.wist_version != crate::WIST_VERSION {
                 return Err(Error::History("unsupported Declaration version".into()));
             }

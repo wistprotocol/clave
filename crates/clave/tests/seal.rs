@@ -4,7 +4,7 @@ use common::{add_delta, make_publisher_with_scope, reserve_addr, serve_static, w
 
 #[test]
 fn seal_produces_verifiable_chain() {
-    let (listener, host) = reserve_addr();
+    let (listener, host, client) = reserve_addr();
     let p = make_publisher_with_scope(&host, &["example.com"]);
     let id1 = add_delta(&p, "https://example.com/a", "alpha body", None);
     write_feed(
@@ -19,7 +19,6 @@ fn seal_produces_verifiable_chain() {
     clave::init::run(&host, data.path()).unwrap();
     let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
     db.set_param("block_cadence_seconds", 1).unwrap();
-    let client = clave::fetch::Client::new(true);
     clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
 
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
@@ -69,7 +68,7 @@ fn seal_produces_verifiable_chain() {
 
 #[test]
 fn seal_orders_same_type_entries_by_ascending_leaf_hash() {
-    let (listener, host) = reserve_addr();
+    let (listener, host, client) = reserve_addr();
     let p = make_publisher_with_scope(&host, &["example.com"]);
     let id1 = add_delta(&p, "https://example.com/a0", "alpha body", None);
     let id2 = add_delta(&p, "https://example.com/b0", "beta body", None);
@@ -85,7 +84,6 @@ fn seal_orders_same_type_entries_by_ascending_leaf_hash() {
     clave::init::run(&host, data.path()).unwrap();
     let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
     db.set_param("block_cadence_seconds", 1).unwrap();
-    let client = clave::fetch::Client::new(true);
     clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
 
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
@@ -143,7 +141,7 @@ fn seal_orders_same_type_entries_by_ascending_leaf_hash() {
 
 #[test]
 fn seal_applies_chained_deltas_in_chain_order_regardless_of_storage_order() {
-    let (listener, host) = reserve_addr();
+    let (listener, host, client) = reserve_addr();
     let p = make_publisher_with_scope(&host, &["example.com"]);
     let id1 = add_delta(&p, "https://example.com/a0", "first content", None);
     let id2 = add_delta(&p, "https://example.com/a0", "second content", Some(&id1));
@@ -159,7 +157,6 @@ fn seal_applies_chained_deltas_in_chain_order_regardless_of_storage_order() {
     clave::init::run(&host, data.path()).unwrap();
     let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
     db.set_param("block_cadence_seconds", 1).unwrap();
-    let client = clave::fetch::Client::new(true);
     clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
 
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
@@ -194,7 +191,7 @@ fn block_frame_declares_decompressed_size() {
 
 #[test]
 fn oversize_block_defers_entries_to_the_next_seal() {
-    let (listener, host) = reserve_addr();
+    let (listener, host, client) = reserve_addr();
     let p = make_publisher_with_scope(&host, &["example.com"]);
     let id1 = add_delta(&p, "https://example.com/a", "alpha body", None);
     let id2 = add_delta(&p, "https://example.com/b", "beta body", None);
@@ -210,7 +207,6 @@ fn oversize_block_defers_entries_to_the_next_seal() {
     clave::init::run(&host, data.path()).unwrap();
     let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
     db.set_param("block_cadence_seconds", 1).unwrap();
-    let client = clave::fetch::Client::new(true);
     clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
 
     let cap = 1024;
@@ -253,7 +249,7 @@ fn oversize_block_defers_entries_to_the_next_seal() {
 
 #[test]
 fn the_per_domain_block_cap_defers_the_surplus_in_acceptance_order() {
-    let (listener, host) = reserve_addr();
+    let (listener, host, client) = reserve_addr();
     let p = make_publisher_with_scope(&host, &["example.com"]);
     let ids: Vec<String> = (0..5)
         .map(|i| add_delta(&p, &format!("https://example.com/p{i}"), "body", None))
@@ -266,7 +262,6 @@ fn the_per_domain_block_cap_defers_the_surplus_in_acceptance_order() {
     let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
     db.set_param("block_cadence_seconds", 1).unwrap();
     db.set_param("domain_block_entries_max", 2).unwrap();
-    let client = clave::fetch::Client::new(true);
     clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
 
@@ -302,7 +297,7 @@ fn the_per_domain_block_cap_defers_the_surplus_in_acceptance_order() {
 
 #[test]
 fn a_delta_held_past_the_inclusion_ceiling_is_reported() {
-    let (listener, host) = reserve_addr();
+    let (listener, host, client) = reserve_addr();
     let p = make_publisher_with_scope(&host, &["example.com"]);
     let ids: Vec<String> = (0..3)
         .map(|i| add_delta(&p, &format!("https://example.com/p{i}"), "body", None))
@@ -316,7 +311,6 @@ fn a_delta_held_past_the_inclusion_ceiling_is_reported() {
     db.set_param("block_cadence_seconds", 1).unwrap();
     db.set_param("max_inclusion_blocks", 1).unwrap();
     db.set_param("block_decompressed_cap_bytes", 1100).unwrap();
-    let client = clave::fetch::Client::new(true);
     clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
 

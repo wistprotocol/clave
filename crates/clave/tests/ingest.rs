@@ -7,7 +7,7 @@ use std::fs;
 
 #[test]
 fn ingest_accepts_valid_and_rejects_bad_commitment() {
-    let (listener, host) = reserve_addr();
+    let (listener, host, client) = reserve_addr();
     let p = make_publisher_with_scope(&host, &["example.com"]);
     let id1 = add_delta(&p, "https://example.com/a", "alpha body", None);
     let id2 = add_delta(&p, "https://example.com/b", "beta body", None);
@@ -30,7 +30,6 @@ fn ingest_accepts_valid_and_rejects_bad_commitment() {
     let tmp = tempfile::tempdir().unwrap();
     clave::init::run(&host, tmp.path()).unwrap();
     let db = clave::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
-    let client = clave::fetch::Client::new(true);
 
     let report =
         clave::ingest::run(&db, &client, tmp.path(), &host, "2026-08-09T12:00:05Z").unwrap();
@@ -66,7 +65,7 @@ fn ingest_accepts_valid_and_rejects_bad_commitment() {
 
 #[test]
 fn drain_pending_entries_orders_declaration_then_deltas_across_passes() {
-    let (listener, host) = reserve_addr();
+    let (listener, host, client) = reserve_addr();
     let p = make_publisher_with_scope(&host, &["example.com"]);
     let id1 = add_delta(&p, "https://example.com/a", "alpha body", None);
     write_feed(
@@ -80,7 +79,6 @@ fn drain_pending_entries_orders_declaration_then_deltas_across_passes() {
     let tmp = tempfile::tempdir().unwrap();
     clave::init::run(&host, tmp.path()).unwrap();
     let db = clave::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
-    let client = clave::fetch::Client::new(true);
 
     let report1 =
         clave::ingest::run(&db, &client, tmp.path(), &host, "2026-08-09T12:00:00Z").unwrap();
@@ -116,7 +114,7 @@ fn drain_pending_entries_orders_declaration_then_deltas_across_passes() {
 
 #[test]
 fn ingest_rejects_publisher_domain_mismatch() {
-    let (listener, host) = reserve_addr();
+    let (listener, host, client) = reserve_addr();
     let p = make_publisher("not-the-host.example");
     let id1 = add_delta(&p, "https://not-the-host.example/a", "alpha body", None);
     write_feed(
@@ -130,7 +128,6 @@ fn ingest_rejects_publisher_domain_mismatch() {
     let tmp = tempfile::tempdir().unwrap();
     clave::init::run(&host, tmp.path()).unwrap();
     let db = clave::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
-    let client = clave::fetch::Client::new(true);
 
     let report =
         clave::ingest::run(&db, &client, tmp.path(), &host, "2026-08-09T12:00:05Z").unwrap();
@@ -144,7 +141,7 @@ fn ingest_rejects_publisher_domain_mismatch() {
 
 #[test]
 fn ingest_rejects_feed_domain_mismatch() {
-    let (listener, host) = reserve_addr();
+    let (listener, host, client) = reserve_addr();
     let p = make_publisher_with_scope(&host, &["example.com"]);
     let id1 = add_delta(&p, "https://example.com/a", "alpha body", None);
     write_feed(
@@ -158,7 +155,6 @@ fn ingest_rejects_feed_domain_mismatch() {
     let tmp = tempfile::tempdir().unwrap();
     clave::init::run(&host, tmp.path()).unwrap();
     let db = clave::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
-    let client = clave::fetch::Client::new(true);
 
     let report =
         clave::ingest::run(&db, &client, tmp.path(), &host, "2026-08-09T12:00:05Z").unwrap();
@@ -175,7 +171,7 @@ fn ingest_rejects_feed_domain_mismatch() {
 
 #[test]
 fn ingest_rejects_delta_url_outside_publisher_scope() {
-    let (listener, host) = reserve_addr();
+    let (listener, host, client) = reserve_addr();
     let p = make_publisher(&host);
     let id1 = add_delta(&p, "https://not-in-scope.example/a", "alpha body", None);
     write_feed(
@@ -189,7 +185,6 @@ fn ingest_rejects_delta_url_outside_publisher_scope() {
     let tmp = tempfile::tempdir().unwrap();
     clave::init::run(&host, tmp.path()).unwrap();
     let db = clave::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
-    let client = clave::fetch::Client::new(true);
 
     let report =
         clave::ingest::run(&db, &client, tmp.path(), &host, "2026-08-09T12:00:05Z").unwrap();
@@ -200,7 +195,7 @@ fn ingest_rejects_delta_url_outside_publisher_scope() {
 
 #[test]
 fn ingest_accepts_delta_url_within_subdomain_scope() {
-    let (listener, host) = reserve_addr();
+    let (listener, host, client) = reserve_addr();
     let p = make_publisher_with_scope(&host, &["scoped.example"]);
     let id1 = add_delta(&p, "https://scoped.example/a", "alpha body", None);
     write_feed(
@@ -214,7 +209,6 @@ fn ingest_accepts_delta_url_within_subdomain_scope() {
     let tmp = tempfile::tempdir().unwrap();
     clave::init::run(&host, tmp.path()).unwrap();
     let db = clave::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
-    let client = clave::fetch::Client::new(true);
 
     let report =
         clave::ingest::run(&db, &client, tmp.path(), &host, "2026-08-09T12:00:05Z").unwrap();
@@ -224,7 +218,7 @@ fn ingest_accepts_delta_url_within_subdomain_scope() {
 
 #[test]
 fn ingest_walks_feed_pages_and_backfills_oldest_first() {
-    let (listener, host) = reserve_addr();
+    let (listener, host, client) = reserve_addr();
     let p = make_publisher_with_scope(&host, &["example.com"]);
     let id1 = add_delta(&p, "https://example.com/a", "first content", None);
     let id2 = add_delta(&p, "https://example.com/a", "second content", Some(&id1));
@@ -257,7 +251,6 @@ fn ingest_walks_feed_pages_and_backfills_oldest_first() {
     let tmp = tempfile::tempdir().unwrap();
     clave::init::run(&host, tmp.path()).unwrap();
     let db = clave::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
-    let client = clave::fetch::Client::new(true);
 
     let report =
         clave::ingest::run(&db, &client, tmp.path(), &host, "2026-08-09T12:00:05Z").unwrap();
@@ -275,7 +268,7 @@ fn ingest_walks_feed_pages_and_backfills_oldest_first() {
 
 #[test]
 fn ingest_budget_suspends_walk_and_resumes_when_budget_allows() {
-    let (listener, host) = reserve_addr();
+    let (listener, host, client) = reserve_addr();
     let p = make_publisher_with_scope(&host, &["example.com"]);
     let id1 = add_delta(&p, "https://example.com/a", "first content", None);
     let id2 = add_delta(&p, "https://example.com/a", "second content", Some(&id1));
@@ -300,7 +293,6 @@ fn ingest_budget_suspends_walk_and_resumes_when_budget_allows() {
     clave::init::run(&host, tmp.path()).unwrap();
     let db = clave::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
     db.set_param("ingest_budget_bytes_day", 1).unwrap();
-    let client = clave::fetch::Client::new(true);
 
     let report =
         clave::ingest::run(&db, &client, tmp.path(), &host, "2026-08-09T12:00:05Z").unwrap();
@@ -319,14 +311,13 @@ fn ingest_budget_suspends_walk_and_resumes_when_budget_allows() {
 
 #[test]
 fn ingest_onboard_failure_is_e04_noise() {
-    let (listener, host) = reserve_addr();
+    let (listener, host, client) = reserve_addr();
     let empty = tempfile::tempdir().unwrap();
     serve_static(listener, empty.path().to_path_buf());
 
     let tmp = tempfile::tempdir().unwrap();
     clave::init::run(&host, tmp.path()).unwrap();
     let db = clave::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
-    let client = clave::fetch::Client::new(true);
 
     let report =
         clave::ingest::run(&db, &client, tmp.path(), &host, "2026-08-09T12:00:05Z").unwrap();
@@ -335,7 +326,7 @@ fn ingest_onboard_failure_is_e04_noise() {
 
 #[test]
 fn a_feed_whose_signature_does_not_verify_is_e04_noise() {
-    let (listener, host) = reserve_addr();
+    let (listener, host, client) = reserve_addr();
     let p = make_publisher(&host);
     let id = add_delta(&p, &format!("https://{host}/a"), "alpha body", None);
     write_feed(&p, &host, &[id], "2026-08-09T12:00:00Z");
@@ -349,7 +340,6 @@ fn a_feed_whose_signature_does_not_verify_is_e04_noise() {
     let tmp = tempfile::tempdir().unwrap();
     clave::init::run(&host, tmp.path()).unwrap();
     let db = clave::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
-    let client = clave::fetch::Client::new(true);
 
     let report =
         clave::ingest::run(&db, &client, tmp.path(), &host, "2026-08-09T12:00:05Z").unwrap();
@@ -367,7 +357,7 @@ fn a_feed_whose_signature_does_not_verify_is_e04_noise() {
 
 #[test]
 fn a_declaration_that_fails_verification_is_e01_and_an_unknown_key_is_e02() {
-    let (listener, host) = reserve_addr();
+    let (listener, host, client) = reserve_addr();
     let p = make_publisher(&host);
     let id = add_delta(&p, &format!("https://{host}/a"), "alpha body", None);
     write_feed(&p, &host, &[id], "2026-08-09T12:00:00Z");
@@ -376,7 +366,6 @@ fn a_declaration_that_fails_verification_is_e01_and_an_unknown_key_is_e02() {
     let tmp = tempfile::tempdir().unwrap();
     clave::init::run(&host, tmp.path()).unwrap();
     let db = clave::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
-    let client = clave::fetch::Client::new(true);
     clave::ingest::run(&db, &client, tmp.path(), &host, "2026-08-09T12:00:05Z").unwrap();
 
     let path = p.dir.path().join(".well-known/wist/publisher.json");
@@ -410,7 +399,7 @@ fn a_declaration_that_fails_verification_is_e01_and_an_unknown_key_is_e02() {
 
 #[test]
 fn a_stale_key_set_cache_with_a_failed_rediscovery_fails_closed() {
-    let (listener, host) = reserve_addr();
+    let (listener, host, client) = reserve_addr();
     let p = make_publisher(&host);
     let id = add_delta(&p, &format!("https://{host}/a"), "alpha body", None);
     write_feed(&p, &host, &[id], "2026-08-09T12:00:00Z");
@@ -419,7 +408,6 @@ fn a_stale_key_set_cache_with_a_failed_rediscovery_fails_closed() {
     let tmp = tempfile::tempdir().unwrap();
     clave::init::run(&host, tmp.path()).unwrap();
     let db = clave::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
-    let client = clave::fetch::Client::new(true);
     clave::ingest::run(&db, &client, tmp.path(), &host, "2026-08-09T12:00:05Z").unwrap();
 
     fs::remove_file(p.dir.path().join(".well-known/wist/publisher.json")).unwrap();
@@ -444,7 +432,7 @@ fn a_stale_key_set_cache_with_a_failed_rediscovery_fails_closed() {
 
 #[test]
 fn an_unsealed_prev_is_retrieved_before_the_delta_naming_it() {
-    let (listener, host) = reserve_addr();
+    let (listener, host, client) = reserve_addr();
     let p = make_publisher(&host);
     let url = format!("https://{host}/a");
     let first = add_delta(&p, &url, "alpha body", None);
@@ -462,7 +450,6 @@ fn an_unsealed_prev_is_retrieved_before_the_delta_naming_it() {
     let tmp = tempfile::tempdir().unwrap();
     clave::init::run(&host, tmp.path()).unwrap();
     let db = clave::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
-    let client = clave::fetch::Client::new(true);
 
     let report =
         clave::ingest::run(&db, &client, tmp.path(), &host, "2026-08-09T12:00:05Z").unwrap();
@@ -528,8 +515,12 @@ fn invalid_first_declarations_remain_e04_noise_without_persistence() {
         ("shape", "WIST1-E14"),
         ("encoding", "WIST1-E14"),
         ("excluded", "WIST1-E02"),
+        ("host", "WIST1-E14"),
+        ("scope", "WIST1-E14"),
+        ("timestamp", "WIST1-E14"),
+        ("optional-null", "WIST1-E14"),
     ] {
-        let (listener, host) = reserve_addr();
+        let (listener, host, client) = reserve_addr();
         let publisher = make_publisher(&host);
         let path = publisher.dir.path().join(".well-known/wist/publisher.json");
         let mut doc: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -574,6 +565,12 @@ fn invalid_first_declarations_remain_e04_noise_without_persistence() {
                 )
                 .unwrap();
             }
+            "host" => doc["publisher"]["domain"] = format!("{host}:8080").into(),
+            "scope" => doc["publisher"]["subdomain_scope"] = serde_json::json!(["EXAMPLE.com"]),
+            "timestamp" => {
+                doc["publisher"]["keys"][0]["valid_from"] = "2016-12-31T23:59:60Z".into()
+            }
+            "optional-null" => doc["publisher"]["contact"] = serde_json::Value::Null,
             _ => doc["extra"] = true.into(),
         }
         fs::write(&path, serde_json::to_vec(&doc).unwrap()).unwrap();
@@ -581,14 +578,8 @@ fn invalid_first_declarations_remain_e04_noise_without_persistence() {
         let data = tempfile::tempdir().unwrap();
         clave::init::run("log.example", data.path()).unwrap();
         let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
-        let report = clave::ingest::run(
-            &db,
-            &clave::fetch::Client::new(true),
-            data.path(),
-            &host,
-            "2026-08-09T12:00:05Z",
-        )
-        .unwrap();
+        let report =
+            clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:05Z").unwrap();
         assert!(report.accepted.is_empty());
         assert_eq!(report.noise, Some("WIST2-E04"));
         assert!(db.get_publisher(&host).unwrap().is_none());
@@ -605,7 +596,7 @@ fn invalid_first_declarations_remain_e04_noise_without_persistence() {
 
 #[test]
 fn unused_excluded_keys_survive_ingest_reopen_and_sealing_without_blocking_usable_keys() {
-    let (listener, host) = reserve_addr();
+    let (listener, host, client) = reserve_addr();
     let publisher = make_publisher_with_scope(&host, &["example.com"]);
     let path = publisher.dir.path().join(".well-known/wist/publisher.json");
     let mut doc: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -637,14 +628,8 @@ fn unused_excluded_keys_survive_ingest_reopen_and_sealing_without_blocking_usabl
     clave::init::run("log.example", data.path()).unwrap();
     let database = data.path().join("clave.sqlite");
     let db = clave::db::Db::open(&database).unwrap();
-    let report = clave::ingest::run(
-        &db,
-        &clave::fetch::Client::new(true),
-        data.path(),
-        &host,
-        "2026-08-09T12:00:05Z",
-    )
-    .unwrap();
+    let report =
+        clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:05Z").unwrap();
     assert_eq!(report.accepted, vec![id.clone()]);
     assert!(report.rejected.is_empty());
     drop(db);
@@ -666,6 +651,92 @@ fn unused_excluded_keys_survive_ingest_reopen_and_sealing_without_blocking_usabl
             .unwrap()
             .delta_id,
         id
+    );
+    let state = clave::history::declarations::Declarations::reconstruct(
+        data.path(),
+        db.last_block().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(*state.domains()[&host].current().envelope(), signed);
+}
+
+#[test]
+fn declaration_field_rejections_preserve_signed_state_through_reopen_and_sealing() {
+    let (listener, host, client) = reserve_addr();
+    let publisher = make_publisher_with_scope(
+        &host,
+        &["example.com", "xn--bcher-kva.example", "-foo.example"],
+    );
+    let path = publisher.dir.path().join(".well-known/wist/publisher.json");
+    let mut initial = common::current_declaration(&publisher)["publisher"].clone();
+    initial["contact"] = "😀".repeat(256).into();
+    initial["keys"][0]["valid_from"] =
+        format!("0000-01-01t00:00:00.{}1+23:59", "0".repeat(5000)).into();
+    let signed =
+        wist_core::envelope::sign_envelope(&initial, "publisher", "k1", &publisher.sk).unwrap();
+    fs::write(&path, serde_json::to_vec(&signed).unwrap()).unwrap();
+    let id = add_delta(
+        &publisher,
+        "https://example.com/fields",
+        "validated fields",
+        None,
+    );
+    write_feed(&publisher, &host, &[id], "2026-08-09T12:00:00Z");
+    serve_static(listener, publisher.dir.path().to_path_buf());
+    let data = tempfile::tempdir().unwrap();
+    clave::init::run("log.example", data.path()).unwrap();
+    let database = data.path().join("clave.sqlite");
+    let mut db = clave::db::Db::open(&database).unwrap();
+    let report =
+        clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:05Z").unwrap();
+    assert_eq!(report.noise, None);
+    assert_eq!(
+        db.count_pending_entries("publisher_declaration").unwrap(),
+        1
+    );
+    for field in [
+        "signature",
+        "timestamp",
+        "hostname",
+        "optional-null",
+        "length",
+    ] {
+        let mut incoming = signed.clone();
+        match field {
+            "signature" => incoming["sig"]["alg"] = "other".into(),
+            "timestamp" => {
+                incoming["publisher"]["keys"][0]["valid_from"] = "2030-12-31T23:59:60Z".into()
+            }
+            "hostname" => incoming["publisher"]["domain"] = "LOCALHOST".into(),
+            "optional-null" => incoming["publisher"]["recovery_keys"] = serde_json::Value::Null,
+            _ => incoming["publisher"]["contact"] = "😀".repeat(257).into(),
+        }
+        fs::write(&path, serde_json::to_vec(&incoming).unwrap()).unwrap();
+        let before = db.list_rejections(&host).unwrap().len();
+        clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:01:00Z").unwrap();
+        let rejections = db.list_rejections(&host).unwrap();
+        assert_eq!(rejections.len(), before + 1, "{field}");
+        assert_eq!(rejections.last().unwrap().code, "WIST1-E14", "{field}");
+        drop(db);
+        db = clave::db::Db::open(&database).unwrap();
+        let stored: serde_json::Value =
+            serde_json::from_slice(&db.get_publisher_declaration(&host).unwrap().unwrap()).unwrap();
+        assert_eq!(stored, signed, "{field}");
+        assert_eq!(
+            db.count_pending_entries("publisher_declaration").unwrap(),
+            1
+        );
+    }
+    let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
+    let at = "2026-08-09T13:00:00Z"
+        .parse::<jiff::Timestamp>()
+        .unwrap()
+        .as_second();
+    assert_eq!(
+        clave::seal::run(&db, data.path(), &sk, at)
+            .unwrap()
+            .entry_count,
+        2
     );
     let state = clave::history::declarations::Declarations::reconstruct(
         data.path(),

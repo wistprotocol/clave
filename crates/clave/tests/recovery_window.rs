@@ -15,14 +15,13 @@ struct Rig {
 }
 
 fn rig(p_for: fn(&str) -> TestPub) -> Rig {
-    let (listener, host) = reserve_addr();
+    let (listener, host, client) = reserve_addr();
     let p = p_for(&host);
     serve_static(listener, p.dir.path().to_path_buf());
     let data = tempfile::tempdir().unwrap();
     clave::init::run(&host, data.path()).unwrap();
     let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
     db.set_param("block_cadence_seconds", 1).unwrap();
-    let client = clave::fetch::Client::new(true);
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
     Rig {
         host,

@@ -6,10 +6,11 @@ use wist_core::objects::{Publisher, PublisherEnvelope, PublisherKey};
 
 mod time;
 
-pub fn validate_encoding(doc: &Value) -> Result<PublisherEnvelope, (&'static str, String)> {
-    wist_core::jcs::canonicalize(doc).map_err(|e| ("WIST1-E05", e.to_string()))?;
+pub fn validate_fields(doc: &Value) -> Result<PublisherEnvelope, (&'static str, String)> {
+    let canonical = wist_core::jcs::canonicalize(doc).map_err(|e| ("WIST1-E05", e.to_string()))?;
     let envelope: PublisherEnvelope =
-        serde_json::from_value(doc.clone()).map_err(|e| ("WIST1-E14", e.to_string()))?;
+        serde_json::from_slice(&canonical).map_err(|e| ("WIST1-E14", e.to_string()))?;
+    validate_structure(doc, &envelope).map_err(|e| ("WIST1-E14", e))?;
     for key in envelope
         .publisher
         .keys
@@ -22,6 +23,75 @@ pub fn validate_encoding(doc: &Value) -> Result<PublisherEnvelope, (&'static str
     canonical_encoding(&envelope.sig.value, 64)
         .map_err(|e| ("WIST1-E14", format!("sig.value: {e}")))?;
     Ok(envelope)
+}
+
+fn validate_structure(doc: &Value, envelope: &PublisherEnvelope) -> Result<(), String> {
+    let publisher = &envelope.publisher;
+    for field in [
+        "prev_declaration",
+        "subdomain_scope",
+        "recovery_keys",
+        "contact",
+    ] {
+        if doc["publisher"].get(field).is_some_and(Value::is_null) {
+            return Err(format!("{field} must not be null"));
+        }
+    }
+    if publisher.seq > 9_007_199_254_740_991 {
+        return Err("seq exceeds the safe integer range".into());
+    }
+    let version: Vec<_> = publisher.wist_version.split('.').collect();
+    if version.len() != 3
+        || version.iter().any(|part| {
+            part.is_empty()
+                || (part.len() > 1 && part.starts_with('0'))
+                || !part.bytes().all(|b| b.is_ascii_digit())
+        })
+    {
+        return Err("wist_version must contain three decimal components".into());
+    }
+    if publisher.prev_declaration.as_ref().is_some_and(|hash| {
+        !hash.strip_prefix("sha256:").is_some_and(|hex| {
+            hex.len() == 64
+                && hex
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+    }) {
+        return Err("prev_declaration must be a lowercase SHA-256 hash".into());
+    }
+    for host in std::iter::once(&publisher.domain).chain(publisher.subdomain_scope.iter().flatten())
+    {
+        if !wist_core::host::canonical_host(host).is_ok_and(|canonical| canonical == *host) {
+            return Err("Declaration hosts must equal their Canonical Host".into());
+        }
+    }
+    if publisher
+        .contact
+        .as_ref()
+        .is_some_and(|value| value.chars().count() > 256)
+    {
+        return Err("contact exceeds 256 characters".into());
+    }
+    if publisher.keys.is_empty() {
+        return Err("keys must not be empty".into());
+    }
+    for key in publisher
+        .keys
+        .iter()
+        .chain(publisher.recovery_keys.iter().flatten())
+    {
+        if key.key_id.chars().count() > 64 || key.alg != "Ed25519" {
+            return Err("key_id exceeds 64 characters or alg is not Ed25519".into());
+        }
+        if !time::valid(&key.valid_from) {
+            return Err("valid_from must satisfy the Publisher timestamp profile".into());
+        }
+    }
+    if envelope.sig.key_id.chars().count() > 64 || envelope.sig.alg != "Ed25519" {
+        return Err("signature key_id exceeds 64 characters or alg is not Ed25519".into());
+    }
+    Ok(())
 }
 
 fn canonical_encoding(value: &str, length: usize) -> Result<(), String> {
@@ -56,7 +126,9 @@ pub fn inner_hash(doc: &Value) -> Result<String, String> {
 }
 
 fn parse(doc: &Value) -> Result<Publisher, String> {
-    serde_json::from_value(doc["publisher"].clone()).map_err(|e| e.to_string())
+    validate_fields(doc)
+        .map(|envelope| envelope.publisher)
+        .map_err(|(code, detail)| format!("{code}: {detail}"))
 }
 
 fn recovery_keys_bytes(p: &Publisher) -> Result<Vec<u8>, String> {
@@ -104,7 +176,7 @@ fn verify_with(doc: &Value, key: &PublisherKey) -> bool {
 }
 
 pub fn evaluate_initial(doc: &Value) -> Result<Publisher, (&'static str, String)> {
-    let envelope = validate_encoding(doc)?;
+    let envelope = validate_fields(doc)?;
     let publisher = envelope.publisher;
     disjoint_key_sets(&publisher).map_err(|e| ("WIST1-E08", e))?;
     if publisher.seq != 0 || publisher.prev_declaration.is_some() {
@@ -159,6 +231,18 @@ pub fn verify_signed(
     kind: &str,
     observed_at: Option<&str>,
 ) -> Result<(), &'static str> {
+    if kind == "delta"
+        && !doc["delta"]["observed_at"]
+            .as_str()
+            .is_some_and(time::valid)
+    {
+        return Err("WIST1-E14");
+    }
+    if observed_at.is_some_and(|value| !time::valid(value))
+        || keys.iter().any(|key| !time::valid(&key.valid_from))
+    {
+        return Err("WIST1-E14");
+    }
     canonical_encoding(doc["sig"]["value"].as_str().ok_or("WIST1-E14")?, 64)
         .map_err(|_| "WIST1-E14")?;
     for key in keys {
@@ -192,7 +276,7 @@ pub fn verify_signed(
 /// carries the WIST-1 §7 code for the failure and its detail.
 pub fn evaluate(stored: &Value, fetched: &Value) -> Result<Decision, (&'static str, String)> {
     let stored_p = parse(stored).map_err(|e| ("WIST2-E04", e))?;
-    let fetched_p = validate_encoding(fetched)?.publisher;
+    let fetched_p = validate_fields(fetched)?.publisher;
     disjoint_key_sets(&fetched_p).map_err(|e| ("WIST1-E08", e))?;
 
     if fetched_p.domain != stored_p.domain {
@@ -273,7 +357,7 @@ pub fn follows_chain_head(head: &Value, candidate: &Value) -> bool {
     let Ok(head_p) = parse(head) else {
         return false;
     };
-    let Ok(candidate_envelope) = validate_encoding(candidate) else {
+    let Ok(candidate_envelope) = validate_fields(candidate) else {
         return false;
     };
     let candidate_p = candidate_envelope.publisher;

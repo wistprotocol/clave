@@ -88,7 +88,7 @@ fn same_seq_different_content_is_rejected() {
 fn lower_seq_is_rejected() {
     let stored = declaration(
         2,
-        Some("sha256:aa"),
+        Some(&format!("sha256:{}", "a".repeat(64))),
         vec![key_json("k1", &K1, "2026-08-01T00:00:00Z")],
         None,
         ("k1", &K1),
@@ -268,7 +268,7 @@ fn fresh_identity_must_carry_recovery_keys_byte_identical() {
 fn fresh_identity_is_accepted_and_left_to_the_windows_settlement() {
     let stored = declaration(
         1,
-        Some("sha256:aa"),
+        Some(&format!("sha256:{}", "a".repeat(64))),
         vec![key_json("k2", &K2, "2026-08-10T00:00:00Z")],
         Some(vec![key_json("r1", &R1, "2026-08-01T00:00:00Z")]),
         ("r1", &R1),
@@ -458,7 +458,7 @@ fn every_key_and_signature_encoding_boundary_is_checked_before_authentication() 
         for path in paths {
             let mut candidate = baseline.clone();
             *candidate.pointer_mut(path).unwrap() = case["encoded"].clone();
-            let result = clave::declaration::validate_encoding(&candidate)
+            let result = clave::declaration::validate_fields(&candidate)
                 .map(|_| "well_formed")
                 .unwrap_or_else(|(code, _)| code);
             assert_eq!(
@@ -502,7 +502,7 @@ fn recovery_chain_membership_uses_authenticated_public_key() {
 }
 
 #[test]
-fn signed_delta_key_bound_orders_rfc3339_instants_exactly() {
+fn signed_delta_key_bound_orders_publisher_instants_exactly() {
     let sk = SigningKey::from_seed(&K1);
     let cases = [
         ("2026-08-04T10:00:00Z", "2026-08-04T10:00:00.5Z", true),
@@ -531,36 +531,6 @@ fn signed_delta_key_bound_orders_rfc3339_instants_exactly() {
         ("2026-08-04T10:00:00Z", "2026-08-04T10:00:00-00:00", true),
         ("2026-08-04T10:00:00+00:00", "2026-08-04T10:00:00Z", true),
         ("2026-08-04T00:00:00Z", "2026-08-03T23:59:59-00:01", true),
-        (
-            "2016-12-31T23:59:59.999999999999Z",
-            "2016-12-31T23:59:60Z",
-            true,
-        ),
-        (
-            "2016-12-31T23:59:60Z",
-            "2016-12-31T23:59:59.999999999999Z",
-            false,
-        ),
-        (
-            "2017-01-01T00:00:00Z",
-            "2016-12-31T23:59:60.999999999999Z",
-            false,
-        ),
-        (
-            "2016-12-31T23:59:60.999999999999Z",
-            "2017-01-01T00:00:00Z",
-            true,
-        ),
-        (
-            "2016-12-31T23:59:60.5Z",
-            "2017-01-01T00:59:60.50+01:00",
-            true,
-        ),
-        (
-            "2016-12-31T23:59:60.5Z",
-            "2016-12-31T18:29:60.4-05:30",
-            false,
-        ),
         ("0000-02-28T23:59:59Z", "0000-02-29T00:00:00Z", true),
         ("2000-02-29T23:59:59Z", "2000-03-01T00:00:00Z", true),
         ("0000-01-01T00:00:00Z", "0000-01-01T00:00:00+23:59", false),
@@ -583,5 +553,127 @@ fn signed_delta_key_bound_orders_rfc3339_instants_exactly() {
                 Err("WIST1-E01")
             );
         }
+    }
+}
+
+#[test]
+fn complete_signed_declaration_fields_match_the_specification_vectors() {
+    for name in ["declaration-fields", "declaration-hosts"] {
+        let vector: Value = serde_json::from_slice(
+            &std::fs::read(common::spec_dir().join(format!("vectors/wist1/{name}.json"))).unwrap(),
+        )
+        .unwrap();
+        for case in vector["cases"].as_array().unwrap() {
+            let incoming = &case["envelope"];
+            let original = incoming.clone();
+            let result = if name == "declaration-hosts" {
+                clave::declaration::evaluate_initial(incoming).map(|_| "initial")
+            } else {
+                evaluate(&vector["stored"], incoming).map(|decision| match decision {
+                    Decision::Ordinary => "ordinary_rotation",
+                    Decision::Recovery => "recovery_rotation",
+                    Decision::FreshIdentity => "fresh_identity",
+                    Decision::Unchanged => "idempotent",
+                })
+            };
+            assert_eq!(
+                result.unwrap_or_else(|(code, _)| code),
+                case["expected"].as_str().unwrap(),
+                "{name}: {}",
+                case["name"]
+            );
+            assert_eq!(*incoming, original);
+        }
+    }
+}
+
+#[test]
+fn signed_timestamp_eligibility_and_key_bounds_match_the_specification_vectors() {
+    let vector: Value = serde_json::from_slice(
+        &std::fs::read(common::spec_dir().join("vectors/wist1/declaration-fields.json")).unwrap(),
+    )
+    .unwrap();
+    let publisher = clave::declaration::publisher_of(&vector["stored"]).unwrap();
+    let keys: Vec<_> = publisher.keys.iter().collect();
+    for case in vector["delta_cases"].as_array().unwrap() {
+        let doc = &case["envelope"];
+        let result = clave::declaration::verify_signed(
+            &keys,
+            doc,
+            "delta",
+            doc["delta"]["observed_at"].as_str(),
+        );
+        assert_eq!(
+            result == Err("WIST1-E14"),
+            case["expected"] == "WIST1-E14",
+            "{}: {result:?}",
+            case["name"]
+        );
+    }
+    for case in vector["key_time_cases"].as_array().unwrap() {
+        let result = clave::declaration::evaluate_initial(&case["declaration"])
+            .map_err(|(code, _)| code)
+            .and_then(|publisher| {
+                let keys: Vec<_> = publisher.keys.iter().collect();
+                let doc = &case["envelope"];
+                clave::declaration::verify_signed(
+                    &keys,
+                    doc,
+                    "delta",
+                    doc["delta"]["observed_at"].as_str(),
+                )
+            });
+        assert_eq!(
+            result
+                .map(|_| "key_bound_satisfied")
+                .unwrap_or_else(|code| code),
+            case["expected"].as_str().unwrap(),
+            "{}",
+            case["name"]
+        );
+    }
+}
+
+#[test]
+fn declaration_numeric_spellings_and_unicode_string_bounds_preserve_signed_bytes() {
+    let sk = SigningKey::from_seed(&K1);
+    let original = declaration(
+        0,
+        None,
+        vec![key_json("k1", &K1, "2026-08-01T00:00:00Z")],
+        None,
+        ("k1", &K1),
+    );
+    for literal in ["0", "0.0", "-0", "-0.0", "0e5"] {
+        let mut inner = original["publisher"].clone();
+        inner["seq"] = serde_json::from_str(literal).unwrap();
+        inner["contact"] = "😀".repeat(256).into();
+        inner["keys"][0]["key_id"] = "😀".repeat(64).into();
+        let doc =
+            wist_core::envelope::sign_envelope(&inner, "publisher", &"😀".repeat(64), &sk).unwrap();
+        let before = doc.clone();
+        assert_eq!(
+            clave::declaration::evaluate_initial(&doc).unwrap().seq,
+            0,
+            "{literal}"
+        );
+        assert_eq!(doc, before);
+    }
+    for version in [
+        "01.0.0",
+        "1.00.0",
+        "1.0.00",
+        "1.0.0\n",
+        "1.0.0-alpha",
+        "١.0.0",
+    ] {
+        let mut inner = original["publisher"].clone();
+        inner["wist_version"] = version.into();
+        let doc = wist_core::envelope::sign_envelope(&inner, "publisher", "k1", &sk).unwrap();
+        assert_eq!(
+            clave::declaration::evaluate_initial(&doc).unwrap_err().0,
+            "WIST1-E14",
+            "{version:?}"
+        );
     }
 }
