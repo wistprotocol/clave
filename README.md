@@ -123,8 +123,10 @@ schedule. Missing or corrupt history stops verification.
 Each file must contain exactly one standard Zstandard frame, with no
 skippable frame or trailing data. Replay and legacy size restoration share
 declared-size, frame-window and actual-size checks. Log timestamp parsing
-rejects leap-second spellings without normalization and supports Gregorian
-year zero.
+rejects leap-second spellings without normalization and supports the complete
+four-digit Gregorian range, from year zero through `9999-12-31T23:59:59Z`.
+Conversion uses civil-calendar arithmetic; accepted parameter schedules still
+determine which seconds are eligible sealing instants.
 
 The `history::History` API exposes each authenticated Block's complete
 Entries, original Envelopes, height, timestamp and canonical positions, plus

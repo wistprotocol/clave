@@ -52,6 +52,10 @@ impl Fixture {
     }
 
     fn append(&self, at: i64, entries: Vec<Value>) -> Value {
+        self.append_at(&ts(at), entries)
+    }
+
+    fn append_at(&self, at: &str, entries: Vec<Value>) -> Value {
         let head = self.db.last_block().unwrap();
         let height = head.as_ref().map_or(0, |b| b.block_number + 1);
         let leaves: Vec<_> = entries
@@ -66,7 +70,7 @@ impl Fixture {
         let header = json!({
             "wist_version": "1.0.0", "block_number": height,
             "prev_block_hash": head.map_or("sha256:genesis".into(), |b| b.block_hash),
-            "sealed_at": ts(at), "entry_count": entries.len(),
+            "sealed_at": at, "entry_count": entries.len(),
             "merkle_root": format!("sha256:{}", hex_encode(&root)),
         });
         let signature = self.sk.sign(&jcs::canonicalize(&header).unwrap());
@@ -80,7 +84,7 @@ impl Fixture {
                 &[],
                 height,
                 &block::block_hash(&header).unwrap(),
-                &ts(at),
+                at,
                 &[],
                 &[],
                 &[],
@@ -96,10 +100,14 @@ impl Fixture {
     }
 
     fn parameter(&self, name: &str, value: i64, effective: i64) -> Value {
+        self.parameter_at(name, value, &ts(effective))
+    }
+
+    fn parameter_at(&self, name: &str, value: i64, effective: &str) -> Value {
         let body = envelope::sign_envelope(
             &json!({
                 "wist_version":"1.0.0", "action":"parameter_change", "subject":name,
-                "details":{"parameter":name,"value":value}, "effective_at":ts(effective),
+                "details":{"parameter":name,"value":value}, "effective_at":effective,
             }),
             "update",
             "log1",
@@ -254,6 +262,93 @@ fn signed_leap_second_blocks_are_rejected_without_normalization() {
     assert!(error.contains("WIST3-E03"));
     assert!(error.contains("timestamp must be whole-second UTC"));
     assert!(history.schedule().is_none());
+}
+
+#[test]
+fn signed_history_reaches_the_last_gregorian_second_after_reopen() {
+    let f = Fixture::new();
+    let lifetime = f.parameter_at("canary_lifetime_blocks", 1_000_000, "9999-12-08T00:00:00Z");
+    f.append_at("9999-12-01T00:00:00Z", vec![lifetime.clone()]);
+    let reveal = f.parameter_at("canary_reveal_min_blocks", 300_000, "9999-12-08T01:00:00Z");
+    f.append_at("9999-12-01T01:00:00Z", vec![reveal.clone()]);
+    let amendment = f.parameter_at("block_cadence_seconds", 1, "9999-12-30T23:00:00Z");
+    f.append_at("9999-12-23T00:00:00Z", vec![amendment.clone()]);
+    let cases = [
+        ("9999-12-30T21:00:00Z", 253_402_203_600),
+        ("9999-12-30T22:00:00Z", 253_402_207_200),
+        ("9999-12-30T23:00:00Z", 253_402_210_800),
+        ("9999-12-30T23:00:01Z", 253_402_210_801),
+        ("9999-12-31T23:59:59Z", 253_402_300_799),
+    ];
+    for (at, _) in cases {
+        f.append_at(at, vec![]);
+    }
+    let path = f.data.path().join("clave.sqlite");
+    drop(f.db);
+    let db = Db::open(&path).unwrap();
+    let mut history = History::open(f.data.path(), db.last_block().unwrap()).unwrap();
+    for expected in [lifetime, reveal, amendment] {
+        let verified = history.next_block().unwrap().unwrap();
+        assert_eq!(verified.block().entries, [expected]);
+        assert!(verified.rejected_parameters().is_empty());
+    }
+    assert_eq!(history.schedule().unwrap().accepted().len(), 3);
+    assert_eq!(
+        history
+            .schedule()
+            .unwrap()
+            .value_at("block_cadence_seconds", 253_402_210_799),
+        Some(3600)
+    );
+    assert_eq!(
+        history
+            .schedule()
+            .unwrap()
+            .value_at("block_cadence_seconds", 253_402_210_800),
+        Some(1)
+    );
+    for (at, seconds) in cases {
+        let verified = history.next_block().unwrap().unwrap();
+        assert_eq!(verified.block().header.sealed_at, at);
+        assert_eq!(verified.sealed_at_s(), seconds);
+    }
+    assert!(history.next_block().unwrap().is_none());
+}
+
+#[test]
+fn signed_calendar_boundaries_preserve_timestamp_and_cadence_rejections() {
+    for (at, expected) in [
+        ("0000-01-01T00:00:00Z", Ok(-62_167_219_200)),
+        ("0000-02-29T00:00:00Z", Ok(-62_162_121_600)),
+        ("9999-12-31T23:00:00Z", Ok(253_402_297_200)),
+        ("9999-12-31T23:59:59Z", Err("cadence grid")),
+        (
+            "9999-12-31T23:59:60Z",
+            Err("timestamp must be whole-second UTC"),
+        ),
+        (
+            "10000-01-01T00:00:00Z",
+            Err("timestamp must be whole-second UTC"),
+        ),
+        ("9999-02-29T00:00:00Z", Err("WIST3-E03")),
+    ] {
+        let f = Fixture::new();
+        f.append_at(at, vec![]);
+        let mut history = f.history();
+        match expected {
+            Ok(seconds) => {
+                let verified = history.next_block().unwrap().unwrap();
+                assert_eq!(verified.sealed_at_s(), seconds, "{at}");
+                assert!(history.next_block().unwrap().is_none());
+            }
+            Err(message) => {
+                let error = history.next_block().unwrap_err().to_string();
+                assert!(error.contains(message), "{at}: {error}");
+                assert!(history.schedule().is_none());
+                assert!(history.next_block().is_err());
+            }
+        }
+    }
 }
 
 #[test]

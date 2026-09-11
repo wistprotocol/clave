@@ -20,20 +20,33 @@ pub fn validate(name: &str, value: i64, lookup: impl Fn(&str) -> i64) -> Result<
 }
 
 pub(crate) fn epoch(at: &str) -> Result<i64> {
-    let timestamp = at
-        .parse::<jiff::Timestamp>()
-        .map_err(|e| Error::ParamChange(e.to_string()))?;
-    if at.len() != 20
-        || jiff::Timestamp::from_second(timestamp.as_second())
-            .map_err(|e| Error::ParamChange(e.to_string()))?
-            .to_string()
-            != at
+    let bytes = at.as_bytes();
+    if bytes.len() != 20
+        || !bytes.iter().enumerate().all(|(index, byte)| match index {
+            4 | 7 => *byte == b'-',
+            10 => *byte == b'T',
+            13 | 16 => *byte == b':',
+            19 => *byte == b'Z',
+            _ => byte.is_ascii_digit(),
+        })
+        || bytes[17] > b'5'
     {
         return Err(Error::ParamChange(
             "timestamp must be whole-second UTC with trailing Z".into(),
         ));
     }
-    Ok(timestamp.as_second())
+    let civil = at[..19]
+        .parse::<jiff::civil::DateTime>()
+        .map_err(|e| Error::ParamChange(e.to_string()))?;
+    let days = civil
+        .date()
+        .since((jiff::Unit::Day, jiff::civil::date(1970, 1, 1)))
+        .map_err(|e| Error::ParamChange(e.to_string()))?
+        .get_days();
+    Ok(i64::from(days) * 86_400
+        + i64::from(civil.hour()) * 3600
+        + i64::from(civil.minute()) * 60
+        + i64::from(civil.second()))
 }
 
 pub(crate) fn accept(
