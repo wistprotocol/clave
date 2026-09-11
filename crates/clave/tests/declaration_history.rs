@@ -685,3 +685,91 @@ fn authenticated_parameter_schedules_freeze_window_length_at_each_owner() {
         );
     }
 }
+
+#[test]
+fn legacy_recovery_owners_require_authenticated_matching_history() {
+    let vector = vector("wist1/recovery-bindings");
+    for (name, history) in vector["histories"].as_object().unwrap() {
+        for mutation in ["none", "opening", "prior", "missing_block", "corrupt_block"] {
+            let blocks = history["blocks"].as_array().unwrap();
+            let fixture = Fixture::new(blocks);
+            let state = fixture.restore().unwrap();
+            let window = state.domains()["example.com"].window().unwrap();
+            let path = fixture.data.path().join("clave.sqlite");
+            let db = clave::db::Db::open(&path).unwrap();
+            for block in blocks {
+                db.commit_seal(
+                    &[],
+                    block["header"]["block_number"].as_u64().unwrap(),
+                    &digest(&block["header"]),
+                    block["header"]["sealed_at"].as_str().unwrap(),
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    jcs::canonicalize(block).unwrap().len() as u64,
+                )
+                .unwrap();
+            }
+            db.open_recovery_window(
+                "example.com",
+                &serde_json::to_vec(window.head().envelope()).unwrap(),
+                &serde_json::to_vec(if mutation == "prior" {
+                    window.owner().envelope()
+                } else {
+                    window.before().envelope()
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            db.activate_recovery_window(
+                "example.com",
+                if mutation == "opening" { 0 } else { 1 },
+                &timestamp(window.end_s().try_into().unwrap()),
+            )
+            .unwrap();
+            drop(db);
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            connection
+                .execute(
+                    "ALTER TABLE recovery_windows DROP COLUMN owner_declaration_json",
+                    [],
+                )
+                .unwrap();
+            drop(connection);
+            let block_path = fixture.data.path().join("log/blocks/000000001.json.zst");
+            if mutation == "missing_block" {
+                std::fs::remove_file(&block_path).unwrap();
+            } else if mutation == "corrupt_block" {
+                std::fs::write(&block_path, b"invalid frame").unwrap();
+            }
+            let restored = clave::db::Db::open(&path);
+            if mutation == "none" {
+                let db = restored.unwrap();
+                let row = db.get_recovery_window("example.com").unwrap().unwrap();
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&row.owner_declaration_json).unwrap(),
+                    *window.owner().envelope(),
+                    "{name}"
+                );
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&row.declaration_json).unwrap(),
+                    *window.head().envelope(),
+                    "{name}"
+                );
+                drop(db);
+                assert!(clave::db::Db::open(&path).is_ok());
+            } else {
+                assert!(restored.is_err(), "{name}: {mutation}");
+                let connection = rusqlite::Connection::open(&path).unwrap();
+                assert!(connection
+                    .query_row(
+                        "SELECT owner_declaration_json IS NULL FROM recovery_windows",
+                        [],
+                        |row| row.get::<_, bool>(0)
+                    )
+                    .unwrap());
+            }
+        }
+    }
+}

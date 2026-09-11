@@ -744,3 +744,244 @@ fn a_sealed_page_signed_by_a_since_retired_key_still_verifies() {
         rejection_codes(&r)
     );
 }
+
+fn reopen_without_owner_column(r: &mut Rig) {
+    let path = r.data.path().join("clave.sqlite");
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "ALTER TABLE recovery_windows DROP COLUMN owner_declaration_json",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    r.db = clave::db::Db::open(&path).unwrap();
+}
+
+#[test]
+fn fixed_recovery_bindings_survive_followers_reopen_migration_and_settlement() {
+    for migration in ["none", "pending", "sealed"] {
+        let mut r = rig(make_publisher_with_recovery);
+        let start = "2026-08-09T12:00:00Z"
+            .parse::<jiff::Timestamp>()
+            .unwrap()
+            .as_second();
+        write_feed(&r.p, &r.host, &[], "2026-08-09T12:00:00Z");
+        ingest(&r, "2026-08-09T12:00:00Z");
+        clave::seal::run(&r.db, r.data.path(), &r.sk, start).unwrap();
+        let before = current_declaration(&r.p);
+        let mut owner = before["publisher"].clone();
+        owner["seq"] = 1.into();
+        owner["prev_declaration"] = declaration_hash(&before).into();
+        owner["keys"] = serde_json::json!([key_entry("k1", &K2_SEED, "2026-08-09T13:00:00Z")]);
+        write_declaration(&r.p, &owner, "r1", &R1_SEED);
+        write_feed_signed(&r.p, &r.host, &[], "2026-08-09T13:00:00Z", "k1", &K2_SEED);
+        ingest(&r, "2026-08-09T13:00:00Z");
+        let owner = current_declaration(&r.p);
+        if migration != "pending" {
+            clave::seal::run(&r.db, r.data.path(), &r.sk, start + 3600).unwrap();
+        }
+        let mut follower = owner["publisher"].clone();
+        follower["seq"] = 2.into();
+        follower["prev_declaration"] = declaration_hash(&owner).into();
+        follower["keys"] = serde_json::json!([
+            key_entry("k1", &K2_SEED, "2026-08-09T15:00:00Z"),
+            key_entry("k3", &X1_SEED, "2026-08-09T13:00:00Z")
+        ]);
+        write_declaration(&r.p, &follower, "k1", &K2_SEED);
+        write_feed_signed(&r.p, &r.host, &[], "2026-08-09T14:00:00Z", "k3", &X1_SEED);
+        let report = ingest(&r, "2026-08-09T14:00:00Z");
+        assert_ne!(
+            report.noise,
+            Some("WIST2-E04"),
+            "{migration}: {:?}",
+            r.db.list_rejections(&r.host).unwrap()
+        );
+        let follower = current_declaration(&r.p);
+        if migration != "pending" {
+            clave::seal::run(&r.db, r.data.path(), &r.sk, start + 7200).unwrap();
+        }
+        if migration == "none" {
+            r.db = clave::db::Db::open(&r.data.path().join("clave.sqlite")).unwrap();
+        } else {
+            reopen_without_owner_column(&mut r);
+        }
+        let window = r.db.get_recovery_window(&r.host).unwrap().unwrap();
+        for (raw, expected) in [
+            (&window.prior_declaration_json, &before),
+            (&window.owner_declaration_json, &owner),
+            (&window.declaration_json, &follower),
+        ] {
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(raw).unwrap(),
+                *expected,
+                "{migration}"
+            );
+        }
+        let cases = [
+            ("prior", "k1", &K1_SEED, "2026-08-09T14:00:00Z", None),
+            ("owner", "k1", &K2_SEED, "2026-08-09T14:00:00Z", None),
+            (
+                "follower",
+                "k3",
+                &X1_SEED,
+                "2026-08-09T14:00:00Z",
+                Some("WIST1-E02"),
+            ),
+            (
+                "wrong",
+                "k1",
+                &X1_SEED,
+                "2026-08-09T14:00:00Z",
+                Some("WIST1-E01"),
+            ),
+            ("survivor", "k1", &K2_SEED, "2026-08-09T15:00:00Z", None),
+        ];
+        let ids: Vec<_> = cases
+            .iter()
+            .map(|(name, key, seed, at, _)| {
+                add_delta_signed(
+                    &r.p,
+                    &format!("https://example.com/{name}"),
+                    name,
+                    None,
+                    at,
+                    key,
+                    seed,
+                )
+            })
+            .collect();
+        write_feed_signed(&r.p, &r.host, &ids, "2026-08-09T15:00:00Z", "k3", &X1_SEED);
+        let report = ingest(&r, "2026-08-09T15:00:05Z");
+        assert_eq!(
+            report.queued,
+            vec![ids[0].clone(), ids[1].clone(), ids[4].clone()],
+            "{migration}"
+        );
+        assert_eq!(
+            report.rejected,
+            vec![
+                (ids[2].clone(), "WIST1-E02".into()),
+                (ids[3].clone(), "WIST1-E01".into())
+            ],
+            "{migration}"
+        );
+        write_feed_signed(&r.p, &r.host, &ids, "2026-08-09T15:00:00Z", "k1", &K1_SEED);
+        assert_eq!(ingest(&r, "2026-08-09T15:00:06Z").noise, Some("WIST2-E04"));
+        if migration == "pending" {
+            clave::seal::run(&r.db, r.data.path(), &r.sk, start + 10800).unwrap();
+        }
+        r.db = clave::db::Db::open(&r.data.path().join("clave.sqlite")).unwrap();
+        clave::seal::run(&r.db, r.data.path(), &r.sk, start + 8 * DAY).unwrap();
+        assert!(r.db.get_recovery_window(&r.host).unwrap().is_none());
+        for id in &ids[..2] {
+            assert!(
+                r.db.list_rejections(&r.host)
+                    .unwrap()
+                    .iter()
+                    .any(|rejection| {
+                        rejection.code == "WIST1-E13" && rejection.delta_id.as_ref() == Some(id)
+                    }),
+                "{migration}: {id}"
+            );
+        }
+        assert_eq!(
+            r.db.get_record("https://example.com/survivor", &r.host)
+                .unwrap()
+                .unwrap()
+                .delta_id,
+            ids[4],
+            "{migration}"
+        );
+        let raw = std::fs::read(r.data.path().join(format!(
+            "log/blocks/{:09}.json.zst",
+            r.db.last_block().unwrap().unwrap().block_number
+        )))
+        .unwrap();
+        let block: serde_json::Value =
+            serde_json::from_slice(&zstd::decode_all(&raw[..]).unwrap()).unwrap();
+        let deltas: Vec<_> = block["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["type"] == "publisher_delta")
+            .collect();
+        assert_eq!(deltas.len(), 1, "{migration}");
+        assert_eq!(
+            deltas[0]["body"]["delta"]["url"],
+            "https://example.com/survivor"
+        );
+    }
+}
+
+#[test]
+fn pending_owner_migration_rejects_missing_ambiguous_and_invalid_sources_atomically() {
+    for mutation in ["missing", "ambiguous", "invalid", "duplicate"] {
+        let data = tempfile::tempdir().unwrap();
+        let path = data.path().join("clave.sqlite");
+        let db = clave::db::Db::open(&path).unwrap();
+        for domain in ["a.example.com", "b.example.com"] {
+            let p = make_publisher_with_recovery(domain);
+            let prior = current_declaration(&p);
+            let mut owner = prior["publisher"].clone();
+            owner["seq"] = 1.into();
+            owner["prev_declaration"] = declaration_hash(&prior).into();
+            owner["keys"] = serde_json::json!([key_entry("k2", &K2_SEED, "2026-08-09T13:00:00Z")]);
+            write_declaration(&p, &owner, "r1", &R1_SEED);
+            let owner = current_declaration(&p);
+            db.open_recovery_window(
+                domain,
+                &serde_json::to_vec(&owner).unwrap(),
+                &serde_json::to_vec(&prior).unwrap(),
+            )
+            .unwrap();
+            if domain == "a.example.com" || mutation != "missing" {
+                let mut candidate = owner.clone();
+                if domain == "b.example.com" && mutation == "invalid" {
+                    candidate["publisher"]["contact"] = "altered@example.com".into();
+                }
+                db.insert_pending_entry("publisher_declaration", domain, &candidate, 0)
+                    .unwrap();
+            }
+            if domain == "b.example.com" && matches!(mutation, "ambiguous" | "duplicate") {
+                let mut competitor = owner["publisher"].clone();
+                if mutation == "ambiguous" {
+                    competitor["seq"] = 2.into();
+                }
+                write_declaration(&p, &competitor, "r1", &R1_SEED);
+                db.insert_pending_entry(
+                    "publisher_declaration",
+                    domain,
+                    &current_declaration(&p),
+                    0,
+                )
+                .unwrap();
+            }
+        }
+        drop(db);
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "ALTER TABLE recovery_windows DROP COLUMN owner_declaration_json",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        let restored = clave::db::Db::open(&path);
+        assert_eq!(restored.is_ok(), mutation == "duplicate", "{mutation}");
+        drop(restored);
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        let missing: u64 = connection
+            .query_row(
+                "SELECT count(*) FROM recovery_windows WHERE owner_declaration_json IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            missing,
+            if mutation == "duplicate" { 0 } else { 2 },
+            "{mutation}"
+        );
+    }
+}

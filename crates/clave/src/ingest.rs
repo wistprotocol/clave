@@ -439,21 +439,29 @@ pub fn run(
     };
     let window = db.get_recovery_window(host)?;
     let window_open = window.is_some();
-    let prior_p: Option<Publisher> = match &window {
-        Some(w) => {
-            let doc: Value = serde_json::from_slice(&w.prior_declaration_json)?;
-            declaration::publisher_of(&doc).ok()
-        }
-        None => None,
+    let recovery_sources = window
+        .as_ref()
+        .map(|window| {
+            [
+                &window.prior_declaration_json,
+                &window.owner_declaration_json,
+            ]
+            .into_iter()
+            .map(|raw| {
+                let doc: Value = serde_json::from_slice(raw)?;
+                declaration::publisher_of(&doc).map_err(crate::error::Error::History)
+            })
+            .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?;
+    let key_set: Vec<_> = match &recovery_sources {
+        Some(sources) => sources
+            .iter()
+            .flat_map(|source| source.keys.iter())
+            .collect(),
+        None => current_p.keys.iter().collect(),
     };
-    let mut key_set: Vec<&wist_core::objects::PublisherKey> = current_p.keys.iter().collect();
-    if let Some(pp) = prior_p.as_ref() {
-        for k in &pp.keys {
-            if !key_set.iter().any(|c| c.key_id == k.key_id) {
-                key_set.push(k);
-            }
-        }
-    }
+    let feed_keys: Vec<_> = current_p.keys.iter().collect();
     let subdomain_scope = current_p.subdomain_scope.clone().unwrap_or_default();
 
     let page_key_sets = page_declarations(db, host, &current_doc)?;
@@ -476,7 +484,7 @@ pub fn run(
         let (_, feed_value) = fetched;
         let live_page = pages.is_empty();
         let verified = if live_page {
-            declaration::verify_signed(&key_set, &feed_value, "feed", None).is_ok()
+            declaration::verify_signed(&feed_keys, &feed_value, "feed", None).is_ok()
         } else {
             let generated_at = feed_value["feed"]["generated_at"]
                 .as_str()

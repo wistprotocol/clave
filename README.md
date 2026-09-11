@@ -83,13 +83,29 @@ WIST1-E02; eligible bindings with no valid signature are WIST1-E01. Reused
 identifiers and public keys with different bounds cannot suppress a later
 eligible binding, and signature success cannot borrow another key's bound.
 
-The signed `recovery-bindings.json` corpus exercises this check using frozen
-pre-recovery and owner Declarations reconstructed through authenticated
-history, including after a legitimate follower. This establishes binding
-verification and Declaration source reconstruction. Live ingest still needs
-to retain both frozen sources without identifier deduplication; sealed Feed
-key provenance, complete authenticated Delta chains, durable queue restoration
-and notice-era appeal authority remain incomplete.
+Recovery queue admission retains the complete signing bindings from the
+pre-recovery Declaration and the original window owner. Later Declarations
+can advance the recovery chain head used at settlement, but cannot replace
+either admission source. Both source Envelopes persist in SQLite across
+restart, including reused identifiers with different public keys or timestamp
+bounds. Live Feed authentication uses the current Declaration's signing set;
+it does not borrow the Delta admission union.
+
+Opening an older store restores missing owner Envelopes atomically. An opened
+window requires complete authenticated Declaration history through the
+operator-trusted database head, with a matching opening height and original
+predecessor. A pending window requires exactly one distinct pending recovery
+Declaration that authenticates against its stored predecessor. Missing,
+ambiguous or invalid evidence stops opening; restore the original history or
+pending entries before retrying. Migration never substitutes the evolving
+chain head for the owner.
+
+The signed `recovery-bindings.json` corpus exercises complete binding checks,
+authenticated source reconstruction and owner migration. Live tests cover
+followers, database reopen, admission diagnostics, settlement rejection and
+actual survivor sealing. Full authenticated Delta chains, deadline-triggered
+settlement during admission, signature-failure Declaration re-fetches, sealed
+Feed key provenance and notice-era appeal authority remain incomplete.
 
 Delta key-time checks compare `observed_at` and `valid_from` as instants,
 including numeric UTC offsets and decimal fractions of arbitrary precision.
@@ -211,8 +227,9 @@ notices, appeals or appeal processes.
 
 This API validates Declaration fields, sequencing and author authentication.
 Deltas, Audit Records and non-parameter Registry Updates receive no eligibility checks here.
-Live admission, sealing and SQLite restoration do not yet consume this state;
-`verify-history` retains its Block/parameter verification scope. Snapshot
+SQLite uses this state to restore missing owners of legacy opened recovery
+windows. General live admission, sealing and database reconstruction still use
+separate state; `verify-history` retains its Block/parameter verification scope. Snapshot
 recovery state also requires the protocol’s unresolved Snapshot representation
 rules. Successful reconstruction is not full protocol conformance.
 

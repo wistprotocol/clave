@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS noise_pings(domain TEXT NOT NULL, day TEXT NOT NULL, 
 CREATE TABLE IF NOT EXISTS ingest_meter(domain TEXT NOT NULL, day TEXT NOT NULL, bytes INTEGER NOT NULL, PRIMARY KEY(domain, day));
 CREATE TABLE IF NOT EXISTS walk_state(domain TEXT PRIMARY KEY, suspended INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS governance(update_id TEXT PRIMARY KEY, action TEXT NOT NULL, domain TEXT NOT NULL, level INTEGER, notice_id TEXT, outcome TEXT, sealed_at TEXT NOT NULL, block_number INTEGER NOT NULL, kind TEXT);
-CREATE TABLE IF NOT EXISTS recovery_windows(domain TEXT PRIMARY KEY, declaration_json BLOB NOT NULL, prior_declaration_json BLOB NOT NULL, opened_block INTEGER, window_end TEXT);
+CREATE TABLE IF NOT EXISTS recovery_windows(domain TEXT PRIMARY KEY, declaration_json BLOB NOT NULL, prior_declaration_json BLOB NOT NULL, owner_declaration_json BLOB NOT NULL, opened_block INTEGER, window_end TEXT);
 CREATE TABLE IF NOT EXISTS sealed_declarations(domain TEXT NOT NULL, seq INTEGER NOT NULL, block_number INTEGER NOT NULL, sealed_at TEXT NOT NULL, declaration_json BLOB NOT NULL, PRIMARY KEY(domain, seq));
 CREATE TABLE IF NOT EXISTS roster_acts(block_number INTEGER NOT NULL, act_index INTEGER NOT NULL, sealed_at TEXT NOT NULL, action TEXT NOT NULL, auditor_id TEXT NOT NULL, key_id TEXT NOT NULL, public_key TEXT NOT NULL, for_cause INTEGER NOT NULL, PRIMARY KEY(block_number, act_index));
 CREATE TABLE IF NOT EXISTS queued_deltas(rowid INTEGER PRIMARY KEY AUTOINCREMENT, domain TEXT NOT NULL, delta_id TEXT NOT NULL, entry_json BLOB NOT NULL, url TEXT NOT NULL, chain_pos INTEGER NOT NULL);
@@ -32,6 +32,7 @@ fn add_missing_columns(conn: &Connection) -> Result<()> {
         "ALTER TABLE pending_entries ADD COLUMN turn_block INTEGER",
         "ALTER TABLE param_changes ADD COLUMN entry_index INTEGER",
         "ALTER TABLE blocks ADD COLUMN decompressed_bytes INTEGER",
+        "ALTER TABLE recovery_windows ADD COLUMN owner_declaration_json BLOB",
     ] {
         match conn.execute(statement, []) {
             Ok(_) => {}
@@ -151,6 +152,7 @@ pub struct SealedDeclarationEntry {
 
 pub struct RecoveryWindowRow {
     pub declaration_json: Vec<u8>,
+    pub owner_declaration_json: Vec<u8>,
     pub prior_declaration_json: Vec<u8>,
     pub opened_block: Option<i64>,
     pub window_end: Option<String>,
@@ -252,7 +254,79 @@ impl Db {
         let db = Db { conn };
         db.restore_block_sizes(path)?;
         db.parameter_schedule(0)?;
+        db.restore_recovery_owners(path)?;
         Ok(db)
+    }
+
+    fn restore_recovery_owners(&self, path: &Path) -> Result<()> {
+        let mut statement = self.conn.prepare(
+            "SELECT domain, prior_declaration_json, opened_block FROM recovery_windows WHERE owner_declaration_json IS NULL ORDER BY domain",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Option<u64>>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let history = if rows.iter().any(|(_, _, opened)| opened.is_some()) {
+            Some(crate::history::declarations::Declarations::reconstruct(
+                path.parent().unwrap_or_else(|| Path::new(".")),
+                self.last_block()?,
+            )?)
+        } else {
+            None
+        };
+        let pending = self.peek_pending_entries()?.0;
+        let tx = self.conn.unchecked_transaction()?;
+        for (domain, prior, opened) in rows {
+            let prior: Value = serde_json::from_slice(&prior)?;
+            let unavailable = || {
+                Error::History(format!(
+                    "cannot restore the fixed recovery owner for {domain}"
+                ))
+            };
+            let owner = if let Some(opened) = opened {
+                let window = history
+                    .as_ref()
+                    .and_then(|state| state.domains().get(&domain))
+                    .and_then(|state| state.window())
+                    .ok_or_else(unavailable)?;
+                if window.owner().position().block_number != opened
+                    || *window.before().envelope() != prior
+                {
+                    return Err(unavailable());
+                }
+                window.owner().envelope().clone()
+            } else {
+                let mut candidates = Vec::new();
+                for entry in &pending {
+                    if entry.entry_type == "publisher_declaration"
+                        && entry.domain == domain
+                        && crate::declaration::evaluate(&prior, &entry.entry_json)
+                            == Ok(crate::declaration::Decision::Recovery)
+                        && !candidates.contains(&entry.entry_json)
+                    {
+                        candidates.push(entry.entry_json.clone());
+                    }
+                }
+                if candidates.len() != 1 {
+                    return Err(unavailable());
+                }
+                candidates.pop().unwrap()
+            };
+            tx.execute(
+                "UPDATE recovery_windows SET owner_declaration_json = ?2 WHERE domain = ?1",
+                (&domain, serde_json::to_vec(&owner)?),
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn param(&self, name: &str) -> Result<i64> {
@@ -466,7 +540,7 @@ impl Db {
         prior_declaration_json: &[u8],
     ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO recovery_windows(domain, declaration_json, prior_declaration_json) VALUES (?1, ?2, ?3)",
+            "INSERT INTO recovery_windows(domain, declaration_json, prior_declaration_json, owner_declaration_json) VALUES (?1, ?2, ?3, ?2)",
             (domain, declaration_json, prior_declaration_json),
         )?;
         Ok(())
@@ -475,7 +549,7 @@ impl Db {
     pub fn get_recovery_window(&self, domain: &str) -> Result<Option<RecoveryWindowRow>> {
         self.conn
             .query_row(
-                "SELECT declaration_json, prior_declaration_json, opened_block, window_end FROM recovery_windows WHERE domain = ?1",
+                "SELECT declaration_json, prior_declaration_json, opened_block, window_end, owner_declaration_json FROM recovery_windows WHERE domain = ?1",
                 [domain],
                 |row| {
                     Ok(RecoveryWindowRow {
@@ -483,6 +557,7 @@ impl Db {
                         prior_declaration_json: row.get(1)?,
                         opened_block: row.get(2)?,
                         window_end: row.get(3)?,
+                        owner_declaration_json: row.get(4)?,
                     })
                 },
             )
