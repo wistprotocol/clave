@@ -129,6 +129,54 @@ checks. Other Entry validation and service state reconstruction remain
 separate from this command; successful history verification is not full
 protocol conformance.
 
+## Declaration history replay
+
+`history::declarations::Declarations::reconstruct(directory, pinned_head)`
+rebuilds Declaration sequence and author state from authenticated Block files.
+It returns state only after reaching the trusted head successfully. Streaming
+callers can instead pass each `History` result to `Declarations::apply`.
+
+Replay preserves original Envelopes, publisher-object hashes, sealing times
+and canonical Entry positions. Each domain’s equal-sequence groups apply in
+ascending sequence after due settlement. Conflicting first installations or
+failed Declaration acceptance reject the entire Block, preserving the previous
+Declaration state and returning no effects. Idempotent current re-serves
+install no signature and change no position. A streaming caller must stop and
+discard its `History` reader after any Declaration-stage failure: that reader
+has already advanced its separate Block/parameter state. Keep reconstructed
+state and effects private until the complete pinned prefix validates.
+
+Each domain retains its current Declaration, highest accepted sequence,
+first-sealing position and latest fresh-identity reset position. An open
+recovery window also retains its owner, original predecessor, current recovery
+head and off-chain competitors. Its deadline uses the owner Block’s signed
+parameter schedule and exact 128-bit arithmetic, surviving later amendments
+and recovery followers. Settlement restores the recovery head without lowering
+the sequence floor or resetting identity. Returned installation and settlement
+effects identify resets, window openings and superseded competitors. They do
+not apply database, queue or sanction changes.
+
+`Domain::appeal_declaration()` selects the signing-key source after the current
+Block’s Declaration stage. Callers must separately establish notice eligibility
+and freeze that notice’s complete key bindings; this accessor does not validate
+notices, appeals or appeal processes.
+
+This API is a Declaration sequencing and author-authentication layer. Typed
+Envelope parsing and key-binding checks do not establish full field/schema
+validation, including hostname and RFC 3339 field profiles. Deltas, Audit
+Records and non-parameter Registry Updates receive no eligibility checks here.
+Live admission, sealing and SQLite restoration do not yet consume this state;
+`verify-history` retains its Block/parameter verification scope. Snapshot
+recovery state also requires the protocol’s unresolved Snapshot representation
+rules. Successful reconstruction is not full protocol conformance.
+
+Replay retains all domains’ current state and open-window competitors in memory;
+atomic application stages a copy of the domain map while sharing immutable
+Declaration Envelopes. It does not provide bounded-cache or Snapshot resume
+behavior. Tests consume signed recovery ownership, predecessor, conflict,
+identity, settlement and appeal-key histories, including corrupted or missing
+history and signed recovery-parameter transitions.
+
 ## Build & test
 
 ```bash

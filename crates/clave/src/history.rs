@@ -1,3 +1,5 @@
+pub mod declarations;
+
 use crate::db::BlockRow;
 use crate::error::{Error, Result};
 use crate::registry;
@@ -14,6 +16,7 @@ pub struct VerifiedBlock {
     sealed_at_s: i64,
     decompressed_bytes: u64,
     rejected_parameters: Vec<usize>,
+    recovery_window_days: i64,
 }
 
 impl VerifiedBlock {
@@ -192,6 +195,7 @@ impl History {
         self.prior_hash = hash.clone();
         self.prior_at = Some(at);
         self.largest = largest;
+        let recovery_window_days = schedule.value_at("recovery_window_days", at).unwrap();
         self.schedule = Some(schedule);
         Ok(Some(VerifiedBlock {
             block,
@@ -199,6 +203,7 @@ impl History {
             sealed_at_s: at,
             decompressed_bytes: size,
             rejected_parameters,
+            recovery_window_days,
         }))
     }
 
