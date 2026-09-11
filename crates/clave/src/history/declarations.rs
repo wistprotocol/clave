@@ -1,12 +1,11 @@
 use super::{History, VerifiedBlock};
 use crate::db::BlockRow;
-use crate::declaration::{evaluate, evaluate_initial, inner_hash, Decision};
+use crate::declaration::{evaluate, evaluate_initial, inner_hash, validate_encoding, Decision};
 use crate::error::{Error, Result};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
-use wist_core::objects::PublisherEnvelope;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Position {
@@ -185,7 +184,7 @@ impl Declarations {
             if entry["type"] != "publisher_declaration" {
                 continue;
             }
-            let envelope: PublisherEnvelope = serde_json::from_value(entry["body"].clone())?;
+            let envelope = validate_encoding(&entry["body"]).map_err(rejection)?;
             if envelope.publisher.wist_version != crate::WIST_VERSION {
                 return Err(Error::History("unsupported Declaration version".into()));
             }

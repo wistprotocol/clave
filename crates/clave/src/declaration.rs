@@ -1,10 +1,43 @@
 use serde_json::Value;
 use sha2::Digest;
-use wist_core::crypto::PublicKey;
+use wist_core::crypto::{b64u_decode, b64u_encode, PublicKey};
 use wist_core::envelope::verify_envelope;
 use wist_core::objects::{Publisher, PublisherEnvelope, PublisherKey};
 
 mod time;
+
+pub fn validate_encoding(doc: &Value) -> Result<PublisherEnvelope, (&'static str, String)> {
+    wist_core::jcs::canonicalize(doc).map_err(|e| ("WIST1-E05", e.to_string()))?;
+    let envelope: PublisherEnvelope =
+        serde_json::from_value(doc.clone()).map_err(|e| ("WIST1-E14", e.to_string()))?;
+    for key in envelope
+        .publisher
+        .keys
+        .iter()
+        .chain(envelope.publisher.recovery_keys.iter().flatten())
+    {
+        canonical_encoding(&key.public_key, 32)
+            .map_err(|e| ("WIST1-E14", format!("public_key: {e}")))?;
+    }
+    canonical_encoding(&envelope.sig.value, 64)
+        .map_err(|e| ("WIST1-E14", format!("sig.value: {e}")))?;
+    Ok(envelope)
+}
+
+fn canonical_encoding(value: &str, length: usize) -> Result<(), String> {
+    let bytes = b64u_decode(value).map_err(|e| e.to_string())?;
+    if bytes.len() != length || b64u_encode(&bytes) != value {
+        return Err(format!(
+            "expected canonical base64url encoding of {length} octets"
+        ));
+    }
+    Ok(())
+}
+
+pub fn usable_keys(keys: &[PublisherKey]) -> impl Iterator<Item = &PublisherKey> {
+    keys.iter()
+        .filter(|key| key.alg == "Ed25519" && PublicKey::from_b64u(&key.public_key).is_ok())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
@@ -71,8 +104,7 @@ fn verify_with(doc: &Value, key: &PublisherKey) -> bool {
 }
 
 pub fn evaluate_initial(doc: &Value) -> Result<Publisher, (&'static str, String)> {
-    let envelope: PublisherEnvelope =
-        serde_json::from_value(doc.clone()).map_err(|e| ("WIST2-E04", e.to_string()))?;
+    let envelope = validate_encoding(doc)?;
     let publisher = envelope.publisher;
     disjoint_key_sets(&publisher).map_err(|e| ("WIST1-E08", e))?;
     if publisher.seq != 0 || publisher.prev_declaration.is_some() {
@@ -93,8 +125,10 @@ fn resolve_signer<'a>(
     let key_id = doc["sig"]["key_id"].as_str().unwrap_or_default();
     let candidates: Vec<_> = previous
         .into_iter()
-        .flat_map(|p| p.keys.iter().chain(p.recovery_keys.iter().flatten()))
-        .chain(incoming.keys.iter())
+        .flat_map(|p| {
+            usable_keys(&p.keys).chain(usable_keys(p.recovery_keys.as_deref().unwrap_or(&[])))
+        })
+        .chain(usable_keys(&incoming.keys))
         .filter(|key| key.key_id == key_id)
         .collect();
     if candidates.is_empty() {
@@ -125,8 +159,15 @@ pub fn verify_signed(
     kind: &str,
     observed_at: Option<&str>,
 ) -> Result<(), &'static str> {
+    canonical_encoding(doc["sig"]["value"].as_str().ok_or("WIST1-E14")?, 64)
+        .map_err(|_| "WIST1-E14")?;
+    for key in keys {
+        canonical_encoding(&key.public_key, 32).map_err(|_| "WIST1-E14")?;
+    }
     let key_id = doc["sig"]["key_id"].as_str().unwrap_or_default();
-    let Some(key) = keys.iter().find(|k| k.key_id == key_id) else {
+    let Some(key) = keys.iter().find(|k| {
+        k.key_id == key_id && k.alg == "Ed25519" && PublicKey::from_b64u(&k.public_key).is_ok()
+    }) else {
         return Err("WIST1-E02");
     };
     if let Some(observed_at) = observed_at {
@@ -151,7 +192,7 @@ pub fn verify_signed(
 /// carries the WIST-1 §7 code for the failure and its detail.
 pub fn evaluate(stored: &Value, fetched: &Value) -> Result<Decision, (&'static str, String)> {
     let stored_p = parse(stored).map_err(|e| ("WIST2-E04", e))?;
-    let fetched_p = parse(fetched).map_err(|e| ("WIST2-E04", e))?;
+    let fetched_p = validate_encoding(fetched)?.publisher;
     disjoint_key_sets(&fetched_p).map_err(|e| ("WIST1-E08", e))?;
 
     if fetched_p.domain != stored_p.domain {
@@ -232,9 +273,10 @@ pub fn follows_chain_head(head: &Value, candidate: &Value) -> bool {
     let Ok(head_p) = parse(head) else {
         return false;
     };
-    let Ok(candidate_p) = parse(candidate) else {
+    let Ok(candidate_envelope) = validate_encoding(candidate) else {
         return false;
     };
+    let candidate_p = candidate_envelope.publisher;
     if disjoint_key_sets(&candidate_p).is_err() {
         return false;
     }

@@ -356,6 +356,122 @@ fn spec_declaration_binding_vectors() {
 }
 
 #[test]
+fn spec_canonical_encoding_and_usable_key_vectors() {
+    for name in ["base64url", "declaration-key-eligibility"] {
+        let vector: Value = serde_json::from_slice(
+            &std::fs::read(common::spec_dir().join(format!("vectors/wist1/{name}.json"))).unwrap(),
+        )
+        .unwrap();
+        for case in vector["cases"].as_array().unwrap() {
+            let fetched = case.get("fetched").unwrap_or(&case["envelope"]);
+            let before = fetched.clone();
+            let result = if case["stored"].is_null() {
+                clave::declaration::evaluate_initial(fetched).map(|_| "initial")
+            } else {
+                evaluate(&case["stored"], fetched).map(|decision| match decision {
+                    Decision::Ordinary => "ordinary_rotation",
+                    Decision::Recovery => "recovery_rotation",
+                    Decision::FreshIdentity => "fresh_identity",
+                    Decision::Unchanged => "idempotent",
+                })
+            };
+            assert_eq!(
+                result.unwrap_or_else(|(code, _)| code),
+                case["expected"].as_str().unwrap(),
+                "{}",
+                case["name"]
+            );
+            if let Some(expected) = case.get("expected_usable") {
+                let publisher = clave::declaration::publisher_of(fetched).unwrap();
+                for (field, keys) in [
+                    ("keys", publisher.keys.as_slice()),
+                    (
+                        "recovery_keys",
+                        publisher.recovery_keys.as_deref().unwrap_or(&[]),
+                    ),
+                ] {
+                    let usable: Vec<_> = clave::declaration::usable_keys(keys).collect();
+                    assert_eq!(
+                        serde_json::to_value(usable).unwrap(),
+                        expected[field],
+                        "{} {field}",
+                        case["name"]
+                    );
+                }
+            }
+            assert_eq!(*fetched, before);
+        }
+    }
+}
+
+#[test]
+fn signed_objects_exclude_unusable_keys_before_signature_verification() {
+    let vector: Value = serde_json::from_slice(
+        &std::fs::read(common::spec_dir().join("vectors/wist1/declaration-key-eligibility.json"))
+            .unwrap(),
+    )
+    .unwrap();
+    for case in vector["cases"].as_array().unwrap() {
+        let publisher = clave::declaration::publisher_of(&case["fetched"]).unwrap();
+        for key in &publisher.keys {
+            if !clave::declaration::usable_keys(std::slice::from_ref(key)).any(|_| true) {
+                let doc = wist_core::envelope::sign_envelope(
+                    &json!({"observed_at":"2026-08-04T12:00:00Z"}),
+                    "delta",
+                    &key.key_id,
+                    &SigningKey::from_seed(&K1),
+                )
+                .unwrap();
+                assert_eq!(
+                    clave::declaration::verify_signed(
+                        &[key],
+                        &doc,
+                        "delta",
+                        Some("2026-08-04T12:00:00Z")
+                    ),
+                    Err("WIST1-E02"),
+                    "{}",
+                    case["name"]
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn every_key_and_signature_encoding_boundary_is_checked_before_authentication() {
+    let vector: Value = serde_json::from_slice(
+        &std::fs::read(common::spec_dir().join("vectors/wist1/base64url.json")).unwrap(),
+    )
+    .unwrap();
+    let baseline = &vector["cases"][0]["envelope"];
+    for case in vector["fields"].as_array().unwrap() {
+        let paths: &[&str] = match case["kind"].as_str().unwrap() {
+            "public_key" => &[
+                "/publisher/keys/0/public_key",
+                "/publisher/recovery_keys/0/public_key",
+            ],
+            "signature" => &["/sig/value"],
+            "salt" => continue,
+            other => panic!("unexpected encoding kind {other}"),
+        };
+        for path in paths {
+            let mut candidate = baseline.clone();
+            *candidate.pointer_mut(path).unwrap() = case["encoded"].clone();
+            let result = clave::declaration::validate_encoding(&candidate)
+                .map(|_| "well_formed")
+                .unwrap_or_else(|(code, _)| code);
+            assert_eq!(
+                result,
+                case["expected"].as_str().unwrap(),
+                "{} {path}",
+                case["name"]
+            );
+        }
+    }
+}
+
+#[test]
 fn recovery_chain_membership_uses_authenticated_public_key() {
     let vector: Value = serde_json::from_slice(
         &std::fs::read(common::spec_dir().join("vectors/wist1/declaration-binding.json")).unwrap(),

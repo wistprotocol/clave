@@ -525,7 +525,9 @@ fn invalid_first_declarations_remain_e04_noise_without_persistence() {
         ("duplicate", "WIST1-E08"),
         ("unknown", "WIST1-E02"),
         ("signature", "WIST1-E01"),
-        ("shape", "WIST2-E04"),
+        ("shape", "WIST1-E14"),
+        ("encoding", "WIST1-E14"),
+        ("excluded", "WIST1-E02"),
     ] {
         let (listener, host) = reserve_addr();
         let publisher = make_publisher(&host);
@@ -550,6 +552,25 @@ fn invalid_first_declarations_remain_e04_noise_without_persistence() {
                     "publisher",
                     "k1",
                     &wist_core::crypto::SigningKey::from_seed(&[22; 32]),
+                )
+                .unwrap();
+            }
+            "encoding" => {
+                let mut encoded = doc["sig"]["value"].as_str().unwrap().to_string();
+                let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+                let last = encoded.pop().unwrap() as u8;
+                let index = alphabet.iter().position(|byte| *byte == last).unwrap();
+                encoded.push(alphabet[index + 1] as char);
+                doc["sig"]["value"] = encoded.into();
+            }
+            "excluded" => {
+                doc["publisher"]["keys"][0]["public_key"] =
+                    wist_core::crypto::b64u_encode(&[0; 32]).into();
+                doc = wist_core::envelope::sign_envelope(
+                    &doc["publisher"],
+                    "publisher",
+                    "k1",
+                    &publisher.sk,
                 )
                 .unwrap();
             }
@@ -580,4 +601,76 @@ fn invalid_first_declarations_remain_e04_noise_without_persistence() {
         assert_eq!(rejected[0].code, "WIST2-E04");
         assert!(rejected[0].detail.as_deref().unwrap().contains(reason));
     }
+}
+
+#[test]
+fn unused_excluded_keys_survive_ingest_reopen_and_sealing_without_blocking_usable_keys() {
+    let (listener, host) = reserve_addr();
+    let publisher = make_publisher_with_scope(&host, &["example.com"]);
+    let path = publisher.dir.path().join(".well-known/wist/publisher.json");
+    let mut doc: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let mut excluded = doc["publisher"]["keys"][0].clone();
+    excluded["key_id"] = "excluded".into();
+    excluded["public_key"] = wist_core::crypto::b64u_encode(&[0; 32]).into();
+    doc["publisher"]["keys"]
+        .as_array_mut()
+        .unwrap()
+        .insert(0, excluded);
+    let signed =
+        wist_core::envelope::sign_envelope(&doc["publisher"], "publisher", "k1", &publisher.sk)
+            .unwrap();
+    fs::write(&path, serde_json::to_vec(&signed).unwrap()).unwrap();
+    let id = add_delta(
+        &publisher,
+        "https://example.com/a",
+        "eligible content",
+        None,
+    );
+    write_feed(
+        &publisher,
+        &host,
+        std::slice::from_ref(&id),
+        "2026-08-09T12:00:00Z",
+    );
+    serve_static(listener, publisher.dir.path().to_path_buf());
+    let data = tempfile::tempdir().unwrap();
+    clave::init::run("log.example", data.path()).unwrap();
+    let database = data.path().join("clave.sqlite");
+    let db = clave::db::Db::open(&database).unwrap();
+    let report = clave::ingest::run(
+        &db,
+        &clave::fetch::Client::new(true),
+        data.path(),
+        &host,
+        "2026-08-09T12:00:05Z",
+    )
+    .unwrap();
+    assert_eq!(report.accepted, vec![id.clone()]);
+    assert!(report.rejected.is_empty());
+    drop(db);
+    let db = clave::db::Db::open(&database).unwrap();
+    let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
+    let at = "2026-08-09T13:00:00Z"
+        .parse::<jiff::Timestamp>()
+        .unwrap()
+        .as_second();
+    let sealed = clave::seal::run(&db, data.path(), &sk, at).unwrap();
+    assert_eq!(sealed.entry_count, 2);
+    let mut history = clave::history::History::open(data.path(), db.last_block().unwrap()).unwrap();
+    let block = history.next_block().unwrap().unwrap();
+    assert_eq!(block.block().entries[0]["body"], signed);
+    assert!(history.next_block().unwrap().is_none());
+    assert_eq!(
+        db.get_record("https://example.com/a", &host)
+            .unwrap()
+            .unwrap()
+            .delta_id,
+        id
+    );
+    let state = clave::history::declarations::Declarations::reconstruct(
+        data.path(),
+        db.last_block().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(*state.domains()[&host].current().envelope(), signed);
 }

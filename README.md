@@ -60,6 +60,25 @@ First-contact pulls apply the same checks before storing a Declaration. An
 invalid first Declaration remains a WIST2-E04 pull rejection, with its specific
 Declaration validation reason in the rejection detail.
 
+Admission and Declaration history replay require canonical unpadded base64url
+for every declared public key and detached signature, including unused keys
+and current re-serves. Malformed encoding is WIST1-E14 before sequencing,
+conflict comparison or cryptographic checks. All Declaration Entries in a
+candidate Block receive these checks before replay can install any group;
+failure preserves the entire accepted Declaration state, including due recovery
+settlement. Typed Envelope failures also report WIST1-E14.
+
+Canonically encoded public bytes that do not decode to an eligible Ed25519
+point are excluded from usable signing and recovery sets. Unused excluded keys
+remain in the signed Envelope and do not prevent acceptance. Signer resolution
+checks every usable named Declaration binding; no usable binding is WIST1-E02,
+while usable bindings without a valid signature are WIST1-E01. Original entries
+still determine identifier uniqueness, disjointness, hashes and recovery-set
+protection. Shared Delta/Feed verification also rejects malformed key/signature
+encoding and excludes unusable keys. These checks do not establish complete
+Declaration field validation, authenticated recovery-union resolution, sealed
+Feed key provenance or notice-era appeal authority.
+
 Delta key-time checks compare `observed_at` and `valid_from` as instants,
 including numeric UTC offsets and decimal fractions of arbitrary precision.
 For example, `10:00:00.5Z` follows `10:00:00Z`; equal instants with different
