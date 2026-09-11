@@ -74,6 +74,41 @@ Schedule validation uses the protocol's Registry defaults. Direct local
 parameter overrides, including the accelerated `--cadence` setting, do not
 amend that schedule and must not be used to assert protocol conformance.
 
+## Authenticated history
+
+`clave verify-history --data <directory>` authenticates stored Block files
+from genesis through the database's current head. It needs the public
+`anchor.json`, not the private signing key. The directory's Anchor and
+database head are operator-trusted inputs; this command does not discover
+newer Checkpoints or detect replacement of both trusted inputs.
+
+The reader checks signatures, Merkle roots, Entry counts and canonical
+positions, chain links, whole-second timestamps, the cadence grid, and
+canonical JCS file bytes. It reconstructs accepted parameter schedules from
+signed Envelopes, independently of the database's parameter summaries and
+local overrides. Each Block's transport bound comes from the verified
+prefix; current and pending caps constrain its actual size. Invalid
+parameter candidates are reported by canonical Entry index and change no
+schedule. Missing or corrupt history stops verification.
+
+The `history::History` API exposes each authenticated Block's complete
+Entries, original Envelopes, height, timestamp and canonical positions, plus
+the accepted parameter schedule. It holds one Block at a time and retains
+the accepted schedule; it currently reads each compressed file into memory.
+Callers must finish iteration successfully before committing a reconstructed
+state: the supplied head's hash binds the complete prefix only when its
+Block is reached. A failed reader cannot resume, and Blocks sealed after
+opening the reader are outside its pinned prefix.
+
+Supported histories use object version `1.0.0` and the genesis signing key.
+Log key transitions and successor Anchors stop the reader as unsupported.
+Authentication establishes Block inclusion; it does not establish an
+Entry's author, Audit Record eligibility, or correct derived reputation and
+sanctions. Parameter Envelopes receive their own signature and admission
+checks. Other Entry validation and service state reconstruction remain
+separate from this command; successful history verification is not full
+protocol conformance.
+
 ## Build & test
 
 ```bash

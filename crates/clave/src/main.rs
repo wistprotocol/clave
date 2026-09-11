@@ -33,6 +33,10 @@ enum Command {
         #[arg(long)]
         data: PathBuf,
     },
+    VerifyHistory {
+        #[arg(long)]
+        data: PathBuf,
+    },
     ParamChange {
         #[arg(long)]
         data: PathBuf,
@@ -138,6 +142,21 @@ fn main() -> Result<(), clave::Error> {
             for late in &report.late {
                 println!("late inclusion: {late}");
             }
+        }
+        Command::VerifyHistory { data } => {
+            let db = clave::db::Db::open(&data.join("clave.sqlite"))?;
+            let mut history = clave::history::History::open(&data, db.last_block()?)?;
+            let mut blocks = 0;
+            let mut entries = 0;
+            let mut rejected = 0;
+            while let Some(block) = history.next_block()? {
+                blocks += 1;
+                entries += block.block().entries.len();
+                rejected += block.rejected_parameters().len();
+            }
+            println!(
+                "authenticated {blocks} Blocks containing {entries} Entries; {rejected} parameter candidates ignored; Entry eligibility and derived state are not verified"
+            );
         }
         Command::ParamChange {
             data,

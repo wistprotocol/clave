@@ -7,6 +7,7 @@ pub mod declaration;
 pub mod error;
 pub mod fetch;
 pub mod governance;
+pub mod history;
 pub mod ingest;
 pub mod init;
 pub mod keys;
