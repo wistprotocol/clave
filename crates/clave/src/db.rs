@@ -964,22 +964,10 @@ impl Db {
                 |at| schedule.block_size_bounds(at).1,
             );
             let file = directory.join(format!("log/blocks/{height:09}.json.zst"));
-            let raw = std::fs::read(&file)?;
-            let declared = zstd::zstd_safe::get_frame_content_size(&raw)
-                .map_err(|_| Error::Seal("WIST3-E03 invalid Block frame".into()))?
-                .filter(|&n| n <= bound)
-                .ok_or_else(|| {
-                    Error::Seal("WIST3-E03 missing or excessive Block frame size".into())
-                })?;
-            let bytes = zstd::bulk::decompress(
-                &raw,
-                usize::try_from(declared)
-                    .map_err(|_| Error::Seal("Block frame size is not addressable".into()))?,
-            )
-            .map_err(|e| Error::Seal(format!("WIST3-E03 invalid compressed Block: {e}")))?;
-            if bytes.len() as u64 != declared {
-                return Err(Error::Seal("WIST3-E03 false Block frame size".into()));
-            }
+            let bytes = crate::block_file::read(&file, bound).map_err(|error| match error {
+                Error::History(message) => Error::Seal(message),
+                error => error,
+            })?;
             let block: Value = serde_json::from_slice(&bytes)?;
             wist_core::block::verify_block(&block, &key)?;
             wist_core::block::verify_chain_link(&block["header"], &prior_hash)?;

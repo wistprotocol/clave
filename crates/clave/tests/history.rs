@@ -189,6 +189,74 @@ fn parameters_come_from_signed_envelopes_not_database_summaries_or_overrides() {
 }
 
 #[test]
+fn extra_frames_fail_history_and_legacy_restoration_without_rewriting_files() {
+    for suffix in [
+        zstd::bulk::compress(b"", 3).unwrap(),
+        zstd::bulk::compress(b"x", 3).unwrap(),
+        vec![0x50, 0x2a, 0x4d, 0x18, 0, 0, 0, 0],
+        vec![0],
+    ] {
+        let f = Fixture::new();
+        f.append(START, vec![]);
+        let mut raw = std::fs::read(f.path(0)).unwrap();
+        raw.extend(suffix);
+        std::fs::write(f.path(0), &raw).unwrap();
+        let mut history = f.history();
+        assert!(history
+            .next_block()
+            .unwrap_err()
+            .to_string()
+            .contains("WIST3-E03"));
+        assert!(history.schedule().is_none());
+        let path = f.data.path().join("clave.sqlite");
+        drop(f.db);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute("UPDATE blocks SET decompressed_bytes = NULL", [])
+            .unwrap();
+        drop(conn);
+        let error = match Db::open(&path) {
+            Ok(_) => panic!("restoration accepted extra frame data"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("WIST3-E03"));
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT decompressed_bytes FROM blocks", [], |r| r
+                .get::<_, Option<u64>>(0))
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            std::fs::read(f.data.path().join("log/blocks/000000000.json.zst")).unwrap(),
+            raw
+        );
+    }
+}
+
+#[test]
+fn signed_leap_second_blocks_are_rejected_without_normalization() {
+    let f = Fixture::new();
+    let at = 1_483_225_200;
+    let mut doc = f.append(at, vec![]);
+    doc["header"]["sealed_at"] = json!("2016-12-31T23:59:60Z");
+    doc["sig"]["value"] = json!(f.sk.sign(&jcs::canonicalize(&doc["header"]).unwrap()));
+    f.write(0, &doc);
+    let mut history = History::open(
+        f.data.path(),
+        Some(BlockRow {
+            block_number: 0,
+            block_hash: block::block_hash(&doc["header"]).unwrap(),
+            sealed_at: "2016-12-31T23:59:60Z".into(),
+        }),
+    )
+    .unwrap();
+    let error = history.next_block().unwrap_err().to_string();
+    assert!(error.contains("WIST3-E03"));
+    assert!(error.contains("timestamp must be whole-second UTC"));
+    assert!(history.schedule().is_none());
+}
+
+#[test]
 fn missing_middle_block_cannot_be_skipped_or_resumed() {
     let f = Fixture::new();
     for h in 0..3 {

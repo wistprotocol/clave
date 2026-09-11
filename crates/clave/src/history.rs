@@ -114,7 +114,7 @@ impl History {
                 .default
                 .unwrap() as u64,
         };
-        let bytes = read_block_bytes(
+        let bytes = crate::block_file::read(
             &self
                 .directory
                 .join(format!("log/blocks/{height:09}.json.zst")),
@@ -278,23 +278,6 @@ fn validate_entry_order(entries: &[Value]) -> Result<()> {
         previous = Some(order);
     }
     Ok(())
-}
-
-fn read_block_bytes(path: &Path, bound: u64) -> Result<Vec<u8>> {
-    let raw = std::fs::read(path)?;
-    let declared = zstd::zstd_safe::get_frame_content_size(&raw)
-        .map_err(|_| failure("invalid Block frame"))?
-        .filter(|&size| size <= bound)
-        .ok_or_else(|| failure("missing or excessive Block frame size"))?;
-    let bytes = zstd::bulk::decompress(
-        &raw,
-        usize::try_from(declared).map_err(|_| failure("Block size is not addressable"))?,
-    )
-    .map_err(|e| failure(&format!("invalid compressed Block: {e}")))?;
-    if bytes.len() as u64 != declared {
-        return Err(failure("false Block frame size"));
-    }
-    Ok(bytes)
 }
 
 fn failure(message: &str) -> Error {

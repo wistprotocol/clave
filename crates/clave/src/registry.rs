@@ -59,6 +59,27 @@ mod tests {
     }
 
     #[test]
+    fn log_timestamp_vectors_reject_leap_seconds_without_normalization() {
+        let dir = std::env::var("WIST_SPEC_DIR").unwrap_or_else(|_| "../../../spec".into());
+        let vector: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(std::path::Path::new(&dir).join("vectors/wist3/timestamps.json"))
+                .unwrap(),
+        )
+        .unwrap();
+        for case in vector["cases"].as_array().unwrap() {
+            let at = case["value"].as_str().unwrap();
+            assert_eq!(epoch(at).ok(), case["epoch_seconds"].as_i64(), "{at:?}");
+        }
+        for case in vector["distances"].as_array().unwrap() {
+            assert_eq!(
+                epoch(case["to"].as_str().unwrap()).unwrap()
+                    - epoch(case["from"].as_str().unwrap()).unwrap(),
+                case["seconds"].as_i64().unwrap()
+            );
+        }
+    }
+
+    #[test]
     fn validate_rejects_unknown_identifier() {
         assert!(validate("no_such_param", 1, defaults).is_err());
     }

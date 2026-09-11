@@ -2,6 +2,7 @@
 
 pub mod appeals;
 pub mod baseline;
+mod block_file;
 pub mod db;
 pub mod declaration;
 pub mod error;

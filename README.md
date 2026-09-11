@@ -91,6 +91,12 @@ prefix; current and pending caps constrain its actual size. Invalid
 parameter candidates are reported by canonical Entry index and change no
 schedule. Missing or corrupt history stops verification.
 
+Each file must contain exactly one standard Zstandard frame, with no
+skippable frame or trailing data. Replay and legacy size restoration share
+declared-size, frame-window and actual-size checks. Log timestamp parsing
+rejects leap-second spellings without normalization and supports Gregorian
+year zero.
+
 The `history::History` API exposes each authenticated Block's complete
 Entries, original Envelopes, height, timestamp and canonical positions, plus
 the accepted parameter schedule. It holds one Block at a time and retains
