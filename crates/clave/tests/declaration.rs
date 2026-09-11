@@ -327,3 +327,60 @@ fn spec_declaration_sequence_vector() {
         }
     }
 }
+
+#[test]
+fn spec_declaration_binding_vectors() {
+    let vector: Value = serde_json::from_slice(
+        &std::fs::read(common::spec_dir().join("vectors/wist1/declaration-binding.json")).unwrap(),
+    )
+    .unwrap();
+    for case in vector["cases"].as_array().unwrap() {
+        let result = if case["stored"].is_null() {
+            clave::declaration::evaluate_initial(&case["fetched"]).map(|_| "initial")
+        } else {
+            evaluate(&case["stored"], &case["fetched"]).map(|decision| match decision {
+                Decision::Ordinary => "ordinary_rotation",
+                Decision::Recovery => "recovery_rotation",
+                Decision::FreshIdentity => "fresh_identity",
+                Decision::Unchanged => "idempotent",
+            })
+        };
+        let outcome = result.unwrap_or_else(|(code, _)| code);
+        assert_eq!(
+            outcome,
+            case["expected"].as_str().unwrap(),
+            "{}",
+            case["name"]
+        );
+    }
+}
+
+#[test]
+fn recovery_chain_membership_uses_authenticated_public_key() {
+    let vector: Value = serde_json::from_slice(
+        &std::fs::read(common::spec_dir().join("vectors/wist1/declaration-binding.json")).unwrap(),
+    )
+    .unwrap();
+    for case in vector["cases"].as_array().unwrap() {
+        if matches!(
+            case["expected"].as_str(),
+            Some(
+                "ordinary_rotation"
+                    | "recovery_rotation"
+                    | "fresh_identity"
+                    | "WIST1-E01"
+                    | "WIST1-E02"
+            )
+        ) {
+            assert_eq!(
+                clave::declaration::follows_chain_head(&case["stored"], &case["fetched"]),
+                matches!(
+                    case["expected"].as_str(),
+                    Some("ordinary_rotation" | "recovery_rotation")
+                ),
+                "{}",
+                case["name"]
+            );
+        }
+    }
+}

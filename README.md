@@ -46,6 +46,20 @@ failures surface as WIST1-E13 on the status endpoint. Snapshots carry tier0 SQLi
 tier1 Parquet (extracts + link graph), optionally sharded
 (`snapshot_shard_count` in the local params table).
 
+## Declaration key binding
+
+Declaration admission rejects repeated key identifiers, including identical
+entries, before resolving a signer. A replacement can reuse an old identifier
+for a different public key: verification checks both the previous and incoming
+bindings. Identity continuity follows the authenticated public key, so renaming
+a signing key preserves ordinary rotation and renaming a recovery key preserves
+its recovery authority. Recovery-set protection still applies. Public-key
+aliases within one set remain permitted; signing/recovery overlap is rejected.
+
+First-contact pulls apply the same checks before storing a Declaration. An
+invalid first Declaration remains a WIST2-E04 pull rejection, with its specific
+Declaration validation reason in the rejection detail.
+
 ## Parameter schedules and Block sizes
 
 Parameter admission checks the accepted schedule and queued amendments in

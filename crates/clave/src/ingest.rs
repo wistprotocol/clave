@@ -3,10 +3,8 @@ use crate::error::Result;
 use crate::fetch::Client;
 use serde_json::Value;
 use std::path::Path;
-use wist_core::crypto::PublicKey;
 use wist_core::delta::{content_bytes, delta_id, verify_commitment};
-use wist_core::envelope::verify_envelope;
-use wist_core::objects::{DeltaEnvelope, FeedEnvelope, Payload, Publisher, PublisherEnvelope};
+use wist_core::objects::{DeltaEnvelope, FeedEnvelope, Payload, Publisher};
 
 use crate::declaration::{self, Decision};
 use crate::registry;
@@ -248,51 +246,21 @@ fn onboard_publisher(
         }
     };
 
-    let sig_key_id = value.pointer("/sig/key_id").and_then(Value::as_str);
-    let embedded_key = value
-        .pointer("/publisher/keys")
-        .and_then(Value::as_array)
-        .zip(sig_key_id)
-        .and_then(|(keys, key_id)| {
-            keys.iter()
-                .find(|k| k["key_id"].as_str() == Some(key_id))
-                .and_then(|k| k["public_key"].as_str())
-        });
-    let pk = match embedded_key.and_then(|s| PublicKey::from_b64u(s).ok()) {
-        Some(pk) => pk,
-        None => {
+    let publisher = match declaration::evaluate_initial(&value) {
+        Ok(publisher) => publisher,
+        Err((code, detail)) => {
             record_rejection(
                 db,
                 host,
                 "WIST2-E04",
                 now,
                 None,
-                "missing or invalid embedded key",
+                &format!("{code}: {detail}"),
             )?;
             return Ok(None);
         }
     };
-
-    if verify_envelope(&value, "publisher", &pk).is_err() {
-        record_rejection(
-            db,
-            host,
-            "WIST2-E04",
-            now,
-            None,
-            "signature verification failed",
-        )?;
-        return Ok(None);
-    }
-
-    let parsed: PublisherEnvelope = match serde_json::from_value(value.clone()) {
-        Ok(p) => p,
-        Err(e) => {
-            record_rejection(db, host, "WIST2-E04", now, None, &e.to_string())?;
-            return Ok(None);
-        }
-    };
-    if canonical_authority(&parsed.publisher.domain).as_deref() != Some(host) {
+    if canonical_authority(&publisher.domain).as_deref() != Some(host) {
         record_rejection(
             db,
             host,
@@ -304,7 +272,7 @@ fn onboard_publisher(
         return Ok(None);
     }
 
-    let key = match parsed.publisher.keys.first() {
+    let key = match publisher.keys.first() {
         Some(k) => k,
         None => {
             record_rejection(db, host, "WIST2-E04", now, None, "publisher has no keys")?;

@@ -2,7 +2,7 @@ use serde_json::Value;
 use sha2::Digest;
 use wist_core::crypto::PublicKey;
 use wist_core::envelope::verify_envelope;
-use wist_core::objects::{Publisher, PublisherKey};
+use wist_core::objects::{Publisher, PublisherEnvelope, PublisherKey};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
@@ -34,13 +34,15 @@ fn recovery_keys_bytes(p: &Publisher) -> Result<Vec<u8>, String> {
     }
 }
 
-fn find_key<'a>(keys: &'a [PublisherKey], key_id: &str) -> Option<&'a PublisherKey> {
-    keys.iter().find(|k| k.key_id == key_id)
-}
-
 /// WIST-1 §5.2: the two key sets are disjoint by `key_id` and by
 /// `public_key`. A recovery key that is also a signing key is stolen with it.
 fn disjoint_key_sets(p: &Publisher) -> Result<(), String> {
+    let mut identifiers = std::collections::BTreeSet::new();
+    for key in p.keys.iter().chain(p.recovery_keys.iter().flatten()) {
+        if !identifiers.insert(&key.key_id) {
+            return Err(format!("duplicate key_id {} in Declaration", key.key_id));
+        }
+    }
     let Some(recovery) = p.recovery_keys.as_deref() else {
         return Ok(());
     };
@@ -60,9 +62,52 @@ fn disjoint_key_sets(p: &Publisher) -> Result<(), String> {
 }
 
 fn verify_with(doc: &Value, key: &PublisherKey) -> bool {
-    PublicKey::from_b64u(&key.public_key)
-        .ok()
+    (key.alg == "Ed25519" && doc["sig"]["alg"] == "Ed25519")
+        .then(|| PublicKey::from_b64u(&key.public_key).ok())
+        .flatten()
         .is_some_and(|pk| verify_envelope(doc, "publisher", &pk).is_ok())
+}
+
+pub fn evaluate_initial(doc: &Value) -> Result<Publisher, (&'static str, String)> {
+    let envelope: PublisherEnvelope =
+        serde_json::from_value(doc.clone()).map_err(|e| ("WIST2-E04", e.to_string()))?;
+    let publisher = envelope.publisher;
+    disjoint_key_sets(&publisher).map_err(|e| ("WIST1-E08", e))?;
+    if publisher.seq != 0 || publisher.prev_declaration.is_some() {
+        return Err((
+            "WIST1-E08",
+            "first Declaration must start at seq 0 without a predecessor".into(),
+        ));
+    }
+    resolve_signer(doc, &publisher, None)?;
+    Ok(publisher)
+}
+
+fn resolve_signer<'a>(
+    doc: &Value,
+    incoming: &'a Publisher,
+    previous: Option<&'a Publisher>,
+) -> Result<&'a PublisherKey, (&'static str, String)> {
+    let key_id = doc["sig"]["key_id"].as_str().unwrap_or_default();
+    let candidates: Vec<_> = previous
+        .into_iter()
+        .flat_map(|p| p.keys.iter().chain(p.recovery_keys.iter().flatten()))
+        .chain(incoming.keys.iter())
+        .filter(|key| key.key_id == key_id)
+        .collect();
+    if candidates.is_empty() {
+        return Err((
+            "WIST1-E02",
+            format!("sig.key_id {key_id} matches no known key"),
+        ));
+    }
+    candidates
+        .into_iter()
+        .find(|key| verify_with(doc, key))
+        .ok_or((
+            "WIST1-E01",
+            "declaration signature verification failed".into(),
+        ))
 }
 
 pub fn publisher_of(doc: &Value) -> Result<Publisher, String> {
@@ -145,40 +190,22 @@ pub fn evaluate(stored: &Value, fetched: &Value) -> Result<Decision, (&'static s
         ));
     }
 
-    let key_id = fetched["sig"]["key_id"].as_str().unwrap_or_default();
-    let decision = if let Some(key) = find_key(&stored_p.keys, key_id) {
-        if !verify_with(fetched, key) {
-            return Err((
-                "WIST1-E01",
-                "declaration signature verification failed".into(),
-            ));
-        }
-        Decision::Ordinary
-    } else if let Some(key) = stored_p
-        .recovery_keys
-        .as_deref()
-        .and_then(|keys| find_key(keys, key_id))
+    let signer = resolve_signer(fetched, &fetched_p, Some(&stored_p))?;
+    let decision = if stored_p
+        .keys
+        .iter()
+        .any(|key| key.public_key == signer.public_key)
     {
-        if !verify_with(fetched, key) {
-            return Err((
-                "WIST1-E01",
-                "declaration signature verification failed".into(),
-            ));
-        }
+        Decision::Ordinary
+    } else if stored_p
+        .recovery_keys
+        .iter()
+        .flatten()
+        .any(|key| key.public_key == signer.public_key)
+    {
         Decision::Recovery
-    } else if let Some(key) = find_key(&fetched_p.keys, key_id) {
-        if !verify_with(fetched, key) {
-            return Err((
-                "WIST1-E01",
-                "declaration signature verification failed".into(),
-            ));
-        }
-        Decision::FreshIdentity
     } else {
-        return Err((
-            "WIST1-E02",
-            format!("sig.key_id {key_id} matches no known key"),
-        ));
+        Decision::FreshIdentity
     };
 
     if decision != Decision::Recovery {
@@ -203,12 +230,17 @@ pub fn follows_chain_head(head: &Value, candidate: &Value) -> bool {
     let Ok(head_p) = parse(head) else {
         return false;
     };
-    let key_id = candidate["sig"]["key_id"].as_str().unwrap_or_default();
-    let signer = find_key(&head_p.keys, key_id).or_else(|| {
+    let Ok(candidate_p) = parse(candidate) else {
+        return false;
+    };
+    if disjoint_key_sets(&candidate_p).is_err() {
+        return false;
+    }
+    resolve_signer(candidate, &candidate_p, Some(&head_p)).is_ok_and(|signer| {
         head_p
-            .recovery_keys
-            .as_deref()
-            .and_then(|keys| find_key(keys, key_id))
-    });
-    signer.is_some_and(|key| verify_with(candidate, key))
+            .keys
+            .iter()
+            .chain(head_p.recovery_keys.iter().flatten())
+            .any(|key| key.public_key == signer.public_key)
+    })
 }

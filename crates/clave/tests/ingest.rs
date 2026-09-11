@@ -518,3 +518,66 @@ fn a_redirect_chain_that_revisits_a_url_stops_at_the_repeat() {
     );
     drop(server);
 }
+
+#[test]
+fn invalid_first_declarations_remain_e04_noise_without_persistence() {
+    for (mutation, reason) in [
+        ("duplicate", "WIST1-E08"),
+        ("unknown", "WIST1-E02"),
+        ("signature", "WIST1-E01"),
+        ("shape", "WIST2-E04"),
+    ] {
+        let (listener, host) = reserve_addr();
+        let publisher = make_publisher(&host);
+        let path = publisher.dir.path().join(".well-known/wist/publisher.json");
+        let mut doc: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        match mutation {
+            "duplicate" => {
+                let key = doc["publisher"]["keys"][0].clone();
+                doc["publisher"]["keys"].as_array_mut().unwrap().push(key);
+                doc = wist_core::envelope::sign_envelope(
+                    &doc["publisher"],
+                    "publisher",
+                    "k1",
+                    &publisher.sk,
+                )
+                .unwrap();
+            }
+            "unknown" => doc["sig"]["key_id"] = "unknown".into(),
+            "signature" => {
+                doc = wist_core::envelope::sign_envelope(
+                    &doc["publisher"],
+                    "publisher",
+                    "k1",
+                    &wist_core::crypto::SigningKey::from_seed(&[22; 32]),
+                )
+                .unwrap();
+            }
+            _ => doc["extra"] = true.into(),
+        }
+        fs::write(&path, serde_json::to_vec(&doc).unwrap()).unwrap();
+        serve_static(listener, publisher.dir.path().to_path_buf());
+        let data = tempfile::tempdir().unwrap();
+        clave::init::run("log.example", data.path()).unwrap();
+        let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
+        let report = clave::ingest::run(
+            &db,
+            &clave::fetch::Client::new(true),
+            data.path(),
+            &host,
+            "2026-08-09T12:00:05Z",
+        )
+        .unwrap();
+        assert!(report.accepted.is_empty());
+        assert_eq!(report.noise, Some("WIST2-E04"));
+        assert!(db.get_publisher(&host).unwrap().is_none());
+        assert_eq!(
+            db.count_pending_entries("publisher_declaration").unwrap(),
+            0
+        );
+        let rejected = db.list_rejections(&host).unwrap();
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0].code, "WIST2-E04");
+        assert!(rejected[0].detail.as_deref().unwrap().contains(reason));
+    }
+}
