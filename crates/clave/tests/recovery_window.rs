@@ -985,3 +985,202 @@ fn pending_owner_migration_rejects_missing_ambiguous_and_invalid_sources_atomica
         );
     }
 }
+
+#[test]
+fn recovery_scope_sources_survive_reopen_and_gate_settlement() {
+    let mut r = rig(make_publisher_with_recovery);
+    let start = "2026-08-09T12:00:00Z"
+        .parse::<jiff::Timestamp>()
+        .unwrap()
+        .as_second();
+    let mut prior = current_declaration(&r.p)["publisher"].clone();
+    prior["subdomain_scope"] = serde_json::json!(["old.example", "shared.example"]);
+    write_declaration(&r.p, &prior, "k1", &K1_SEED);
+    write_feed(&r.p, &r.host, &[], "2026-08-09T12:00:00Z");
+    ingest(&r, "2026-08-09T12:00:00Z");
+    clave::seal::run(&r.db, r.data.path(), &r.sk, start).unwrap();
+    let prior = current_declaration(&r.p);
+    let mut owner = prior["publisher"].clone();
+    owner["seq"] = 1.into();
+    owner["prev_declaration"] = declaration_hash(&prior).into();
+    owner["keys"] = serde_json::json!([key_entry("k1", &K2_SEED, "2026-08-09T13:00:00Z")]);
+    owner["subdomain_scope"] = serde_json::json!(["owner.example", "shared.example"]);
+    write_declaration(&r.p, &owner, "r1", &R1_SEED);
+    write_feed_signed(&r.p, &r.host, &[], "2026-08-09T13:00:00Z", "k1", &K2_SEED);
+    ingest(&r, "2026-08-09T13:00:00Z");
+    clave::seal::run(&r.db, r.data.path(), &r.sk, start + 3600).unwrap();
+    let owner = current_declaration(&r.p);
+    let mut follower = owner["publisher"].clone();
+    follower["seq"] = 2.into();
+    follower["prev_declaration"] = declaration_hash(&owner).into();
+    follower["subdomain_scope"] = serde_json::json!(["shared.example", "follower.example"]);
+    write_declaration(&r.p, &follower, "k1", &K2_SEED);
+    write_feed_signed(&r.p, &r.host, &[], "2026-08-09T14:00:00Z", "k1", &K2_SEED);
+    ingest(&r, "2026-08-09T14:00:00Z");
+    clave::seal::run(&r.db, r.data.path(), &r.sk, start + 7200).unwrap();
+    r.db = clave::db::Db::open(&r.data.path().join("clave.sqlite")).unwrap();
+    let window = r.db.get_recovery_window(&r.host).unwrap().unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&window.prior_declaration_json).unwrap(),
+        prior
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&window.owner_declaration_json).unwrap(),
+        owner
+    );
+    let cases = [
+        ("https://old.example/old", &K1_SEED, true),
+        ("https://owner.example/owner", &K2_SEED, true),
+        ("https://owner.example/crossed", &K1_SEED, false),
+        ("https://old.example/crossed", &K2_SEED, false),
+        ("https://follower.example/new", &K2_SEED, false),
+        ("https://shared.example/survivor", &K2_SEED, true),
+    ];
+    let ids: Vec<_> = cases
+        .iter()
+        .map(|(url, key, _)| {
+            add_delta_signed(&r.p, url, "body", None, "2026-08-09T15:00:00Z", "k1", key)
+        })
+        .collect();
+    write_feed_signed(&r.p, &r.host, &ids, "2026-08-09T15:00:00Z", "k1", &K2_SEED);
+    let report = ingest(&r, "2026-08-09T15:00:00Z");
+    assert_eq!(
+        report.queued,
+        vec![ids[0].clone(), ids[1].clone(), ids[5].clone()]
+    );
+    assert_eq!(
+        report.rejected,
+        ids[2..5]
+            .iter()
+            .map(|id| (id.clone(), "WIST1-E03".into()))
+            .collect::<Vec<_>>()
+    );
+    for (id, (url, _, accepted)) in ids.iter().zip(cases) {
+        assert_eq!(r.db.is_delta_seen_for(id, &r.host).unwrap(), accepted);
+        assert_eq!(
+            r.db.url_tip(&r.host, url).unwrap().as_ref(),
+            accepted.then_some(id)
+        );
+    }
+    r.db = clave::db::Db::open(&r.data.path().join("clave.sqlite")).unwrap();
+    clave::seal::run(&r.db, r.data.path(), &r.sk, start + 3600 + 7 * DAY).unwrap();
+    assert!(r.db.get_recovery_window(&r.host).unwrap().is_none());
+    let rejected = r.db.list_rejections(&r.host).unwrap();
+    for id in &ids[..2] {
+        assert!(rejected
+            .iter()
+            .any(|rejection| rejection.code == "WIST1-E13"
+                && rejection.delta_id.as_ref() == Some(id)));
+    }
+    assert_eq!(
+        r.db.get_record("https://shared.example/survivor", &r.host)
+            .unwrap()
+            .unwrap()
+            .delta_id,
+        ids[5]
+    );
+    let head = r.db.last_block().unwrap().unwrap();
+    let raw = std::fs::read(
+        r.data
+            .path()
+            .join(format!("log/blocks/{:09}.json.zst", head.block_number)),
+    )
+    .unwrap();
+    let block: serde_json::Value =
+        serde_json::from_slice(&zstd::decode_all(&raw[..]).unwrap()).unwrap();
+    let sealed: Vec<_> = block["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry["type"] == "publisher_delta")
+        .map(|entry| wist_core::delta::delta_id(&entry["body"]["delta"]).unwrap())
+        .collect();
+    assert_eq!(sealed, vec![ids[5].clone()]);
+}
+
+#[test]
+fn sealing_rechecks_scope_when_the_signing_key_is_retained() {
+    let mut r = rig(|host| make_publisher_with_scope(host, &["example.com"]));
+    let scoped = add_delta(&r.p, "https://example.com/scoped", "scoped", None);
+    let local = add_delta(&r.p, &format!("https://{}/local", r.host), "local", None);
+    write_feed(
+        &r.p,
+        &r.host,
+        &[scoped.clone(), local.clone()],
+        "2026-08-09T12:00:00Z",
+    );
+    assert_eq!(
+        ingest(&r, "2026-08-09T12:00:00Z").accepted,
+        vec![scoped.clone(), local.clone()]
+    );
+    let prior = current_declaration(&r.p);
+    let mut replacement = prior["publisher"].clone();
+    replacement["seq"] = 1.into();
+    replacement["prev_declaration"] = declaration_hash(&prior).into();
+    replacement
+        .as_object_mut()
+        .unwrap()
+        .remove("subdomain_scope");
+    write_declaration(&r.p, &replacement, "k1", &K1_SEED);
+    write_feed(&r.p, &r.host, &[], "2026-08-09T13:00:00Z");
+    ingest(&r, "2026-08-09T13:00:00Z");
+    r.db = clave::db::Db::open(&r.data.path().join("clave.sqlite")).unwrap();
+    let at = "2026-08-09T13:00:00Z"
+        .parse::<jiff::Timestamp>()
+        .unwrap()
+        .as_second();
+    let report = clave::seal::run(&r.db, r.data.path(), &r.sk, at).unwrap();
+    assert!(report
+        .dropped
+        .iter()
+        .any(|drop| drop.contains(&scoped) && drop.contains("WIST1-E03")));
+    assert!(r
+        .db
+        .get_record("https://example.com/scoped", &r.host)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        r.db.get_record(&format!("https://{}/local", r.host), &r.host)
+            .unwrap()
+            .unwrap()
+            .delta_id,
+        local
+    );
+}
+
+#[test]
+fn signed_urls_reject_normalization_changes_before_admission() {
+    let r = rig(|host| make_publisher_with_scope(host, &["example.com", "xn--bcher-kva.example"]));
+    let rejected = [
+        "https://EXAMPLE.com/a",
+        "https://example.com:443/a",
+        "https://example.com/a#fragment",
+        "https://example.com/a/../b",
+        "https://example.com/%zz",
+        "https://bücher.example/a",
+        "http://example.com/a",
+    ];
+    let accepted = [
+        "https://example.com:8443/a",
+        "https://xn--bcher-kva.example/a",
+    ];
+    let ids: Vec<_> = rejected
+        .iter()
+        .chain(&accepted)
+        .map(|url| add_delta(&r.p, url, "body", None))
+        .collect();
+    write_feed(&r.p, &r.host, &ids, "2026-08-09T12:00:00Z");
+    let report = ingest(&r, "2026-08-09T12:00:00Z");
+    assert_eq!(
+        report.rejected,
+        ids[..rejected.len()]
+            .iter()
+            .map(|id| (id.clone(), "WIST1-E03".into()))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(report.accepted, ids[rejected.len()..]);
+    for (id, url) in ids.iter().zip(rejected) {
+        assert!(!r.db.is_delta_seen_for(id, &r.host).unwrap());
+        assert!(r.db.url_tip(&r.host, url).unwrap().is_none());
+    }
+}

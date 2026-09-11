@@ -248,6 +248,46 @@ pub fn delta_publisher(doc: &Value) -> Result<&str, &'static str> {
     Ok(domain)
 }
 
+pub fn verify_delta_authority(sources: &[&Publisher], doc: &Value) -> Result<(), &'static str> {
+    let domain = delta_publisher(doc)?;
+    let sources: Vec<_> = sources
+        .iter()
+        .filter(|source| source.domain == domain)
+        .collect();
+    let keys: Vec<_> = sources.iter().flat_map(|source| &source.keys).collect();
+    let observed_at = doc["delta"]["observed_at"].as_str();
+    verify_signed(&keys, doc, "delta", observed_at)?;
+    let url = doc["delta"]["url"].as_str().ok_or("WIST1-E03")?;
+    for source in sources {
+        if url_in_scope(
+            url,
+            &source.domain,
+            source.subdomain_scope.as_deref().unwrap_or(&[]),
+        ) && verify_signed(
+            &source.keys.iter().collect::<Vec<_>>(),
+            doc,
+            "delta",
+            observed_at,
+        )
+        .is_ok()
+        {
+            return Ok(());
+        }
+    }
+    Err("WIST1-E03")
+}
+
+pub(crate) fn url_in_scope(url: &str, domain: &str, scope: &[String]) -> bool {
+    if wist_core::extract::normalize_url(url, url).as_deref() != Some(url) {
+        return false;
+    }
+    let host = url["https://".len()..]
+        .split(['/', ':'])
+        .next()
+        .unwrap_or_default();
+    host == domain || scope.iter().any(|declared| declared == host)
+}
+
 /// WIST-1 §5.1/§5.2 Key Set checks for a signed object. `observed_at`
 /// activates the `valid_from` bound (Deltas); pass None for feeds.
 /// Err is the rejection code.

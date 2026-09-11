@@ -63,26 +63,6 @@ pub fn canonical_authority(host: &str) -> Option<String> {
     })
 }
 
-fn url_authority(url: &str) -> Option<String> {
-    let parsed = url::Url::parse(url).ok()?;
-    let host = parsed.host_str()?;
-    Some(match parsed.port() {
-        Some(port) => format!("{host}:{port}"),
-        None => host.to_string(),
-    })
-}
-
-/// WIST-1 §3.2 scope rule, compared on Canonical Hosts (§2): a Delta's
-/// `url` authority must equal the Publisher's `domain` or one of its
-/// `subdomain_scope` hostnames.
-fn url_in_scope(url: &str, domain: &str, subdomain_scope: &[String]) -> bool {
-    let Some(authority) = url_authority(url).and_then(|a| canonical_authority(&a)) else {
-        return false;
-    };
-    let matches = |declared: &str| canonical_authority(declared).as_deref() == Some(&authority);
-    matches(domain) || subdomain_scope.iter().any(|s| matches(s))
-}
-
 fn record_rejection(
     db: &Db,
     domain: &str,
@@ -460,15 +440,11 @@ pub fn run_with_clock(
             .collect::<Result<Vec<_>>>()
         })
         .transpose()?;
-    let key_set: Vec<_> = match &recovery_sources {
-        Some(sources) => sources
-            .iter()
-            .flat_map(|source| source.keys.iter())
-            .collect(),
-        None => current_p.keys.iter().collect(),
+    let delta_sources: Vec<_> = match &recovery_sources {
+        Some(sources) => sources.iter().collect(),
+        None => vec![&current_p],
     };
     let feed_keys: Vec<_> = current_p.keys.iter().collect();
-    let subdomain_scope = current_p.subdomain_scope.clone().unwrap_or_default();
 
     let page_key_sets = page_declarations(db, host, &current_doc)?;
     let mut pages: Vec<FeedEnvelope> = Vec::new();
@@ -636,19 +612,14 @@ pub fn run_with_clock(
             report.rejected.push((id.clone(), code.into()));
             continue;
         }
-        let observed_at = delta_value["delta"]["observed_at"]
-            .as_str()
-            .unwrap_or_default();
-        if let Err(code) =
-            declaration::verify_signed(&key_set, &delta_value, "delta", Some(observed_at))
-        {
+        if let Err(code) = declaration::verify_delta_authority(&delta_sources, &delta_value) {
             record_rejection(
                 db,
                 host,
                 code,
                 now,
                 Some(id.as_str()),
-                "key set validation failed",
+                "Delta signing and scope authority failed",
             )?;
             report.rejected.push((id.clone(), code.to_string()));
             continue;
@@ -714,19 +685,6 @@ pub fn run_with_clock(
                 "delta id mismatch",
             )?;
             report.rejected.push((id.clone(), "WIST2-E03".to_string()));
-            continue;
-        }
-
-        if !url_in_scope(&delta_env.delta.url, host, &subdomain_scope) {
-            record_rejection(
-                db,
-                host,
-                "WIST1-E03",
-                now,
-                Some(id.as_str()),
-                "delta url is outside the publisher's authority (scope rule)",
-            )?;
-            report.rejected.push((id.clone(), "WIST1-E03".to_string()));
             continue;
         }
 
@@ -994,45 +952,43 @@ mod tests {
     }
 
     #[test]
-    fn url_in_scope_compares_canonical_hosts() {
-        assert!(url_in_scope(
-            "https://BÜCHER.example/a",
-            "xn--bcher-kva.example",
-            &[]
-        ));
-        assert!(url_in_scope(
+    fn scope_requires_normalized_urls_and_literal_canonical_hosts() {
+        for url in [
+            "https://example.com/a",
+            "https://example.com:8443/a",
             "https://xn--bcher-kva.example/a",
-            "bücher.example",
-            &[]
-        ));
-        assert!(url_in_scope(
+        ] {
+            assert!(declaration::url_in_scope(
+                url,
+                "example.com",
+                &["xn--bcher-kva.example".into()]
+            ));
+        }
+        for url in [
+            "https://EXAMPLE.com/a",
+            "https://bücher.example/a",
+            "https://example.com:443/a",
+            "https://example.com/a#fragment",
+            "https://example.com/a/../b",
+            "https://example.com/%zz",
+            "http://example.com/a",
+            "https://other.example/a",
+            "not a url",
+        ] {
+            assert!(!declaration::url_in_scope(url, "example.com", &[]), "{url}");
+        }
+        assert!(!declaration::url_in_scope(
             "https://sub.example.com/a",
             "example.com",
-            &["SUB.EXAMPLE.COM".to_string()]
-        ));
-        assert!(url_in_scope("https://example.com/a", "EXAMPLE.COM", &[]));
-        assert!(!url_in_scope(
-            "https://bücher.example/a",
-            "example.com",
             &[]
+        ));
+        assert!(declaration::url_in_scope(
+            "https://sub.example.com/a",
+            "example.com",
+            &["sub.example.com".into()]
         ));
     }
 
-    #[test]
-    fn url_in_scope_matches_domain_or_subdomain_scope() {
-        assert!(url_in_scope("https://example.com/a", "example.com", &[]));
-        assert!(url_in_scope(
-            "https://blog.example.com/a",
-            "example.com",
-            &["blog.example.com".to_string()]
-        ));
-        assert!(!url_in_scope(
-            "https://other.example/a",
-            "example.com",
-            &["blog.example.com".to_string()]
-        ));
-        assert!(!url_in_scope("not a url", "example.com", &[]));
-    }
     #[test]
     fn signed_attribution_vectors_preserve_source_and_feed_identity() {
         let root = std::env::var_os("WIST_SPEC_DIR")
@@ -1065,24 +1021,10 @@ mod tests {
                         {
                             return Err("WIST2-E03");
                         }
-                        let source = sources
-                            .iter()
-                            .find(|p| p.domain == domain)
-                            .ok_or("WIST1-E02")?;
-                        let keys: Vec<_> = source.keys.iter().collect();
-                        declaration::verify_signed(
-                            &keys,
+                        declaration::verify_delta_authority(
+                            &sources.iter().collect::<Vec<_>>(),
                             envelope,
-                            "delta",
-                            envelope["delta"]["observed_at"].as_str(),
                         )?;
-                        if !url_in_scope(
-                            envelope["delta"]["url"].as_str().unwrap(),
-                            domain,
-                            source.subdomain_scope.as_deref().unwrap_or(&[]),
-                        ) {
-                            return Err("WIST1-E03");
-                        }
                         Ok(())
                     })();
                     assert_eq!(

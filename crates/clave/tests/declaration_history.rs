@@ -140,6 +140,101 @@ fn delta_bindings_use_frozen_authenticated_recovery_sources() {
     }
 }
 
+#[test]
+fn delta_scope_stays_with_its_authenticated_declaration_source() {
+    let vector = vector("wist1/recovery-scope");
+    let key_id = vector["log_key"]["key_id"].as_str().unwrap();
+    let mut sources = std::collections::BTreeMap::new();
+    for (name, history) in vector["histories"].as_object().unwrap() {
+        let blocks = history["blocks"].as_array().unwrap();
+        assert_eq!(
+            digest(&blocks.last().unwrap()["header"]),
+            history["pinned_head"]
+        );
+        let fixture = Fixture::with_key_id(blocks, key_id);
+        let mut reader = fixture.reader();
+        let mut state = Declarations::default();
+        while let Some(block) = reader.next_block().unwrap() {
+            let effects = state.apply(&block).unwrap();
+            let height = block.block().header.block_number;
+            let domain = &state.domains()["example.com"];
+            fn parse(doc: &Value) -> wist_core::objects::Publisher {
+                clave::declaration::publisher_of(doc).unwrap()
+            }
+            let admission = match domain.window() {
+                Some(window) => vec![
+                    parse(window.before().envelope()),
+                    parse(window.owner().envelope()),
+                ],
+                None => vec![parse(domain.current().envelope())],
+            };
+            sources.insert((name.clone(), height, "admission"), admission);
+            sources.insert(
+                (name.clone(), height, "sealing"),
+                vec![parse(domain.current().envelope())],
+            );
+            for settlement in effects.settlements {
+                assert_eq!(settlement.domain, "example.com");
+                sources.insert(
+                    (name.clone(), height, "settlement"),
+                    vec![parse(settlement.restored.envelope())],
+                );
+            }
+            if vector["probes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|probe| probe["history"] == *name && probe["height"] == height)
+            {
+                let restored = Fixture::with_key_id(&blocks[..=height as usize], key_id)
+                    .restore()
+                    .unwrap();
+                assert_eq!(format!("{restored:?}"), format!("{state:?}"));
+            }
+        }
+        assert_eq!(
+            format!("{:?}", fixture.restore().unwrap()),
+            format!("{state:?}")
+        );
+    }
+    for probe in vector["probes"].as_array().unwrap() {
+        let stage = probe["stage"].as_str().unwrap();
+        let source = &sources[&(
+            probe["history"].as_str().unwrap().to_owned(),
+            probe["height"].as_u64().unwrap(),
+            stage,
+        )];
+        let envelope = &probe["envelope"];
+        let original = envelope.clone();
+        for reverse in [false, true] {
+            let mut source: Vec<_> = source.iter().collect();
+            if reverse {
+                source.reverse();
+            }
+            let check = |doc| match clave::declaration::verify_delta_authority(&source, doc) {
+                Ok(()) => "accepted",
+                Err("WIST1-E14") => "WIST1-E14",
+                Err(_) if stage == "settlement" => "WIST1-E13",
+                Err("WIST1-E01") if stage == "sealing" => "WIST1-E02",
+                Err(code) => code,
+            };
+            assert_eq!(check(envelope), probe["expected"], "{}", probe["name"]);
+            if probe["expected"] == "accepted" {
+                let mut altered = envelope.clone();
+                let signature = altered["sig"]["value"].as_str().unwrap();
+                altered["sig"]["value"] = format!(
+                    "{}{}",
+                    if signature.starts_with('A') { "B" } else { "A" },
+                    &signature[1..]
+                )
+                .into();
+                assert_ne!(check(&altered), "accepted", "{}", probe["name"]);
+            }
+        }
+        assert_eq!(*envelope, original);
+    }
+}
+
 fn log_key() -> SigningKey {
     SigningKey::from_seed(&std::array::from_fn(|i| i as u8))
 }
@@ -189,9 +284,12 @@ struct Fixture {
 
 impl Fixture {
     fn new(blocks: &[Value]) -> Self {
+        Self::with_key_id(blocks, "test-log-k1")
+    }
+    fn with_key_id(blocks: &[Value], key_id: &str) -> Self {
         let data = tempfile::tempdir().unwrap();
-        let anchor = json!({"wist_version":"1.0.0", "log_id":"log.example.org", "genesis_key":{"key_id":"test-log-k1","alg":"Ed25519","public_key":"A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg"},"created_at":"2026-08-02T00:00:00Z"});
-        let anchor = envelope::sign_envelope(&anchor, "anchor", "test-log-k1", &log_key()).unwrap();
+        let anchor = json!({"wist_version":"1.0.0", "log_id":"log.example.org", "genesis_key":{"key_id":key_id,"alg":"Ed25519","public_key":"A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg"},"created_at":"2026-08-02T00:00:00Z"});
+        let anchor = envelope::sign_envelope(&anchor, "anchor", key_id, &log_key()).unwrap();
         std::fs::write(
             data.path().join("anchor.json"),
             jcs::canonicalize(&anchor).unwrap(),

@@ -1,8 +1,8 @@
 # clave
 
-The signed Delta format targets [WIST specification revision `b96e21fe97b591075c369db17346df81292a8158`](https://github.com/wistprotocol/spec/tree/b96e21fe97b591075c369db17346df81292a8158). Object version `1.0.0` alone does not identify a compatible draft.
+The signed Delta format targets [WIST specification revision `8785c62e9e121037473d6144685fc547fa08a1b7`](https://github.com/wistprotocol/spec/tree/8785c62e9e121037473d6144685fc547fa08a1b7). Object version `1.0.0` alone does not identify a compatible draft.
 
-Delta ingestion checks the signed canonical `publisher` against the logical Feed domain before source selection and duplicate suppression, including fetched predecessors. Chain tips use `(publisher, url)` and persist across reopen; the database upgrade preserves existing stored pairs but cannot reconstruct tips already overwritten by an older URL-only table. Sealing and recovery settlement reject mismatches between queue ownership and the signed author. Complete authenticated Delta history, recovery scope provenance and Audit Record eligibility remain separate validation requirements.
+Delta ingestion checks the signed canonical `publisher` against the logical Feed domain before source selection and duplicate suppression, including fetched predecessors. Chain tips use `(publisher, url)` and persist across reopen; the database upgrade preserves existing stored pairs but cannot reconstruct tips already overwritten by an older URL-only table. Sealing and recovery settlement reject mismatches between queue ownership and the signed author. Complete authenticated Delta history, recovery source selection and Audit Record eligibility remain separate validation requirements.
 
 WIST Protocol aggregator. Clave pulls signed deltas from publishers (via ping + the
 publisher's `.well-known/wist` tree), verifies each one against its schema
@@ -87,13 +87,43 @@ WIST1-E02; eligible bindings with no valid signature are WIST1-E01. Reused
 identifiers and public keys with different bounds cannot suppress a later
 eligible binding, and signature success cannot borrow another key's bound.
 
-Recovery queue admission retains the complete signing bindings from the
-pre-recovery Declaration and the original window owner. Later Declarations
-can advance the recovery chain head used at settlement, but cannot replace
-either admission source. Both source Envelopes persist in SQLite across
-restart, including reused identifiers with different public keys or timestamp
-bounds. Live Feed authentication uses the current Declaration's signing set;
-it does not borrow the Delta admission union.
+Recovery queue admission retains complete pre-recovery and window-owner
+Declarations, pairing each source's scope with its signing bindings. A Delta
+must name that Publisher and verify under a usable, time-eligible binding in
+a source that covers its URL host. Reused identifiers, shared public bytes and
+differing timestamp bounds cannot transfer scope between sources. Later
+followers change neither frozen admission source. Both Envelopes persist in
+SQLite across restart; live Feed authentication still uses the current
+Declaration's signing set.
+
+`declaration::verify_delta_authority` checks already-selected, authenticated
+Publisher sources. It derives time from signed `observed_at`, checks every
+eligible binding before E01/E02, and returns E03 when no verifying source
+covers the URL. URLs must already equal their protocol normalization; scope
+compares canonical hostnames independently of a nondefault HTTPS port. Original
+signed bytes remain unchanged. Admission, recovery settlement and sealing use
+this check. Settlement maps binding/scope failure to E13; sealing preserves E03
+for scope and E02 for stranded signing authority. Malformed checked fields
+retain E14 in all three paths.
+
+The signed `recovery-scope.json` probes derive sources from authenticated
+Declaration histories, exercise exact timestamp bounds and reversed source
+order, and compare reconstructed prefixes. Live tests cover crossed source
+rejection, frozen sources through reopen, scope-only E13 settlement, survivor
+publication, and ordinary scope revocation with an unchanged signing key.
+
+Source selection and durable state integration remain incomplete. Sealing's
+highest-sequence lookup still includes superseded competitors; recovery heads
+advance on acceptance rather than only on sealing; admission does not yet
+settle expired windows. Live predecessor evaluation must adopt both eligible
+heads during an open window, then only the restored current head, while
+preserving the accepted sequence floor. Dropped queue copies leave seen-ID
+and chain-tip state that can obstruct permitted re-serving. Restoring a head
+also enqueues a redundant Declaration re-serve; replay must retain idempotence
+without a new installation, window or identity reset. These paths
+require authenticated replay adoption and restart/retry tests before recovery
+conformance can be claimed. Correct supplied-source checks do not establish
+complete Delta chains, schema validation, Audit Record eligibility or sanctions.
 
 Opening an older store restores missing owner Envelopes atomically. An opened
 window requires complete authenticated Declaration history through the
@@ -144,10 +174,9 @@ restart/retry followed by sealing.
 
 Full authenticated Delta chains and strict predecessor timestamp ordering
 remain separate requirements. Log timestamps retain their distinct whole-second
-profile. Cross-check diagnostic priority remains provisional: binding failures
-precede skew failures, which precede URL, chain and Payload checks. The
-specification's CONFORMANCE.md records the unresolved simultaneous-error
-precedence and Publisher-attribution questions.
+profile. Binding and scope checks precede clock, chain and Payload checks;
+WIST-1 §7 permits any established applicable semantic diagnostic after mandatory
+field checks. Signed `publisher` determines attribution under WIST-1 §3.8.
 
 ## Parameter schedules and Block sizes
 

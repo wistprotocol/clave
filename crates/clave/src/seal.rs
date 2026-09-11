@@ -418,9 +418,9 @@ fn revalidate_queued_deltas(
     entries: Vec<SealEntry>,
     sealed_at: &str,
 ) -> Result<(Vec<SealEntry>, Vec<i64>, Vec<String>)> {
-    let mut key_sets: HashMap<String, Vec<wist_core::objects::PublisherKey>> = HashMap::new();
+    let mut sources: HashMap<String, Option<wist_core::objects::Publisher>> = HashMap::new();
     for e in entries.iter().filter(|e| e.entry_type == "publisher_delta") {
-        if key_sets.contains_key(&e.domain) {
+        if sources.contains_key(&e.domain) {
             continue;
         }
         let in_block = entries
@@ -439,11 +439,8 @@ fn revalidate_queued_deltas(
                     .map(|doc| (d.seq, doc))
             });
         let newest = in_block.chain(sealed).max_by_key(|(seq, _)| *seq);
-        let keys = newest
-            .and_then(|(_, doc)| crate::declaration::publisher_of(&doc).ok())
-            .map(|p| p.keys)
-            .unwrap_or_default();
-        key_sets.insert(e.domain.clone(), keys);
+        let source = newest.and_then(|(_, doc)| crate::declaration::publisher_of(&doc).ok());
+        sources.insert(e.domain.clone(), source);
     }
 
     let mut kept = Vec::with_capacity(entries.len());
@@ -454,12 +451,7 @@ fn revalidate_queued_deltas(
             kept.push(e);
             continue;
         }
-        let keys: Vec<&wist_core::objects::PublisherKey> =
-            key_sets.get(&e.domain).into_iter().flatten().collect();
-        let observed_at = e.body["delta"]["observed_at"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
+        let source: Vec<_> = sources.get(&e.domain).into_iter().flatten().collect();
         let verified = crate::declaration::delta_publisher(&e.body)
             .and_then(|domain| {
                 if domain == e.domain {
@@ -468,15 +460,13 @@ fn revalidate_queued_deltas(
                     Err("WIST1-E02")
                 }
             })
-            .and_then(|()| {
-                crate::declaration::verify_signed(&keys, &e.body, "delta", Some(&observed_at))
-            });
+            .and_then(|()| crate::declaration::verify_delta_authority(&source, &e.body));
         let code = match verified {
             Ok(()) => {
                 kept.push(e);
                 continue;
             }
-            Err("WIST1-E14") => "WIST1-E14",
+            Err(code @ ("WIST1-E14" | "WIST1-E03")) => code,
             Err(_) => "WIST1-E02",
         };
         let delta_id = wist_core::delta::delta_id(&e.body["delta"]).unwrap_or_default();
@@ -485,7 +475,7 @@ fn revalidate_queued_deltas(
             code,
             sealed_at,
             Some(&delta_id),
-            Some("Delta fields or signing authority fail at sealing"),
+            Some("Delta fields, signing or scope authority fail at sealing"),
         )?;
         dropped.push(format!("{delta_id}: {code} at sealing"));
         dropped_rowids.push(e.rowid);
@@ -834,12 +824,7 @@ fn settle_recovery_windows(db: &Db, sealed_at: &str) -> Result<()> {
         let publisher: wist_core::objects::Publisher =
             serde_json::from_value(doc["publisher"].clone())
                 .map_err(|e| Error::Seal(format!("stored declaration unparsable: {e}")))?;
-        let keys: Vec<&wist_core::objects::PublisherKey> = publisher.keys.iter().collect();
         for q in db.drain_queued_deltas(&domain)? {
-            let observed_at = q.entry_json["delta"]["observed_at"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string();
             let verified = crate::declaration::delta_publisher(&q.entry_json)
                 .and_then(|author| {
                     if author == domain {
@@ -849,12 +834,7 @@ fn settle_recovery_windows(db: &Db, sealed_at: &str) -> Result<()> {
                     }
                 })
                 .and_then(|()| {
-                    crate::declaration::verify_signed(
-                        &keys,
-                        &q.entry_json,
-                        "delta",
-                        Some(&observed_at),
-                    )
+                    crate::declaration::verify_delta_authority(&[&publisher], &q.entry_json)
                 });
             match verified {
                 Ok(()) => {
@@ -865,7 +845,7 @@ fn settle_recovery_windows(db: &Db, sealed_at: &str) -> Result<()> {
                     if code == "WIST1-E14" { code } else { "WIST1-E13" },
                     sealed_at,
                     Some(&q.delta_id),
-                    Some("queued delta does not verify against the key set at the recovery window's end"),
+                    Some("queued Delta fails signing or scope authority at the recovery window's end"),
                 )?,
             }
         }
