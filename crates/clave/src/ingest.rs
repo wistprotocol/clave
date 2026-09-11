@@ -317,6 +317,20 @@ pub fn run(
     host: &str,
     now: &str,
 ) -> Result<IngestReport> {
+    let clock = now
+        .parse::<jiff::Timestamp>()
+        .map_err(|e| crate::error::Error::Clock(e.to_string()))?;
+    run_with_clock(db, client, data_dir, host, now, || clock)
+}
+
+pub fn run_with_clock(
+    db: &Db,
+    client: &Client,
+    data_dir: &Path,
+    host: &str,
+    now: &str,
+    clock: impl Fn() -> jiff::Timestamp,
+) -> Result<IngestReport> {
     let mut report = IngestReport::default();
     let Some(host) = canonical_authority(host) else {
         return Ok(report);
@@ -613,6 +627,27 @@ pub fn run(
                 now,
                 Some(id.as_str()),
                 "key set validation failed",
+            )?;
+            report.rejected.push((id.clone(), code.to_string()));
+            continue;
+        }
+        let validation_clock = clock();
+        let profile_at = jiff::Timestamp::from_second(
+            validation_clock.as_nanosecond().div_euclid(1_000_000_000) as i64,
+        )
+        .map_err(|e| crate::error::Error::Clock(e.to_string()))?
+        .to_string();
+        let allowance_s = registry::effective(db, "clock_skew_seconds", &profile_at)?;
+        if let Err(code) =
+            declaration::verify_delta_clock(&delta_value, validation_clock, allowance_s)
+        {
+            record_rejection(
+                db,
+                host,
+                code,
+                now,
+                Some(id.as_str()),
+                "observed_at exceeds the clock_skew_seconds allowance",
             )?;
             report.rejected.push((id.clone(), code.to_string()));
             continue;

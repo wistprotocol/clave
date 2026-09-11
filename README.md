@@ -119,8 +119,31 @@ zero, arbitrary decimal fractions and numeric offsets, including arithmetic
 beyond the written year range. Every leap-second label rejects with WIST1-E14;
 validation needs no external leap table. Missing or malformed Delta
 `observed_at` also rejects with WIST1-E14 before shared key verification.
-Full Delta chain ordering and live clock/skew validation remain separate
-requirements. Log timestamps retain their distinct whole-second profile.
+Ingest compares each authenticated Delta with the validator clock plus the
+`clock_skew_seconds` allowance in force at that instant (default 600 seconds).
+The bound is inclusive, preserves every signed fractional digit, and supports
+the Registry's signed integer range, including negative allowances. Rejection
+is WIST1-E06 and leaves the Delta unseen, its chain tip unchanged, and its
+Payload unstored; it enters neither pending sealing nor a recovery queue.
+The same ID can succeed when retried after the clock advances, including
+after reopening the database.
+
+HTTP ingest and baseline polling sample the system clock separately for each
+Delta, including fetched predecessors. `ingest::run_with_clock` accepts a clock
+callback for controlled validation; its `now` argument remains a whole-second
+Log timestamp for existing accounting and governance calls. `ingest::run`
+uses that supplied instant as a fixed validation clock. Clock comparison uses
+the full sampled precision; only parameter lookup floors to whole seconds,
+because amendments take effect on that grid. Tests cover signed clock vectors,
+zero and negative sealed amendments, exact activation, recovery queues and
+restart/retry followed by sealing.
+
+Full authenticated Delta chains and strict predecessor timestamp ordering
+remain separate requirements. Log timestamps retain their distinct whole-second
+profile. Cross-check diagnostic priority remains provisional: binding failures
+precede skew failures, which precede URL, chain and Payload checks. The
+specification's CONFORMANCE.md records the unresolved simultaneous-error
+precedence and Publisher-attribution questions.
 
 ## Parameter schedules and Block sizes
 

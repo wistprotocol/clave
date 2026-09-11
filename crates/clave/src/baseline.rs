@@ -40,7 +40,8 @@ pub fn run_pass(
         .to_string();
     let due = due_domains(db, now_epoch)?;
     for domain in &due {
-        let _ = crate::ingest::run(db, client, data_dir, domain, &now);
+        let _ =
+            crate::ingest::run_with_clock(db, client, data_dir, domain, &now, jiff::Timestamp::now);
     }
     crate::appeals::poll(db, client, sk, now_epoch)?;
     Ok(due)

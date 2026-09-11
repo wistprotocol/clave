@@ -159,7 +159,14 @@ async fn ingest_handler(State(state): State<AppState>, body: Bytes) -> axum::res
         let _guard = guard;
         let _ = tokio::task::spawn_blocking(move || {
             let db = db.lock().unwrap_or_else(PoisonError::into_inner);
-            let report = ingest::run(&db, &client, &data_dir, &payload.host, &now);
+            let report = ingest::run_with_clock(
+                &db,
+                &client,
+                &data_dir,
+                &payload.host,
+                &now,
+                jiff::Timestamp::now,
+            );
             if let Ok(report) = report {
                 if report.noise.is_some() {
                     let day = now.get(..10).unwrap_or(&now);

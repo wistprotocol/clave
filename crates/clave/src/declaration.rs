@@ -6,6 +6,19 @@ use wist_core::objects::{Publisher, PublisherEnvelope, PublisherKey};
 
 mod time;
 
+pub fn verify_delta_clock(
+    doc: &Value,
+    clock: jiff::Timestamp,
+    allowance_s: i64,
+) -> Result<(), &'static str> {
+    let observed_at = doc["delta"]["observed_at"].as_str().ok_or("WIST1-E14")?;
+    match time::within_clock_bound(observed_at, clock, allowance_s) {
+        Some(true) => Ok(()),
+        Some(false) => Err("WIST1-E06"),
+        None => Err("WIST1-E14"),
+    }
+}
+
 pub fn validate_fields(doc: &Value) -> Result<PublisherEnvelope, (&'static str, String)> {
     let canonical = wist_core::jcs::canonicalize(doc).map_err(|e| ("WIST1-E05", e.to_string()))?;
     let envelope: PublisherEnvelope =

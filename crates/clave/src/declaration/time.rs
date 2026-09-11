@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Instant<'a> {
-    second: i64,
+    second: i128,
     fraction: &'a str,
 }
 
@@ -73,11 +73,13 @@ fn parse(value: &str) -> Option<Instant<'_>> {
         .ok()?
         .get_days();
     Some(Instant {
-        second: i64::from(days) * 86_400
-            + i64::from(civil.hour()) * 3600
-            + i64::from(civil.minute()) * 60
-            + i64::from(civil.second())
-            - offset,
+        second: i128::from(
+            i64::from(days) * 86_400
+                + i64::from(civil.hour()) * 3600
+                + i64::from(civil.minute()) * 60
+                + i64::from(civil.second())
+                - offset,
+        ),
         fraction,
     })
 }
@@ -88,6 +90,20 @@ pub(super) fn valid(value: &str) -> bool {
 
 pub(super) fn compare(left: &str, right: &str) -> Option<Ordering> {
     Some(parse(left)?.cmp(&parse(right)?))
+}
+
+pub(super) fn within_clock_bound(
+    value: &str,
+    clock: jiff::Timestamp,
+    allowance_s: i64,
+) -> Option<bool> {
+    let nanoseconds = clock.as_nanosecond();
+    let fraction = format!("{:09}", nanoseconds.rem_euclid(1_000_000_000));
+    let bound = Instant {
+        second: nanoseconds.div_euclid(1_000_000_000) + i128::from(allowance_s),
+        fraction: fraction.trim_end_matches('0'),
+    };
+    Some(parse(value)? <= bound)
 }
 
 #[cfg(test)]
