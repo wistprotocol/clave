@@ -190,30 +190,17 @@ fn verify_sealed_page(
         return false;
     };
     let cut = cut.as_second();
-    let entries: Vec<wist_core::keyset::DeclarationAtInstant> = declarations
+    let current = declarations
         .iter()
-        .map(|(at, seq, keys)| wist_core::keyset::DeclarationAtInstant {
-            seq: *seq,
-            sealed_at_s: *at,
-            keys: keys.iter().map(|k| k.key_id.clone()).collect(),
-        })
-        .collect();
-    let signer = doc["sig"]["key_id"].as_str().unwrap_or_default();
-    let resolved = match wist_core::keyset::page_resolution(&entries, cut, signer) {
-        Some(wist_core::keyset::PageResolution::Current) => {
-            wist_core::keyset::page_key_set_current(&entries, cut)
-        }
-        Some(wist_core::keyset::PageResolution::Next) => {
-            wist_core::keyset::page_key_set_next(&entries, cut)
-        }
-        None => return false,
-    };
-    let keys: Vec<&wist_core::objects::PublisherKey> = declarations
+        .filter(|(at, _, _)| *at <= cut)
+        .max_by_key(|(at, seq, _)| (*at, *seq));
+    let next = declarations
         .iter()
-        .flat_map(|(_, _, keys)| keys.iter())
-        .filter(|k| resolved.contains(&k.key_id))
-        .collect();
-    declaration::verify_signed(&keys, doc, "feed", None).is_ok()
+        .filter(|(at, _, _)| *at > cut)
+        .min_by_key(|(at, seq, _)| (*at, std::cmp::Reverse(*seq)));
+    current.into_iter().chain(next).any(|(_, _, keys)| {
+        declaration::verify_signed(&keys.iter().collect::<Vec<_>>(), doc, "feed", None).is_ok()
+    })
 }
 
 fn key_set_cache_expired(db: &Db, host: &str, now: &str) -> Result<bool> {
@@ -829,6 +816,86 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signed_pages_consume_keyset_resolution_vectors() {
+        let root = std::env::var_os("WIST_SPEC_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../spec")
+            });
+        let vector: Value = serde_json::from_slice(
+            &std::fs::read(root.join("vectors/wist2/page-keyset.json")).unwrap(),
+        )
+        .unwrap();
+        let seeds = std::collections::BTreeMap::from([
+            ("k1", [21; 32]),
+            ("k2", [22; 32]),
+            ("k3", [23; 32]),
+        ]);
+        for case in vector["cases"].as_array().unwrap() {
+            let mut declarations: Vec<_> = case["declarations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|declaration| {
+                    let keys = declaration["keys"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|key| {
+                            let id = key.as_str().unwrap();
+                            wist_core::objects::PublisherKey {
+                                key_id: id.into(),
+                                alg: "Ed25519".into(),
+                                public_key: wist_core::crypto::b64u_encode(
+                                    &ed25519_dalek::SigningKey::from_bytes(&seeds[id])
+                                        .verifying_key()
+                                        .to_bytes(),
+                                ),
+                                valid_from: "2099-01-01T00:00:00Z".into(),
+                            }
+                        })
+                        .collect();
+                    (
+                        declaration["sealed_at_s"].as_i64().unwrap(),
+                        declaration["seq"].as_u64().unwrap(),
+                        keys,
+                    )
+                })
+                .collect();
+            for (page, expected) in case["pages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .zip(case["expected"].as_array().unwrap())
+            {
+                let cut = jiff::Timestamp::from_second(page["generated_at_s"].as_i64().unwrap())
+                    .unwrap()
+                    .to_string();
+                let signer = page["signer"].as_str().unwrap();
+                let body = serde_json::json!({
+                    "wist_version": "1.0.0", "domain": "example.com",
+                    "generated_at": cut, "deltas": [], "next": null
+                });
+                let key = wist_core::crypto::SigningKey::from_seed(&seeds[signer]);
+                let mut doc =
+                    wist_core::envelope::sign_envelope(&body, "feed", signer, &key).unwrap();
+                for _ in 0..2 {
+                    assert_eq!(
+                        verify_sealed_page(&declarations, &doc, &cut),
+                        expected["verifies"].as_bool().unwrap(),
+                        "{}: {}",
+                        case["name"],
+                        page["page"]
+                    );
+                    declarations.reverse();
+                }
+                doc["feed"]["domain"] = "tampered.example".into();
+                assert!(!verify_sealed_page(&declarations, &doc, &cut));
+            }
+        }
+    }
 
     #[test]
     fn is_bare_authority_accepts_host_and_host_port() {
