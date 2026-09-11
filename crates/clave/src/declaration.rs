@@ -249,23 +249,28 @@ pub fn verify_signed(
         canonical_encoding(&key.public_key, 32).map_err(|_| "WIST1-E14")?;
     }
     let key_id = doc["sig"]["key_id"].as_str().unwrap_or_default();
-    let Some(key) = keys.iter().find(|k| {
-        k.key_id == key_id && k.alg == "Ed25519" && PublicKey::from_b64u(&k.public_key).is_ok()
-    }) else {
-        return Err("WIST1-E02");
-    };
-    if let Some(observed_at) = observed_at {
-        if !time::compare(observed_at, &key.valid_from).is_some_and(|order| !order.is_lt()) {
-            return Err("WIST1-E02");
+    let mut eligible = false;
+    for key in keys.iter().filter(|key| key.key_id == key_id) {
+        if key.alg != "Ed25519" {
+            continue;
+        }
+        let Ok(public) = PublicKey::from_b64u(&key.public_key) else {
+            continue;
+        };
+        if observed_at.is_some_and(|at| {
+            !time::compare(at, &key.valid_from).is_some_and(|order| !order.is_lt())
+        }) {
+            continue;
+        }
+        eligible = true;
+        if verify_envelope(doc, kind, &public).is_ok() {
+            return Ok(());
         }
     }
-    let ok = PublicKey::from_b64u(&key.public_key)
-        .ok()
-        .is_some_and(|pk| verify_envelope(doc, kind, &pk).is_ok());
-    if ok {
-        Ok(())
-    } else {
+    if eligible {
         Err("WIST1-E01")
+    } else {
+        Err("WIST1-E02")
     }
 }
 

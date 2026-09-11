@@ -76,8 +76,20 @@ checks every usable named Declaration binding; no usable binding is WIST1-E02,
 while usable bindings without a valid signature are WIST1-E01. Original entries
 still determine identifier uniqueness, disjointness, hashes and recovery-set
 protection. Shared Delta/Feed verification also rejects malformed key/signature
-encoding and excludes unusable keys. Authenticated recovery-union resolution,
-sealed Feed key provenance and notice-era appeal authority remain incomplete.
+encoding and excludes unusable keys. Delta verification retains all supplied
+named bindings, filters each by usability and its inclusive timestamp bound,
+then accepts if any eligible binding verifies. No eligible binding is
+WIST1-E02; eligible bindings with no valid signature are WIST1-E01. Reused
+identifiers and public keys with different bounds cannot suppress a later
+eligible binding, and signature success cannot borrow another key's bound.
+
+The signed `recovery-bindings.json` corpus exercises this check using frozen
+pre-recovery and owner Declarations reconstructed through authenticated
+history, including after a legitimate follower. This establishes binding
+verification and Declaration source reconstruction. Live ingest still needs
+to retain both frozen sources without identifier deduplication; sealed Feed
+key provenance, complete authenticated Delta chains, durable queue restoration
+and notice-era appeal authority remain incomplete.
 
 Delta key-time checks compare `observed_at` and `valid_from` as instants,
 including numeric UTC offsets and decimal fractions of arbitrary precision.

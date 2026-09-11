@@ -77,6 +77,69 @@ fn field_rejection_preserves_the_complete_declaration_prefix() {
     }
 }
 
+#[test]
+fn delta_bindings_use_frozen_authenticated_recovery_sources() {
+    let vector = vector("wist1/recovery-bindings");
+    let mut prefixes = std::collections::BTreeMap::new();
+    for (name, history) in vector["histories"].as_object().unwrap() {
+        let blocks = history["blocks"].as_array().unwrap();
+        assert_eq!(
+            digest(&blocks.last().unwrap()["header"]),
+            history["pinned_head"]
+        );
+        let fixture = Fixture::new(blocks);
+        let mut reader = fixture.reader();
+        let mut state = Declarations::default();
+        while let Some(block) = reader.next_block().unwrap() {
+            state.apply(&block).unwrap();
+            if state.domains()["example.com"].window().is_some() {
+                prefixes.insert(
+                    (name.clone(), block.block().header.block_number),
+                    state.clone(),
+                );
+            }
+        }
+        assert_eq!(
+            format!("{:?}", fixture.restore().unwrap()),
+            format!("{state:?}")
+        );
+    }
+    for case in vector["cases"].as_array().unwrap() {
+        let name = case["name"].as_str().unwrap();
+        let state = &prefixes[&(
+            case["history"].as_str().unwrap().to_owned(),
+            case["prefix_height"].as_u64().unwrap(),
+        )];
+        let before = format!("{state:?}");
+        let window = state.domains()["example.com"].window().unwrap();
+        assert_eq!(window.owner().position().block_number, 1);
+        assert_eq!(window.before().position().block_number, 0);
+        let prior = clave::declaration::publisher_of(window.before().envelope()).unwrap();
+        let owner = clave::declaration::publisher_of(window.owner().envelope()).unwrap();
+        let mut keys: Vec<_> = prior.keys.iter().chain(&owner.keys).collect();
+        let envelope = &case["envelope"];
+        let check = |keys: &[&wist_core::objects::PublisherKey], doc: &Value| {
+            clave::declaration::verify_signed(
+                keys,
+                doc,
+                "delta",
+                doc["delta"]["observed_at"].as_str(),
+            )
+            .err()
+            .unwrap_or("accepted")
+        };
+        assert_eq!(check(&keys, envelope), case["expected"], "{name}");
+        keys.reverse();
+        assert_eq!(check(&keys, envelope), case["expected"], "{name}");
+        if case["expected"] == "accepted" {
+            let mut altered = envelope.clone();
+            altered["delta"]["url"] = json!("https://example.com/changed");
+            assert_eq!(check(&keys, &altered), "WIST1-E01", "{name}");
+        }
+        assert_eq!(format!("{state:?}"), before, "{name}");
+    }
+}
+
 fn log_key() -> SigningKey {
     SigningKey::from_seed(&std::array::from_fn(|i| i as u8))
 }
