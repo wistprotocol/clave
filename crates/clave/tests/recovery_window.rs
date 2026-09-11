@@ -121,6 +121,141 @@ fn rotation_extends_key_set_and_enforces_valid_from() {
 }
 
 #[test]
+fn fractional_key_bound_survives_ingest_reopen_and_sealing() {
+    let r = rig(|h| make_publisher_with_scope(h, &["example.com"]));
+    let mut declaration = current_declaration(&r.p)["publisher"].clone();
+    declaration["keys"][0]["valid_from"] = "2026-08-09T12:00:00Z".into();
+    write_declaration(&r.p, &declaration, "k1", &K1_SEED);
+    let accepted = add_delta_signed(
+        &r.p,
+        "https://example.com/a",
+        "alpha",
+        None,
+        "2026-08-09T12:00:00.5Z",
+        "k1",
+        &K1_SEED,
+    );
+    let rejected = add_delta_signed(
+        &r.p,
+        "https://example.com/b",
+        "beta",
+        None,
+        "2026-08-09T11:59:59.999Z",
+        "k1",
+        &K1_SEED,
+    );
+    write_feed(
+        &r.p,
+        &r.host,
+        &[accepted.clone(), rejected.clone()],
+        "2026-08-09T12:00:00Z",
+    );
+    let report = ingest(&r, "2026-08-09T12:00:05Z");
+    assert_eq!(report.accepted, vec![accepted.clone()]);
+    assert_eq!(report.rejected, vec![(rejected, "WIST1-E02".into())]);
+    drop(r.db);
+    let db = clave::db::Db::open(&r.data.path().join("clave.sqlite")).unwrap();
+    let now = "2026-08-09T12:00:06Z"
+        .parse::<jiff::Timestamp>()
+        .unwrap()
+        .as_second();
+    clave::seal::run(&db, r.data.path(), &r.sk, now).unwrap();
+    let record = db
+        .get_record("https://example.com/a", &r.host)
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.delta_id, accepted);
+    assert_eq!(record.observed_at, "2026-08-09T12:00:00.5Z");
+    assert!(db
+        .get_record("https://example.com/b", &r.host)
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn recovery_settlement_applies_the_followers_fractional_key_bound_after_reopen() {
+    let r = rig(make_publisher_with_recovery);
+    let opened_at = "2026-08-09T12:00:00Z"
+        .parse::<jiff::Timestamp>()
+        .unwrap()
+        .as_second();
+    write_feed(&r.p, &r.host, &[], "2026-08-09T12:00:00Z");
+    ingest(&r, "2026-08-09T12:00:00Z");
+    clave::seal::run(&r.db, r.data.path(), &r.sk, opened_at).unwrap();
+    let previous = current_declaration(&r.p);
+    let mut recovery = previous["publisher"].clone();
+    recovery["seq"] = 1.into();
+    recovery["prev_declaration"] = declaration_hash(&previous).into();
+    recovery["keys"] = serde_json::json!([key_entry("k2", &K2_SEED, "2026-08-09T12:00:00Z")]);
+    write_declaration(&r.p, &recovery, "r1", &R1_SEED);
+    let survivor = add_delta_signed(
+        &r.p,
+        "https://example.com/a",
+        "alpha",
+        None,
+        "2026-08-09T13:00:00.5Z",
+        "k2",
+        &K2_SEED,
+    );
+    let rejected = add_delta_signed(
+        &r.p,
+        "https://example.com/b",
+        "beta",
+        None,
+        "2026-08-09T12:59:59.9Z",
+        "k2",
+        &K2_SEED,
+    );
+    write_feed_signed(
+        &r.p,
+        &r.host,
+        &[survivor.clone(), rejected.clone()],
+        "2026-08-09T13:00:00Z",
+        "k2",
+        &K2_SEED,
+    );
+    assert_eq!(
+        ingest(&r, "2026-08-09T13:00:01Z").queued,
+        vec![survivor.clone(), rejected.clone()]
+    );
+    clave::seal::run(&r.db, r.data.path(), &r.sk, opened_at + 3600).unwrap();
+    let previous = current_declaration(&r.p);
+    let mut follower = previous["publisher"].clone();
+    follower["seq"] = 2.into();
+    follower["prev_declaration"] = declaration_hash(&previous).into();
+    follower["keys"][0]["valid_from"] = "2026-08-09T13:00:00Z".into();
+    write_declaration(&r.p, &follower, "k2", &K2_SEED);
+    write_feed_signed(&r.p, &r.host, &[], "2026-08-09T14:00:00Z", "k2", &K2_SEED);
+    ingest(&r, "2026-08-09T14:00:01Z");
+    clave::seal::run(&r.db, r.data.path(), &r.sk, opened_at + 7200).unwrap();
+    assert!(r
+        .db
+        .get_record("https://example.com/a", &r.host)
+        .unwrap()
+        .is_none());
+    drop(r.db);
+    let db = clave::db::Db::open(&r.data.path().join("clave.sqlite")).unwrap();
+    clave::seal::run(&db, r.data.path(), &r.sk, opened_at + 3600 + 7 * DAY).unwrap();
+    assert!(db.get_recovery_window(&r.host).unwrap().is_none());
+    assert_eq!(
+        db.get_record("https://example.com/a", &r.host)
+            .unwrap()
+            .unwrap()
+            .delta_id,
+        survivor
+    );
+    assert!(db
+        .get_record("https://example.com/b", &r.host)
+        .unwrap()
+        .is_none());
+    assert!(db
+        .list_rejections(&r.host)
+        .unwrap()
+        .iter()
+        .any(|r| r.code == "WIST1-E13" && r.delta_id.as_ref() == Some(&rejected)));
+}
+
+#[test]
 fn stale_declaration_is_e08_and_stored_set_stays() {
     let r = rig(|h| make_publisher_with_scope(h, &["example.com"]));
     let d1 = add_delta(&r.p, "https://example.com/a", "alpha", None);

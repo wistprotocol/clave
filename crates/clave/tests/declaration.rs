@@ -384,3 +384,88 @@ fn recovery_chain_membership_uses_authenticated_public_key() {
         }
     }
 }
+
+#[test]
+fn signed_delta_key_bound_orders_rfc3339_instants_exactly() {
+    let sk = SigningKey::from_seed(&K1);
+    let cases = [
+        ("2026-08-04T10:00:00Z", "2026-08-04T10:00:00.5Z", true),
+        ("2026-08-04T10:00:00.5Z", "2026-08-04T10:00:00Z", false),
+        ("2026-08-04T10:00:00Z", "2026-08-04T10:00:00.0000Z", true),
+        ("2026-08-04T10:00:00.10Z", "2026-08-04T10:00:00.1Z", true),
+        (
+            "2026-08-04T10:00:00.0000000001Z",
+            "2026-08-04T10:00:00.0000000000Z",
+            false,
+        ),
+        (
+            "2026-08-04T10:00:00.0000000001Z",
+            "2026-08-04T10:00:00.0000000002Z",
+            true,
+        ),
+        (
+            "2026-08-04T10:00:00.1000000000000000000000000001Z",
+            "2026-08-04T10:00:00.1Z",
+            false,
+        ),
+        ("2026-08-04T10:00:00Z", "2026-08-04T11:00:00+01:00", true),
+        ("2026-08-04T10:00:00Z", "2026-08-04T10:30:00+01:00", false),
+        ("2026-08-04T10:00:00Z", "2026-08-04T09:30:00-01:00", true),
+        ("2026-08-04T10:00:00Z", "2026-08-04t10:00:00z", true),
+        ("2026-08-04T10:00:00Z", "2026-08-04T10:00:00-00:00", true),
+        ("2026-08-04T10:00:00+00:00", "2026-08-04T10:00:00Z", true),
+        ("2026-08-04T00:00:00Z", "2026-08-03T23:59:59-00:01", true),
+        (
+            "2016-12-31T23:59:59.999999999999Z",
+            "2016-12-31T23:59:60Z",
+            true,
+        ),
+        (
+            "2016-12-31T23:59:60Z",
+            "2016-12-31T23:59:59.999999999999Z",
+            false,
+        ),
+        (
+            "2017-01-01T00:00:00Z",
+            "2016-12-31T23:59:60.999999999999Z",
+            false,
+        ),
+        (
+            "2016-12-31T23:59:60.999999999999Z",
+            "2017-01-01T00:00:00Z",
+            true,
+        ),
+        (
+            "2016-12-31T23:59:60.5Z",
+            "2017-01-01T00:59:60.50+01:00",
+            true,
+        ),
+        (
+            "2016-12-31T23:59:60.5Z",
+            "2016-12-31T18:29:60.4-05:30",
+            false,
+        ),
+        ("0000-02-28T23:59:59Z", "0000-02-29T00:00:00Z", true),
+        ("2000-02-29T23:59:59Z", "2000-03-01T00:00:00Z", true),
+        ("0000-01-01T00:00:00Z", "0000-01-01T00:00:00+23:59", false),
+        ("9999-12-31T23:59:59Z", "9999-12-31T23:59:59-23:59", true),
+    ];
+    for (valid_from, observed_at, eligible) in cases {
+        let key = serde_json::from_value(key_json("k1", &K1, valid_from)).unwrap();
+        let delta = json!({"wist_version":"1.0.0", "url":"https://example.com/a", "change_type":"delete", "observed_at":observed_at, "prev":format!("sha256:{}", "0".repeat(64)), "meta":{"lang":"en"}});
+        let signed = wist_core::envelope::sign_envelope(&delta, "delta", "k1", &sk).unwrap();
+        assert_eq!(
+            clave::declaration::verify_signed(&[&key], &signed, "delta", Some(observed_at)),
+            if eligible { Ok(()) } else { Err("WIST1-E02") },
+            "valid_from={valid_from}, observed_at={observed_at}"
+        );
+        if eligible {
+            let mut tampered = signed;
+            tampered["delta"]["url"] = "https://example.com/b".into();
+            assert_eq!(
+                clave::declaration::verify_signed(&[&key], &tampered, "delta", Some(observed_at)),
+                Err("WIST1-E01")
+            );
+        }
+    }
+}

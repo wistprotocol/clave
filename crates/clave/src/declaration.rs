@@ -4,6 +4,8 @@ use wist_core::crypto::PublicKey;
 use wist_core::envelope::verify_envelope;
 use wist_core::objects::{Publisher, PublisherEnvelope, PublisherKey};
 
+mod time;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
     Unchanged,
@@ -128,7 +130,7 @@ pub fn verify_signed(
         return Err("WIST1-E02");
     };
     if let Some(observed_at) = observed_at {
-        if observed_at < key.valid_from.as_str() {
+        if !time::compare(observed_at, &key.valid_from).is_some_and(|order| !order.is_lt()) {
             return Err("WIST1-E02");
         }
     }

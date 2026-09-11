@@ -60,6 +60,21 @@ First-contact pulls apply the same checks before storing a Declaration. An
 invalid first Declaration remains a WIST2-E04 pull rejection, with its specific
 Declaration validation reason in the rejection detail.
 
+Delta key-time checks compare `observed_at` and `valid_from` as instants,
+including numeric UTC offsets and decimal fractions of arbitrary precision.
+For example, `10:00:00.5Z` follows `10:00:00Z`; equal instants with different
+fraction lengths or offsets satisfy the inclusive key bound. Ingest, sealing
+and recovery settlement share this comparison. Timestamp strings remain
+unchanged in signed Envelopes.
+
+The comparison preserves a represented leap second between the preceding
+second and the following midnight. It does not establish that a leap second
+was actually inserted on that date. Full timestamp eligibility, Declaration
+field validation and schema-error classification remain incomplete; an
+unparseable key-time comparison currently fails with WIST1-E02. This diagnostic
+is not a specified general syntax-error code. Log timestamps retain their
+separate whole-second profile.
+
 ## Parameter schedules and Block sizes
 
 Parameter admission checks the accepted schedule and queued amendments in
