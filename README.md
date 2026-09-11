@@ -1,5 +1,9 @@
 # clave
 
+The signed Delta format targets [WIST specification revision `b96e21fe97b591075c369db17346df81292a8158`](https://github.com/wistprotocol/spec/tree/b96e21fe97b591075c369db17346df81292a8158). Object version `1.0.0` alone does not identify a compatible draft.
+
+Delta ingestion checks the signed canonical `publisher` against the logical Feed domain before source selection and duplicate suppression, including fetched predecessors. Chain tips use `(publisher, url)` and persist across reopen; the database upgrade preserves existing stored pairs but cannot reconstruct tips already overwritten by an older URL-only table. Sealing and recovery settlement reject mismatches between queue ownership and the signed author. Complete authenticated Delta history, recovery scope provenance and Audit Record eligibility remain separate validation requirements.
+
 WIST Protocol aggregator. Clave pulls signed deltas from publishers (via ping + the
 publisher's `.well-known/wist` tree), verifies each one against its schema
 and signature before admitting it, and seals them hourly into a public,

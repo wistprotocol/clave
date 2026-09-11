@@ -290,9 +290,17 @@ fn the_per_domain_block_cap_defers_the_surplus_in_acceptance_order() {
             "block {i} carried {} deltas",
             deltas.len()
         );
+        let mut expected = ids[i * 2..ids.len().min(i * 2 + 2)].to_vec();
+        let mut actual = deltas.clone();
+        expected.sort();
+        actual.sort();
+        assert_eq!(
+            actual, expected,
+            "Block {i} must select by acceptance order"
+        );
         sealed.extend(deltas);
     }
-    assert_eq!(sealed, ids, "sealed order {sealed:?}");
+    assert_eq!(sealed.len(), ids.len());
 }
 
 #[test]

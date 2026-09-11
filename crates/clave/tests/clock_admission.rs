@@ -88,7 +88,10 @@ fn excess_skew_cannot_enter_a_recovery_queue() {
     assert!(report.accepted.is_empty());
     assert_eq!(report.rejected, [(rejected.clone(), "WIST1-E06".into())]);
     assert!(!db.is_delta_seen(&rejected).unwrap());
-    assert!(db.url_tip("https://localhost/b").unwrap().is_none());
+    assert!(db
+        .url_tip("localhost", "https://localhost/b")
+        .unwrap()
+        .is_none());
     assert!(!data
         .path()
         .join(format!("payloads/{}.json", &rejected[7..]))
@@ -269,7 +272,10 @@ fn ingest_rechecks_rejected_ids_after_restart_without_advancing_the_chain() {
     assert_eq!(report.accepted, std::slice::from_ref(&first));
     assert_eq!(report.rejected, [(later.clone(), "WIST1-E06".into())]);
     assert_eq!(report.noise, None);
-    assert_eq!(db.url_tip(url).unwrap().as_deref(), Some(first.as_str()));
+    assert_eq!(
+        db.url_tip("localhost", url).unwrap().as_deref(),
+        Some(first.as_str())
+    );
     assert!(!db.is_delta_seen(&later).unwrap());
     assert!(!data
         .path()
@@ -290,7 +296,10 @@ fn ingest_rechecks_rejected_ids_after_restart_without_advancing_the_chain() {
     .unwrap();
     assert_eq!(report.accepted, std::slice::from_ref(&later));
     assert!(report.rejected.is_empty());
-    assert_eq!(db.url_tip(url).unwrap().as_deref(), Some(later.as_str()));
+    assert_eq!(
+        db.url_tip("localhost", url).unwrap().as_deref(),
+        Some(later.as_str())
+    );
     assert!(data
         .path()
         .join(format!("payloads/{}.json", &later[7..]))

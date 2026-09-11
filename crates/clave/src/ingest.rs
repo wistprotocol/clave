@@ -117,6 +117,7 @@ fn retrieve_prev_chain(
     client: &Client,
     meter: &Meter<'_>,
     base: &str,
+    domain: &str,
     prev: Option<&str>,
     tip: Option<&str>,
     prefetched: &mut std::collections::HashMap<String, Value>,
@@ -133,7 +134,7 @@ fn retrieve_prev_chain(
             }
             break;
         };
-        if Some(id.as_str()) == tip || db.is_delta_seen(&id)? {
+        if Some(id.as_str()) == tip || db.is_delta_seen_for(&id, domain)? {
             break;
         }
         if !seen.insert(id.clone()) {
@@ -147,9 +148,13 @@ fn retrieve_prev_chain(
             Ok(None) => return Ok(PrevChain::BudgetExhausted),
             Err(_) => return Ok(PrevChain::Unresolved),
         };
+        let rejected_source = declaration::delta_publisher(&fetched) != Ok(domain);
         cursor = fetched["delta"]["prev"].as_str().map(str::to_string);
         prefetched.insert(id.clone(), fetched);
         chain.push(id);
+        if rejected_source {
+            break;
+        }
     }
     chain.reverse();
     Ok(PrevChain::Resolved(chain))
@@ -527,7 +532,7 @@ pub fn run_with_clock(
 
         let mut page_has_unseen = false;
         for id in &feed_parsed.feed.deltas {
-            if !db.is_delta_seen(id)? {
+            if !db.is_delta_seen_for(id, host)? {
                 page_has_unseen = true;
                 break;
             }
@@ -574,7 +579,7 @@ pub fn run_with_clock(
     'process: while position < delta_ids.len() {
         let id = &delta_ids[position].clone();
         position += 1;
-        if db.is_delta_seen(id)? {
+        if db.is_delta_seen_for(id, host)? {
             continue;
         }
 
@@ -614,6 +619,23 @@ pub fn run_with_clock(
                 }
             },
         };
+        let association = match declaration::delta_publisher(&delta_value) {
+            Err(_) => Err("WIST1-E14"),
+            Ok(domain) if domain != host => Err("WIST2-E03"),
+            Ok(_) => Ok(()),
+        };
+        if let Err(code) = association {
+            record_rejection(
+                db,
+                host,
+                code,
+                now,
+                Some(id),
+                "Delta Publisher does not match the logical Feed",
+            )?;
+            report.rejected.push((id.clone(), code.into()));
+            continue;
+        }
         let observed_at = delta_value["delta"]["observed_at"]
             .as_str()
             .unwrap_or_default();
@@ -708,7 +730,7 @@ pub fn run_with_clock(
             continue;
         }
 
-        let expected_prev = db.url_tip(&delta_env.delta.url)?;
+        let expected_prev = db.url_tip(host, &delta_env.delta.url)?;
         if delta_env.delta.prev != expected_prev {
             // WIST-2 §5 step 3: retrieve and validate any `prev` not yet
             // sealed, in chain order, before the Delta naming it.
@@ -718,6 +740,7 @@ pub fn run_with_clock(
                     client,
                     &meter,
                     &base,
+                    host,
                     delta_env.delta.prev.as_deref(),
                     expected_prev.as_deref(),
                     &mut prefetched,
@@ -1009,5 +1032,68 @@ mod tests {
             &["blog.example.com".to_string()]
         ));
         assert!(!url_in_scope("not a url", "example.com", &[]));
+    }
+    #[test]
+    fn signed_attribution_vectors_preserve_source_and_feed_identity() {
+        let root = std::env::var_os("WIST_SPEC_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../spec")
+            });
+        let vector: Value = serde_json::from_slice(
+            &std::fs::read(root.join("vectors/wist1/delta-attribution.json")).unwrap(),
+        )
+        .unwrap();
+        for case in vector["cases"].as_array().unwrap() {
+            for reverse in [false, true] {
+                let mut sources: Vec<_> = case["declarations"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|doc| declaration::evaluate_initial(doc).unwrap())
+                    .collect();
+                if reverse {
+                    sources.reverse();
+                }
+                for (index, envelope) in case["envelopes"].as_array().unwrap().iter().enumerate() {
+                    let original = envelope.clone();
+                    let actual = (|| {
+                        let domain = declaration::delta_publisher(envelope)?;
+                        if case["feed_domain"]
+                            .as_str()
+                            .is_some_and(|feed| feed != domain)
+                        {
+                            return Err("WIST2-E03");
+                        }
+                        let source = sources
+                            .iter()
+                            .find(|p| p.domain == domain)
+                            .ok_or("WIST1-E02")?;
+                        let keys: Vec<_> = source.keys.iter().collect();
+                        declaration::verify_signed(
+                            &keys,
+                            envelope,
+                            "delta",
+                            envelope["delta"]["observed_at"].as_str(),
+                        )?;
+                        if !url_in_scope(
+                            envelope["delta"]["url"].as_str().unwrap(),
+                            domain,
+                            source.subdomain_scope.as_deref().unwrap_or(&[]),
+                        ) {
+                            return Err("WIST1-E03");
+                        }
+                        Ok(())
+                    })();
+                    assert_eq!(
+                        actual.err().unwrap_or("accepted"),
+                        case["expected"][index],
+                        "{}",
+                        case["name"]
+                    );
+                    assert_eq!(*envelope, original);
+                }
+            }
+        }
     }
 }

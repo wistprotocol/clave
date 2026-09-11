@@ -12,7 +12,7 @@ CREATE TABLE IF NOT EXISTS records(url TEXT NOT NULL, publisher TEXT NOT NULL, d
 CREATE TABLE IF NOT EXISTS blocks(block_number INTEGER PRIMARY KEY, block_hash TEXT NOT NULL, sealed_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS rejections(domain TEXT NOT NULL, code TEXT NOT NULL, at TEXT NOT NULL, delta_id TEXT, detail TEXT);
 CREATE TABLE IF NOT EXISTS params(name TEXT PRIMARY KEY, value INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS url_tips(url TEXT PRIMARY KEY, domain TEXT NOT NULL, tip TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS url_tips(url TEXT NOT NULL, domain TEXT NOT NULL, tip TEXT NOT NULL, PRIMARY KEY(domain, url));
 CREATE TABLE IF NOT EXISTS param_changes(parameter TEXT NOT NULL, value INTEGER NOT NULL, effective_at TEXT NOT NULL, block_number INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS noise_pings(domain TEXT NOT NULL, day TEXT NOT NULL, count INTEGER NOT NULL, PRIMARY KEY(domain, day));
 CREATE TABLE IF NOT EXISTS ingest_meter(domain TEXT NOT NULL, day TEXT NOT NULL, bytes INTEGER NOT NULL, PRIMARY KEY(domain, day));
@@ -215,7 +215,7 @@ fn exec_insert_seen_delta(conn: &Connection, delta_id: &str, domain: &str) -> Re
 
 fn exec_set_url_tip(conn: &Connection, url: &str, domain: &str, tip: &str) -> Result<()> {
     conn.execute(
-        "INSERT INTO url_tips(url, domain, tip) VALUES (?1, ?2, ?3) ON CONFLICT(url) DO UPDATE SET tip = excluded.tip, domain = excluded.domain",
+        "INSERT INTO url_tips(url, domain, tip) VALUES (?1, ?2, ?3) ON CONFLICT(domain, url) DO UPDATE SET tip = excluded.tip",
         (url, domain, tip),
     )?;
     Ok(())
@@ -251,6 +251,19 @@ impl Db {
         let _mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
         conn.execute_batch(SCHEMA)?;
         add_missing_columns(&conn)?;
+        let old_tips: bool = conn.query_row(
+            "SELECT pk = 0 FROM pragma_table_info('url_tips') WHERE name = 'domain'",
+            [],
+            |row| row.get(0),
+        )?;
+        if old_tips {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch("ALTER TABLE url_tips RENAME TO old_url_tips;
+                CREATE TABLE url_tips(url TEXT NOT NULL, domain TEXT NOT NULL, tip TEXT NOT NULL, PRIMARY KEY(domain, url));
+                INSERT INTO url_tips SELECT url, domain, tip FROM old_url_tips;
+                DROP TABLE old_url_tips;")?;
+            tx.commit()?;
+        }
         let db = Db { conn };
         db.restore_block_sizes(path)?;
         db.parameter_schedule(0)?;
@@ -714,6 +727,18 @@ impl Db {
             .optional()
             .map(|row| row.is_some())
             .map_err(Error::Db)
+    }
+
+    pub fn is_delta_seen_for(&self, delta_id: &str, domain: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM seen_deltas WHERE delta_id = ?1 AND domain = ?2",
+                (delta_id, domain),
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
     }
 
     pub fn insert_seen_delta(&self, delta_id: &str, domain: &str) -> Result<()> {
@@ -1345,11 +1370,13 @@ impl Db {
         Ok(admitted)
     }
 
-    pub fn url_tip(&self, url: &str) -> Result<Option<String>> {
+    pub fn url_tip(&self, domain: &str, url: &str) -> Result<Option<String>> {
         self.conn
-            .query_row("SELECT tip FROM url_tips WHERE url = ?1", [url], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT tip FROM url_tips WHERE domain = ?1 AND url = ?2",
+                (domain, url),
+                |row| row.get(0),
+            )
             .optional()
             .map_err(Error::Db)
     }
@@ -1499,7 +1526,9 @@ mod tests {
         .unwrap();
         assert!(db.is_delta_seen("sha256:d1").unwrap());
         assert_eq!(
-            db.url_tip("https://example.com/a").unwrap().as_deref(),
+            db.url_tip("example.com", "https://example.com/a")
+                .unwrap()
+                .as_deref(),
             Some("sha256:d2")
         );
         assert_eq!(db.count_pending_entries("publisher_delta").unwrap(), 0);
@@ -1702,17 +1731,24 @@ mod tests {
     fn url_tip_roundtrips_and_updates() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
-        assert!(db.url_tip("https://example.com/a").unwrap().is_none());
+        assert!(db
+            .url_tip("example.com", "https://example.com/a")
+            .unwrap()
+            .is_none());
         db.set_url_tip("https://example.com/a", "example.com", "sha256:1")
             .unwrap();
         assert_eq!(
-            db.url_tip("https://example.com/a").unwrap().unwrap(),
+            db.url_tip("example.com", "https://example.com/a")
+                .unwrap()
+                .unwrap(),
             "sha256:1"
         );
         db.set_url_tip("https://example.com/a", "example.com", "sha256:2")
             .unwrap();
         assert_eq!(
-            db.url_tip("https://example.com/a").unwrap().unwrap(),
+            db.url_tip("example.com", "https://example.com/a")
+                .unwrap()
+                .unwrap(),
             "sha256:2"
         );
     }
@@ -1761,7 +1797,10 @@ mod tests {
             )
             .is_err());
         assert_eq!(db.count_pending_entries("publisher_delta").unwrap(), 1);
-        assert!(db.url_tip("https://example.com/y").unwrap().is_none());
+        assert!(db
+            .url_tip("example.com", "https://example.com/y")
+            .unwrap()
+            .is_none());
     }
 
     #[test]

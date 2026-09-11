@@ -416,7 +416,7 @@ fn signed_objects_exclude_unusable_keys_before_signature_verification() {
         for key in &publisher.keys {
             if !clave::declaration::usable_keys(std::slice::from_ref(key)).any(|_| true) {
                 let doc = wist_core::envelope::sign_envelope(
-                    &json!({"observed_at":"2026-08-04T12:00:00Z"}),
+                    &json!({"publisher":publisher.domain, "observed_at":"2026-08-04T12:00:00Z"}),
                     "delta",
                     &key.key_id,
                     &SigningKey::from_seed(&K1),
@@ -538,7 +538,7 @@ fn signed_delta_key_bound_orders_publisher_instants_exactly() {
     ];
     for (valid_from, observed_at, eligible) in cases {
         let key = serde_json::from_value(key_json("k1", &K1, valid_from)).unwrap();
-        let delta = json!({"wist_version":"1.0.0", "url":"https://example.com/a", "change_type":"delete", "observed_at":observed_at, "prev":format!("sha256:{}", "0".repeat(64)), "meta":{"lang":"en"}});
+        let delta = json!({"wist_version":"1.0.0", "publisher":"example.com", "url":"https://example.com/a", "change_type":"delete", "observed_at":observed_at, "prev":format!("sha256:{}", "0".repeat(64)), "meta":{"lang":"en"}});
         let signed = wist_core::envelope::sign_envelope(&delta, "delta", "k1", &sk).unwrap();
         assert_eq!(
             clave::declaration::verify_signed(&[&key], &signed, "delta", Some(observed_at)),

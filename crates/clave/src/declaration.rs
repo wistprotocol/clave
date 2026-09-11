@@ -235,6 +235,19 @@ pub fn publisher_of(doc: &Value) -> Result<Publisher, String> {
     parse(doc)
 }
 
+pub fn delta_publisher(doc: &Value) -> Result<&str, &'static str> {
+    let domain = wist_core::delta::publisher(&doc["delta"]).map_err(|_| "WIST1-E14")?;
+    if !doc["delta"]["observed_at"]
+        .as_str()
+        .is_some_and(time::valid)
+    {
+        return Err("WIST1-E14");
+    }
+    canonical_encoding(doc["sig"]["value"].as_str().ok_or("WIST1-E14")?, 64)
+        .map_err(|_| "WIST1-E14")?;
+    Ok(domain)
+}
+
 /// WIST-1 §5.1/§5.2 Key Set checks for a signed object. `observed_at`
 /// activates the `valid_from` bound (Deltas); pass None for feeds.
 /// Err is the rejection code.
@@ -244,12 +257,8 @@ pub fn verify_signed(
     kind: &str,
     observed_at: Option<&str>,
 ) -> Result<(), &'static str> {
-    if kind == "delta"
-        && !doc["delta"]["observed_at"]
-            .as_str()
-            .is_some_and(time::valid)
-    {
-        return Err("WIST1-E14");
+    if kind == "delta" {
+        delta_publisher(doc)?;
     }
     if observed_at.is_some_and(|value| !time::valid(value))
         || keys.iter().any(|key| !time::valid(&key.valid_from))

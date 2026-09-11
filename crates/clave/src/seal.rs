@@ -460,19 +460,34 @@ fn revalidate_queued_deltas(
             .as_str()
             .unwrap_or_default()
             .to_string();
-        if crate::declaration::verify_signed(&keys, &e.body, "delta", Some(&observed_at)).is_ok() {
-            kept.push(e);
-            continue;
-        }
+        let verified = crate::declaration::delta_publisher(&e.body)
+            .and_then(|domain| {
+                if domain == e.domain {
+                    Ok(())
+                } else {
+                    Err("WIST1-E02")
+                }
+            })
+            .and_then(|()| {
+                crate::declaration::verify_signed(&keys, &e.body, "delta", Some(&observed_at))
+            });
+        let code = match verified {
+            Ok(()) => {
+                kept.push(e);
+                continue;
+            }
+            Err("WIST1-E14") => "WIST1-E14",
+            Err(_) => "WIST1-E02",
+        };
         let delta_id = wist_core::delta::delta_id(&e.body["delta"]).unwrap_or_default();
         db.insert_rejection(
             &e.domain,
-            "WIST1-E02",
+            code,
             sealed_at,
             Some(&delta_id),
-            Some("signing key retired by the Key Set the sealing Block resolves"),
+            Some("Delta fields or signing authority fail at sealing"),
         )?;
-        dropped.push(format!("{delta_id}: WIST1-E02 at sealing"));
+        dropped.push(format!("{delta_id}: {code} at sealing"));
         dropped_rowids.push(e.rowid);
     }
     Ok((kept, dropped_rowids, dropped))
@@ -648,7 +663,6 @@ struct SealEntry {
 }
 
 struct DeltaApply {
-    domain: String,
     body: Value,
     id: String,
     prev: Option<String>,
@@ -773,7 +787,6 @@ fn resolve_record_updates(
         let id = wist_core::delta::delta_id(&e.body["delta"])?;
         let prev = e.body["delta"]["prev"].as_str().map(str::to_string);
         deltas.push(DeltaApply {
-            domain: e.domain.clone(),
             body: e.body.clone(),
             id,
             prev,
@@ -798,7 +811,7 @@ fn resolve_record_updates(
         };
         updates.push(OwnedRecordUpsert {
             url: delta.url,
-            publisher: d.domain,
+            publisher: delta.publisher,
             delta_id: d.id,
             observed_at: delta.observed_at,
             title: payload.content.summary.title,
@@ -827,14 +840,29 @@ fn settle_recovery_windows(db: &Db, sealed_at: &str) -> Result<()> {
                 .as_str()
                 .unwrap_or_default()
                 .to_string();
-            match crate::declaration::verify_signed(&keys, &q.entry_json, "delta", Some(&observed_at))
-            {
+            let verified = crate::declaration::delta_publisher(&q.entry_json)
+                .and_then(|author| {
+                    if author == domain {
+                        Ok(())
+                    } else {
+                        Err("WIST1-E02")
+                    }
+                })
+                .and_then(|()| {
+                    crate::declaration::verify_signed(
+                        &keys,
+                        &q.entry_json,
+                        "delta",
+                        Some(&observed_at),
+                    )
+                });
+            match verified {
                 Ok(()) => {
                     db.insert_pending_entry("publisher_delta", &domain, &q.entry_json, q.chain_pos)?
                 }
-                Err(_) => db.insert_rejection(
+                Err(code) => db.insert_rejection(
                     &domain,
-                    "WIST1-E13",
+                    if code == "WIST1-E14" { code } else { "WIST1-E13" },
                     sealed_at,
                     Some(&q.delta_id),
                     Some("queued delta does not verify against the key set at the recovery window's end"),

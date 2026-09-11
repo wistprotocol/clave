@@ -11,6 +11,7 @@ pub fn spec_dir() -> std::path::PathBuf {
 }
 
 pub struct TestPub {
+    pub domain: String,
     pub sk: wist_core::crypto::SigningKey,
     pub dir: tempfile::TempDir,
 }
@@ -36,7 +37,11 @@ fn build_publisher(domain: &str, subdomain_scope: Option<&[&str]>) -> TestPub {
     }
     let env = wist_core::envelope::sign_envelope(&publisher, "publisher", "k1", &sk).unwrap();
     fs::write(wk.join("publisher.json"), serde_json::to_vec(&env).unwrap()).unwrap();
-    TestPub { sk, dir }
+    TestPub {
+        domain: domain.into(),
+        sk,
+        dir,
+    }
 }
 
 pub fn make_publisher(domain: &str) -> TestPub {
@@ -62,7 +67,7 @@ pub fn add_delta_with_links(
     let content = serde_json::json!({"extract": extract, "links": {"total": links.len(), "urls": links}, "summary": {"title": url}});
     let payload = serde_json::json!({"wist_version": "1.0.0", "salt": salt, "content": content});
     let mut delta = serde_json::json!({
-        "wist_version": "1.0.0", "url": url,
+        "wist_version": "1.0.0", "publisher": p.domain, "url": url,
         "change_type": if prev.is_some() { "update" } else { "new" },
         "observed_at": "2026-08-09T12:00:00Z",
         "payload": {"commitment": wist_core::delta::make_commitment(&salt, &content).unwrap(), "alg": "HMAC-SHA256", "bytes": wist_core::delta::content_bytes(&content).unwrap()},
@@ -209,7 +214,11 @@ pub fn make_publisher_with_recovery(domain: &str) -> TestPub {
     });
     let env = wist_core::envelope::sign_envelope(&publisher, "publisher", "k1", &sk).unwrap();
     fs::write(wk.join("publisher.json"), serde_json::to_vec(&env).unwrap()).unwrap();
-    TestPub { sk, dir }
+    TestPub {
+        domain: domain.into(),
+        sk,
+        dir,
+    }
 }
 
 pub fn current_declaration(p: &TestPub) -> serde_json::Value {
@@ -255,7 +264,7 @@ pub fn add_delta_signed(
     let content = serde_json::json!({"extract": extract, "links": {"total": 0, "urls": []}, "summary": {"title": url}});
     let payload = serde_json::json!({"wist_version": "1.0.0", "salt": salt, "content": content});
     let mut delta = serde_json::json!({
-        "wist_version": "1.0.0", "url": url,
+        "wist_version": "1.0.0", "publisher": p.domain, "url": url,
         "change_type": if prev.is_some() { "update" } else { "new" },
         "observed_at": observed_at,
         "payload": {"commitment": wist_core::delta::make_commitment(&salt, &content).unwrap(), "alg": "HMAC-SHA256", "bytes": wist_core::delta::content_bytes(&content).unwrap()},
