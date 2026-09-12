@@ -96,7 +96,7 @@ fn valid_unchanged_discovery_renews_the_cache_after_expiry() {
 }
 
 #[test]
-fn exhausted_discovery_budget_preserves_suspension_even_when_the_cache_expired() {
+fn exhausted_content_budget_allows_cache_renewal_and_preserves_walk_suspension() {
     let (listener, host, client) = reserve_addr();
     let p = make_publisher(&host);
     write_feed(&p, &host, &[], INITIAL);
@@ -114,6 +114,6 @@ fn exhausted_discovery_budget_preserves_suspension_even_when_the_cache_expired()
     assert!(db.list_rejections(&host).unwrap().is_empty());
     assert_eq!(
         db.declaration_fetched_at(&host).unwrap().as_deref(),
-        Some(INITIAL)
+        Some(EXPIRED)
     );
 }

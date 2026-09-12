@@ -279,7 +279,7 @@ fn unsuccessful_refresh_counts_one_feed_failure_without_installing_invalid_autho
 }
 
 #[test]
-fn exhausted_refresh_budget_suspends_without_noise_and_resumes_after_restart() {
+fn exhausted_content_budget_allows_feed_refresh_and_resumes_after_restart() {
     let (listener, host, client) = reserve_addr();
     let p = make_publisher_with_recovery(&host);
     let previous = current_declaration(&p);
@@ -309,12 +309,13 @@ fn exhausted_refresh_budget_suspends_without_noise_and_resumes_after_restart() {
     assert_eq!(report.noise, None);
     assert!(report.accepted.is_empty());
     assert!(db.list_rejections(&host).unwrap().is_empty());
-    assert_eq!(stored(&db), previous);
+    assert_eq!(stored(&db), next);
     assert_eq!(
         *requests.lock().unwrap(),
         [
             format!("{PREFIX}publisher.json"),
-            format!("{PREFIX}feed.json")
+            format!("{PREFIX}feed.json"),
+            format!("{PREFIX}publisher.json")
         ]
     );
     drop(db);
@@ -395,4 +396,379 @@ fn failed_refresh_persistence_rolls_back_authority_and_admission_state() {
     assert_eq!(stored(&db), previous);
     assert_eq!(db.highest_accepted_declaration_seq(&host).unwrap(), Some(0));
     assert_eq!(db.peek_pending_entries().unwrap().0.len(), pending);
+}
+
+#[test]
+fn signed_transport_vectors_refresh_delta_authority_and_preserve_content_budgets() {
+    let root = std::env::var_os("WIST_SPEC_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../spec")
+        });
+    let vector: Value = serde_json::from_slice(
+        &std::fs::read(root.join("vectors/wist2/declaration-refresh.json")).unwrap(),
+    )
+    .unwrap();
+    for case in vector["cases"].as_array().unwrap() {
+        let (listener, host, client) = reserve_addr();
+        let served = tempfile::tempdir().unwrap();
+        let directory = served.path().join(".well-known/wist");
+        std::fs::create_dir_all(directory.join("deltas")).unwrap();
+        std::fs::create_dir_all(directory.join("payloads")).unwrap();
+        let feed = wist_core::jcs::canonicalize(&case["feed"]).unwrap();
+        std::fs::write(directory.join("feed.json"), &feed).unwrap();
+        let mut delta_bytes = 0;
+        for entry in case["deltas"].as_array().unwrap() {
+            let hex = &entry["id"].as_str().unwrap()[7..];
+            let delta = wist_core::jcs::canonicalize(&entry["envelope"]).unwrap();
+            delta_bytes += delta.len();
+            std::fs::write(directory.join(format!("deltas/{hex}.json")), delta).unwrap();
+            std::fs::write(
+                directory.join(format!("payloads/{hex}.json")),
+                wist_core::jcs::canonicalize(&vector["payload"]).unwrap(),
+            )
+            .unwrap();
+        }
+        let mut responses = vec![response(&case["initial"])];
+        responses.extend(case["responses"].as_array().unwrap().iter().map(|doc| {
+            if doc.is_null() {
+                (axum::http::StatusCode::SERVICE_UNAVAILABLE, Vec::new())
+            } else {
+                response(doc)
+            }
+        }));
+        let requests = serve_sequence(listener, served.path().into(), responses);
+        let data = tempfile::tempdir().unwrap();
+        clave::init::run(&host, data.path()).unwrap();
+        let path = data.path().join("clave.sqlite");
+        let db = Db::open(&path).unwrap();
+        if case["cached"].as_bool().unwrap() {
+            install(&db, &case["initial"]);
+        }
+        let budget = match case["content_budget"].as_str() {
+            Some("feed") => Some(feed.len() as i64),
+            Some("feed and deltas") => Some((feed.len() + delta_bytes) as i64),
+            _ => case["content_budget"].as_i64(),
+        };
+        if let Some(budget) = budget {
+            db.set_param("ingest_budget_bytes_day", budget.max(1))
+                .unwrap();
+            if budget == 0 {
+                db.add_ingest_bytes(&host, &vector["now"].as_str().unwrap()[..10], 1)
+                    .unwrap();
+            }
+        }
+        let report = clave::ingest::run(
+            &db,
+            &client,
+            data.path(),
+            &host,
+            vector["now"].as_str().unwrap(),
+        )
+        .unwrap();
+        let expected = &case["expected"];
+        assert_eq!(
+            json!(report.accepted),
+            expected["accepted"],
+            "{}: {report:?}",
+            case["name"]
+        );
+        assert_eq!(
+            json!(report.rejected),
+            expected["rejected"],
+            "{}: {report:?}",
+            case["name"]
+        );
+        assert_eq!(
+            json!(report.suspended),
+            expected["suspended"],
+            "{}: {report:?}",
+            case["name"]
+        );
+        assert_eq!(report.noise, None, "{}: {report:?}", case["name"]);
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|p| **p == format!("{PREFIX}publisher.json"))
+                .count(),
+            expected["declaration_requests"].as_u64().unwrap() as usize,
+            "{}",
+            case["name"],
+        );
+        for entry in case["deltas"].as_array().unwrap() {
+            let id = entry["id"].as_str().unwrap();
+            let accepted = report.accepted.iter().any(|accepted| accepted == id);
+            assert_eq!(db.is_delta_seen_for(id, &host).unwrap(), accepted);
+            assert_eq!(
+                data.path()
+                    .join(format!("payloads/{}.json", &id[7..]))
+                    .exists(),
+                accepted
+            );
+        }
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.walk_suspended(&host).unwrap(), report.suspended);
+        for id in report.accepted {
+            assert!(db.is_delta_seen_for(&id, &host).unwrap());
+        }
+    }
+}
+
+#[test]
+fn unsuccessful_delta_attempt_resets_after_restart_on_a_later_pull() {
+    let (listener, host, client) = reserve_addr();
+    let p = make_publisher_with_recovery(&host);
+    let previous = current_declaration(&p);
+    let next = replacement(&p, "k2", false);
+    let id = add_delta_signed(&p, "https://localhost/a", "body", None, NOW, "k2", &K2_SEED);
+    write_feed(&p, &host, std::slice::from_ref(&id), NOW);
+    let requests = serve_sequence(
+        listener,
+        p.dir.path().into(),
+        vec![
+            response(&previous),
+            response(&previous),
+            response(&previous),
+            response(&next),
+        ],
+    );
+    let data = tempfile::tempdir().unwrap();
+    clave::init::run(&host, data.path()).unwrap();
+    let path = data.path().join("clave.sqlite");
+    let db = Db::open(&path).unwrap();
+    let report = clave::ingest::run(&db, &client, data.path(), &host, NOW).unwrap();
+    assert_eq!(report.rejected, [(id.clone(), "WIST1-E02".into())]);
+    assert_eq!(report.noise, None);
+    assert!(!db.is_delta_seen_for(&id, &host).unwrap());
+    drop(db);
+    let db = Db::open(&path).unwrap();
+    let report =
+        clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T14:01:00Z").unwrap();
+    assert_eq!(report.accepted, [id]);
+    assert_eq!(stored(&db), next);
+    assert_eq!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| **p == format!("{PREFIX}publisher.json"))
+            .count(),
+        4
+    );
+}
+
+#[test]
+fn delta_refresh_opens_recovery_but_a_follower_cannot_replace_frozen_sources() {
+    let (listener, host, client) = reserve_addr();
+    let p = make_publisher_with_recovery(&host);
+    let previous = current_declaration(&p);
+    let owner = replacement(&p, "k2", true);
+    let mut body = owner["publisher"].clone();
+    body["seq"] = json!(2);
+    body["prev_declaration"] = json!(declaration_hash(&owner));
+    body["keys"] = json!([key_entry("k3", &X1_SEED, "2026-08-09T00:00:00Z")]);
+    let follower = wist_core::envelope::sign_envelope(
+        &body,
+        "publisher",
+        "k2",
+        &wist_core::crypto::SigningKey::from_seed(&K2_SEED),
+    )
+    .unwrap();
+    let first = add_delta_signed(
+        &p,
+        "https://localhost/a",
+        "owner",
+        None,
+        NOW,
+        "k2",
+        &K2_SEED,
+    );
+    write_feed(&p, &host, std::slice::from_ref(&first), NOW);
+    let requests = serve_sequence(
+        listener,
+        p.dir.path().into(),
+        vec![
+            response(&previous),
+            response(&owner),
+            response(&owner),
+            response(&follower),
+        ],
+    );
+    let data = tempfile::tempdir().unwrap();
+    clave::init::run(&host, data.path()).unwrap();
+    let path = data.path().join("clave.sqlite");
+    let db = Db::open(&path).unwrap();
+    let report = clave::ingest::run(&db, &client, data.path(), &host, NOW).unwrap();
+    assert_eq!(report.queued, [first]);
+    assert!(report.accepted.is_empty());
+    let window = db.get_recovery_window(&host).unwrap().unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&window.owner_declaration_json).unwrap(),
+        owner
+    );
+    let second = add_delta_signed(
+        &p,
+        "https://localhost/b",
+        "follower",
+        None,
+        NOW,
+        "k3",
+        &X1_SEED,
+    );
+    write_feed_signed(
+        &p,
+        &host,
+        std::slice::from_ref(&second),
+        NOW,
+        "k2",
+        &K2_SEED,
+    );
+    drop(db);
+    let db = Db::open(&path).unwrap();
+    let report = clave::ingest::run(&db, &client, data.path(), &host, NOW).unwrap();
+    assert_eq!(report.rejected, [(second.clone(), "WIST1-E02".into())]);
+    assert_eq!(report.noise, None);
+    assert!(report.queued.is_empty());
+    assert!(report.accepted.is_empty());
+    assert_eq!(stored(&db), follower);
+    assert!(!db.is_delta_seen_for(&second, &host).unwrap());
+    let window = db.get_recovery_window(&host).unwrap().unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&window.owner_declaration_json).unwrap(),
+        owner
+    );
+    assert_eq!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| **p == format!("{PREFIX}publisher.json"))
+            .count(),
+        4
+    );
+}
+
+#[test]
+fn settlement_after_payload_fetch_retries_before_final_delta_admission() {
+    for repaired in [false, true] {
+        let (listener, host, client) = reserve_addr();
+        let p = make_publisher_with_recovery(&host);
+        let previous = current_declaration(&p);
+        let owner = replacement(&p, "k2", true);
+        let mut body = owner["publisher"].clone();
+        body["seq"] = json!(2);
+        body["prev_declaration"] = json!(declaration_hash(&owner));
+        body["keys"] = json!([
+            key_entry("k1", &K1_SEED, "2026-08-09T00:00:00Z"),
+            key_entry("k2", &K2_SEED, "2026-08-09T00:00:00Z"),
+        ]);
+        let restored = wist_core::envelope::sign_envelope(
+            &body,
+            "publisher",
+            "k2",
+            &wist_core::crypto::SigningKey::from_seed(&K2_SEED),
+        )
+        .unwrap();
+        let requests = serve_sequence(
+            listener,
+            p.dir.path().into(),
+            vec![
+                response(&previous),
+                response(&owner),
+                response(&owner),
+                response(if repaired { &restored } else { &owner }),
+            ],
+        );
+        let data = tempfile::tempdir().unwrap();
+        clave::init::run(&host, data.path()).unwrap();
+        let path = data.path().join("clave.sqlite");
+        let db = Db::open(&path).unwrap();
+        db.set_param("block_cadence_seconds", 1).unwrap();
+        let key = clave::keys::load(&data.path().join("keys/seed")).unwrap();
+        for (at, key_id, seed) in [
+            ("2026-08-09T12:00:00Z", "k1", &K1_SEED),
+            ("2026-08-09T13:00:00Z", "k2", &K2_SEED),
+        ] {
+            write_feed_signed(&p, &host, &[], at, key_id, seed);
+            clave::ingest::run(&db, &client, data.path(), &host, at).unwrap();
+            clave::seal::run(
+                &db,
+                data.path(),
+                &key,
+                at.parse::<jiff::Timestamp>().unwrap().as_second(),
+            )
+            .unwrap();
+        }
+        let before = "2026-08-16T12:59:59Z";
+        let deadline = "2026-08-16T13:00:00Z";
+        let id = add_delta_signed(
+            &p,
+            "https://localhost/a",
+            "body",
+            None,
+            before,
+            "k1",
+            &K1_SEED,
+        );
+        write_feed_signed(&p, &host, std::slice::from_ref(&id), before, "k2", &K2_SEED);
+        let crossed = std::cell::Cell::new(false);
+        let report =
+            clave::ingest::run_with_clock(&db, &client, data.path(), &host, before, || {
+                if requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|p| p.contains("/payloads/"))
+                {
+                    crossed.set(true);
+                }
+                if crossed.get() { deadline } else { before }
+                    .parse()
+                    .unwrap()
+            })
+            .unwrap();
+        assert!(crossed.get());
+        assert!(db.get_recovery_window(&host).unwrap().is_none());
+        assert!(report.queued.is_empty());
+        assert_eq!(report.noise, None);
+        if repaired {
+            assert_eq!(report.accepted, std::slice::from_ref(&id));
+            assert!(report.rejected.is_empty());
+            assert_eq!(stored(&db), restored);
+        } else {
+            assert!(report.accepted.is_empty());
+            assert_eq!(report.rejected, [(id.clone(), "WIST1-E02".into())]);
+            assert_eq!(stored(&db), owner);
+        }
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|p| **p == format!("{PREFIX}publisher.json"))
+                .count(),
+            4
+        );
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|p| p.contains("/payloads/"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            data.path()
+                .join(format!("payloads/{}.json", &id[7..]))
+                .exists(),
+            repaired
+        );
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.is_delta_seen_for(&id, &host).unwrap(), repaired);
+    }
 }

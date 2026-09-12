@@ -69,8 +69,8 @@ retains E15 for unsupported queued Deltas and releases their accepted indexes.
 combinations. Live tests cover persistent rejection, active caps, decimal
 byte counts, fetched unsupported predecessors and signed version preservation
 across duplicate pulls, restart and sealing. These checks do not establish
-complete authenticated Delta history, other objects' version support or live
-signature-failure refresh behavior.
+complete authenticated Delta history or other objects' version support.
+Live Declaration retries are described below.
 
 ## Declaration key binding
 
@@ -98,8 +98,10 @@ admission rows are local accepted state, not authenticated Log inclusion.
 Only an accepted replacement or a valid unchanged re-serve renews the cached
 Declaration's discovery timestamp. Rejected or unavailable responses preserve
 that timestamp; after attempted discovery, an expired cache stops the pull
-with WIST1-E02 before fetching the Feed. An exhausted discovery budget preserves
-walk suspension. Restart preserves the same expiry basis.
+with WIST1-E02 before fetching the Feed. Restart preserves the same expiry
+basis. Initial, periodic and failure-triggered Declaration requests are outside
+the content byte budget under WIST-2 §5/ADR-0031; exhausted content fetching
+still suspends the walk.
 
 A failed live `feed.json` signature triggers one Declaration re-fetch under
 WIST-2 §5. Replacement admission uses the same transaction, sequence floor and
@@ -108,13 +110,22 @@ again against the resulting current keys; a remaining failure records one
 WIST2-E04 pull rejection. This includes first-contact rotation races. An invalid
 replacement cannot supply Feed authority or renew the cache.
 
-The retry provisionally shares periodic discovery's ingest meter: an exhausted
-budget suspends the walk without noise, and restart retains that suspension.
-Declaration budget treatment remains unresolved in the specification's
-CONFORMANCE.md, Declaration refresh boundaries. Tests cover ordinary/recovery
-rotations, reused key identifiers, unchanged/invalid/unavailable responses,
-tampered Feeds, transaction rollback and restart. Delta retries and sealed Page
-retry/source eligibility are outside this live Feed behavior.
+A live Delta E01/E02 binding failure triggers one authenticated Declaration
+retry per requested ID per pull, independently of Feed retries. Both authority
+checks use post-settlement admission sources and the same attempt set;
+predecessor retrieval and reinsertion cannot grant another attempt. The same
+Delta Envelope is reverified, including scope. Invalid fields and foreign
+Publisher association reject before binding checks. Invalid or unavailable
+refreshes consume the attempt; a later pull can retry the ID again.
+
+`declaration-refresh.json` supplies 19 signed transport cases consumed through
+live HTTP, including ordinary rotation, reused identifiers, absent, excluded
+and future bindings, separate Feed/Delta/predecessor attempts, unsuccessful
+responses and content-budget boundaries. Additional tests cover
+recovery, frozen sources, settlement during Payload fetching, cache expiry,
+rollback and restart. Sealed-Page retry/source eligibility, complete Feed
+fields and bounded fetch/work remain incomplete; the content budget does not
+bound Declaration traffic.
 
 During recovery, a replacement may name either the current Declaration or
 the accepted recovery-chain head. Its named predecessor determines signer

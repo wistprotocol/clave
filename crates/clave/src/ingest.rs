@@ -456,6 +456,38 @@ fn next_page_url(next: &str, host: &str, allow_http: bool) -> Option<String> {
     Some(format!("{scheme}://{host}{}", parsed.path()))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn verify_delta_with_refresh(
+    db: &Db,
+    client: &Client,
+    data_dir: &Path,
+    host: &str,
+    now: &str,
+    clock: &impl Fn() -> jiff::Timestamp,
+    scope: &[String],
+    base: &str,
+    id: &str,
+    envelope: &Value,
+    attempted: &mut std::collections::HashSet<String>,
+) -> Result<(bool, std::result::Result<(), &'static str>)> {
+    settle_before_admission(db, data_dir, host, clock)?;
+    let (mut window_open, sources) = delta_admission_sources(db, host)?;
+    let mut authority =
+        declaration::verify_delta_authority(&sources.iter().collect::<Vec<_>>(), envelope);
+    if matches!(authority, Err("WIST1-E01" | "WIST1-E02")) && attempted.insert(id.into()) {
+        if let Ok((raw, value)) = client.get_json_in_scope(&format!("{base}publisher.json"), scope)
+        {
+            admit_fetched_declaration(db, data_dir, host, now, clock, raw, value)?;
+        }
+        settle_before_admission(db, data_dir, host, clock)?;
+        let sources;
+        (window_open, sources) = delta_admission_sources(db, host)?;
+        authority =
+            declaration::verify_delta_authority(&sources.iter().collect::<Vec<_>>(), envelope);
+    }
+    Ok((window_open, authority))
+}
+
 pub fn run(
     db: &Db,
     client: &Client,
@@ -518,20 +550,10 @@ pub fn run_with_clock(
 
     if known {
         let publisher_url = format!("{base}publisher.json");
-        match meter.get(client, &publisher_url) {
-            Ok(Some((raw, value))) => {
+        match client.get_json_in_scope(&publisher_url, &meter.subdomain_scope) {
+            Ok((raw, value)) => {
                 current_doc =
                     admit_fetched_declaration(db, data_dir, host, now, &clock, raw, value)?;
-            }
-            // WIST-1 §5.1: a cached Key Set is valid for at most
-            // keyset_cache_ttl_seconds. Past that, a discovery failure
-            // leaves no Key Set to validate against and the pull fails
-            // closed with WIST1-E02 rather than sealing under a
-            // declaration of any age.
-            Ok(None) => {
-                db.set_walk_suspended(host, true)?;
-                report.suspended = true;
-                return Ok(report);
             }
             Err(e) => {
                 if key_set_cache_expired(db, host, now)? {
@@ -600,15 +622,10 @@ pub fn run_with_clock(
             verify_sealed_page(&page_key_sets, &feed_value, &generated_at)
         };
         if live_page && !verified {
-            match meter.get(client, &format!("{base}publisher.json")) {
-                Ok(Some((raw, value))) => {
-                    admit_fetched_declaration(db, data_dir, host, now, &clock, raw, value)?;
-                }
-                Ok(None) => {
-                    suspended = true;
-                    break;
-                }
-                Err(_) => {}
+            if let Ok((raw, value)) =
+                client.get_json_in_scope(&format!("{base}publisher.json"), &meter.subdomain_scope)
+            {
+                admit_fetched_declaration(db, data_dir, host, now, &clock, raw, value)?;
             }
             settle_before_admission(db, data_dir, host, &clock)?;
             verified = verify_live_feed(db, host, &feed_value)?;
@@ -695,6 +712,7 @@ pub fn run_with_clock(
     let mut delta_ids = delta_ids;
     let mut prefetched: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
     let mut resolved_prev: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut refreshed_deltas = std::collections::HashSet::new();
     let mut position = 0usize;
     'process: while position < delta_ids.len() {
         let id = &delta_ids[position].clone();
@@ -757,11 +775,20 @@ pub fn run_with_clock(
             report.rejected.push((id.clone(), code.into()));
             continue;
         }
-        settle_before_admission(db, data_dir, host, &clock)?;
-        let (_, sources) = delta_admission_sources(db, host)?;
-        if let Err(code) =
-            declaration::verify_delta_authority(&sources.iter().collect::<Vec<_>>(), &delta_value)
-        {
+        let (_, authority) = verify_delta_with_refresh(
+            db,
+            client,
+            data_dir,
+            host,
+            now,
+            &clock,
+            &meter.subdomain_scope,
+            &base,
+            id,
+            &delta_value,
+            &mut refreshed_deltas,
+        )?;
+        if let Err(code) = authority {
             record_rejection(
                 db,
                 host,
@@ -989,11 +1016,20 @@ pub fn run_with_clock(
             None
         };
 
-        settle_before_admission(db, data_dir, host, &clock)?;
-        let (window_open, sources) = delta_admission_sources(db, host)?;
-        if let Err(code) =
-            declaration::verify_delta_authority(&sources.iter().collect::<Vec<_>>(), &delta_value)
-        {
+        let (window_open, authority) = verify_delta_with_refresh(
+            db,
+            client,
+            data_dir,
+            host,
+            now,
+            &clock,
+            &meter.subdomain_scope,
+            &base,
+            id,
+            &delta_value,
+            &mut refreshed_deltas,
+        )?;
+        if let Err(code) = authority {
             record_rejection(
                 db,
                 host,
