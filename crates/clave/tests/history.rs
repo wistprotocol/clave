@@ -127,13 +127,13 @@ fn real_seals_replay_complete_envelopes_and_positions_after_reopen() {
         ("registry_update", "update"),
         ("audit_record", "record"),
     ] {
-        let body = envelope::sign_envelope(
-            &json!({inner:{"preserved":"complete signed content"}}),
-            inner,
-            "log1",
-            &f.sk,
-        )
-        .unwrap();
+        let object = if inner == "publisher" {
+            json!({"wist_version":"1.0.0", "domain":"example.com", "seq":0,
+                "keys":[{"key_id":"log1", "alg":"Ed25519", "public_key":f.sk.public().to_b64u(), "valid_from":"2026-08-01T00:00:00Z"}]})
+        } else {
+            json!({"preserved":"complete signed content"})
+        };
+        let body = envelope::sign_envelope(&object, inner, "log1", &f.sk).unwrap();
         f.db.insert_pending_entry(kind, "", &body, 0).unwrap();
         expected.push(json!({"type":kind,"body":body}));
     }

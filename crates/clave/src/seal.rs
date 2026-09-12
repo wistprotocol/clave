@@ -2,6 +2,8 @@ use crate::db::{
     Db, GovernanceRow, ParamChangeRow, PendingEntryRow, RecordUpsert, SealedDeclarationRow,
 };
 use crate::error::{Error, Result};
+use crate::history::declarations::{Declarations, Projection};
+use crate::history::History;
 use crate::registry;
 use crate::WIST_VERSION;
 use serde_json::Value;
@@ -269,30 +271,20 @@ fn roster_act_of(update: &Value) -> Option<(RosterAction, String, String, String
     Some((action, auditor_id, key_id, public_key))
 }
 
-/// WIST-4 §4: a roster act the §3/§4 rules reject is `WIST4-E07` and
-/// every replaying party ignores it, so the Aggregator MUST NOT seal one.
-/// The roster is replayed from the acts already accepted, then this
-/// Block's are applied against it.
-/// WIST-1 §5.2: the recovery window opens at the `sealed_at` of the
-/// Block sealing the recovery Declaration, so a Delta already accepted
-/// and pending when that Block seals is inside the window too and is
-/// queued rather than sealed.
-fn divert_deltas_into_opening_windows(db: &Db, entries: Vec<SealEntry>) -> Result<Vec<SealEntry>> {
-    let opening: HashSet<String> = db
-        .list_pending_recovery_windows()?
-        .into_iter()
-        .filter(|domain| {
-            entries
-                .iter()
-                .any(|e| e.entry_type == "publisher_declaration" && e.domain == *domain)
-        })
+fn divert_deltas_into_opening_windows(
+    db: &Db,
+    entries: Vec<SealEntry>,
+    projection: &Projection,
+) -> Result<Vec<SealEntry>> {
+    let opening: HashSet<_> = projection
+        .domains()
+        .iter()
+        .filter(|(_, state)| state.window().is_some())
+        .map(|(domain, _)| domain.as_str())
         .collect();
-    if opening.is_empty() {
-        return Ok(entries);
-    }
     let mut kept = Vec::with_capacity(entries.len());
     for e in entries {
-        if e.entry_type != "publisher_delta" || !opening.contains(&e.domain) {
+        if e.entry_type != "publisher_delta" || !opening.contains(e.domain.as_str()) {
             kept.push(e);
             continue;
         }
@@ -417,31 +409,19 @@ fn revalidate_queued_deltas(
     db: &Db,
     entries: Vec<SealEntry>,
     sealed_at: &str,
+    projection: &Projection,
 ) -> Result<(Vec<SealEntry>, Vec<i64>, Vec<String>)> {
-    let mut sources: HashMap<String, Option<wist_core::objects::Publisher>> = HashMap::new();
-    for e in entries.iter().filter(|e| e.entry_type == "publisher_delta") {
-        if sources.contains_key(&e.domain) {
-            continue;
-        }
-        let in_block = entries
-            .iter()
-            .filter(|d| d.entry_type == "publisher_declaration" && d.domain == e.domain)
-            .filter_map(|d| {
-                let seq = d.body["publisher"]["seq"].as_u64()?;
-                Some((seq, d.body.clone()))
-            });
-        let sealed = db
-            .sealed_declarations(&e.domain)?
-            .into_iter()
-            .filter_map(|d| {
-                serde_json::from_slice::<Value>(&d.declaration_json)
-                    .ok()
-                    .map(|doc| (d.seq, doc))
-            });
-        let newest = in_block.chain(sealed).max_by_key(|(seq, _)| *seq);
-        let source = newest.and_then(|(_, doc)| crate::declaration::publisher_of(&doc).ok());
-        sources.insert(e.domain.clone(), source);
-    }
+    let sources = projection
+        .domains()
+        .iter()
+        .filter_map(|(domain, state)| {
+            state.delta_sealing_source().map(|source| {
+                crate::declaration::publisher_of(source.envelope())
+                    .map(|publisher| (domain.clone(), publisher))
+                    .map_err(Error::History)
+            })
+        })
+        .collect::<Result<HashMap<_, _>>>()?;
 
     let mut kept = Vec::with_capacity(entries.len());
     let mut dropped_rowids = Vec::new();
@@ -451,7 +431,7 @@ fn revalidate_queued_deltas(
             kept.push(e);
             continue;
         }
-        let source: Vec<_> = sources.get(&e.domain).into_iter().flatten().collect();
+        let source: Vec<_> = sources.get(&e.domain).into_iter().collect();
         let verified = crate::declaration::delta_publisher(&e.body)
             .and_then(|domain| {
                 if domain == e.domain {
@@ -587,9 +567,10 @@ fn enforce_governance(
 }
 
 fn fit_to_cap(
-    entries: Vec<SealEntry>,
+    mut entries: Vec<SealEntry>,
     cap: i64,
     empty_block_bytes: usize,
+    installed: &HashSet<String>,
 ) -> Result<(Vec<SealEntry>, usize)> {
     let cap = usize::try_from(cap).map_err(|_| Error::Seal("invalid Block cap".into()))?;
     if empty_block_bytes > cap {
@@ -597,20 +578,74 @@ fn fit_to_cap(
             "empty Block exceeds the decompressed cap".into(),
         ));
     }
+    let pending_declarations: HashSet<_> = entries
+        .iter()
+        .filter(|entry| entry.entry_type == "publisher_declaration")
+        .filter_map(|entry| crate::declaration::inner_hash(&entry.body).ok())
+        .collect();
+    entries.sort_by(|a, b| {
+        entry_type_rank(&a.entry_type)
+            .cmp(&entry_type_rank(&b.entry_type))
+            .then_with(|| {
+                if a.entry_type == "publisher_declaration" {
+                    a.body["publisher"]["domain"]
+                        .as_str()
+                        .cmp(&b.body["publisher"]["domain"].as_str())
+                        .then_with(|| {
+                            a.body["publisher"]["seq"]
+                                .as_u64()
+                                .cmp(&b.body["publisher"]["seq"].as_u64())
+                        })
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .then_with(|| a.leaf.cmp(&b.leaf))
+    });
+    let mut selected = installed.clone();
+    let mut deferred_domains = HashSet::new();
     let mut used = empty_block_bytes;
     let mut kept = Vec::with_capacity(entries.len());
     let mut deferred = 0usize;
     for e in entries {
+        let declaration_domain = (e.entry_type == "publisher_declaration")
+            .then(|| e.body["publisher"]["domain"].as_str().unwrap_or_default());
+        if declaration_domain.is_some_and(|domain| {
+            deferred_domains.contains(domain)
+                || e.body["publisher"]["prev_declaration"]
+                    .as_str()
+                    .is_some_and(|previous| {
+                        pending_declarations.contains(previous) && !selected.contains(previous)
+                    })
+        }) {
+            deferred_domains.insert(declaration_domain.unwrap().to_string());
+            deferred += 1;
+            continue;
+        }
+
         let count_bytes = (kept.len() + 1).to_string().len() - kept.len().to_string().len();
         let size =
             jcs::canonicalize(&e.wrapped)?.len() + usize::from(!kept.is_empty()) + count_bytes;
         if size > cap - used {
+            if let Some(domain) = declaration_domain {
+                deferred_domains.insert(domain.to_string());
+            }
             deferred += 1;
             continue;
+        }
+        if e.entry_type == "publisher_declaration" {
+            if let Ok(hash) = crate::declaration::inner_hash(&e.body) {
+                selected.insert(hash);
+            }
         }
         used += size;
         kept.push(e);
     }
+    kept.sort_by(|a, b| {
+        entry_type_rank(&a.entry_type)
+            .cmp(&entry_type_rank(&b.entry_type))
+            .then_with(|| a.leaf.cmp(&b.leaf))
+    });
     Ok((kept, deferred))
 }
 
@@ -812,19 +847,15 @@ fn resolve_record_updates(
     Ok(updates)
 }
 
-/// WIST-1 §5.2 queue settlement: at the first Block whose `sealed_at` is at
-/// or after a recovery window's end, revalidate each queued Delta against
-/// the Key Set of the recovery chain's newest Declaration; failures are
-/// WIST1-E13, survivors become pending entries in their original acceptance
-/// order. Everything else sealed inside the window is superseded, so the
-/// domain resumes under the chain head whatever was accepted meanwhile.
-fn settle_recovery_windows(db: &Db, sealed_at: &str) -> Result<()> {
-    for (domain, chain_head) in db.list_due_recovery_windows(sealed_at)? {
-        let doc: Value = serde_json::from_slice(&chain_head)?;
+fn settle_recovery_windows(db: &Db, projection: &Projection, sealed_at: &str) -> Result<()> {
+    for settlement in &projection.effects().settlements {
+        let domain = &settlement.domain;
+        let doc = settlement.restored.envelope();
+        let chain_head = serde_json::to_vec(doc)?;
         let publisher: wist_core::objects::Publisher =
             serde_json::from_value(doc["publisher"].clone())
                 .map_err(|e| Error::Seal(format!("stored declaration unparsable: {e}")))?;
-        for q in db.drain_queued_deltas(&domain)? {
+        for q in db.drain_queued_deltas(domain)? {
             let verified = crate::declaration::delta_publisher(&q.entry_json)
                 .and_then(|author| {
                     if author == domain {
@@ -838,10 +869,10 @@ fn settle_recovery_windows(db: &Db, sealed_at: &str) -> Result<()> {
                 });
             match verified {
                 Ok(()) => {
-                    db.insert_pending_entry("publisher_delta", &domain, &q.entry_json, q.chain_pos)?
+                    db.insert_pending_entry("publisher_delta", domain, &q.entry_json, q.chain_pos)?
                 }
                 Err(code) => db.insert_rejection(
-                    &domain,
+                    domain,
                     if code == "WIST1-E14" { code } else { "WIST1-E13" },
                     sealed_at,
                     Some(&q.delta_id),
@@ -858,8 +889,8 @@ fn settle_recovery_windows(db: &Db, sealed_at: &str) -> Result<()> {
                 )
             })
             .unwrap_or_default();
-        db.update_publisher_declaration(&domain, &chain_head, &key_id, &public_key, &doc)?;
-        db.close_recovery_window(&domain)?;
+        db.restore_publisher_declaration(domain, &chain_head, &key_id, &public_key)?;
+        db.close_recovery_window(domain)?;
     }
     Ok(())
 }
@@ -868,6 +899,7 @@ pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<
     let now_at = jiff::Timestamp::from_second(now_epoch)
         .map_err(|_| Error::Seal("now out of range".into()))?
         .to_string();
+    let mutation = db.mutation()?;
     let prev = db.last_block()?;
     let cadence = registry::effective(
         db,
@@ -893,7 +925,22 @@ pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<
         None => (0, "sha256:genesis".to_string()),
     };
 
-    settle_recovery_windows(db, &sealed_at)?;
+    let mut history = History::open(data_dir, db.last_block()?)?;
+    let mut declarations = Declarations::default();
+    while let Some(block) = history.next_block()? {
+        declarations.apply(&block)?;
+    }
+    let recovery_days = history
+        .schedule()
+        .and_then(|schedule| schedule.value_at("recovery_window_days", sealed_epoch))
+        .unwrap_or_else(|| {
+            registry::spec("recovery_window_days")
+                .unwrap()
+                .default
+                .unwrap()
+        });
+    let settlement = declarations.project(&sealed_at, recovery_days, &[])?;
+    settle_recovery_windows(db, &settlement, &sealed_at)?;
 
     let (peeked, _up_to_rowid) = db.peek_pending_entries()?;
     let peeked = restate_appeal_deadlines(db, sk, peeked, &sealed_at, sealed_epoch)?;
@@ -934,10 +981,29 @@ pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<
         sk,
     )?;
     let framing = jcs::canonicalize(&serde_json::to_value(&empty)?)?.len();
-    let (seal_entries, _deferred) = fit_to_cap(seal_entries, cap, framing)?;
-    let seal_entries = divert_deltas_into_opening_windows(db, seal_entries)?;
+    let installed = settlement
+        .domains()
+        .values()
+        .flat_map(|state| {
+            std::iter::once(state.current().hash().to_string()).chain(
+                state
+                    .window()
+                    .map(|window| window.head().hash().to_string()),
+            )
+        })
+        .collect();
+    let (seal_entries, _deferred) = fit_to_cap(seal_entries, cap, framing, &installed)?;
+    let projection = declarations.project(
+        &sealed_at,
+        recovery_days,
+        &seal_entries
+            .iter()
+            .map(|entry| entry.wrapped.clone())
+            .collect::<Vec<_>>(),
+    )?;
+    let seal_entries = divert_deltas_into_opening_windows(db, seal_entries, &projection)?;
     let (seal_entries, retired_rowids, retired) =
-        revalidate_queued_deltas(db, seal_entries, &sealed_at)?;
+        revalidate_queued_deltas(db, seal_entries, &sealed_at, &projection)?;
     let (seal_entries, roster_rowids, roster_dropped) = check_roster_acts(
         db,
         seal_entries,
@@ -1000,6 +1066,21 @@ pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<
     )?;
     let block_hash = wist_core::block::block_hash(&serde_json::to_value(&block.header)?)?;
 
+    let projection = declarations.project(&sealed_at, recovery_days, &block.entries)?;
+    let windows = projection
+        .domains()
+        .iter()
+        .filter_map(|(domain, state)| {
+            state.window().map(|window| {
+                let window_end = i64::try_from(window.end_s())
+                    .ok()
+                    .and_then(|end| jiff::Timestamp::from_second(end).ok())
+                    .ok_or_else(|| Error::Seal("recovery window end out of range".into()))?
+                    .to_string();
+                Ok((domain, window, window_end))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
     let record_updates = resolve_record_updates(data_dir, &seal_entries)?;
 
     let blocks_dir = data_dir.join("log/blocks");
@@ -1100,18 +1181,21 @@ pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<
         block_bytes.len() as u64,
     )?;
 
-    for domain in db.list_pending_recovery_windows()? {
-        let sealed_here = seal_entries
-            .iter()
-            .any(|e| e.entry_type == "publisher_declaration" && e.domain == domain);
-        if !sealed_here {
+    for (domain, window, window_end) in windows {
+        db.store_sealed_recovery_window(
+            domain,
+            &serde_json::to_vec(window.head().envelope())?,
+            &serde_json::to_vec(window.before().envelope())?,
+            &serde_json::to_vec(window.owner().envelope())?,
+            window.owner().position().block_number,
+            &window_end,
+        )?;
+    }
+    for installation in &projection.effects().installations {
+        if !installation.opens_window {
             continue;
         }
-        let days = registry::effective(db, "recovery_window_days", &sealed_at)?;
-        let window_end = jiff::Timestamp::from_second(sealed_epoch + days * 86400)
-            .map_err(|_| Error::Seal("recovery window end out of range".into()))?
-            .to_string();
-        db.activate_recovery_window(&domain, block_number as i64, &window_end)?;
+        let domain = &installation.declaration.envelope()["publisher"]["domain"];
         let update = serde_json::json!({
             "wist_version": WIST_VERSION,
             "action": "notice",
@@ -1122,6 +1206,8 @@ pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<
         let envelope = sign_envelope(&update, "update", GENESIS_KEY_ID, sk)?;
         db.insert_pending_entry("registry_update", "", &envelope, 0)?;
     }
+
+    mutation.commit()?;
 
     if !withdrawals.is_empty() {
         for delta_id in &withdrawals {
@@ -1211,10 +1297,11 @@ mod tests {
             let framing = jcs::canonicalize(&serde_json::to_value(empty).unwrap())
                 .unwrap()
                 .len();
-            let (fit, deferred) = fit_to_cap(all, size as i64, framing).unwrap();
+            let (fit, deferred) = fit_to_cap(all, size as i64, framing, &HashSet::new()).unwrap();
             assert_eq!(fit.len(), count as usize);
             assert_eq!(deferred, 0);
-            let (fit, deferred) = fit_to_cap(entries(count), size as i64 - 1, framing).unwrap();
+            let (fit, deferred) =
+                fit_to_cap(entries(count), size as i64 - 1, framing, &HashSet::new()).unwrap();
             assert_eq!(fit.len(), count as usize - 1);
             assert_eq!(deferred, 1);
         }

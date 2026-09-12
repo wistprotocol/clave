@@ -203,7 +203,7 @@ fn snapshot_index_replaces_same_date_entry_on_reseal() {
 
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
     clave::seal::run(&db, data.path(), &sk, 1_754_740_800).unwrap();
-    let r1 = clave::seal::run(&db, data.path(), &sk, 1_754_740_801).unwrap();
+    let r1 = clave::seal::run(&db, data.path(), &sk, 1_754_744_400).unwrap();
     assert_eq!(r1.block_number, 1);
 
     let idx: serde_json::Value =
@@ -390,16 +390,16 @@ fn the_state_artifact_carries_every_kind_with_live_instances() {
             format!("sha256:{}", "2".repeat(64)),
         ],
         None,
-        1_754_740_801,
+        1_754_744_400,
     )
     .unwrap();
-    clave::seal::run(&db, data.path(), &sk, 1_754_740_801).unwrap();
+    clave::seal::run(&db, data.path(), &sk, 1_754_744_400).unwrap();
 
     // The record for the deleted URL is gone, but its chain tip is not.
     db.delete_record_by_delta(&doomed).unwrap();
 
-    clave::seal::run(&db, data.path(), &sk, 1_754_740_802).unwrap();
-    let date = &jiff::Timestamp::from_second(1_754_740_802)
+    clave::seal::run(&db, data.path(), &sk, 1_754_748_000).unwrap();
+    let date = &jiff::Timestamp::from_second(1_754_748_000)
         .unwrap()
         .to_string()[..10];
     let state_env: serde_json::Value = serde_json::from_slice(

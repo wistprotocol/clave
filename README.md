@@ -2,7 +2,7 @@
 
 The signed Delta format targets [WIST specification revision `8785c62e9e121037473d6144685fc547fa08a1b7`](https://github.com/wistprotocol/spec/tree/8785c62e9e121037473d6144685fc547fa08a1b7). Object version `1.0.0` alone does not identify a compatible draft.
 
-Delta ingestion checks the signed canonical `publisher` against the logical Feed domain before source selection and duplicate suppression, including fetched predecessors. Chain tips use `(publisher, url)` and persist across reopen; the database upgrade preserves existing stored pairs but cannot reconstruct tips already overwritten by an older URL-only table. Sealing and recovery settlement reject mismatches between queue ownership and the signed author. Complete authenticated Delta history, recovery source selection and Audit Record eligibility remain separate validation requirements.
+Delta ingestion checks the signed canonical `publisher` against the logical Feed domain before source selection and duplicate suppression, including fetched predecessors. Chain tips use `(publisher, url)` and persist across reopen; the database upgrade preserves existing stored pairs but cannot reconstruct tips already overwritten by an older URL-only table. Sealing and recovery settlement reject mismatches between queue ownership and the signed author. Complete authenticated Delta history, live recovery admission state and Audit Record eligibility remain separate validation requirements.
 
 WIST Protocol aggregator. Clave pulls signed deltas from publishers (via ping + the
 publisher's `.well-known/wist` tree), verifies each one against its schema
@@ -42,10 +42,10 @@ rotation, or fresh identity — WIST1-E08 otherwise), and verifies every
 delta against the full declared key set (`sig.key_id` membership and
 `valid_from`; WIST1-E01/E02). A recovery rotation opens the WIST-1 §5.2
 recovery window at its sealing Block (a `notice` with `details.kind`
-`"recovery"` is sealed alongside, and the open window appears in snapshot
+`"recovery"` is queued for inclusion, and the open window appears in snapshot
 state): the domain's deltas queue instead of sealing, declarations signed
 by superseded keys are rejected, and the first Block at or past the
-window's end settles the queue — survivors seal in acceptance order,
+window's end settles the queue — survivors become eligible for sealing,
 failures surface as WIST1-E13 on the status endpoint. Snapshots carry tier0 SQLite and
 tier1 Parquet (extracts + link graph), optionally sharded
 (`snapshot_shard_count` in the local params table).
@@ -112,18 +112,46 @@ order, and compare reconstructed prefixes. Live tests cover crossed source
 rejection, frozen sources through reopen, scope-only E13 settlement, survivor
 publication, and ordinary scope revocation with an unchanged signing key.
 
-Source selection and durable state integration remain incomplete. Sealing's
-highest-sequence lookup still includes superseded competitors; recovery heads
-advance on acceptance rather than only on sealing; admission does not yet
-settle expired windows. Live predecessor evaluation must adopt both eligible
-heads during an open window, then only the restored current head, while
-preserving the accepted sequence floor. Dropped queue copies leave seen-ID
-and chain-tip state that can obstruct permitted re-serving. Restoring a head
-also enqueues a redundant Declaration re-serve; replay must retain idempotence
-without a new installation, window or identity reset. These paths
-require authenticated replay adoption and restart/retry tests before recovery
-conformance can be claimed. Correct supplied-source checks do not establish
-complete Delta chains, schema validation, Audit Record eligibility or sanctions.
+Every seal reconstructs Declaration state from the complete authenticated Block
+prefix pinned by the database head before using recovery sources. Settlement
+uses the last recovery follower sealed inside the window, before the candidate
+Block's Declarations. Delta sealing uses the Declaration state projected from
+the Entries actually selected under the byte cap. A superseded competitor's
+higher sequence cannot displace the restored recovery head; an unsealed
+follower cannot change settlement authority. A deadline-Block replacement can
+still invalidate a settlement survivor with sealing E02 or scope E03.
+
+Declaration packing considers each domain's ascending sequences and defers a
+successor when its pending predecessor does not fit. Selected Entries are then
+stored in canonical type/leaf order and validated atomically. The final
+Declaration projection is recomputed after Entry filtering. Recovery lengths
+come from the authenticated schedule at the candidate instant, and existing
+window ends remain frozen. Successful seals refresh stored recovery heads and
+frozen sources from the projected state, without synthesizing a re-served
+Declaration at settlement.
+
+Database mutations for a seal share one transaction, including queue movement,
+status rejections, stored recovery state and the committed Block head. A failed
+Declaration candidate rolls those changes back. Missing or corrupt pinned
+history stops sealing before settlement. Block/checkpoint file publication and
+Snapshot generation do not share SQLite's transaction; crash recovery across
+those stores remains a separate requirement. The history reader also rejects
+prefixes produced off the signed cadence grid by local cadence overrides.
+
+Live admission still advances its recovery head on acceptance, evaluates only
+the current predecessor, does not settle expired windows before ingest, and
+must preserve its accepted sequence floor separately from sealed history.
+Post-settlement admission state must also reconcile replacements that sealed
+or remain pending. Dropped queue copies still leave seen-ID and chain-tip
+state that can obstruct permitted re-serving. Queue movement must retain the
+original acceptance order across already-pending and newly queued Deltas;
+cap-deferred pending copies must enter recovery settlement even if they never
+fit an intermediate Block. These requirements remain open, including correct
+E13 diagnostics and inclusion-turn accounting for those deferred copies.
+Exact recovery ends outside the supported timestamp range stop sealing before
+publication; full-range Snapshot representation requires specification resolution.
+Correct sealing source selection does not establish complete recovery admission,
+Delta chains, schema validation, Audit Record eligibility or sanctions.
 
 Opening an older store restores missing owner Envelopes atomically. An opened
 window requires complete authenticated Declaration history through the
@@ -307,8 +335,10 @@ live admission state, settle SQLite queues, or perform Delta eligibility checks.
 
 Signed recovery probes exercise candidate rejection, retained sequence floors,
 unsealed follower isolation, deadline boundaries, distinct settlement/sealing
-scope and restart reconstruction. Live admission and sealing still require
-projection integration with durable queue, status and chain-tip updates.
+scope and restart reconstruction. Live sealing consumes these projections
+after packing and filtering. Live admission still requires integration with
+durable queue, status and chain-tip updates, including preservation of
+acceptance order across queues.
 
 `Domain::appeal_declaration()` selects the signing-key source after the current
 Block’s Declaration stage. Callers must separately establish notice eligibility
@@ -318,8 +348,9 @@ notices, appeals or appeal processes.
 This API validates Declaration fields, sequencing and author authentication.
 Deltas, Audit Records and non-parameter Registry Updates receive no eligibility checks here.
 SQLite uses this state to restore missing owners of legacy opened recovery
-windows. General live admission, sealing and database reconstruction still use
-separate state; `verify-history` retains its Block/parameter verification scope. Snapshot
+windows. Live sealing reconstructs and projects this state for source selection;
+general admission and database reconstruction still use separate state.
+`verify-history` retains its Block/parameter verification scope. Snapshot
 recovery state also requires the protocol’s unresolved Snapshot representation
 rules. Successful reconstruction is not full protocol conformance.
 

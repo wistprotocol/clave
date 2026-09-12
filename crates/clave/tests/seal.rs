@@ -215,7 +215,7 @@ fn oversize_block_defers_entries_to_the_next_seal() {
     let mut total = 0u64;
     let mut sealed_blocks = 0u64;
     for i in 0..5 {
-        let report = clave::seal::run(&db, data.path(), &sk, 1_800_000_000 + i).unwrap();
+        let report = clave::seal::run(&db, data.path(), &sk, 1_800_000_000 + i * 3600).unwrap();
         total += report.entry_count;
         let raw = std::fs::read(
             data.path()
@@ -266,7 +266,7 @@ fn the_per_domain_block_cap_defers_the_surplus_in_acceptance_order() {
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
 
     let mut sealed: Vec<String> = Vec::new();
-    for (i, at) in [1_754_740_800i64, 1_754_740_801, 1_754_740_802]
+    for (i, at) in [1_754_740_800i64, 1_754_744_400, 1_754_748_000]
         .into_iter()
         .enumerate()
     {
@@ -323,7 +323,7 @@ fn a_delta_held_past_the_inclusion_ceiling_is_reported() {
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
 
     let mut late = Vec::new();
-    for at in 1_754_740_800i64..1_754_740_806 {
+    for at in (1_754_740_800i64..1_754_762_400).step_by(3600) {
         let report = clave::seal::run(&db, data.path(), &sk, at).unwrap();
         late.extend(report.late);
     }

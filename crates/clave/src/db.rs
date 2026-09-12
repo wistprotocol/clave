@@ -44,6 +44,46 @@ fn add_missing_columns(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+pub(crate) struct Mutation<'a> {
+    conn: &'a Connection,
+    committed: bool,
+}
+
+impl<'a> Mutation<'a> {
+    fn new(conn: &'a Connection) -> Result<Self> {
+        conn.execute_batch("SAVEPOINT clave_mutation")?;
+        Ok(Self {
+            conn,
+            committed: false,
+        })
+    }
+
+    pub(crate) fn commit(mut self) -> Result<()> {
+        self.conn
+            .execute_batch("RELEASE SAVEPOINT clave_mutation")?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl std::ops::Deref for Mutation<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        self.conn
+    }
+}
+
+impl Drop for Mutation<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = self.conn.execute_batch(
+                "ROLLBACK TO SAVEPOINT clave_mutation; RELEASE SAVEPOINT clave_mutation",
+            );
+        }
+    }
+}
+
 pub struct PublisherRow {
     pub key_id: String,
     pub public_key: String,
@@ -245,6 +285,10 @@ pub struct Db {
 }
 
 impl Db {
+    pub(crate) fn mutation(&self) -> Result<Mutation<'_>> {
+        Mutation::new(&self.conn)
+    }
+
     pub fn open(path: &Path) -> Result<Db> {
         let conn = Connection::open(path)?;
         conn.busy_timeout(std::time::Duration::from_millis(5000))?;
@@ -257,7 +301,7 @@ impl Db {
             |row| row.get(0),
         )?;
         if old_tips {
-            let tx = conn.unchecked_transaction()?;
+            let tx = Mutation::new(&conn)?;
             tx.execute_batch("ALTER TABLE url_tips RENAME TO old_url_tips;
                 CREATE TABLE url_tips(url TEXT NOT NULL, domain TEXT NOT NULL, tip TEXT NOT NULL, PRIMARY KEY(domain, url));
                 INSERT INTO url_tips SELECT url, domain, tip FROM old_url_tips;
@@ -296,7 +340,7 @@ impl Db {
             None
         };
         let pending = self.peek_pending_entries()?.0;
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.mutation()?;
         for (domain, prior, opened) in rows {
             let prior: Value = serde_json::from_slice(&prior)?;
             let unavailable = || {
@@ -415,7 +459,7 @@ impl Db {
         public_key: &str,
         entry_json: &Value,
     ) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.mutation()?;
         exec_insert_publisher(&tx, domain, declaration_json, key_id, public_key)?;
         exec_insert_pending_entry(&tx, "publisher_declaration", domain, entry_json, 0)?;
         tx.commit()?;
@@ -430,13 +474,44 @@ impl Db {
         public_key: &str,
         entry_json: &Value,
     ) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.mutation()?;
         tx.execute(
             "UPDATE publishers SET declaration_json = ?2, key_id = ?3, public_key = ?4 WHERE domain = ?1",
             (domain, declaration_json, key_id, public_key),
         )?;
         exec_insert_pending_entry(&tx, "publisher_declaration", domain, entry_json, 0)?;
         tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn restore_publisher_declaration(
+        &self,
+        domain: &str,
+        declaration_json: &[u8],
+        key_id: &str,
+        public_key: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE publishers SET declaration_json = ?2, key_id = ?3, public_key = ?4 WHERE domain = ?1",
+            (domain, declaration_json, key_id, public_key),
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn store_sealed_recovery_window(
+        &self,
+        domain: &str,
+        head: &[u8],
+        before: &[u8],
+        owner: &[u8],
+        opened_block: u64,
+        window_end: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO recovery_windows(domain, declaration_json, prior_declaration_json, owner_declaration_json, opened_block, window_end) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(domain) DO UPDATE SET declaration_json = excluded.declaration_json, prior_declaration_json = excluded.prior_declaration_json, owner_declaration_json = excluded.owner_declaration_json, opened_block = excluded.opened_block, window_end = excluded.window_end",
+            (domain, head, before, owner, opened_block, window_end),
+        )?;
         Ok(())
     }
 
@@ -506,7 +581,7 @@ impl Db {
     }
 
     pub fn record_roster_acts(&self, acts: &[RosterActRow]) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.mutation()?;
         for (i, a) in acts.iter().enumerate() {
             tx.execute(
                 "INSERT INTO roster_acts(block_number, act_index, sealed_at, action, auditor_id, key_id, public_key, for_cause) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
@@ -645,7 +720,7 @@ impl Db {
         chain_pos: i64,
     ) -> Result<()> {
         let bytes = serde_json::to_vec(entry_json)?;
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.mutation()?;
         exec_insert_seen_delta(&tx, delta_id, domain)?;
         tx.execute(
             "INSERT INTO queued_deltas(domain, delta_id, entry_json, url, chain_pos) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -669,7 +744,7 @@ impl Db {
         chain_pos: i64,
     ) -> Result<()> {
         let bytes = serde_json::to_vec(entry_json)?;
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.mutation()?;
         tx.execute("DELETE FROM pending_entries WHERE rowid = ?1", [rowid])?;
         tx.execute(
             "INSERT INTO queued_deltas(domain, delta_id, entry_json, url, chain_pos) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -680,7 +755,7 @@ impl Db {
     }
 
     pub fn drain_queued_deltas(&self, domain: &str) -> Result<Vec<QueuedDeltaRow>> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.mutation()?;
         let rows = {
             let mut stmt = tx.prepare(
                 "SELECT delta_id, entry_json, url, chain_pos FROM queued_deltas WHERE domain = ?1 ORDER BY rowid",
@@ -766,7 +841,7 @@ impl Db {
     }
 
     pub fn drain_pending_entries(&self) -> Result<Vec<PendingEntry>> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.mutation()?;
         let mut stmt = tx
             .prepare("SELECT entry_type, domain, entry_json FROM pending_entries ORDER BY rowid")?;
         let rows: Vec<(String, String, Vec<u8>)> = stmt
@@ -848,7 +923,7 @@ impl Db {
         declarations: &[SealedDeclarationRow],
         decompressed_bytes: u64,
     ) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.mutation()?;
         for rowid in sealed_rowids {
             tx.execute("DELETE FROM pending_entries WHERE rowid = ?1", [rowid])?;
         }
@@ -1054,7 +1129,7 @@ impl Db {
         let mut largest = 0;
         let mut prior_at = None;
         let mut prior_hash = "sha256:genesis".to_string();
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.mutation()?;
         for (index, (height, hash, sealed_at)) in blocks.into_iter().enumerate() {
             let bound = prior_at.map_or(
                 crate::registry::spec("block_decompressed_cap_bytes")
@@ -1394,7 +1469,7 @@ impl Db {
         url: &str,
         tip: &str,
     ) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.mutation()?;
         exec_insert_seen_delta(&tx, delta_id, domain)?;
         exec_insert_pending_entry(&tx, "publisher_delta", domain, entry_json, chain_pos)?;
         exec_set_url_tip(&tx, url, domain, tip)?;

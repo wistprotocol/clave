@@ -1184,3 +1184,342 @@ fn signed_urls_reject_normalization_changes_before_admission() {
         assert!(r.db.url_tip(&r.host, url).unwrap().is_none());
     }
 }
+
+fn sealed_recovery() -> (Rig, i64, serde_json::Value) {
+    let r = rig(make_publisher_with_recovery);
+    let start = "2026-08-09T12:00:00Z"
+        .parse::<jiff::Timestamp>()
+        .unwrap()
+        .as_second();
+    write_feed(&r.p, &r.host, &[], "2026-08-09T12:00:00Z");
+    ingest(&r, "2026-08-09T12:00:00Z");
+    clave::seal::run(&r.db, r.data.path(), &r.sk, start).unwrap();
+    let prior = current_declaration(&r.p);
+    let mut owner = prior["publisher"].clone();
+    owner["seq"] = 1.into();
+    owner["prev_declaration"] = declaration_hash(&prior).into();
+    owner["keys"] = serde_json::json!([key_entry("k2", &K2_SEED, "2026-08-09T13:00:00Z")]);
+    write_declaration(&r.p, &owner, "r1", &R1_SEED);
+    write_feed_signed(&r.p, &r.host, &[], "2026-08-09T13:00:00Z", "k2", &K2_SEED);
+    ingest(&r, "2026-08-09T13:00:00Z");
+    clave::seal::run(&r.db, r.data.path(), &r.sk, start + 3600).unwrap();
+    (r, start, owner)
+}
+
+fn stored_block(r: &Rig, height: u64) -> serde_json::Value {
+    let bytes = std::fs::read(
+        r.data
+            .path()
+            .join(format!("log/blocks/{height:09}.json.zst")),
+    )
+    .unwrap();
+    serde_json::from_slice(&zstd::decode_all(bytes.as_slice()).unwrap()).unwrap()
+}
+
+#[test]
+fn authenticated_sealing_separates_settlement_from_packed_authority() {
+    for case in [
+        "competitor",
+        "deferred_follower",
+        "deadline_key",
+        "deadline_scope",
+    ] {
+        let (mut r, start, owner) = sealed_recovery();
+        let survivor = add_delta_signed(
+            &r.p,
+            "https://example.com/survivor",
+            "survivor",
+            None,
+            "2026-08-09T15:00:00Z",
+            "k2",
+            &K2_SEED,
+        );
+        let rejected = add_delta_signed(
+            &r.p,
+            "https://example.com/rejected",
+            "rejected",
+            None,
+            "2026-08-09T15:00:00Z",
+            "k1",
+            &K1_SEED,
+        );
+        write_feed_signed(
+            &r.p,
+            &r.host,
+            &[survivor.clone(), rejected.clone()],
+            "2026-08-09T15:00:00Z",
+            "k2",
+            &K2_SEED,
+        );
+        assert_eq!(
+            ingest(&r, "2026-08-09T15:00:00Z").queued,
+            [survivor.clone(), rejected.clone()]
+        );
+        let mut replacement = owner.clone();
+        replacement["seq"] = 2.into();
+        replacement["prev_declaration"] = declaration_hash(&current_declaration(&r.p)).into();
+        let (signer, seed) = if case == "competitor" {
+            ("x1", &X1_SEED)
+        } else {
+            ("k2", &K2_SEED)
+        };
+        if case == "competitor" {
+            replacement["keys"] =
+                serde_json::json!([key_entry("x1", &X1_SEED, "2026-08-09T13:00:00Z")]);
+        } else if case == "deadline_scope" {
+            replacement["subdomain_scope"] = serde_json::json!([]);
+        } else {
+            replacement["keys"][0]["valid_from"] = "2026-08-10T00:00:00Z".into();
+        }
+        if case == "deferred_follower" {
+            replacement["subdomain_scope"] =
+                serde_json::json!(std::iter::once("example.com".to_string())
+                    .chain((0..70).map(|i| format!("explicit-host-{i}.example.com")))
+                    .collect::<Vec<_>>());
+        }
+        write_declaration(&r.p, &replacement, signer, seed);
+        write_feed_signed(&r.p, &r.host, &[], "2026-08-09T16:00:00Z", signer, seed);
+        ingest(&r, "2026-08-09T16:00:00Z");
+        assert_eq!(
+            r.db.count_pending_entries("publisher_declaration").unwrap(),
+            1,
+            "{case}"
+        );
+        if case == "competitor" {
+            clave::seal::run(&r.db, r.data.path(), &r.sk, start + 7200).unwrap();
+        }
+        if case == "deferred_follower" {
+            r.db.set_param("block_decompressed_cap_bytes", 1800)
+                .unwrap();
+        }
+        r.db = clave::db::Db::open(&r.data.path().join("clave.sqlite")).unwrap();
+        let report = clave::seal::run(&r.db, r.data.path(), &r.sk, start + 3600 + 7 * DAY).unwrap();
+        let block = stored_block(&r, report.block_number);
+        wist_core::block::verify_block(&block, &r.sk.public()).unwrap();
+        let state = clave::history::declarations::Declarations::reconstruct(
+            r.data.path(),
+            r.db.last_block().unwrap(),
+        )
+        .unwrap();
+        let current = &state.domains()[&r.host];
+        assert!(current.window().is_none(), "{case}");
+        let should_seal = matches!(case, "competitor" | "deferred_follower");
+        assert_eq!(
+            r.db.get_record("https://example.com/survivor", &r.host)
+                .unwrap()
+                .is_some(),
+            should_seal,
+            "{case}"
+        );
+        assert_eq!(
+            current.current().envelope()["publisher"]["seq"],
+            if should_seal { 1 } else { 2 }
+        );
+        assert_eq!(
+            current.highest_accepted_seq(),
+            if case == "deferred_follower" { 1 } else { 2 }
+        );
+        assert!(
+            r.db.list_rejections(&r.host)
+                .unwrap()
+                .iter()
+                .any(|r| r.delta_id.as_ref() == Some(&rejected) && r.code == "WIST1-E13"),
+            "{case}"
+        );
+        let codes: Vec<_> =
+            r.db.list_rejections(&r.host)
+                .unwrap()
+                .into_iter()
+                .filter(|r| r.delta_id.as_ref() == Some(&survivor))
+                .map(|r| r.code)
+                .collect();
+        assert_eq!(
+            codes,
+            match case {
+                "deadline_key" => vec!["WIST1-E02"],
+                "deadline_scope" => vec!["WIST1-E03"],
+                _ => vec![],
+            },
+            "{case}"
+        );
+        assert_eq!(
+            r.db.count_pending_entries("publisher_declaration").unwrap(),
+            i64::from(case == "deferred_follower"),
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn rejected_candidate_rolls_back_due_settlement_and_status() {
+    let (mut r, start, owner) = sealed_recovery();
+    let delta = add_delta_signed(
+        &r.p,
+        "https://example.com/rejected",
+        "body",
+        None,
+        "2026-08-09T15:00:00Z",
+        "k1",
+        &K1_SEED,
+    );
+    write_feed_signed(
+        &r.p,
+        &r.host,
+        std::slice::from_ref(&delta),
+        "2026-08-09T15:00:00Z",
+        "k2",
+        &K2_SEED,
+    );
+    assert_eq!(
+        ingest(&r, "2026-08-09T15:00:00Z").queued,
+        std::slice::from_ref(&delta)
+    );
+    let mut candidate = owner;
+    candidate["seq"] = 2.into();
+    candidate["prev_declaration"] = declaration_hash(&current_declaration(&r.p)).into();
+    let invalid = wist_core::envelope::sign_envelope(
+        &candidate,
+        "publisher",
+        "k2",
+        &wist_core::crypto::SigningKey::from_seed(&X1_SEED),
+    )
+    .unwrap();
+    r.db.insert_pending_entry("publisher_declaration", &r.host, &invalid, 0)
+        .unwrap();
+    let before =
+        r.db.get_recovery_window(&r.host)
+            .unwrap()
+            .unwrap()
+            .declaration_json;
+    let pending = r.db.count_pending_entries("publisher_declaration").unwrap();
+    let checkpoint = std::fs::read(r.data.path().join("log/checkpoint.json")).unwrap();
+    assert!(clave::seal::run(&r.db, r.data.path(), &r.sk, start + 3600 + 7 * DAY).is_err());
+    r.db = clave::db::Db::open(&r.data.path().join("clave.sqlite")).unwrap();
+    assert_eq!(r.db.last_block().unwrap().unwrap().block_number, 1);
+    assert_eq!(
+        r.db.get_recovery_window(&r.host)
+            .unwrap()
+            .unwrap()
+            .declaration_json,
+        before
+    );
+    assert_eq!(
+        r.db.count_pending_entries("publisher_declaration").unwrap(),
+        pending
+    );
+    assert!(r.db.list_rejections(&r.host).unwrap().is_empty());
+    assert!(r.db.is_delta_seen_for(&delta, &r.host).unwrap());
+    assert_eq!(
+        r.db.drain_queued_deltas(&r.host).unwrap()[0].delta_id,
+        delta
+    );
+    assert_eq!(
+        std::fs::read(r.data.path().join("log/checkpoint.json")).unwrap(),
+        checkpoint
+    );
+    assert!(!r.data.path().join("log/blocks/000000002.json.zst").exists());
+}
+
+#[test]
+fn corrupt_pinned_history_cannot_settle_a_queue() {
+    let (mut r, start, _) = sealed_recovery();
+    let delta = add_delta_signed(
+        &r.p,
+        "https://example.com/survivor",
+        "body",
+        None,
+        "2026-08-09T15:00:00Z",
+        "k2",
+        &K2_SEED,
+    );
+    write_feed_signed(
+        &r.p,
+        &r.host,
+        std::slice::from_ref(&delta),
+        "2026-08-09T15:00:00Z",
+        "k2",
+        &K2_SEED,
+    );
+    assert_eq!(
+        ingest(&r, "2026-08-09T15:00:00Z").queued,
+        std::slice::from_ref(&delta)
+    );
+    let block = r.data.path().join("log/blocks/000000001.json.zst");
+    let original = std::fs::read(&block).unwrap();
+    std::fs::write(&block, b"invalid frame").unwrap();
+    assert!(clave::seal::run(&r.db, r.data.path(), &r.sk, start + 3600 + 7 * DAY).is_err());
+    r.db = clave::db::Db::open(&r.data.path().join("clave.sqlite")).unwrap();
+    assert!(r.db.get_recovery_window(&r.host).unwrap().is_some());
+    assert!(r.db.list_rejections(&r.host).unwrap().is_empty());
+    assert_eq!(r.db.last_block().unwrap().unwrap().block_number, 1);
+    std::fs::write(&block, original).unwrap();
+    clave::seal::run(&r.db, r.data.path(), &r.sk, start + 3600 + 7 * DAY).unwrap();
+    assert_eq!(
+        r.db.get_record("https://example.com/survivor", &r.host)
+            .unwrap()
+            .unwrap()
+            .delta_id,
+        delta
+    );
+}
+
+#[test]
+fn sealed_recovery_sources_ignore_corrupt_summaries_and_local_window_lengths() {
+    let (mut r, start, _) = sealed_recovery();
+    let delta = add_delta_signed(
+        &r.p,
+        "https://example.com/survivor",
+        "body",
+        None,
+        "2026-08-09T15:00:00Z",
+        "k2",
+        &K2_SEED,
+    );
+    write_feed_signed(
+        &r.p,
+        &r.host,
+        std::slice::from_ref(&delta),
+        "2026-08-09T15:00:00Z",
+        "k2",
+        &K2_SEED,
+    );
+    assert_eq!(
+        ingest(&r, "2026-08-09T15:00:00Z").queued,
+        std::slice::from_ref(&delta)
+    );
+    r.db.set_param("recovery_window_days", 1).unwrap();
+    let path = r.data.path().join("clave.sqlite");
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection.execute("UPDATE recovery_windows SET window_end = '2026-08-10T13:00:00Z', declaration_json = x'7b7d'", []).unwrap();
+    connection
+        .execute(
+            "UPDATE sealed_declarations SET declaration_json = x'7b7d'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    r.db = clave::db::Db::open(&path).unwrap();
+    clave::seal::run(&r.db, r.data.path(), &r.sk, start + 2 * DAY).unwrap();
+    assert!(r
+        .db
+        .get_record("https://example.com/survivor", &r.host)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        r.db.get_recovery_window(&r.host)
+            .unwrap()
+            .unwrap()
+            .window_end
+            .as_deref(),
+        Some("2026-08-16T13:00:00Z")
+    );
+    assert!(r.db.list_rejections(&r.host).unwrap().is_empty());
+    clave::seal::run(&r.db, r.data.path(), &r.sk, start + 3600 + 7 * DAY).unwrap();
+    assert_eq!(
+        r.db.get_record("https://example.com/survivor", &r.host)
+            .unwrap()
+            .unwrap()
+            .delta_id,
+        delta
+    );
+}
