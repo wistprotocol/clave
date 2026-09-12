@@ -101,6 +101,21 @@ that timestamp; after attempted discovery, an expired cache stops the pull
 with WIST1-E02 before fetching the Feed. An exhausted discovery budget preserves
 walk suspension. Restart preserves the same expiry basis.
 
+A failed live `feed.json` signature triggers one Declaration re-fetch under
+WIST-2 §5. Replacement admission uses the same transaction, sequence floor and
+recovery rules as periodic discovery. The same fetched Feed is checked
+again against the resulting current keys; a remaining failure records one
+WIST2-E04 pull rejection. This includes first-contact rotation races. An invalid
+replacement cannot supply Feed authority or renew the cache.
+
+The retry provisionally shares periodic discovery's ingest meter: an exhausted
+budget suspends the walk without noise, and restart retains that suspension.
+Declaration budget treatment remains unresolved in the specification's
+CONFORMANCE.md, Declaration refresh boundaries. Tests cover ordinary/recovery
+rotations, reused key identifiers, unchanged/invalid/unavailable responses,
+tampered Feeds, transaction rollback and restart. Delta retries and sealed Page
+retry/source eligibility are outside this live Feed behavior.
+
 During recovery, a replacement may name either the current Declaration or
 the accepted recovery-chain head. Its named predecessor determines signer
 classification and recovery-key protection. Only an ordinary or recovery

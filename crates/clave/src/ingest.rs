@@ -284,6 +284,85 @@ fn delta_admission_sources(db: &Db, host: &str) -> Result<(bool, Vec<Publisher>)
     Ok((window.is_some(), sources))
 }
 
+fn admit_fetched_declaration(
+    db: &Db,
+    data_dir: &Path,
+    host: &str,
+    now: &str,
+    clock: &impl Fn() -> jiff::Timestamp,
+    raw: Vec<u8>,
+    value: Value,
+) -> Result<Value> {
+    settle_before_admission(db, data_dir, host, clock)?;
+    let mutation = db.mutation()?;
+    let stored_raw = db.get_publisher_declaration(host)?.ok_or_else(|| {
+        crate::error::Error::History("publisher row lost before Declaration admission".into())
+    })?;
+    let mut current_doc: Value = serde_json::from_slice(&stored_raw)?;
+    let open_window = db.get_recovery_window(host)?;
+    let recovery_head = open_window
+        .as_ref()
+        .map(|window| accepted_recovery_head(db, data_dir, host, window))
+        .transpose()?;
+    if let Some(head) = &recovery_head {
+        db.update_recovery_chain_head(host, &serde_json::to_vec(head)?)?;
+    }
+    let floor = db.highest_accepted_declaration_seq(host)?.ok_or_else(|| {
+        crate::error::Error::History("missing accepted Declaration sequence floor".into())
+    })?;
+    match declaration::evaluate_with_heads(&current_doc, recovery_head.as_ref(), floor, &value) {
+        Ok(Decision::Unchanged) => {
+            db.mark_declaration_fetched(host, now)?;
+        }
+        Ok(decision) => {
+            let (key_id, public_key) = value
+                .pointer("/publisher/keys/0")
+                .map(|k| {
+                    (
+                        k["key_id"].as_str().unwrap_or_default().to_string(),
+                        k["public_key"].as_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .unwrap_or_default();
+            db.update_publisher_declaration(host, &raw, &key_id, &public_key, &value)?;
+            match &open_window {
+                None => {
+                    if decision == Decision::Recovery {
+                        db.open_recovery_window(host, &raw, &stored_raw)?;
+                    }
+                }
+                Some(_) => {
+                    if declaration::follows_chain_head(recovery_head.as_ref().unwrap(), &value) {
+                        db.update_recovery_chain_head(host, &raw)?;
+                    }
+                }
+            }
+            current_doc = value;
+            db.mark_declaration_fetched(host, now)?;
+        }
+        Err((code, detail)) => {
+            record_rejection(db, host, code, now, None, &detail)?;
+        }
+    }
+    mutation.commit()?;
+    Ok(current_doc)
+}
+
+fn verify_live_feed(db: &Db, host: &str, feed: &Value) -> Result<bool> {
+    let raw = db
+        .get_publisher_declaration(host)?
+        .ok_or_else(|| crate::error::Error::History("missing Feed admission Declaration".into()))?;
+    let doc = serde_json::from_slice(&raw)?;
+    let publisher = declaration::publisher_of(&doc).map_err(crate::error::Error::History)?;
+    Ok(declaration::verify_signed(
+        &publisher.keys.iter().collect::<Vec<_>>(),
+        feed,
+        "feed",
+        None,
+    )
+    .is_ok())
+}
+
 fn onboard_publisher(
     db: &Db,
     client: &Client,
@@ -441,70 +520,8 @@ pub fn run_with_clock(
         let publisher_url = format!("{base}publisher.json");
         match meter.get(client, &publisher_url) {
             Ok(Some((raw, value))) => {
-                settle_before_admission(db, data_dir, host, &clock)?;
-                let mutation = db.mutation()?;
-                let stored_raw = db.get_publisher_declaration(host)?.ok_or_else(|| {
-                    crate::error::Error::History(
-                        "publisher row lost before Declaration admission".into(),
-                    )
-                })?;
-                current_doc = serde_json::from_slice(&stored_raw)?;
-                let open_window = db.get_recovery_window(host)?;
-                let recovery_head = open_window
-                    .as_ref()
-                    .map(|window| accepted_recovery_head(db, data_dir, host, window))
-                    .transpose()?;
-                if let Some(head) = &recovery_head {
-                    db.update_recovery_chain_head(host, &serde_json::to_vec(head)?)?;
-                }
-                let floor = db.highest_accepted_declaration_seq(host)?.ok_or_else(|| {
-                    crate::error::Error::History(
-                        "missing accepted Declaration sequence floor".into(),
-                    )
-                })?;
-                match declaration::evaluate_with_heads(
-                    &current_doc,
-                    recovery_head.as_ref(),
-                    floor,
-                    &value,
-                ) {
-                    Ok(Decision::Unchanged) => {
-                        db.mark_declaration_fetched(host, now)?;
-                    }
-                    Ok(decision) => {
-                        let (key_id, public_key) = value
-                            .pointer("/publisher/keys/0")
-                            .map(|k| {
-                                (
-                                    k["key_id"].as_str().unwrap_or_default().to_string(),
-                                    k["public_key"].as_str().unwrap_or_default().to_string(),
-                                )
-                            })
-                            .unwrap_or_default();
-                        db.update_publisher_declaration(host, &raw, &key_id, &public_key, &value)?;
-                        match &open_window {
-                            None => {
-                                if decision == Decision::Recovery {
-                                    db.open_recovery_window(host, &raw, &stored_raw)?;
-                                }
-                            }
-                            Some(_) => {
-                                if declaration::follows_chain_head(
-                                    recovery_head.as_ref().unwrap(),
-                                    &value,
-                                ) {
-                                    db.update_recovery_chain_head(host, &raw)?;
-                                }
-                            }
-                        }
-                        current_doc = value;
-                        db.mark_declaration_fetched(host, now)?;
-                    }
-                    Err((code, detail)) => {
-                        record_rejection(db, host, code, now, None, &detail)?;
-                    }
-                }
-                mutation.commit()?;
+                current_doc =
+                    admit_fetched_declaration(db, data_dir, host, now, &clock, raw, value)?;
             }
             // WIST-1 §5.1: a cached Key Set is valid for at most
             // keyset_cache_ttl_seconds. Past that, a discovery failure
@@ -553,7 +570,7 @@ pub fn run_with_clock(
         }
     };
 
-    let page_key_sets = page_declarations(db, host, &current_doc)?;
+    let mut page_key_sets = page_declarations(db, host, &current_doc)?;
     let mut pages: Vec<FeedEnvelope> = Vec::new();
     let mut page_url = format!("{base}feed.json");
     let mut unseen_any = false;
@@ -573,20 +590,8 @@ pub fn run_with_clock(
         let (_, feed_value) = fetched;
         settle_before_admission(db, data_dir, host, &clock)?;
         let live_page = pages.is_empty();
-        let verified = if live_page {
-            let raw = db.get_publisher_declaration(host)?.ok_or_else(|| {
-                crate::error::Error::History("missing Feed admission Declaration".into())
-            })?;
-            let doc = serde_json::from_slice(&raw)?;
-            let publisher =
-                declaration::publisher_of(&doc).map_err(crate::error::Error::History)?;
-            declaration::verify_signed(
-                &publisher.keys.iter().collect::<Vec<_>>(),
-                &feed_value,
-                "feed",
-                None,
-            )
-            .is_ok()
+        let mut verified = if live_page {
+            verify_live_feed(db, host, &feed_value)?
         } else {
             let generated_at = feed_value["feed"]["generated_at"]
                 .as_str()
@@ -594,6 +599,25 @@ pub fn run_with_clock(
                 .to_string();
             verify_sealed_page(&page_key_sets, &feed_value, &generated_at)
         };
+        if live_page && !verified {
+            match meter.get(client, &format!("{base}publisher.json")) {
+                Ok(Some((raw, value))) => {
+                    admit_fetched_declaration(db, data_dir, host, now, &clock, raw, value)?;
+                }
+                Ok(None) => {
+                    suspended = true;
+                    break;
+                }
+                Err(_) => {}
+            }
+            settle_before_admission(db, data_dir, host, &clock)?;
+            verified = verify_live_feed(db, host, &feed_value)?;
+            let raw = db.get_publisher_declaration(host)?.ok_or_else(|| {
+                crate::error::Error::History("missing refreshed Feed Declaration".into())
+            })?;
+            current_doc = serde_json::from_slice(&raw)?;
+            page_key_sets = page_declarations(db, host, &current_doc)?;
+        }
         if !verified {
             record_rejection(
                 db,
