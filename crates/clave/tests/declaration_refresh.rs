@@ -76,7 +76,13 @@ fn replacement(p: &TestPub, key_id: &str, recovery: bool) -> Value {
 
 fn install(db: &Db, doc: &Value) {
     let key = &doc["publisher"]["keys"][0];
-    db.record_publisher_declaration(
+    let persist = if db.get_publisher("localhost").unwrap().is_some() {
+        Db::update_publisher_declaration
+    } else {
+        Db::record_publisher_declaration
+    };
+    persist(
+        db,
         "localhost",
         &serde_json::to_vec(doc).unwrap(),
         key["key_id"].as_str().unwrap(),
@@ -399,7 +405,128 @@ fn failed_refresh_persistence_rolls_back_authority_and_admission_state() {
 }
 
 #[test]
-fn signed_transport_vectors_refresh_delta_authority_and_preserve_content_budgets() {
+fn page_retry_resets_after_restart_and_waits_for_declaration_inclusion() {
+    let (listener, host, client) = reserve_addr();
+    let p = make_publisher_with_recovery(&host);
+    let previous = current_declaration(&p);
+    let next = replacement(&p, "k2", false);
+    let id = add_delta_signed(
+        &p,
+        "https://localhost/a",
+        "rotated Page",
+        None,
+        NOW,
+        "k2",
+        &K2_SEED,
+    );
+    write_feed_page_signed(
+        &p,
+        &host,
+        0,
+        &[],
+        "2026-08-09T12:30:00Z",
+        None,
+        "k2",
+        &K2_SEED,
+    );
+    let page_path = p.dir.path().join(".well-known/wist/feed/0.json");
+    let page = std::fs::read(&page_path).unwrap();
+    let requests = serve_sequence(
+        listener,
+        p.dir.path().into(),
+        vec![response(&previous), response(&next)],
+    );
+    let data = tempfile::tempdir().unwrap();
+    clave::init::run(&host, data.path()).unwrap();
+    let path = data.path().join("clave.sqlite");
+    let db = Db::open(&path).unwrap();
+    install(&db, &previous);
+    let signing = clave::keys::load(&data.path().join("keys/seed")).unwrap();
+    clave::seal::run(
+        &db,
+        data.path(),
+        &signing,
+        "2026-08-09T12:00:00Z"
+            .parse::<jiff::Timestamp>()
+            .unwrap()
+            .as_second(),
+    )
+    .unwrap();
+    drop(db);
+
+    for (attempt, (key, seed)) in [("k1", &K1_SEED), ("k2", &K2_SEED)].into_iter().enumerate() {
+        let feed = json!({"wist_version": "1.0.0", "domain": host, "generated_at": NOW,
+            "deltas": [id], "next": page_url(&host, 0)});
+        let envelope = wist_core::envelope::sign_envelope(
+            &feed,
+            "feed",
+            key,
+            &wist_core::crypto::SigningKey::from_seed(seed),
+        )
+        .unwrap();
+        std::fs::write(
+            p.dir.path().join(".well-known/wist/feed.json"),
+            serde_json::to_vec(&envelope).unwrap(),
+        )
+        .unwrap();
+        let db = Db::open(&path).unwrap();
+        let report = clave::ingest::run(&db, &client, data.path(), &host, NOW).unwrap();
+        assert_eq!(report.noise, Some("WIST2-E04"));
+        assert!(!report.suspended);
+        assert!(report.accepted.is_empty());
+        assert!(report.queued.is_empty());
+        assert!(!db.is_delta_seen_for(&id, &host).unwrap());
+        assert_eq!(stored(&db), next);
+        assert_eq!(db.list_rejections(&host).unwrap().len(), attempt + 1);
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|path| **path == format!("{PREFIX}publisher.json"))
+                .count(),
+            2 * (attempt + 1)
+        );
+    }
+
+    let db = Db::open(&path).unwrap();
+    clave::seal::run(
+        &db,
+        data.path(),
+        &signing,
+        "2026-08-09T15:00:00Z"
+            .parse::<jiff::Timestamp>()
+            .unwrap()
+            .as_second(),
+    )
+    .unwrap();
+    drop(db);
+    let db = Db::open(&path).unwrap();
+    let report =
+        clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T15:00:01Z").unwrap();
+    assert_eq!(report.noise, None);
+    assert_eq!(report.accepted, [id]);
+    assert_eq!(db.list_rejections(&host).unwrap().len(), 2);
+    assert_eq!(std::fs::read(page_path).unwrap(), page);
+    let paths = requests.lock().unwrap();
+    assert_eq!(
+        paths
+            .iter()
+            .filter(|path| **path == format!("{PREFIX}publisher.json"))
+            .count(),
+        5
+    );
+    assert_eq!(
+        paths
+            .iter()
+            .filter(|path| **path == format!("{PREFIX}feed/0.json"))
+            .count(),
+        3
+    );
+}
+
+#[test]
+fn signed_transport_vectors_refresh_authority_and_preserve_content_budgets() {
     let root = std::env::var_os("WIST_SPEC_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| {
@@ -417,6 +544,14 @@ fn signed_transport_vectors_refresh_delta_authority_and_preserve_content_budgets
         std::fs::create_dir_all(directory.join("payloads")).unwrap();
         let feed = wist_core::jcs::canonicalize(&case["feed"]).unwrap();
         std::fs::write(directory.join("feed.json"), &feed).unwrap();
+        let page_bytes = if let Some(page) = case.get("page") {
+            std::fs::create_dir_all(directory.join("feed")).unwrap();
+            let bytes = wist_core::jcs::canonicalize(page).unwrap();
+            std::fs::write(directory.join("feed/0.json"), &bytes).unwrap();
+            bytes.len()
+        } else {
+            0
+        };
         let mut delta_bytes = 0;
         for entry in case["deltas"].as_array().unwrap() {
             let hex = &entry["id"].as_str().unwrap()[7..];
@@ -442,12 +577,31 @@ fn signed_transport_vectors_refresh_delta_authority_and_preserve_content_budgets
         clave::init::run(&host, data.path()).unwrap();
         let path = data.path().join("clave.sqlite");
         let db = Db::open(&path).unwrap();
+        if let Some(sealed) = case["sealed"].as_array() {
+            let signing = clave::keys::load(&data.path().join("keys/seed")).unwrap();
+            for entry in sealed {
+                install(&db, &entry["envelope"]);
+                clave::seal::run(
+                    &db,
+                    data.path(),
+                    &signing,
+                    entry["at"]
+                        .as_str()
+                        .unwrap()
+                        .parse::<jiff::Timestamp>()
+                        .unwrap()
+                        .as_second(),
+                )
+                .unwrap();
+            }
+        }
         if case["cached"].as_bool().unwrap() {
             install(&db, &case["initial"]);
         }
         let budget = match case["content_budget"].as_str() {
             Some("feed") => Some(feed.len() as i64),
             Some("feed and deltas") => Some((feed.len() + delta_bytes) as i64),
+            Some("feed and page") => Some((feed.len() + page_bytes) as i64),
             _ => case["content_budget"].as_i64(),
         };
         if let Some(budget) = budget {
@@ -485,7 +639,35 @@ fn signed_transport_vectors_refresh_delta_authority_and_preserve_content_budgets
             "{}: {report:?}",
             case["name"]
         );
-        assert_eq!(report.noise, None, "{}: {report:?}", case["name"]);
+        assert_eq!(
+            json!(report.noise),
+            expected["noise"],
+            "{}: {report:?}",
+            case["name"]
+        );
+        if case.get("page").is_some() {
+            assert_eq!(
+                requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|path| **path == format!("{PREFIX}feed/0.json"))
+                    .count(),
+                1,
+                "{}",
+                case["name"],
+            );
+            assert_eq!(
+                db.list_rejections(&host)
+                    .unwrap()
+                    .iter()
+                    .filter(|rejection| rejection.code == "WIST2-E04")
+                    .count(),
+                usize::from(report.noise == Some("WIST2-E04")),
+                "{}",
+                case["name"],
+            );
+        }
         assert_eq!(
             requests
                 .lock()

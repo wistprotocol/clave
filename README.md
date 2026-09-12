@@ -118,11 +118,11 @@ Delta Envelope is reverified, including scope. Invalid fields and foreign
 Publisher association reject before binding checks. Invalid or unavailable
 refreshes consume the attempt; a later pull can retry the ID again.
 
-`declaration-refresh.json` supplies 19 signed transport cases consumed through
+`declaration-refresh.json` supplies 30 signed transport cases consumed through
 live HTTP, including ordinary rotation, reused identifiers, absent, excluded
 and future bindings, separate Feed/Delta/predecessor attempts, unsuccessful
-responses and content-budget boundaries. Additional tests cover
-recovery, frozen sources, settlement during Payload fetching, cache expiry,
+responses, sealed Page sources and content-budget boundaries. Additional tests
+cover recovery, frozen sources, settlement during Payload fetching, cache expiry,
 rollback and restart. Page authority is described under
 [Page source verification](#page-source-verification); the content budget
 does not bound Declaration traffic.
@@ -332,9 +332,20 @@ Signed HTTP/restart tests cover unsealed-to-sealed authority, retired and reused
 keys, alias renames, multiple Declarations in one Block, idempotent repetitions, recovery
 supersession and forged or absent database summaries. Reconstruction runs once
 when a pull first reaches a sealed Page and retains that prefix for the walk;
-bounded replay/cache work remains unimplemented. Complete Feed fields and
-timestamps, sealed-Page signature-failure refresh and durable selected-source
-provenance remain incomplete. WIST-2 §3.2 named-entry fallback is covered by
+bounded replay/cache work remains unimplemented.
+
+A failed Page signature uses WIST-2 §5's shared Feed/Page Declaration retry
+if the live Feed has not consumed it. The original Page is rechecked against
+the same authenticated prefix; an accepted unsealed replacement cannot
+authorize it. Failure records WIST2-E04 even at the content-budget boundary.
+Signed transport cases distinguish shared attempts, invalid/unavailable
+responses, retired and first-next sources, unsealed and later-source
+exclusion, and independent Delta retries. A restart regression preserves the
+discovered rotation, renews the next pull's attempt and admits the unchanged
+Page only after its authorizing Declaration seals.
+
+Complete Feed fields/timestamps and durable selected-source provenance remain
+incomplete. WIST-2 §3.2 named-entry fallback is covered by
 all 16 signed `page-bindings.json` probes, including excluded entries and
 rejection of aliases or public bytes available only from a later source.
 

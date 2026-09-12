@@ -537,6 +537,7 @@ pub fn run_with_clock(
     };
 
     let mut page_key_sets = None;
+    let mut feed_refresh_attempted = false;
     let mut pages: Vec<FeedEnvelope> = Vec::new();
     let mut page_url = format!("{base}feed.json");
     let mut unseen_any = false;
@@ -568,14 +569,25 @@ pub fn run_with_clock(
                 .to_string();
             verify_sealed_page(page_key_sets.as_ref().unwrap(), &feed_value, &generated_at)
         };
-        if live_page && !verified {
+        if !verified && !feed_refresh_attempted {
+            feed_refresh_attempted = true;
             if let Ok((raw, value)) =
                 client.get_json_in_scope(&format!("{base}publisher.json"), &meter.subdomain_scope)
             {
                 admit_fetched_declaration(db, data_dir, host, now, &clock, raw, value)?;
             }
             settle_before_admission(db, data_dir, host, &clock)?;
-            verified = verify_live_feed(db, host, &feed_value)?;
+            verified = if live_page {
+                verify_live_feed(db, host, &feed_value)?
+            } else {
+                verify_sealed_page(
+                    page_key_sets.as_ref().unwrap(),
+                    &feed_value,
+                    feed_value["feed"]["generated_at"]
+                        .as_str()
+                        .unwrap_or_default(),
+                )
+            };
         }
         if !verified {
             record_rejection(
