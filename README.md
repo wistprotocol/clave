@@ -1,6 +1,6 @@
 # clave
 
-The signed Delta format targets [WIST specification revision `dc0e6f06d413de8cf666ae8180f097821135f7b7`](https://github.com/wistprotocol/spec/tree/dc0e6f06d413de8cf666ae8180f097821135f7b7). Object version `1.0.0` alone does not identify a compatible draft.
+The signed Delta format targets [WIST specification revision `3dd2e8e97847e77d09de6d9b529d0c03d3766098`](https://github.com/wistprotocol/spec/tree/3dd2e8e97847e77d09de6d9b529d0c03d3766098). Object version `1.0.0` alone does not identify a compatible draft.
 
 Delta ingestion checks the signed canonical `publisher` against the logical Feed domain before source selection and duplicate suppression, including fetched predecessors. Chain tips use `(publisher, url)` and persist across reopen; legacy index restoration is described under [Delta index reconciliation](#delta-index-reconciliation). Sealing and recovery settlement reject mismatches between queue ownership and the signed author. Complete authenticated Delta eligibility and Audit Record derivation remain separate validation requirements.
 
@@ -51,18 +51,26 @@ tier1 Parquet (extracts + link graph), optionally sharded
 
 `declaration::delta::validate_fields` enforces WIST-1 §7's complete Delta
 Envelope field checks before Feed association, authority or signature use.
-`validate_static` checks content/predecessor presence and URL/commitment caps;
-its caller supplies valid stage-specific caps. The helper does not select or
-authenticate parameter profiles. Live ingestion supplies the effective caps
-at its validation clock, including the sum defining the commitment cap.
+`validate_version` applies those checks, then rejects unsupported majors with
+WIST1-E15. It supports major `1`, preserves minor/patch components without
+numeric conversion, and is used by Delta signature verification and
+`validate_static`. The latter also checks content/predecessor presence and
+URL/commitment caps. Its caller supplies valid stage-specific caps; the helper
+does not authenticate parameter profiles. Live ingestion supplies effective
+caps at its validation clock, including the derived commitment cap.
 
 Typed ingestion reads a canonical temporary copy so integral decimal numbers
 remain admissible; stored and verified signed objects retain their original
 values. Rejected Deltas receive persistent typed status entries without
-recording accepted IDs, changing URL tips or writing Payload files. `delta-fields.json` exercises
-field and diagnostic boundaries; live tests cover rejection across reopen,
-active URL caps and decimal byte counts. These checks do not establish complete
-authenticated Delta history, version support or live refresh/retrieval behavior.
+recording accepted IDs, changing URL tips or writing Payload files. Sealing
+retains E15 for unsupported queued Deltas and releases their accepted indexes.
+
+`delta-fields.json` exercises field/version boundaries and diagnostic
+combinations. Live tests cover persistent rejection, active caps, decimal
+byte counts, fetched unsupported predecessors and signed version preservation
+across duplicate pulls, restart and sealing. These checks do not establish
+complete authenticated Delta history, other objects' version support or live
+signature-failure refresh behavior.
 
 ## Declaration key binding
 

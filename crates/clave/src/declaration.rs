@@ -311,7 +311,7 @@ pub fn verify_signed(
     observed_at: Option<&str>,
 ) -> Result<(), &'static str> {
     if kind == "delta" {
-        delta_publisher(doc)?;
+        delta::validate_version(doc)?;
     }
     if observed_at.is_some_and(|value| !time::valid(value))
         || keys.iter().any(|key| !time::valid(&key.valid_from))

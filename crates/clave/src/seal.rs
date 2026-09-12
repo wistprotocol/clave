@@ -432,7 +432,7 @@ fn revalidate_queued_deltas(
                 kept.push(e);
                 continue;
             }
-            Err(code @ ("WIST1-E14" | "WIST1-E03")) => code,
+            Err(code @ ("WIST1-E14" | "WIST1-E03" | "WIST1-E15")) => code,
             Err(_) => "WIST1-E02",
         };
         rejections

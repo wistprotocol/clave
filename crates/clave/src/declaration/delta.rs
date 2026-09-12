@@ -118,12 +118,26 @@ pub fn validate_fields(doc: &Value) -> Result<(), &'static str> {
     Ok(())
 }
 
+pub fn validate_version(doc: &Value) -> Result<(), &'static str> {
+    validate_fields(doc)?;
+    if doc["delta"]["wist_version"]
+        .as_str()
+        .unwrap()
+        .split('.')
+        .next()
+        != Some("1")
+    {
+        return Err("WIST1-E15");
+    }
+    Ok(())
+}
+
 pub fn validate_static(
     doc: &Value,
     url_cap: i64,
     commitment_cap: i128,
 ) -> Result<(), &'static str> {
-    validate_fields(doc)?;
+    validate_version(doc)?;
     let body = &doc["delta"];
     if let Some(payload) = body.get("payload") {
         if payload["bytes"].as_f64().unwrap() as i128 > commitment_cap {

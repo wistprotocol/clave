@@ -2,7 +2,7 @@ mod common;
 
 use clave::declaration::{
     self,
-    delta::{validate_fields, validate_static},
+    delta::{validate_fields, validate_static, validate_version},
 };
 use common::*;
 use serde_json::{json, Value};
@@ -35,6 +35,19 @@ fn signed_field_vectors_preserve_diagnostics_and_source_bytes() {
         } else {
             field.unwrap();
         }
+        let version = validate_version(doc);
+        assert_eq!(
+            version,
+            if allowed.contains("WIST1-E14") {
+                Err("WIST1-E14")
+            } else if allowed.contains("WIST1-E15") {
+                Err("WIST1-E15")
+            } else {
+                Ok(())
+            },
+            "{}",
+            case["name"]
+        );
         let errors: BTreeSet<_> = [
             validate_static(
                 doc,
@@ -110,6 +123,8 @@ fn field_and_static_rejections_leave_no_admission_state_across_restart() {
         "WIST1-E07",
         "WIST1-E04",
         "WIST1-E11",
+        "WIST1-E15",
+        "WIST1-E14",
     ]
     .iter()
     .enumerate()
@@ -134,6 +149,13 @@ fn field_and_static_rejections_leave_no_admission_state_across_restart() {
                 inner["url"] = json!(format!("https://localhost/{}", "a".repeat(2048)));
                 inner["change_type"] = json!("attest");
                 inner["prev"] = json!(format!("sha256:{}", "0".repeat(64)));
+            }
+            6 | 7 => {
+                inner["wist_version"] = json!("2.0.0");
+                inner["payload"] = json!({"commitment":format!("hmac-sha256:{}", "0".repeat(64)),"alg":"HMAC-SHA256","bytes":0});
+                if index == 7 {
+                    inner["meta"]["lang"] = json!("EN");
+                }
             }
             _ => unreachable!(),
         }
@@ -205,4 +227,164 @@ fn decimal_byte_counts_and_active_url_caps_use_canonical_values() {
     assert_eq!(db.url_tip(&host, &url).unwrap(), Some(id));
     let public = wist_core::crypto::PublicKey::from_b64u(&seed_public_b64u(&K1_SEED)).unwrap();
     wist_core::envelope::verify_envelope(&doc, "delta", &public).unwrap();
+}
+
+fn retained_delta(db: &clave::db::Db, id: &str) -> Value {
+    db.peek_pending_entries()
+        .unwrap()
+        .0
+        .into_iter()
+        .find(|row| {
+            row.entry_type == "publisher_delta"
+                && wist_core::delta::delta_id(&row.entry_json["delta"]).unwrap() == id
+        })
+        .unwrap()
+        .entry_json
+}
+
+fn versioned_delta(p: &TestPub, url: &str, version: &str) -> (String, Value) {
+    let original = add_delta(p, url, "body", None);
+    let source = p.dir.path().join(".well-known/wist");
+    let doc: Value = serde_json::from_slice(
+        &std::fs::read(source.join(format!("deltas/{}.json", &original[7..]))).unwrap(),
+    )
+    .unwrap();
+    let mut inner = doc["delta"].clone();
+    inner["wist_version"] = json!(version);
+    let updated = wist_core::envelope::sign_envelope(&inner, "delta", "k1", &p.sk).unwrap();
+    let id = store(p, &updated);
+    std::fs::copy(
+        source.join(format!("payloads/{}.json", &original[7..])),
+        source.join(format!("payloads/{}.json", &id[7..])),
+    )
+    .unwrap();
+    (id, updated)
+}
+
+#[test]
+fn same_major_versions_preserve_signed_values_through_admission_and_restart() {
+    let (listener, host, client) = reserve_addr();
+    let p = make_publisher(&host);
+    serve_static(listener, p.dir.path().to_path_buf());
+    let data = tempfile::tempdir().unwrap();
+    clave::init::run(&host, data.path()).unwrap();
+    let path = data.path().join("clave.sqlite");
+    let mut db = clave::db::Db::open(&path).unwrap();
+    for (index, version) in [
+        "1.0.1".into(),
+        "1.1.0".into(),
+        format!("1.{}.{}", "9".repeat(80), "9".repeat(80)),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let url = format!("https://localhost/{index}");
+        let (id, doc) = versioned_delta(&p, &url, version);
+        write_feed(&p, &host, std::slice::from_ref(&id), "2026-08-09T12:00:00Z");
+        let report =
+            clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
+        assert_eq!(report.accepted, std::slice::from_ref(&id));
+        assert!(report.rejected.is_empty());
+        drop(db);
+        db = clave::db::Db::open(&path).unwrap();
+        let retained = retained_delta(&db, &id);
+        assert_eq!(retained, doc);
+        assert_eq!(db.url_tip(&host, &url).unwrap(), Some(id.clone()));
+        let duplicate =
+            clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
+        assert!(duplicate.rejected.is_empty());
+        assert_eq!(retained_delta(&db, &id), doc);
+    }
+}
+
+#[test]
+fn fetched_unsupported_predecessor_cannot_advance_a_supported_chain() {
+    let (listener, host, client) = reserve_addr();
+    let p = make_publisher(&host);
+    serve_static(listener, p.dir.path().to_path_buf());
+    let data = tempfile::tempdir().unwrap();
+    clave::init::run(&host, data.path()).unwrap();
+    let path = data.path().join("clave.sqlite");
+    let db = clave::db::Db::open(&path).unwrap();
+    let url = "https://localhost/page";
+    let (prior, _) = versioned_delta(&p, url, "2.0.0");
+    let next = add_delta(&p, url, "changed", Some(&prior));
+    write_feed(
+        &p,
+        &host,
+        std::slice::from_ref(&next),
+        "2026-08-09T12:00:00Z",
+    );
+    let report =
+        clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
+    assert!(report.accepted.is_empty() && report.queued.is_empty());
+    assert!(report
+        .rejected
+        .contains(&(prior.clone(), "WIST1-E15".into())));
+    assert!(report
+        .rejected
+        .contains(&(next.clone(), "WIST1-E07".into())));
+    drop(db);
+    let db = clave::db::Db::open(&path).unwrap();
+    assert!(db.url_tip(&host, url).unwrap().is_none());
+    for id in [prior, next] {
+        assert!(!db.is_delta_seen(&id).unwrap());
+        assert!(!data
+            .path()
+            .join(format!("payloads/{}.json", &id[7..]))
+            .exists());
+    }
+}
+
+#[test]
+fn sealing_preserves_version_diagnostics_and_supported_signed_values() {
+    let (listener, host, client) = reserve_addr();
+    let p = make_publisher(&host);
+    serve_static(listener, p.dir.path().to_path_buf());
+    let data = tempfile::tempdir().unwrap();
+    clave::init::run(&host, data.path()).unwrap();
+    let path = data.path().join("clave.sqlite");
+    let db = clave::db::Db::open(&path).unwrap();
+    write_feed(&p, &host, &[], "2026-08-09T12:00:00Z");
+    clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
+    let bad_url = "https://localhost/unsupported";
+    let (bad_id, bad) = versioned_delta(&p, bad_url, "2.0.0");
+    let good_url = "https://localhost/supported";
+    let (good_id, good) = versioned_delta(&p, good_url, "1.2.3");
+    for (id, doc, url) in [(&bad_id, &bad, bad_url), (&good_id, &good, good_url)] {
+        db.record_accepted_delta(&host, id, doc, 0, url, id)
+            .unwrap();
+    }
+    drop(db);
+    let db = clave::db::Db::open(&path).unwrap();
+    let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
+    let at = "2026-08-09T12:00:00Z"
+        .parse::<jiff::Timestamp>()
+        .unwrap()
+        .as_second();
+    let report = clave::seal::run(&db, data.path(), &sk, at).unwrap();
+    assert_eq!(report.entry_count, 2);
+    assert_eq!(report.dropped.len(), 1);
+    assert!(report.dropped[0].contains("WIST1-E15"));
+    let bytes = std::fs::read(data.path().join("log/blocks/000000000.json.zst")).unwrap();
+    let block: Value = serde_json::from_slice(&zstd::decode_all(&bytes[..]).unwrap()).unwrap();
+    assert_eq!(
+        block["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["type"] == "publisher_delta")
+            .unwrap()["body"],
+        good
+    );
+    drop(db);
+    let db = clave::db::Db::open(&path).unwrap();
+    assert!(!db.is_delta_seen(&bad_id).unwrap());
+    assert!(db.url_tip(&host, bad_url).unwrap().is_none());
+    assert_eq!(db.url_tip(&host, good_url).unwrap(), Some(good_id));
+    assert!(db
+        .list_rejections(&host)
+        .unwrap()
+        .iter()
+        .any(|entry| entry.delta_id.as_deref() == Some(&bad_id) && entry.code == "WIST1-E15"));
 }
