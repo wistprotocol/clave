@@ -518,6 +518,163 @@ fn retained_version_and_field_failures_preserve_indexes_and_precedence() {
 }
 
 #[test]
+fn missing_content_and_predecessor_vectors_stop_restoration_atomically() {
+    let vector: Value = serde_json::from_slice(
+        &std::fs::read(spec_dir().join("vectors/wist1/delta-fields.json")).unwrap(),
+    )
+    .unwrap();
+    let sources: Value = serde_json::from_slice(
+        &std::fs::read(spec_dir().join("vectors/wist1/declaration-fields.json")).unwrap(),
+    )
+    .unwrap();
+    let mut cases = 0;
+    for case in vector["cases"].as_array().unwrap() {
+        let allowed = case["allowed"].as_array().unwrap();
+        if !allowed
+            .iter()
+            .any(|code| code == "WIST1-E09" || code == "WIST1-E07")
+        {
+            continue;
+        }
+        cases += 1;
+        for store in ["sealed", "pending", "recovery"] {
+            let f = Fixture::new();
+            let body = &case["envelope"];
+            let domain = body["delta"]["publisher"].as_str().unwrap();
+            let url = body["delta"]["url"].as_str().unwrap();
+            let id = case["id"].as_str().unwrap();
+            f.append(vec![
+                json!({"type":"publisher_declaration", "body":sources["stored"]}),
+            ]);
+            match store {
+                "sealed" => f.append(vec![entry(body.clone())]),
+                "pending" => {
+                    f.db.record_accepted_delta(domain, id, body, 0, url, id)
+                        .unwrap()
+                }
+                _ => f.db.queue_delta(domain, id, body, url, id, 0).unwrap(),
+            }
+            f.connection()
+                .execute_batch("DELETE FROM seen_deltas; DELETE FROM url_tips;")
+                .unwrap();
+            f.db.insert_seen_delta("residue", domain).unwrap();
+            f.db.set_url_tip(url, domain, "residue").unwrap();
+            f.legacy();
+            for _ in 0..2 {
+                let context = format!("{}: {store}", case["name"]);
+                let error = f.reopen().err().expect(&context).to_string();
+                assert!(
+                    allowed
+                        .iter()
+                        .any(|code| error.contains(code.as_str().unwrap())),
+                    "{context}: {error}"
+                );
+                assert!(f.db.is_delta_seen("residue").unwrap(), "{context}");
+                assert!(!f.db.is_delta_seen(id).unwrap(), "{context}");
+                assert_eq!(
+                    f.db.url_tip(domain, url).unwrap().as_deref(),
+                    Some("residue"),
+                    "{context}"
+                );
+                let marker: bool = f.connection().query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'delta_index_reconciliation')", [], |row| row.get(0)).unwrap();
+                assert!(!marker, "{context}");
+                let retained = match store {
+                    "sealed" => {
+                        let bytes =
+                            std::fs::read(f.directory.path().join("log/blocks/000000001.json.zst"))
+                                .unwrap();
+                        let block: Value =
+                            serde_json::from_slice(&zstd::decode_all(&bytes[..]).unwrap()).unwrap();
+                        block["entries"][0]["body"].clone()
+                    }
+                    _ => {
+                        let query = if store == "pending" {
+                            "SELECT entry_json FROM pending_entries"
+                        } else {
+                            "SELECT entry_json FROM queued_deltas"
+                        };
+                        let bytes: Vec<u8> = f
+                            .connection()
+                            .query_row(query, [], |row| row.get(0))
+                            .unwrap();
+                        serde_json::from_slice(&bytes).unwrap()
+                    }
+                };
+                assert_eq!(retained, *body, "{context}");
+            }
+        }
+    }
+    assert_eq!(cases, 10);
+}
+
+#[test]
+fn retained_change_types_require_content_and_preserve_contentless_successors() {
+    for store in ["sealed", "pending", "recovery"] {
+        for (kind, with_payload, with_prev, expected) in [
+            ("update", true, false, Some("WIST1-E07")),
+            ("update", false, true, Some("WIST1-E09")),
+            ("new", false, true, Some("WIST1-E09")),
+            ("delete", false, true, None),
+            ("attest", false, true, None),
+            ("new", true, true, None),
+            ("update", true, true, None),
+        ] {
+            let f = Fixture::new();
+            let publisher = make_publisher("example.com");
+            let url = "https://example.com/";
+            let (prior_id, prior) = delta(&publisher, url, "first", None);
+            f.append(vec![declaration(&publisher), entry(prior)]);
+            let (_, mut body) = delta(&publisher, url, "second", Some(&prior_id));
+            body["delta"]["change_type"] = json!(kind);
+            if !with_payload {
+                body["delta"].as_object_mut().unwrap().remove("payload");
+            }
+            if !with_prev {
+                body["delta"].as_object_mut().unwrap().remove("prev");
+            }
+            let body =
+                wist_core::envelope::sign_envelope(&body["delta"], "delta", "k1", &publisher.sk)
+                    .unwrap();
+            let id = wist_core::delta::delta_id(&body["delta"]).unwrap();
+            match store {
+                "sealed" => f.append(vec![entry(body)]),
+                "pending" => {
+                    f.db.record_accepted_delta(&publisher.domain, &id, &body, 0, url, &id)
+                        .unwrap()
+                }
+                _ => {
+                    f.db.queue_delta(&publisher.domain, &id, &body, url, &id, 0)
+                        .unwrap()
+                }
+            }
+            f.legacy();
+            for _ in 0..2 {
+                let context = format!("{store}: {kind}, payload={with_payload}, prev={with_prev}");
+                if let Some(code) = expected {
+                    let error = f.reopen().err().expect(&context).to_string();
+                    assert!(error.contains(code), "{context}: {error}");
+                } else {
+                    let db = f.reopen().unwrap();
+                    assert_eq!(
+                        db.url_tip(&publisher.domain, url).unwrap().as_deref(),
+                        Some(id.as_str()),
+                        "{context}"
+                    );
+                    assert!(
+                        db.is_delta_seen_for(&prior_id, &publisher.domain).unwrap(),
+                        "{context}"
+                    );
+                    assert!(
+                        db.is_delta_seen_for(&id, &publisher.domain).unwrap(),
+                        "{context}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn signed_predecessor_times_reconcile_across_sealed_and_retained_chains() {
     let vector: Value = serde_json::from_slice(
         &std::fs::read(spec_dir().join("vectors/wist1/declaration-fields.json")).unwrap(),

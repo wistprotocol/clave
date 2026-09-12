@@ -132,22 +132,31 @@ pub fn validate_version(doc: &Value) -> Result<(), &'static str> {
     Ok(())
 }
 
+pub(crate) fn validate_content_and_prev(doc: &Value) -> Result<(), &'static str> {
+    validate_version(doc)?;
+    let body = &doc["delta"];
+    if body.get("payload").is_none()
+        && matches!(body["change_type"].as_str(), Some("new" | "update"))
+    {
+        return Err("WIST1-E09");
+    }
+    if body["change_type"] != "new" && body.get("prev").is_none() {
+        return Err("WIST1-E07");
+    }
+    Ok(())
+}
+
 pub fn validate_static(
     doc: &Value,
     url_cap: i64,
     commitment_cap: i128,
 ) -> Result<(), &'static str> {
-    validate_version(doc)?;
+    validate_content_and_prev(doc)?;
     let body = &doc["delta"];
     if let Some(payload) = body.get("payload") {
         if payload["bytes"].as_f64().unwrap() as i128 > commitment_cap {
             return Err("WIST1-E04");
         }
-    } else if matches!(body["change_type"].as_str(), Some("new" | "update")) {
-        return Err("WIST1-E09");
-    }
-    if body["change_type"] != "new" && body.get("prev").is_none() {
-        return Err("WIST1-E07");
     }
     if wist_core::jcs::canonicalize(&body["url"])
         .map_err(|_| "WIST1-E05")?

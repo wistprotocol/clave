@@ -361,8 +361,11 @@ and restores pairs overwritten by the former URL-only table. The Anchor and
 database head are operator-trusted inputs, as in [Authenticated history](#authenticated-history).
 
 Every retained Envelope passes the field and version checks in
-[Delta field validation](#delta-field-validation). Sealed sources come from
-Declaration replay at each Block. Restoration checks Delta signing bindings,
+[Delta field validation](#delta-field-validation). A `new` or `update`
+without a `payload` commitment stops restoration with WIST1-E09;
+an `update`, `delete` or `attest` without `prev` stops it with WIST1-E07.
+Field/version checks run first. Sealed sources come from Declaration replay
+at each Block. Restoration checks Delta signing bindings,
 key-time bounds and scope, then follows predecessor
 links within that Block. Retained unsealed copies follow persistent acceptance
 positions across both queues; their Envelopes remain trusted local admission
@@ -390,12 +393,17 @@ retry repeats restoration. Subsequent opens skip this completed repair. Queues,
 Payloads and rejection history are preserved. The repair retains all seen IDs
 in memory plus each tip's signed observation time. It does not establish
 complete Delta eligibility, governance replay, general legacy-state revalidation
-or crash-safe publication.
+or crash-safe publication. Historical size-cap selection awaits the temporal
+anchor resolution in specification `CONFORMANCE.md`; no current/default cap
+is substituted during restoration.
 
 Signed restart tests cover chain and ownership restoration, preserved versioned
 Envelopes across all three stores, field/version diagnostic precedence,
 exact predecessor times, shared-URL identity resets, corrupt history, invalid
-authority and atomic failure. The signed `declaration-fields.json` predecessor
+authority and atomic failure. Signed `delta-fields.json` missing-content and
+missing-predecessor cases exercise all three stores, retry and Envelope
+preservation; additional chains distinguish contentless successors from
+invalid content-bearing entries. The signed `declaration-fields.json` predecessor
 cases exercise same-Block chains, successive Blocks, sealed-to-queue transitions
 and both queue orders.
 

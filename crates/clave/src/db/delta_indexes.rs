@@ -17,7 +17,7 @@ struct Delta {
 
 impl Delta {
     fn read(envelope: &Value) -> Result<Self> {
-        declaration::delta::validate_version(envelope).map_err(failure)?;
+        declaration::delta::validate_content_and_prev(envelope).map_err(failure)?;
         let body = &envelope["delta"];
         let domain = wist_core::delta::publisher(body).map_err(|e| failure(&e.to_string()))?;
         let url = body["url"]
