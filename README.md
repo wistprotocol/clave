@@ -2,7 +2,7 @@
 
 The signed Delta format targets [WIST specification revision `8785c62e9e121037473d6144685fc547fa08a1b7`](https://github.com/wistprotocol/spec/tree/8785c62e9e121037473d6144685fc547fa08a1b7). Object version `1.0.0` alone does not identify a compatible draft.
 
-Delta ingestion checks the signed canonical `publisher` against the logical Feed domain before source selection and duplicate suppression, including fetched predecessors. Chain tips use `(publisher, url)` and persist across reopen; the database upgrade preserves existing stored pairs but cannot reconstruct tips already overwritten by an older URL-only table. Sealing and recovery settlement reject mismatches between queue ownership and the signed author. Complete authenticated Delta history, live recovery admission state and Audit Record eligibility remain separate validation requirements.
+Delta ingestion checks the signed canonical `publisher` against the logical Feed domain before source selection and duplicate suppression, including fetched predecessors. Chain tips use `(publisher, url)` and persist across reopen; legacy index restoration is described under [Delta index reconciliation](#delta-index-reconciliation). Sealing and recovery settlement reject mismatches between queue ownership and the signed author. Complete authenticated Delta eligibility and Audit Record derivation remain separate validation requirements.
 
 WIST Protocol aggregator. Clave pulls signed Deltas from Publishers through
 ping + pull, validates them, and seals hourly hash-chained Blocks. It serves
@@ -190,9 +190,8 @@ and missing acceptance positions stops without assigning positions or deleting
 copies. Restore independently retained admission-order evidence before
 reopening; do not infer positions from queue rowids, leaf hashes or observation
 timestamps. Stores with at most one outstanding Delta per domain can upgrade
-without deciding an unknown within-domain order. Already discarded legacy
-copies whose Envelopes are gone require separate reconciliation of their stale
-seen IDs and tips; new rejection handling cannot reconstruct that lost history.
+without deciding an unknown within-domain order. For already-discarded copies,
+see [Delta index reconciliation](#delta-index-reconciliation).
 
 Exact recovery ends outside the supported timestamp range stop sealing before
 publication; full-range Snapshot representation requires specification resolution.
@@ -255,6 +254,38 @@ remain separate requirements. Log timestamps retain their distinct whole-second
 profile. Binding and scope checks precede clock, chain and Payload checks;
 WIST-1 §7 permits any established applicable semantic diagnostic after mandatory
 field checks. Signed `publisher` determines attribution under WIST-1 §3.8.
+
+## Delta index reconciliation
+
+Opening a store without a completed reconciliation marker rebuilds seen IDs
+and Publisher/URL tips from its complete authenticated Block prefix and retained
+pending/recovery admissions. This removes orphaned IDs left by discarded copies
+and restores pairs overwritten by the former URL-only table. The Anchor and
+database head are operator-trusted inputs, as in [Authenticated history](#authenticated-history).
+
+Sealed sources come from Declaration replay at each Block. Restoration checks
+Delta signing bindings, key-time bounds and scope, then follows predecessor
+links within that Block. Retained unsealed copies follow persistent acceptance
+positions across both queues; their Envelopes remain trusted local admission
+state, without Log authentication or renewed admission validation. They must
+agree with their stored ownership, ID and URL and extend their pair's tip.
+
+Missing or corrupt history, unsupported versions/key transitions, invalid
+sealed authority, duplicate IDs, forks, disconnected chains or invalid
+acceptance positions stop restoration. Restore missing original Envelopes or
+independently retained acceptance-order evidence and reconcile invalid retained
+copies before retrying. No order is inferred from leaf hashes or timestamps.
+Original Envelopes lacking the signed `publisher` cannot be translated during
+restoration; their attribution requires separate resolution.
+
+Index replacement and its completion marker commit under one SQLite write
+transaction after the pinned prefix validates. Failure preserves both indexes;
+retry repeats restoration. Subsequent opens skip this completed repair. Queues,
+Payloads and rejection history are preserved. The repair retains all seen IDs
+in memory and does not establish full Delta schema/timestamp eligibility,
+governance replay, general legacy-state revalidation or crash-safe publication.
+Signed tests cover shared URLs, intra-Block chains, both queues, reopen,
+corrupt heads/files, invalid authors/scope and rollback after a write failure.
 
 ## Parameter schedules and Block sizes
 

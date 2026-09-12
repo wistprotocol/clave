@@ -123,7 +123,7 @@ fn malformed_signed_publisher_rejects_before_binding_and_feed_association() {
 }
 
 #[test]
-fn domain_url_tips_survive_reopen_and_upgrade_without_cross_author_overwrite() {
+fn orphaned_legacy_tips_are_cleared_before_publisher_scoped_updates() {
     let data = tempfile::tempdir().unwrap();
     let path = data.path().join("clave.sqlite");
     let url = "https://shared.example/a";
@@ -140,10 +140,7 @@ fn domain_url_tips_survive_reopen_and_upgrade_without_cross_author_overwrite() {
         .unwrap();
     }
     let db = clave::db::Db::open(&path).unwrap();
-    assert_eq!(
-        db.url_tip("first.example", url).unwrap().as_deref(),
-        Some("sha256:first")
-    );
+    assert!(db.url_tip("first.example", url).unwrap().is_none());
     assert!(db.url_tip("second.example", url).unwrap().is_none());
     db.set_url_tip(url, "second.example", "sha256:second")
         .unwrap();

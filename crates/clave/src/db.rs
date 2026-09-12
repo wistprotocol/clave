@@ -4,6 +4,8 @@ use serde_json::Value;
 use std::path::Path;
 use wist_core::objects::{PublisherState, StatusRejection};
 
+mod delta_indexes;
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS publishers(domain TEXT PRIMARY KEY, declaration_json BLOB NOT NULL, key_id TEXT NOT NULL, public_key TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'new', last_pull_at TEXT, declaration_fetched_at TEXT);
 CREATE TABLE IF NOT EXISTS declaration_floors(domain TEXT PRIMARY KEY, seq INTEGER NOT NULL CHECK(typeof(seq) = 'integer' AND seq BETWEEN 0 AND 9007199254740991));
@@ -377,6 +379,7 @@ impl Db {
         db.parameter_schedule(0)?;
         db.restore_recovery_owners(path)?;
         db.restore_declaration_floors(path)?;
+        db.restore_delta_indexes(path)?;
         Ok(db)
     }
 
