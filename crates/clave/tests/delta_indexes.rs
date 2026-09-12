@@ -516,3 +516,170 @@ fn retained_version_and_field_failures_preserve_indexes_and_precedence() {
         }
     }
 }
+
+#[test]
+fn signed_predecessor_times_reconcile_across_sealed_and_retained_chains() {
+    let vector: Value = serde_json::from_slice(
+        &std::fs::read(spec_dir().join("vectors/wist1/declaration-fields.json")).unwrap(),
+    )
+    .unwrap();
+    let mut cases = 0;
+    for case in vector["relation_cases"].as_array().unwrap() {
+        if case["kind"] != "predecessor" {
+            continue;
+        }
+        cases += 1;
+        for (prior_store, next_store) in [
+            ("same_block", "same_block"),
+            ("sealed", "sealed"),
+            ("sealed", "pending"),
+            ("sealed", "recovery"),
+            ("pending", "pending"),
+            ("pending", "recovery"),
+            ("recovery", "pending"),
+            ("recovery", "recovery"),
+        ] {
+            let f = Fixture::new();
+            let domain = case["envelope"]["delta"]["publisher"].as_str().unwrap();
+            let url = case["envelope"]["delta"]["url"].as_str().unwrap();
+            let predecessor = &case["predecessor"];
+            let envelope = &case["envelope"];
+            let prior_id = wist_core::delta::delta_id(&predecessor["delta"]).unwrap();
+            let id = wist_core::delta::delta_id(&envelope["delta"]).unwrap();
+            f.append(vec![
+                json!({"type":"publisher_declaration", "body":vector["stored"]}),
+            ]);
+            if prior_store == "same_block" {
+                f.append(vec![entry(predecessor.clone()), entry(envelope.clone())]);
+            } else {
+                for (store, id, body) in [
+                    (prior_store, &prior_id, predecessor),
+                    (next_store, &id, envelope),
+                ] {
+                    match store {
+                        "sealed" => f.append(vec![entry(body.clone())]),
+                        "pending" => {
+                            f.db.record_accepted_delta(domain, id, body, 0, url, id)
+                                .unwrap()
+                        }
+                        _ => f.db.queue_delta(domain, id, body, url, id, 1).unwrap(),
+                    }
+                }
+            }
+            f.connection()
+                .execute_batch("DELETE FROM seen_deltas; DELETE FROM url_tips;")
+                .unwrap();
+            f.db.insert_seen_delta("residue", domain).unwrap();
+            f.db.set_url_tip(url, domain, "residue").unwrap();
+            f.legacy();
+            let stored: Vec<(String, Vec<u8>)> = f
+                .connection()
+                .prepare("SELECT 'pending', entry_json FROM pending_entries UNION ALL SELECT 'recovery', entry_json FROM queued_deltas")
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            for _ in 0..2 {
+                let context = format!("{}: {prior_store} -> {next_store}", case["name"]);
+                if case["expected"] == "relation_satisfied" {
+                    let db = f.reopen().unwrap();
+                    assert!(
+                        db.is_delta_seen_for(&prior_id, domain).unwrap(),
+                        "{context}"
+                    );
+                    assert!(db.is_delta_seen_for(&id, domain).unwrap(), "{context}");
+                    assert!(!db.is_delta_seen("residue").unwrap(), "{context}");
+                    assert_eq!(
+                        db.url_tip(domain, url).unwrap().as_deref(),
+                        Some(id.as_str()),
+                        "{context}"
+                    );
+                } else {
+                    let error = f.reopen().err().expect(&context).to_string();
+                    assert!(error.contains("WIST1-E07"), "{context}: {error}");
+                    assert!(f.db.is_delta_seen("residue").unwrap(), "{context}");
+                    assert!(!f.db.is_delta_seen(&prior_id).unwrap(), "{context}");
+                    assert!(!f.db.is_delta_seen(&id).unwrap(), "{context}");
+                    assert_eq!(
+                        f.db.url_tip(domain, url).unwrap().as_deref(),
+                        Some("residue"),
+                        "{context}"
+                    );
+                    let marker: bool = f.connection().query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'delta_index_reconciliation')", [], |row| row.get(0)).unwrap();
+                    assert!(!marker, "{context}");
+                }
+                let retained: Vec<(String, Vec<u8>)> = f
+                    .connection()
+                    .prepare("SELECT 'pending', entry_json FROM pending_entries UNION ALL SELECT 'recovery', entry_json FROM queued_deltas")
+                    .unwrap()
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .collect();
+                assert_eq!(retained, stored, "{context}");
+            }
+        }
+    }
+    assert_eq!(cases, 3);
+}
+
+#[test]
+fn observation_history_stays_with_its_publisher_through_identity_reset() {
+    for (at, accepted) in [
+        ("2027-01-15T07:00:00.00000000000000000001Z", true),
+        ("2027-01-15T04:00:00.000-03:00", false),
+        ("2027-01-15T06:59:59.99999999999999999999Z", false),
+    ] {
+        let f = Fixture::new();
+        let url = "https://shared.example/page";
+        let a = make_publisher_with_scope("a.example", &["shared.example"]);
+        let b = make_publisher_with_scope("b.example", &["shared.example"]);
+        let mut roots = Vec::new();
+        for (publisher, at) in [(&a, "2027-01-15T07:00:00Z"), (&b, "2027-01-15T07:00:01Z")] {
+            let (_, mut body) = delta(publisher, url, "root", None);
+            body["delta"]["observed_at"] = json!(at);
+            let body =
+                wist_core::envelope::sign_envelope(&body["delta"], "delta", "k1", &publisher.sk)
+                    .unwrap();
+            let id = wist_core::delta::delta_id(&body["delta"]).unwrap();
+            roots.push((id, body));
+        }
+        f.append(vec![
+            declaration(&a),
+            declaration(&b),
+            entry(roots[0].1.clone()),
+            entry(roots[1].1.clone()),
+        ]);
+        let key = crypto::SigningKey::from_seed(&[2; 32]);
+        let mut replacement = declaration(&a)["body"]["publisher"].clone();
+        replacement["seq"] = json!(1);
+        replacement["prev_declaration"] =
+            json!(clave::declaration::inner_hash(&declaration(&a)["body"]).unwrap());
+        replacement["keys"][0]["public_key"] = json!(seed_public_b64u(&[2; 32]));
+        let replacement =
+            wist_core::envelope::sign_envelope(&replacement, "publisher", "k1", &key).unwrap();
+        let (_, mut body) = delta(&a, url, "after reset", Some(&roots[0].0));
+        body["delta"]["observed_at"] = json!(at);
+        let body = wist_core::envelope::sign_envelope(&body["delta"], "delta", "k1", &key).unwrap();
+        let id = wist_core::delta::delta_id(&body["delta"]).unwrap();
+        f.append(vec![
+            json!({"type":"publisher_declaration", "body":replacement}),
+            entry(body),
+        ]);
+        f.legacy();
+        if accepted {
+            let db = f.reopen().unwrap();
+            assert_eq!(
+                db.url_tip(&a.domain, url).unwrap().as_deref(),
+                Some(id.as_str())
+            );
+            assert_eq!(
+                db.url_tip(&b.domain, url).unwrap().as_deref(),
+                Some(roots[1].0.as_str())
+            );
+        } else {
+            assert!(f.reopen().err().unwrap().to_string().contains("WIST1-E07"));
+        }
+    }
+}

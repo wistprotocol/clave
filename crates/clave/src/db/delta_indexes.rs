@@ -12,6 +12,7 @@ struct Delta {
     domain: String,
     url: String,
     prev: Option<String>,
+    observed_at: String,
 }
 
 impl Delta {
@@ -29,6 +30,7 @@ impl Delta {
             domain: domain.into(),
             url: url.into(),
             prev,
+            observed_at: body["observed_at"].as_str().unwrap().into(),
         })
     }
 }
@@ -36,7 +38,12 @@ impl Delta {
 #[derive(Default)]
 struct Indexes {
     seen: BTreeMap<String, String>,
-    tips: BTreeMap<(String, String), String>,
+    tips: BTreeMap<(String, String), Tip>,
+}
+
+struct Tip {
+    id: String,
+    observed_at: String,
 }
 
 impl Indexes {
@@ -45,10 +52,21 @@ impl Indexes {
         if self.seen.contains_key(&delta.id) {
             return Err(failure("duplicate retained Delta ID"));
         }
-        if self.tips.get(&pair) != delta.prev.as_ref() {
+        let tip = self.tips.get(&pair);
+        if tip.map(|tip| &tip.id) != delta.prev.as_ref() {
             return Err(failure("retained Delta does not extend its Publisher/URL tip; restore missing accepted Envelopes or reconcile invalid retained copies"));
         }
-        self.tips.insert(pair, delta.id.clone());
+        if let Some(tip) = tip {
+            declaration::verify_observation_order(&delta.observed_at, &tip.observed_at)
+                .map_err(failure)?;
+        }
+        self.tips.insert(
+            pair,
+            Tip {
+                id: delta.id.clone(),
+                observed_at: delta.observed_at,
+            },
+        );
         self.seen.insert(delta.id, delta.domain);
         Ok(())
     }
@@ -64,7 +82,7 @@ impl Indexes {
             }
         }
         for (pair, mut chain) in chains {
-            while let Some(delta) = chain.remove(&self.tips.get(&pair).cloned()) {
+            while let Some(delta) = chain.remove(&self.tips.get(&pair).map(|tip| tip.id.clone())) {
                 self.append(delta)?;
             }
             if !chain.is_empty() {
@@ -154,7 +172,7 @@ impl Db {
             super::exec_insert_seen_delta(&tx, &id, &domain)?;
         }
         for ((domain, url), tip) in indexes.tips {
-            super::exec_set_url_tip(&tx, &url, &domain, &tip)?;
+            super::exec_set_url_tip(&tx, &url, &domain, &tip.id)?;
         }
         tx.execute("INSERT INTO delta_index_reconciliation VALUES (1)", [])?;
         tx.commit()?;

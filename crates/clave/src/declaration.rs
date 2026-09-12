@@ -18,10 +18,17 @@ pub fn verify_delta_predecessor(doc: &Value, predecessor: &Value) -> Result<(), 
     {
         return Err("WIST1-E07");
     }
-    match time::compare(
+    verify_observation_order(
         doc["delta"]["observed_at"].as_str().unwrap(),
         prior["observed_at"].as_str().unwrap(),
-    ) {
+    )
+}
+
+pub(crate) fn verify_observation_order(
+    observed_at: &str,
+    predecessor_observed_at: &str,
+) -> Result<(), &'static str> {
+    match time::compare(observed_at, predecessor_observed_at) {
         Some(std::cmp::Ordering::Greater) => Ok(()),
         _ => Err("WIST1-E07"),
     }

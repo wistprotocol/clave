@@ -370,6 +370,12 @@ state, without Log authentication or renewed authority, clock or Payload
 checks. They must agree with their stored ownership, ID and URL and extend
 their pair's tip.
 
+Every successor, sealed or unsealed, must have a strictly later signed
+`observed_at` than its predecessor under WIST-1 §3.4's exact comparison.
+Equal instants and decreasing times stop restoration with WIST1-E07.
+The predecessor time follows its Publisher/URL chain through Declaration
+changes and identity resets; materialized record timestamps supply no authority.
+
 Missing or corrupt history, unsupported versions/key transitions, invalid
 sealed authority, duplicate IDs, forks, disconnected chains or invalid
 acceptance positions stop restoration. Restore missing original Envelopes or
@@ -382,13 +388,16 @@ Index replacement and its completion marker commit under one SQLite write
 transaction after the pinned prefix validates. Failure preserves both indexes;
 retry repeats restoration. Subsequent opens skip this completed repair. Queues,
 Payloads and rejection history are preserved. The repair retains all seen IDs
-in memory and does not establish complete Delta eligibility or predecessor-time
-validation, governance replay, general legacy-state revalidation or crash-safe
-publication.
+in memory plus each tip's signed observation time. It does not establish
+complete Delta eligibility, governance replay, general legacy-state revalidation
+or crash-safe publication.
 
 Signed restart tests cover chain and ownership restoration, preserved versioned
 Envelopes across all three stores, field/version diagnostic precedence,
-corrupt history, invalid authority and atomic failure.
+exact predecessor times, shared-URL identity resets, corrupt history, invalid
+authority and atomic failure. The signed `declaration-fields.json` predecessor
+cases exercise same-Block chains, successive Blocks, sealed-to-queue transitions
+and both queue orders.
 
 ## Parameter schedules and Block sizes
 
