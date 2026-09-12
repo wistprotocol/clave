@@ -6,6 +6,7 @@ use wist_core::objects::{PublisherState, StatusRejection};
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS publishers(domain TEXT PRIMARY KEY, declaration_json BLOB NOT NULL, key_id TEXT NOT NULL, public_key TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'new', last_pull_at TEXT, declaration_fetched_at TEXT);
+CREATE TABLE IF NOT EXISTS declaration_floors(domain TEXT PRIMARY KEY, seq INTEGER NOT NULL CHECK(typeof(seq) = 'integer' AND seq BETWEEN 0 AND 9007199254740991));
 CREATE TABLE IF NOT EXISTS seen_deltas(delta_id TEXT PRIMARY KEY, domain TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS pending_entries(rowid INTEGER PRIMARY KEY AUTOINCREMENT, entry_type TEXT NOT NULL, domain TEXT NOT NULL, entry_json BLOB NOT NULL, chain_pos INTEGER NOT NULL, turn_block INTEGER, acceptance_order INTEGER);
 CREATE TABLE IF NOT EXISTS records(url TEXT NOT NULL, publisher TEXT NOT NULL, delta_id TEXT NOT NULL, observed_at TEXT NOT NULL, weight TEXT NOT NULL, title TEXT NOT NULL, abstract TEXT, lang TEXT NOT NULL, sealed_at TEXT NOT NULL DEFAULT '', PRIMARY KEY(url, publisher));
@@ -296,6 +297,24 @@ fn exec_insert_seen_delta(conn: &Connection, delta_id: &str, domain: &str) -> Re
     Ok(())
 }
 
+fn exec_retain_declaration_seq(conn: &Connection, domain: &str, seq: u64) -> Result<()> {
+    conn.execute(
+        "INSERT INTO declaration_floors(domain, seq) VALUES (?1, ?2) ON CONFLICT(domain) DO UPDATE SET seq = MAX(seq, excluded.seq)",
+        (domain, seq),
+    )?;
+    Ok(())
+}
+
+fn accepted_declaration_seq(domain: &str, doc: &Value) -> Result<u64> {
+    let publisher = crate::declaration::validate_fields(doc)
+        .map_err(|(code, detail)| Error::History(format!("{code} {detail}")))?
+        .publisher;
+    if publisher.domain != domain {
+        return Err(Error::History("stored Declaration domain mismatch".into()));
+    }
+    Ok(publisher.seq)
+}
+
 fn exec_set_url_tip(conn: &Connection, url: &str, domain: &str, tip: &str) -> Result<()> {
     conn.execute(
         "INSERT INTO url_tips(url, domain, tip) VALUES (?1, ?2, ?3) ON CONFLICT(domain, url) DO UPDATE SET tip = excluded.tip",
@@ -356,7 +375,59 @@ impl Db {
         db.restore_block_sizes(path)?;
         db.parameter_schedule(0)?;
         db.restore_recovery_owners(path)?;
+        db.restore_declaration_floors(path)?;
         Ok(db)
+    }
+
+    fn restore_declaration_floors(&self, path: &Path) -> Result<()> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let rows = tx
+            .prepare("SELECT domain, declaration_json FROM publishers WHERE domain NOT IN (SELECT domain FROM declaration_floors) ORDER BY domain")?
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if rows.is_empty() {
+            tx.commit()?;
+            return Ok(());
+        }
+        let head = self.last_block()?;
+        let history = if head.is_some() {
+            crate::history::declarations::Declarations::reconstruct(
+                path.parent().unwrap_or_else(|| Path::new(".")),
+                head,
+            )?
+        } else {
+            crate::history::declarations::Declarations::default()
+        };
+        let pending = self.peek_pending_entries()?.0;
+        for (domain, raw) in rows {
+            let current: Value = serde_json::from_slice(&raw)?;
+            let mut seq = accepted_declaration_seq(&domain, &current)?;
+            if let Some(state) = history.domains().get(&domain) {
+                seq = seq.max(state.highest_accepted_seq());
+            }
+            for entry in pending.iter().filter(|entry| {
+                entry.domain == domain && entry.entry_type == "publisher_declaration"
+            }) {
+                seq = seq.max(accepted_declaration_seq(&domain, &entry.entry_json)?);
+            }
+            exec_retain_declaration_seq(&tx, &domain, seq)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn highest_accepted_declaration_seq(&self, domain: &str) -> Result<Option<u64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT seq FROM declaration_floors WHERE domain = ?1",
+                [domain],
+                |row| row.get(0),
+            )
+            .optional()?)
     }
 
     fn restore_recovery_owners(&self, path: &Path) -> Result<()> {
@@ -506,6 +577,7 @@ impl Db {
         let tx = self.mutation()?;
         exec_insert_publisher(&tx, domain, declaration_json, key_id, public_key)?;
         exec_insert_pending_entry(&tx, "publisher_declaration", domain, entry_json, 0)?;
+        exec_retain_declaration_seq(&tx, domain, accepted_declaration_seq(domain, entry_json)?)?;
         tx.commit()?;
         Ok(())
     }
@@ -524,6 +596,7 @@ impl Db {
             (domain, declaration_json, key_id, public_key),
         )?;
         exec_insert_pending_entry(&tx, "publisher_declaration", domain, entry_json, 0)?;
+        exec_retain_declaration_seq(&tx, domain, accepted_declaration_seq(domain, entry_json)?)?;
         tx.commit()?;
         Ok(())
     }
@@ -1098,6 +1171,7 @@ impl Db {
             exec_upsert_record(&tx, r, sealed_at)?;
         }
         for d in declarations {
+            exec_retain_declaration_seq(&tx, d.domain, d.seq)?;
             tx.execute(
                 "INSERT INTO sealed_declarations(domain, seq, block_number, sealed_at, declaration_json) VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(domain, seq) DO NOTHING",
@@ -1696,6 +1770,26 @@ impl Db {
 mod tests {
     use super::*;
 
+    fn test_declaration(seq: u64) -> Value {
+        let key = wist_core::crypto::SigningKey::from_seed(&[1; 32]);
+        let mut publisher = serde_json::json!({
+            "wist_version": "1.0.0", "domain": "example.com", "seq": seq,
+            "keys": [{"key_id": "k1", "alg": "Ed25519",
+                "public_key": key.public().to_b64u(), "valid_from": "2026-01-01T00:00:00Z"}]
+        });
+        if seq > 0 {
+            publisher["prev_declaration"] = crate::declaration::inner_hash(&test_declaration(0))
+                .unwrap()
+                .into();
+        }
+        wist_core::envelope::sign_envelope(&publisher, "publisher", "k1", &key).unwrap()
+    }
+
+    fn record_test_declaration(db: &Db) -> Result<()> {
+        let doc = test_declaration(0);
+        db.record_publisher_declaration("example.com", &serde_json::to_vec(&doc)?, "k1", "pk", &doc)
+    }
+
     #[test]
     fn recovery_window_lifecycle() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1784,14 +1878,13 @@ mod tests {
     fn update_publisher_declaration_updates_row_and_enqueues_entry() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
-        db.record_publisher_declaration("example.com", b"{\"v\":0}", "k1", "pk1", &Value::Null)
-            .unwrap();
+        record_test_declaration(&db).unwrap();
         db.update_publisher_declaration(
             "example.com",
-            b"{\"v\":1}",
+            &serde_json::to_vec(&test_declaration(1)).unwrap(),
             "k2",
             "pk2",
-            &serde_json::json!({"seq": 1}),
+            &test_declaration(1),
         )
         .unwrap();
         let row = db.get_publisher("example.com").unwrap().unwrap();
@@ -1801,7 +1894,7 @@ mod tests {
             db.get_publisher_declaration("example.com")
                 .unwrap()
                 .unwrap(),
-            b"{\"v\":1}"
+            serde_json::to_vec(&test_declaration(1)).unwrap()
         );
         assert_eq!(
             db.count_pending_entries("publisher_declaration").unwrap(),
@@ -1995,15 +2088,12 @@ mod tests {
     fn record_publisher_declaration_is_atomic_on_conflict() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
-        db.record_publisher_declaration("example.com", b"{}", "k1", "pk", &Value::Null)
-            .unwrap();
+        record_test_declaration(&db).unwrap();
         assert_eq!(
             db.count_pending_entries("publisher_declaration").unwrap(),
             1
         );
-        assert!(db
-            .record_publisher_declaration("example.com", b"{}", "k1", "pk", &Value::Null)
-            .is_err());
+        assert!(record_test_declaration(&db).is_err());
         assert_eq!(
             db.count_pending_entries("publisher_declaration").unwrap(),
             1
@@ -2045,8 +2135,7 @@ mod tests {
     fn drain_pending_entries_orders_by_rowid_and_empties_table() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
-        db.record_publisher_declaration("example.com", b"{}", "k1", "pk", &Value::Null)
-            .unwrap();
+        record_test_declaration(&db).unwrap();
         db.record_accepted_delta(
             "example.com",
             "sha256:a",
@@ -2081,8 +2170,7 @@ mod tests {
     fn peek_pending_entries_orders_without_deleting_then_commit_seal_drains_up_to_rowid() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
-        db.record_publisher_declaration("example.com", b"{}", "k1", "pk", &Value::Null)
-            .unwrap();
+        record_test_declaration(&db).unwrap();
         db.record_accepted_delta(
             "example.com",
             "sha256:a",

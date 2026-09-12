@@ -64,6 +64,26 @@ First-contact pulls apply the same checks before storing a Declaration. An
 invalid first Declaration remains a WIST2-E04 pull rejection, with its specific
 Declaration validation reason in the rejection detail.
 
+Replacement admission retains the highest accepted sequence separately from
+the current Declaration. Recovery restoration cannot lower that floor; a
+well-formed re-serve of the current publisher object remains idempotent even
+below it. Declaration, floor, pending Entry and recovery-head writes share a
+SQLite transaction. Database upgrades reconstruct missing floors from the
+authenticated pinned Block prefix and retained current/pending admission rows;
+corrupt history rejects restoration before any floor is written. Retained
+admission rows are local accepted state, not authenticated Log inclusion.
+
+During recovery, a replacement may name either the current Declaration or
+the accepted recovery-chain head. Its named predecessor determines signer
+classification and recovery-key protection. Only an ordinary or recovery
+rotation naming the recovery head advances that chain. Admission rebuilds
+the head from authenticated sealed history and pending followers, preserving
+unsealed continuations after partial packing and ignoring stale head summaries.
+Pending recovery owners are verified against their retained predecessor.
+This admission head does not replace the sealed authority used to settle
+queued Deltas. Admission-time deadline settlement and reconciliation of
+post-settlement pending replacements remain unimplemented.
+
 Admission and Declaration history replay validate complete Envelope fields
 before sequencing, conflicts, idempotence or signer resolution (WIST1-E14).
 Checks include required and unknown members, optional nulls, safe integer

@@ -1798,3 +1798,521 @@ fn pending_copy_in_an_expired_window_receives_settlement_rejection() {
     assert_eq!(rejections[0].delta_id.as_deref(), Some(id.as_str()));
     assert_eq!(rejections[0].code, "WIST1-E13");
 }
+
+#[test]
+fn admission_uses_both_heads_without_joining_a_competing_branch() {
+    let (mut r, start, owner) = sealed_recovery();
+    let owner_envelope = current_declaration(&r.p);
+    let mut competitor = owner.clone();
+    competitor["seq"] = 4.into();
+    competitor["prev_declaration"] = declaration_hash(&owner_envelope).into();
+    competitor["keys"] = serde_json::json!([
+        key_entry("x1", &X1_SEED, "2026-08-09T13:00:00Z"),
+        key_entry("k2", &K2_SEED, "2026-08-09T13:00:00Z")
+    ]);
+    write_declaration(&r.p, &competitor, "x1", &X1_SEED);
+    write_feed_signed(&r.p, &r.host, &[], "2026-08-09T14:00:00Z", "x1", &X1_SEED);
+    ingest(&r, "2026-08-09T14:00:00Z");
+    let mut branch = competitor.clone();
+    branch["seq"] = 6.into();
+    branch["prev_declaration"] = declaration_hash(&current_declaration(&r.p)).into();
+    write_declaration(&r.p, &branch, "k2", &K2_SEED);
+    let branch_envelope = current_declaration(&r.p);
+    ingest(&r, "2026-08-09T14:00:00Z");
+    let recovery = r.db.get_recovery_window(&r.host).unwrap().unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&recovery.declaration_json).unwrap(),
+        owner_envelope
+    );
+    assert_eq!(
+        r.db.highest_accepted_declaration_seq(&r.host).unwrap(),
+        Some(6)
+    );
+    r.db.update_recovery_chain_head(&r.host, &serde_json::to_vec(&branch_envelope).unwrap())
+        .unwrap();
+    r.db = clave::db::Db::open(&r.data.path().join("clave.sqlite")).unwrap();
+
+    let mut follower = owner.clone();
+    follower["prev_declaration"] = declaration_hash(&owner_envelope).into();
+    for seq in [5, 6] {
+        follower["seq"] = seq.into();
+        write_declaration(&r.p, &follower, "k2", &K2_SEED);
+        ingest(&r, "2026-08-09T14:00:00Z");
+        assert_eq!(
+            r.db.highest_accepted_declaration_seq(&r.host).unwrap(),
+            Some(6)
+        );
+        assert_eq!(
+            r.db.count_pending_entries("publisher_declaration").unwrap(),
+            2
+        );
+    }
+    assert_eq!(
+        rejection_codes(&r)
+            .iter()
+            .filter(|code| *code == "WIST1-E08")
+            .count(),
+        2
+    );
+    write_declaration(&r.p, &owner, "r1", &R1_SEED);
+    ingest(&r, "2026-08-09T14:00:00Z");
+    assert_eq!(
+        rejection_codes(&r)
+            .iter()
+            .filter(|code| *code == "WIST1-E08")
+            .count(),
+        3
+    );
+    let mut malformed = branch_envelope.clone();
+    malformed["sig"]["value"] = "=".into();
+    std::fs::write(
+        r.p.dir.path().join(".well-known/wist/publisher.json"),
+        serde_json::to_vec(&malformed).unwrap(),
+    )
+    .unwrap();
+    ingest(&r, "2026-08-09T14:00:00Z");
+    assert!(rejection_codes(&r).contains(&"WIST1-E14".into()));
+    assert_eq!(
+        r.db.highest_accepted_declaration_seq(&r.host).unwrap(),
+        Some(6)
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(
+            &r.db.get_publisher_declaration(&r.host).unwrap().unwrap()
+        )
+        .unwrap(),
+        branch_envelope
+    );
+    follower["seq"] = 7.into();
+    write_declaration(&r.p, &follower, "k2", &K2_SEED);
+    write_feed_signed(&r.p, &r.host, &[], "2026-08-09T14:00:00Z", "k2", &K2_SEED);
+    ingest(&r, "2026-08-09T14:00:00Z");
+    assert_eq!(
+        r.db.highest_accepted_declaration_seq(&r.host).unwrap(),
+        Some(7)
+    );
+    assert_eq!(
+        r.db.count_pending_entries("publisher_declaration").unwrap(),
+        3
+    );
+    clave::seal::run(&r.db, r.data.path(), &r.sk, start + 7200).unwrap();
+    let history = clave::history::declarations::Declarations::reconstruct(
+        r.data.path(),
+        r.db.last_block().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        history.domains()[&r.host]
+            .window()
+            .unwrap()
+            .head()
+            .envelope(),
+        &current_declaration(&r.p)
+    );
+}
+
+#[test]
+fn settled_admission_retains_the_floor_and_current_idempotence_after_migration() {
+    for migrate in [false, true] {
+        let (mut r, start, owner) = sealed_recovery();
+        let owner_envelope = current_declaration(&r.p);
+        let mut competitor = owner.clone();
+        competitor["seq"] = 9.into();
+        competitor["prev_declaration"] = declaration_hash(&owner_envelope).into();
+        competitor["keys"] = serde_json::json!([key_entry("x1", &X1_SEED, "2026-08-09T13:00:00Z")]);
+        write_declaration(&r.p, &competitor, "x1", &X1_SEED);
+        write_feed_signed(&r.p, &r.host, &[], "2026-08-09T14:00:00Z", "x1", &X1_SEED);
+        ingest(&r, "2026-08-09T14:00:00Z");
+        clave::seal::run(&r.db, r.data.path(), &r.sk, start + 7200).unwrap();
+        clave::seal::run(&r.db, r.data.path(), &r.sk, start + 3600 + 7 * DAY).unwrap();
+        let path = r.data.path().join("clave.sqlite");
+        if migrate {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute("DROP TABLE declaration_floors", []).unwrap();
+            conn.execute(
+                "UPDATE sealed_declarations SET seq = seq + 100, declaration_json = x'7b7d'",
+                [],
+            )
+            .unwrap();
+        }
+        r.db = clave::db::Db::open(&path).unwrap();
+        assert_eq!(
+            r.db.highest_accepted_declaration_seq(&r.host).unwrap(),
+            Some(9)
+        );
+        write_declaration(&r.p, &owner, "r1", &R1_SEED);
+        write_feed_signed(&r.p, &r.host, &[], "2026-08-16T14:00:00Z", "k2", &K2_SEED);
+        ingest(&r, "2026-08-16T14:00:00Z");
+        assert_eq!(
+            r.db.count_pending_entries("publisher_declaration").unwrap(),
+            0
+        );
+        assert!(!rejection_codes(&r).contains(&"WIST1-E08".into()));
+        let mut follower = owner.clone();
+        follower["seq"] = 8.into();
+        follower["prev_declaration"] = declaration_hash(&owner_envelope).into();
+        write_declaration(&r.p, &follower, "k2", &K2_SEED);
+        ingest(&r, "2026-08-16T14:00:00Z");
+        assert!(rejection_codes(&r).contains(&"WIST1-E08".into()));
+        assert_eq!(
+            r.db.count_pending_entries("publisher_declaration").unwrap(),
+            0
+        );
+        follower["seq"] = 10.into();
+        write_declaration(&r.p, &follower, "k2", &K2_SEED);
+        ingest(&r, "2026-08-16T14:00:00Z");
+        assert_eq!(
+            r.db.highest_accepted_declaration_seq(&r.host).unwrap(),
+            Some(10)
+        );
+        assert_eq!(
+            r.db.count_pending_entries("publisher_declaration").unwrap(),
+            1
+        );
+    }
+}
+
+#[test]
+fn capped_recovery_siblings_preserve_sequences_and_progress_after_restart() {
+    for oversized_lower in [false, true] {
+        let (mut r, start, owner) = sealed_recovery();
+        let owner_envelope = current_declaration(&r.p);
+        let mut competitor = owner.clone();
+        competitor["seq"] = 2.into();
+        competitor["prev_declaration"] = declaration_hash(&owner_envelope).into();
+        competitor["keys"] = serde_json::json!([key_entry("x1", &X1_SEED, "2026-08-09T13:00:00Z")]);
+        write_declaration(&r.p, &competitor, "x1", &X1_SEED);
+        write_feed_signed(&r.p, &r.host, &[], "2026-08-09T14:00:00Z", "x1", &X1_SEED);
+        ingest(&r, "2026-08-09T14:00:00Z");
+        clave::seal::run(&r.db, r.data.path(), &r.sk, start + 7200).unwrap();
+
+        competitor["seq"] = 3.into();
+        competitor["prev_declaration"] = declaration_hash(&current_declaration(&r.p)).into();
+        competitor["subdomain_scope"] = serde_json::json!((0..70)
+            .map(|i| format!("explicit-host-{i}.example.com"))
+            .collect::<Vec<_>>());
+        write_declaration(&r.p, &competitor, "x1", &X1_SEED);
+        let lower = current_declaration(&r.p);
+        ingest(&r, "2026-08-09T14:00:00Z");
+        let mut follower = owner;
+        follower["seq"] = 4.into();
+        follower["prev_declaration"] = declaration_hash(&owner_envelope).into();
+        write_declaration(&r.p, &follower, "k2", &K2_SEED);
+        let higher = current_declaration(&r.p);
+        write_feed_signed(&r.p, &r.host, &[], "2026-08-09T15:00:00Z", "k2", &K2_SEED);
+        ingest(&r, "2026-08-09T15:00:00Z");
+        assert_eq!(
+            r.db.highest_accepted_declaration_seq(&r.host).unwrap(),
+            Some(4)
+        );
+        let pending = r.db.peek_pending_entries().unwrap().0;
+        assert_eq!(pending.len(), 2);
+        let retained: Vec<_> = pending
+            .iter()
+            .map(|p| (p.rowid, p.entry_json.clone()))
+            .collect();
+
+        let mut candidate = stored_block(&r, 2);
+        candidate["header"]["block_number"] = 3.into();
+        candidate["header"]["entry_count"] = 1.into();
+        let mut size_of = |declaration: &serde_json::Value| {
+            candidate["entries"] = serde_json::json!([{
+                "type": "publisher_declaration", "body": declaration
+            }]);
+            wist_core::jcs::canonicalize(&candidate).unwrap().len() as i64
+        };
+        let lower_cap = size_of(&lower);
+        let higher_cap = size_of(&higher);
+        assert!(lower_cap > higher_cap);
+        r.db.set_param(
+            "block_decompressed_cap_bytes",
+            if oversized_lower {
+                higher_cap
+            } else {
+                lower_cap
+            },
+        )
+        .unwrap();
+        let database = r.data.path().join("clave.sqlite");
+        let first_height = if oversized_lower {
+            let mut independent = lower["publisher"].clone();
+            independent["domain"] = "zz-independent.example".into();
+            independent["seq"] = 0.into();
+            for field in ["prev_declaration", "subdomain_scope", "recovery_keys"] {
+                independent.as_object_mut().unwrap().remove(field);
+            }
+            let independent = wist_core::envelope::sign_envelope(
+                &independent,
+                "publisher",
+                "x1",
+                &wist_core::crypto::SigningKey::from_seed(&X1_SEED),
+            )
+            .unwrap();
+            assert!(size_of(&independent) <= higher_cap);
+            r.db.record_publisher_declaration(
+                "zz-independent.example",
+                &serde_json::to_vec(&independent).unwrap(),
+                "x1",
+                independent["publisher"]["keys"][0]["public_key"]
+                    .as_str()
+                    .unwrap(),
+                &independent,
+            )
+            .unwrap();
+            for height in [3, 4] {
+                r.db = clave::db::Db::open(&database).unwrap();
+                let report =
+                    clave::seal::run(&r.db, r.data.path(), &r.sk, start + height * 3600).unwrap();
+                assert_eq!(report.entry_count, u64::from(height == 3));
+                assert!(report.dropped.is_empty());
+                if height == 3 {
+                    assert_eq!(
+                        stored_block(&r, 3)["entries"],
+                        serde_json::json!([{
+                            "type": "publisher_declaration", "body": independent
+                        }])
+                    );
+                }
+                assert_eq!(
+                    r.db.peek_pending_entries()
+                        .unwrap()
+                        .0
+                        .iter()
+                        .map(|p| (p.rowid, p.entry_json.clone()))
+                        .collect::<Vec<_>>(),
+                    retained
+                );
+                assert_eq!(
+                    r.db.highest_accepted_declaration_seq(&r.host).unwrap(),
+                    Some(4)
+                );
+                let state = clave::history::declarations::Declarations::reconstruct(
+                    r.data.path(),
+                    r.db.last_block().unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    state.domains()[&r.host].current().envelope()["publisher"]["seq"],
+                    2
+                );
+                assert_eq!(
+                    state.domains()[&r.host].window().unwrap().head().envelope(),
+                    &owner_envelope
+                );
+            }
+            r.db.set_param("block_decompressed_cap_bytes", lower_cap)
+                .unwrap();
+            5
+        } else {
+            3
+        };
+        for (height, expected) in [(first_height, &lower), (first_height + 1, &higher)] {
+            r.db = clave::db::Db::open(&database).unwrap();
+            let report =
+                clave::seal::run(&r.db, r.data.path(), &r.sk, start + height * 3600).unwrap();
+            assert_eq!(report.entry_count, 1);
+            assert!(report.dropped.is_empty());
+            let block = stored_block(&r, height as u64);
+            assert_eq!(
+                block["entries"],
+                serde_json::json!([{"type": "publisher_declaration", "body": expected}])
+            );
+            assert!(wist_core::jcs::canonicalize(&block).unwrap().len() as i64 <= lower_cap);
+            let state = clave::history::declarations::Declarations::reconstruct(
+                r.data.path(),
+                r.db.last_block().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(state.domains()[&r.host].current().envelope(), expected);
+            assert_eq!(
+                state.domains()[&r.host].window().unwrap().head().envelope(),
+                if height == first_height {
+                    &owner_envelope
+                } else {
+                    &higher
+                }
+            );
+            assert_eq!(
+                r.db.highest_accepted_declaration_seq(&r.host).unwrap(),
+                Some(4)
+            );
+            assert_eq!(
+                r.db.peek_pending_entries().unwrap().0.len(),
+                (first_height + 1 - height) as usize
+            );
+        }
+        r.db = clave::db::Db::open(&database).unwrap();
+        assert_eq!(
+            clave::seal::run(
+                &r.db,
+                r.data.path(),
+                &r.sk,
+                start + (first_height + 2) * 3600
+            )
+            .unwrap()
+            .entry_count,
+            0
+        );
+        clave::history::declarations::Declarations::reconstruct(
+            r.data.path(),
+            r.db.last_block().unwrap(),
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn pending_recovery_followers_remain_eligible_after_partial_sealing() {
+    let (mut r, start, owner) = sealed_recovery();
+    let mut follower = owner.clone();
+    follower["seq"] = 2.into();
+    follower["prev_declaration"] = declaration_hash(&current_declaration(&r.p)).into();
+    write_declaration(&r.p, &follower, "k2", &K2_SEED);
+    write_feed_signed(&r.p, &r.host, &[], "2026-08-09T14:00:00Z", "k2", &K2_SEED);
+    ingest(&r, "2026-08-09T14:00:00Z");
+    follower["seq"] = 3.into();
+    follower["prev_declaration"] = declaration_hash(&current_declaration(&r.p)).into();
+    follower["subdomain_scope"] = serde_json::json!((0..70)
+        .map(|i| format!("long-explicit-host-{i}.example.com"))
+        .collect::<Vec<_>>());
+    write_declaration(&r.p, &follower, "k2", &K2_SEED);
+    let pending_follower = current_declaration(&r.p);
+    ingest(&r, "2026-08-09T14:00:00Z");
+    r.db.set_param("block_decompressed_cap_bytes", 1800)
+        .unwrap();
+    clave::seal::run(&r.db, r.data.path(), &r.sk, start + 7200).unwrap();
+    assert_eq!(
+        r.db.count_pending_entries("publisher_declaration").unwrap(),
+        1
+    );
+    let window = r.db.get_recovery_window(&r.host).unwrap().unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&window.declaration_json).unwrap()["publisher"]
+            ["seq"],
+        2
+    );
+    r.db = clave::db::Db::open(&r.data.path().join("clave.sqlite")).unwrap();
+    let mut competitor = follower.clone();
+    competitor["seq"] = 4.into();
+    competitor["prev_declaration"] = declaration_hash(&pending_follower).into();
+    competitor["keys"] = serde_json::json!([key_entry("x1", &X1_SEED, "2026-08-09T13:00:00Z")]);
+    write_declaration(&r.p, &competitor, "x1", &X1_SEED);
+    write_feed_signed(&r.p, &r.host, &[], "2026-08-09T15:00:00Z", "x1", &X1_SEED);
+    ingest(&r, "2026-08-09T15:00:00Z");
+    follower["seq"] = 5.into();
+    follower["prev_declaration"] = declaration_hash(&pending_follower).into();
+    write_declaration(&r.p, &follower, "k2", &K2_SEED);
+    ingest(&r, "2026-08-09T15:00:00Z");
+    assert_eq!(
+        r.db.highest_accepted_declaration_seq(&r.host).unwrap(),
+        Some(5)
+    );
+    assert_eq!(
+        r.db.count_pending_entries("publisher_declaration").unwrap(),
+        3
+    );
+    assert!(!rejection_codes(&r).contains(&"WIST1-E08".into()));
+    r.db.set_param("block_decompressed_cap_bytes", 16_777_216)
+        .unwrap();
+    clave::seal::run(&r.db, r.data.path(), &r.sk, start + 10800).unwrap();
+    let state = clave::history::declarations::Declarations::reconstruct(
+        r.data.path(),
+        r.db.last_block().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        state.domains()[&r.host].window().unwrap().head().envelope()["publisher"]["seq"],
+        5
+    );
+}
+
+#[test]
+fn floor_migration_authenticates_the_pinned_prefix_before_writing() {
+    let (mut r, _, owner) = sealed_recovery();
+    let owner_envelope = current_declaration(&r.p);
+    let mut follower = owner.clone();
+    follower["seq"] = 12.into();
+    follower["prev_declaration"] = declaration_hash(&owner_envelope).into();
+    write_declaration(&r.p, &follower, "k2", &K2_SEED);
+    write_feed_signed(&r.p, &r.host, &[], "2026-08-09T14:00:00Z", "k2", &K2_SEED);
+    ingest(&r, "2026-08-09T14:00:00Z");
+    let database = r.data.path().join("clave.sqlite");
+    let conn = rusqlite::Connection::open(&database).unwrap();
+    conn.execute(
+        "UPDATE publishers SET declaration_json = ?1",
+        [serde_json::to_vec(&owner_envelope).unwrap()],
+    )
+    .unwrap();
+    conn.execute("DROP TABLE declaration_floors", []).unwrap();
+    let block = r.data.path().join("log/blocks/000000001.json.zst");
+    let original = std::fs::read(&block).unwrap();
+    std::fs::write(&block, b"corrupt").unwrap();
+    assert!(clave::db::Db::open(&database).is_err());
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM declaration_floors", [], |row| row
+            .get::<_, u64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        r.db.count_pending_entries("publisher_declaration").unwrap(),
+        1
+    );
+    std::fs::write(&block, original).unwrap();
+    r.db = clave::db::Db::open(&database).unwrap();
+    assert_eq!(
+        r.db.highest_accepted_declaration_seq(&r.host).unwrap(),
+        Some(12)
+    );
+}
+
+#[test]
+fn failed_recovery_head_write_rolls_back_declaration_floor_and_pending_entry() {
+    let (mut r, _, owner) = sealed_recovery();
+    let owner_envelope = current_declaration(&r.p);
+    let mut follower = owner.clone();
+    follower["seq"] = 2.into();
+    follower["prev_declaration"] = declaration_hash(&owner_envelope).into();
+    write_declaration(&r.p, &follower, "k2", &K2_SEED);
+    write_feed_signed(&r.p, &r.host, &[], "2026-08-09T14:00:00Z", "k2", &K2_SEED);
+    let path = r.data.path().join("clave.sqlite");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("CREATE TRIGGER fail_changed_recovery_head AFTER UPDATE OF declaration_json ON recovery_windows WHEN NEW.declaration_json != OLD.declaration_json BEGIN SELECT RAISE(ABORT, 'injected head write failure'); END;").unwrap();
+    let error = clave::ingest::run(
+        &r.db,
+        &r.client,
+        r.data.path(),
+        &r.host,
+        "2026-08-09T14:00:00Z",
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("injected head write failure"));
+    assert_eq!(
+        r.db.highest_accepted_declaration_seq(&r.host).unwrap(),
+        Some(1)
+    );
+    assert_eq!(
+        r.db.count_pending_entries("publisher_declaration").unwrap(),
+        0
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(
+            &r.db.get_publisher_declaration(&r.host).unwrap().unwrap()
+        )
+        .unwrap(),
+        owner_envelope
+    );
+    assert!(r.db.list_rejections(&r.host).unwrap().is_empty());
+    conn.execute("DROP TRIGGER fail_changed_recovery_head", [])
+        .unwrap();
+    r.db = clave::db::Db::open(&path).unwrap();
+    ingest(&r, "2026-08-09T14:00:00Z");
+    assert_eq!(
+        r.db.highest_accepted_declaration_seq(&r.host).unwrap(),
+        Some(2)
+    );
+    assert_eq!(
+        r.db.count_pending_entries("publisher_declaration").unwrap(),
+        1
+    );
+}

@@ -341,6 +341,34 @@ pub fn verify_signed(
 /// Declaration sealed inside one is superseded at the window's end, and
 /// rejecting it here would leave the attempt invisible on replay. Err
 /// carries the WIST-1 §7 code for the failure and its detail.
+pub fn evaluate_with_heads(
+    current: &Value,
+    recovery_head: Option<&Value>,
+    highest_accepted_seq: u64,
+    fetched: &Value,
+) -> Result<Decision, (&'static str, String)> {
+    let incoming = validate_fields(fetched)?.publisher;
+    if incoming.domain != current["publisher"]["domain"] {
+        return Err(("WIST2-E04", "declaration domain changed".into()));
+    }
+    if inner_hash(current).map_err(|e| ("WIST2-E04", e))?
+        == inner_hash(fetched).map_err(|e| ("WIST2-E04", e))?
+    {
+        return Ok(Decision::Unchanged);
+    }
+    if incoming.seq <= highest_accepted_seq {
+        return Err((
+            "WIST1-E08",
+            "Declaration sequence does not exceed the accepted floor".into(),
+        ));
+    }
+    let previous = std::iter::once(current)
+        .chain(recovery_head)
+        .find(|head| inner_hash(head).ok().as_deref() == incoming.prev_declaration.as_deref())
+        .ok_or(("WIST1-E08", "ineligible Declaration predecessor".into()))?;
+    evaluate(previous, fetched)
+}
+
 pub fn evaluate(stored: &Value, fetched: &Value) -> Result<Decision, (&'static str, String)> {
     let stored_p = parse(stored).map_err(|e| ("WIST2-E04", e))?;
     let fetched_p = validate_fields(fetched)?.publisher;
@@ -421,21 +449,8 @@ pub fn evaluate(stored: &Value, fetched: &Value) -> Result<Decision, (&'static s
 /// its signer is named in the chain head's `keys` or `recovery_keys`.
 /// Anything else sealed inside the window is superseded at its end.
 pub fn follows_chain_head(head: &Value, candidate: &Value) -> bool {
-    let Ok(head_p) = parse(head) else {
-        return false;
-    };
-    let Ok(candidate_envelope) = validate_fields(candidate) else {
-        return false;
-    };
-    let candidate_p = candidate_envelope.publisher;
-    if disjoint_key_sets(&candidate_p).is_err() {
-        return false;
-    }
-    resolve_signer(candidate, &candidate_p, Some(&head_p)).is_ok_and(|signer| {
-        head_p
-            .keys
-            .iter()
-            .chain(head_p.recovery_keys.iter().flatten())
-            .any(|key| key.public_key == signer.public_key)
-    })
+    matches!(
+        evaluate(head, candidate),
+        Ok(Decision::Ordinary | Decision::Recovery)
+    )
 }

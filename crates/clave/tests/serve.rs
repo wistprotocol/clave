@@ -238,8 +238,16 @@ fn status_reports_real_quota_remaining() {
     clave::init::run("127.0.0.1:0", tmp.path()).unwrap();
     {
         let db = clave::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
-        db.insert_publisher("example.com", b"{}", "k1", "pk")
-            .unwrap();
+        let publisher = common::make_publisher("example.com");
+        let doc = common::current_declaration(&publisher);
+        db.record_publisher_declaration(
+            "example.com",
+            &serde_json::to_vec(&doc).unwrap(),
+            "k1",
+            doc["publisher"]["keys"][0]["public_key"].as_str().unwrap(),
+            &doc,
+        )
+        .unwrap();
         db.set_param("quota_base", 50).unwrap();
         db.set_param("quota_slope", 0).unwrap();
         let day = &jiff::Timestamp::now().to_string()[..10];
@@ -277,8 +285,16 @@ fn sanctioned_domain_ping_gets_403_and_status_shows_state() {
     clave::init::run("127.0.0.1:0", tmp.path()).unwrap();
     {
         let db = clave::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
-        db.insert_publisher("example.com", b"{}", "k1", "pk")
-            .unwrap();
+        let publisher = common::make_publisher("example.com");
+        let doc = common::current_declaration(&publisher);
+        db.record_publisher_declaration(
+            "example.com",
+            &serde_json::to_vec(&doc).unwrap(),
+            "k1",
+            doc["publisher"]["keys"][0]["public_key"].as_str().unwrap(),
+            &doc,
+        )
+        .unwrap();
         let now = jiff::Timestamp::now().as_second();
         let sealed = jiff::Timestamp::from_second(now - 3600)
             .unwrap()

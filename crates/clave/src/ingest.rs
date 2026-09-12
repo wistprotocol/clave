@@ -202,6 +202,52 @@ fn key_set_cache_expired(db: &Db, host: &str, now: &str) -> Result<bool> {
     Ok(now_ts.as_second() - fetched.as_second() > ttl)
 }
 
+fn accepted_recovery_head(
+    db: &Db,
+    data_dir: &Path,
+    host: &str,
+    window: &crate::db::RecoveryWindowRow,
+) -> Result<Value> {
+    let mut head = if window.opened_block.is_some() {
+        let state =
+            crate::history::declarations::Declarations::reconstruct(data_dir, db.last_block()?)?;
+        state
+            .domains()
+            .get(host)
+            .and_then(|domain| domain.window())
+            .ok_or_else(|| {
+                crate::error::Error::History(
+                    "stored recovery window has no authenticated open window".into(),
+                )
+            })?
+            .head()
+            .envelope()
+            .clone()
+    } else {
+        let owner: Value = serde_json::from_slice(&window.owner_declaration_json)?;
+        let prior: Value = serde_json::from_slice(&window.prior_declaration_json)?;
+        if declaration::evaluate(&prior, &owner) != Ok(Decision::Recovery) {
+            return Err(crate::error::Error::History(
+                "invalid pending recovery owner".into(),
+            ));
+        }
+        owner
+    };
+    let mut pending: Vec<_> = db
+        .peek_pending_entries()?
+        .0
+        .into_iter()
+        .filter(|entry| entry.domain == host && entry.entry_type == "publisher_declaration")
+        .collect();
+    pending.sort_by_key(|entry| entry.entry_json["publisher"]["seq"].as_u64());
+    for entry in pending {
+        if declaration::follows_chain_head(&head, &entry.entry_json) {
+            head = entry.entry_json;
+        }
+    }
+    Ok(head)
+}
+
 fn onboard_publisher(
     db: &Db,
     client: &Client,
@@ -358,8 +404,32 @@ pub fn run_with_clock(
         let publisher_url = format!("{base}publisher.json");
         match meter.get(client, &publisher_url) {
             Ok(Some((raw, value))) => {
+                let mutation = db.mutation()?;
+                let stored_raw = db.get_publisher_declaration(host)?.ok_or_else(|| {
+                    crate::error::Error::History(
+                        "publisher row lost before Declaration admission".into(),
+                    )
+                })?;
+                current_doc = serde_json::from_slice(&stored_raw)?;
                 let open_window = db.get_recovery_window(host)?;
-                match declaration::evaluate(&current_doc, &value) {
+                let recovery_head = open_window
+                    .as_ref()
+                    .map(|window| accepted_recovery_head(db, data_dir, host, window))
+                    .transpose()?;
+                if let Some(head) = &recovery_head {
+                    db.update_recovery_chain_head(host, &serde_json::to_vec(head)?)?;
+                }
+                let floor = db.highest_accepted_declaration_seq(host)?.ok_or_else(|| {
+                    crate::error::Error::History(
+                        "missing accepted Declaration sequence floor".into(),
+                    )
+                })?;
+                match declaration::evaluate_with_heads(
+                    &current_doc,
+                    recovery_head.as_ref(),
+                    floor,
+                    &value,
+                ) {
                     Ok(Decision::Unchanged) => {}
                     Ok(decision) => {
                         let (key_id, public_key) = value
@@ -378,9 +448,11 @@ pub fn run_with_clock(
                                     db.open_recovery_window(host, &raw, &stored_raw)?;
                                 }
                             }
-                            Some(window) => {
-                                let head: Value = serde_json::from_slice(&window.declaration_json)?;
-                                if declaration::follows_chain_head(&head, &value) {
+                            Some(_) => {
+                                if declaration::follows_chain_head(
+                                    recovery_head.as_ref().unwrap(),
+                                    &value,
+                                ) {
                                     db.update_recovery_chain_head(host, &raw)?;
                                 }
                             }
@@ -392,6 +464,7 @@ pub fn run_with_clock(
                     }
                 }
                 db.mark_declaration_fetched(host, now)?;
+                mutation.commit()?;
             }
             // WIST-1 §5.1: a cached Key Set is valid for at most
             // keyset_cache_ttl_seconds. Past that, a discovery failure
