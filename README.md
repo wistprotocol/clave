@@ -4,12 +4,9 @@ The signed Delta format targets [WIST specification revision `8785c62e9e12103747
 
 Delta ingestion checks the signed canonical `publisher` against the logical Feed domain before source selection and duplicate suppression, including fetched predecessors. Chain tips use `(publisher, url)` and persist across reopen; the database upgrade preserves existing stored pairs but cannot reconstruct tips already overwritten by an older URL-only table. Sealing and recovery settlement reject mismatches between queue ownership and the signed author. Complete authenticated Delta history, live recovery admission state and Audit Record eligibility remain separate validation requirements.
 
-WIST Protocol aggregator. Clave pulls signed deltas from publishers (via ping + the
-publisher's `.well-known/wist` tree), verifies each one against its schema
-and signature before admitting it, and seals them hourly into a public,
-hash-chained, append-only log — the Certificate Transparency model applied
-to a web index. It also serves the log, checkpoints, and periodic snapshots
-over HTTP for consumers to sync against.
+WIST Protocol aggregator. Clave pulls signed Deltas from Publishers through
+ping + pull, validates them, and seals hourly hash-chained Blocks. It serves
+the Log, Checkpoints and periodic Snapshots over HTTP for Consumer sync.
 
 Subcommands: `init` (generate the log's genesis key and local store),
 `serve` (HTTP ingest + read endpoints), `seal` (cut the next Block from
@@ -158,11 +155,9 @@ Snapshot generation do not share SQLite's transaction; crash recovery across
 those stores remains a separate requirement. The history reader also rejects
 prefixes produced off the signed cadence grid by local cadence overrides.
 
-Live admission still advances its recovery head on acceptance, evaluates only
-the current predecessor, does not settle expired windows before ingest, and
-must preserve its accepted sequence floor separately from sealed history.
-Post-settlement admission state must also reconcile replacements that sealed
-or remain pending.
+Admission's predecessor choices, accepted sequence floor and remaining
+deadline-settlement limitations are described at the start of
+[Declaration key binding](#declaration-key-binding).
 
 Pending and recovery copies share a persistent acceptance counter. Queue
 transfers retain that order and clear pre-window inclusion turns; every pending
