@@ -329,13 +329,14 @@ stops the pull before Page-derived Deltas enter admission. Trust inputs and
 unsupported history transitions follow [Authenticated history](#authenticated-history).
 
 Signed HTTP/restart tests cover unsealed-to-sealed authority, retired and reused
-keys, multiple Declarations in one Block, idempotent repetitions, recovery
+keys, alias renames, multiple Declarations in one Block, idempotent repetitions, recovery
 supersession and forged or absent database summaries. Reconstruction runs once
 when a pull first reaches a sealed Page and retains that prefix for the walk;
 bounded replay/cache work remains unimplemented. Complete Feed fields and
 timestamps, sealed-Page signature-failure refresh and durable selected-source
-provenance remain incomplete. Alias-renaming fallback retains the provisional
-named-binding reading recorded in specification `CONFORMANCE.md`.
+provenance remain incomplete. WIST-2 §3.2 named-entry fallback is covered by
+all 16 signed `page-bindings.json` probes, including excluded entries and
+rejection of aliases or public bytes available only from a later source.
 
 ## Delta predecessor admission
 

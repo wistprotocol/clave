@@ -1100,6 +1100,59 @@ mod tests {
     }
 
     #[test]
+    fn signed_page_bindings_preserve_named_source_authority() {
+        let root = std::env::var_os("WIST_SPEC_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../spec")
+            });
+        let vector: Value = serde_json::from_slice(
+            &std::fs::read(root.join("vectors/wist2/page-bindings.json")).unwrap(),
+        )
+        .unwrap();
+        let mut histories = std::collections::BTreeMap::new();
+        for (name, sources) in vector["histories"].as_object().unwrap() {
+            let mut previous = None;
+            let mut declarations = Vec::new();
+            for source in sources.as_array().unwrap() {
+                let doc = &source["envelope"];
+                if let Some(previous) = previous {
+                    declaration::evaluate(previous, doc).unwrap();
+                } else {
+                    declaration::evaluate_initial(doc).unwrap();
+                }
+                previous = Some(doc);
+                let publisher = declaration::publisher_of(doc).unwrap();
+                let at = source["sealed_at"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<jiff::Timestamp>()
+                    .unwrap()
+                    .as_second();
+                declarations.push((at, publisher.seq, publisher.keys));
+            }
+            histories.insert(name.as_str(), declarations);
+        }
+        for probe in vector["probes"].as_array().unwrap() {
+            let mut declarations = histories[probe["history"].as_str().unwrap()].clone();
+            let doc = &probe["envelope"];
+            let cut = doc["feed"]["generated_at"].as_str().unwrap();
+            for _ in 0..2 {
+                assert_eq!(
+                    verify_sealed_page(&declarations, doc, cut),
+                    probe["expected"] != "WIST2-E04",
+                    "{}",
+                    probe["name"]
+                );
+                declarations.reverse();
+            }
+            let mut damaged = doc.clone();
+            damaged["feed"]["domain"] = "tampered.example".into();
+            assert!(!verify_sealed_page(&declarations, &damaged, cut));
+        }
+    }
+
+    #[test]
     fn is_bare_authority_accepts_host_and_host_port() {
         assert!(is_bare_authority("example.com"));
         assert!(is_bare_authority("127.0.0.1:8080"));

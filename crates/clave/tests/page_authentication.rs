@@ -168,6 +168,28 @@ fn reused_page_identifiers_preserve_current_and_first_next_authority() {
 }
 
 #[test]
+fn renamed_page_keys_use_only_current_and_first_next_named_entries() {
+    let mut fixture = Fixture::new();
+    fixture.install(
+        0,
+        key_entry("old", &K2_SEED, "2099-01-01T00:00:00Z"),
+        "2026-08-09T12:00:00Z",
+        true,
+    );
+    fixture.install(1, page_key(&K2_SEED), "2026-08-09T13:00:00Z", true);
+    fixture.install(
+        2,
+        key_entry("later", &K2_SEED, "2099-01-01T00:00:00Z"),
+        "2026-08-09T14:00:00Z",
+        true,
+    );
+    fixture.probe("2026-08-09T11:00:00Z", &K2_SEED, false);
+    fixture.probe("2026-08-09T12:30:00Z", &K2_SEED, true);
+    fixture.probe("2026-08-09T13:00:00Z", &K2_SEED, true);
+    fixture.probe("2026-08-09T14:00:00Z", &K2_SEED, false);
+}
+
+#[test]
 fn a_lower_sequence_in_the_selected_block_cannot_supply_page_keys() {
     let mut fixture = Fixture::new();
     fixture.install(0, page_key(&K2_SEED), "2026-08-09T12:00:00Z", true);
