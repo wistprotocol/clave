@@ -75,6 +75,23 @@ pub fn add_delta_with_links(
     });
     if let Some(pv) = prev {
         delta["prev"] = pv.into();
+        if let Ok(raw) = fs::read(
+            p.dir
+                .path()
+                .join(format!(".well-known/wist/deltas/{}.json", &pv[7..])),
+        ) {
+            let predecessor: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+            let at = predecessor["delta"]["observed_at"]
+                .as_str()
+                .unwrap()
+                .parse::<jiff::Timestamp>()
+                .unwrap();
+            delta["observed_at"] = at
+                .checked_add(jiff::SignedDuration::from_secs(1))
+                .unwrap()
+                .to_string()
+                .into();
+        }
     }
     let id = wist_core::delta::delta_id(&delta).unwrap();
     let env = wist_core::envelope::sign_envelope(&delta, "delta", "k1", &p.sk).unwrap();

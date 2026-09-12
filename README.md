@@ -249,11 +249,42 @@ because amendments take effect on that grid. Tests cover signed clock vectors,
 zero and negative sealed amendments, exact activation, recovery queues and
 restart/retry followed by sealing.
 
-Full authenticated Delta chains and strict predecessor timestamp ordering
-remain separate requirements. Log timestamps retain their distinct whole-second
-profile. Binding and scope checks precede clock, chain and Payload checks;
+Log timestamps retain their distinct whole-second profile.
+Binding and scope checks precede clock, chain and Payload checks;
 WIST-1 §7 permits any established applicable semantic diagnostic after mandatory
 field checks. Signed `publisher` determines attribution under WIST-1 §3.8.
+
+## Delta predecessor admission
+
+Ingest requires each Delta naming the accepted Publisher/URL tip to have a
+strictly later signed `observed_at`, using the exact Publisher timestamp
+comparison in WIST-1 §3.4. Equal instants, including equivalent offsets and
+trailing fractional zeros, reject with WIST1-E07. Rejection leaves the ID
+unseen, the tip unchanged and the Payload unstored; neither queue receives it.
+Retrieved predecessors undergo the same admission checks before descendants.
+
+The predecessor Envelope comes from retained pending/recovery admissions or
+the complete authenticated Block prefix pinned to the database head. Lookup
+checks its Delta ID; comparison also checks Publisher and URL ownership.
+Materialized record timestamps supply no comparison authority. Unsealed
+Envelopes remain trusted local admission state. Missing accepted evidence or
+invalid Block history stops the pull; the sealed lookup validates the entire
+pinned prefix before returning an Envelope. See
+[Authenticated history](#authenticated-history) for its trust inputs and limits.
+
+`declaration::verify_delta_predecessor` checks current Publisher/timestamp
+fields, predecessor ID and ownership, and strict observation ordering. Callers
+must separately establish both Envelopes' eligibility and predecessor
+acceptance; this helper does not verify signatures, retrieve Deltas, establish
+Log positions or select the canonical chain tip.
+
+Signed `declaration-fields.json` relation cases and live tests cover exact
+fractions, offset equality, both queues, restart, sealed evidence despite altered
+materialized timestamps, fetched predecessors and corrupt history. Lookup scans
+retained domain admissions and, when needed, the full pinned Block prefix for
+each predecessor; bounded lookup and complete authenticated Delta replay remain
+separate requirements. Existing accepted or sealed chains receive no retroactive
+timestamp revalidation from this admission check.
 
 ## Delta index reconciliation
 

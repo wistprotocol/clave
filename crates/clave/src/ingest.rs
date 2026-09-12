@@ -836,6 +836,22 @@ pub fn run_with_clock(
             continue;
         }
 
+        if let Some(prev) = &delta_env.delta.prev {
+            let predecessor = db.accepted_delta(data_dir, host, prev)?;
+            if let Err(code) = declaration::verify_delta_predecessor(&delta_value, &predecessor) {
+                record_rejection(
+                    db,
+                    host,
+                    code,
+                    now,
+                    Some(id),
+                    "Delta does not strictly follow its predecessor observation",
+                )?;
+                report.rejected.push((id.clone(), code.into()));
+                continue;
+            }
+        }
+
         let payload_raw = if let Some(commitment) = &delta_env.delta.payload {
             let payload_url = format!("{base}payloads/{hex}.json");
             let (payload_raw, payload_value) = match meter.get(client, &payload_url) {

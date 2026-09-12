@@ -1,0 +1,37 @@
+use super::Db;
+use crate::error::{Error, Result};
+use crate::history::History;
+use serde_json::Value;
+use std::path::Path;
+
+impl Db {
+    pub(crate) fn accepted_delta(&self, directory: &Path, domain: &str, id: &str) -> Result<Value> {
+        if !self.is_delta_seen_for(id, domain)? {
+            return Err(Error::History("predecessor is no longer accepted".into()));
+        }
+        let mut statement = self.conn.prepare(
+            "SELECT entry_json FROM pending_entries WHERE entry_type = 'publisher_delta' AND domain = ?1 UNION ALL SELECT entry_json FROM queued_deltas WHERE domain = ?1",
+        )?;
+        let mut rows = statement.query([domain])?;
+        while let Some(row) = rows.next()? {
+            let doc: Value = serde_json::from_slice(&row.get::<_, Vec<u8>>(0)?)?;
+            if wist_core::delta::delta_id(&doc["delta"])? == id {
+                return Ok(doc);
+            }
+        }
+        let mut history = History::open(directory, self.last_block()?)?;
+        let mut found = None;
+        while let Some(block) = history.next_block()? {
+            for entry in &block.block().entries {
+                if entry["type"] == "publisher_delta"
+                    && wist_core::delta::delta_id(&entry["body"]["delta"])? == id
+                {
+                    found = Some(entry["body"].clone());
+                }
+            }
+        }
+        found.ok_or_else(|| {
+            Error::History("accepted predecessor Envelope is missing from retained state".into())
+        })
+    }
+}

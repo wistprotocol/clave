@@ -4,6 +4,7 @@ use serde_json::Value;
 use std::path::Path;
 use wist_core::objects::{PublisherState, StatusRejection};
 
+mod delta_history;
 mod delta_indexes;
 
 const SCHEMA: &str = "

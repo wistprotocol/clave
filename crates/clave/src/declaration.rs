@@ -6,6 +6,26 @@ use wist_core::objects::{Publisher, PublisherEnvelope, PublisherKey};
 
 mod time;
 
+pub fn verify_delta_predecessor(doc: &Value, predecessor: &Value) -> Result<(), &'static str> {
+    let publisher = delta_publisher(doc)?;
+    let prior = &predecessor["delta"];
+    let prior_id = wist_core::delta::delta_id(prior).map_err(|_| "WIST1-E07")?;
+    if delta_publisher(predecessor) != Ok(publisher)
+        || doc["delta"]["url"].as_str().is_none()
+        || doc["delta"]["url"] != prior["url"]
+        || Some(prior_id.as_str()) != doc["delta"]["prev"].as_str()
+    {
+        return Err("WIST1-E07");
+    }
+    match time::compare(
+        doc["delta"]["observed_at"].as_str().unwrap(),
+        prior["observed_at"].as_str().unwrap(),
+    ) {
+        Some(std::cmp::Ordering::Greater) => Ok(()),
+        _ => Err("WIST1-E07"),
+    }
+}
+
 pub fn verify_delta_clock(
     doc: &Value,
     clock: jiff::Timestamp,
