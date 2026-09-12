@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS param_changes(parameter TEXT NOT NULL, value INTEGER 
 CREATE TABLE IF NOT EXISTS noise_pings(domain TEXT NOT NULL, day TEXT NOT NULL, count INTEGER NOT NULL, PRIMARY KEY(domain, day));
 CREATE TABLE IF NOT EXISTS ingest_meter(domain TEXT NOT NULL, day TEXT NOT NULL, bytes INTEGER NOT NULL, PRIMARY KEY(domain, day));
 CREATE TABLE IF NOT EXISTS walk_state(domain TEXT PRIMARY KEY, suspended INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS feed_observations(domain TEXT PRIMARY KEY, generated_at_s INTEGER NOT NULL CHECK(typeof(generated_at_s) = 'integer' AND generated_at_s BETWEEN -62167219200 AND 253402300799));
 CREATE TABLE IF NOT EXISTS governance(update_id TEXT PRIMARY KEY, action TEXT NOT NULL, domain TEXT NOT NULL, level INTEGER, notice_id TEXT, outcome TEXT, sealed_at TEXT NOT NULL, block_number INTEGER NOT NULL, kind TEXT);
 CREATE TABLE IF NOT EXISTS recovery_windows(domain TEXT PRIMARY KEY, declaration_json BLOB NOT NULL, prior_declaration_json BLOB NOT NULL, owner_declaration_json BLOB NOT NULL, opened_block INTEGER, window_end TEXT);
 CREATE TABLE IF NOT EXISTS recovery_settlements(domain TEXT NOT NULL, owner_hash TEXT NOT NULL, PRIMARY KEY(domain, owner_hash));
@@ -351,6 +352,22 @@ pub struct Db {
 }
 
 impl Db {
+    pub(crate) fn observe_feed_generated_at(&self, domain: &str, at: &str) -> Result<bool> {
+        let at = crate::registry::epoch(at)?;
+        Ok(self
+            .conn
+            .query_row(
+                "INSERT INTO feed_observations(domain, generated_at_s) VALUES (?1, ?2)
+                 ON CONFLICT(domain) DO UPDATE SET generated_at_s = excluded.generated_at_s
+                 WHERE excluded.generated_at_s >= feed_observations.generated_at_s
+                 RETURNING generated_at_s",
+                rusqlite::params![domain, at],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some())
+    }
+
     pub(crate) fn mutation(&self) -> Result<Mutation<'_>> {
         Mutation::new(&self.conn)
     }
@@ -1937,6 +1954,40 @@ mod tests {
         let path = tmp.path().join("clave.sqlite");
         Db::open(&path).unwrap();
         Db::open(&path).unwrap();
+    }
+
+    #[test]
+    fn feed_observations_are_atomic_and_host_scoped_across_connections() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("clave.sqlite");
+        let db = Db::open(&path).unwrap();
+        assert!(db
+            .observe_feed_generated_at("example.com", "0000-01-01T00:00:00Z")
+            .unwrap());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles = ["2026-08-09T14:00:00Z", "2026-08-09T14:00:01Z"].map(|at| {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let db = Db::open(&path).unwrap();
+                barrier.wait();
+                db.observe_feed_generated_at("example.com", at).unwrap()
+            })
+        });
+        let [earlier, later] = handles;
+        earlier.join().unwrap();
+        assert!(later.join().unwrap());
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        assert!(!db
+            .observe_feed_generated_at("example.com", "2026-08-09T14:00:00Z")
+            .unwrap());
+        assert!(db
+            .observe_feed_generated_at("other.example", "0000-01-01T00:00:00Z")
+            .unwrap());
+        assert!(db
+            .observe_feed_generated_at("example.com", "2026-08-09T14:00:01Z")
+            .unwrap());
     }
 
     #[test]

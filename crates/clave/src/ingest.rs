@@ -621,6 +621,17 @@ pub fn run_with_clock(
             report.noise = Some("WIST2-E04");
             return Ok(report);
         }
+        if live_page && !db.observe_feed_generated_at(host, &feed_parsed.feed.generated_at)? {
+            record_rejection(
+                db,
+                host,
+                "WIST2-E05",
+                now,
+                None,
+                "live Feed generated_at precedes the retained authenticated observation",
+            )?;
+            return Ok(report);
+        }
         let mut page_has_unseen = false;
         for id in &feed_parsed.feed.deltas {
             if !db.is_delta_seen_for(id, host)? {

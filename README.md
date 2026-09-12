@@ -326,8 +326,29 @@ receive WIST2-E04 without retry, even with a bad signature.
 through first contact and restart, checking persisted diagnostics, noise and
 request counts. Page field regressions stop before Delta/Payload admission.
 The schema gate does not establish complete `next` URL/authority validation,
-Feed timestamp-regression state, exact Page cardinality, publication/history
+exact Page cardinality, publication/history
 partitioning, supported-major policy or durable selected-source provenance.
+
+## Feed rollback protection
+
+Ingestion implements WIST-2 §3.2/ADR-0033 using an atomic SQLite comparison
+and update of each host's greatest authenticated live Feed timestamp.
+WIST2-E05 stops Page and Delta work without noise. Field/domain/signature
+failures retain their earlier diagnostics and cannot change that observation.
+Equal timestamps pass; older sealed Pages do not enter this comparison.
+The observation survives restart, subsequent retrieval failures, budget
+suspension, empty Feeds and Declaration changes.
+
+`feed-regression.json` supplies 21 signed observations, consumed over HTTP
+with database reopen between observations. Additional tests cover dependent
+Page/Delta/Payload failures, budget exhaustion, storage failure, older sealed
+Pages, ordinary rotation, identity reset and concurrent per-host storage.
+Recovery-settlement integration remains unexercised for this state.
+
+Existing databases have no retained Feed observations to reconstruct; protection
+starts at the first authenticated live Feed after upgrade. Backups must preserve
+this table to preserve its observations. General crash recovery, backup restore
+and concurrent pull serialization remain separate requirements.
 
 ## Page source verification
 
