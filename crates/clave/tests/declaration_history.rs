@@ -42,7 +42,25 @@ fn field_rejection_preserves_the_complete_declaration_prefix() {
                 state.apply(&reader.next_block().unwrap().unwrap()).unwrap();
             }
             let before = format!("{state:?}");
-            let result = state.apply(&reader.next_block().unwrap().unwrap());
+            let block = reader.next_block().unwrap().unwrap();
+            let projection = state.project(
+                &block.block().header.sealed_at,
+                reader
+                    .schedule()
+                    .unwrap()
+                    .value_at("recovery_window_days", block.sealed_at_s())
+                    .unwrap(),
+                &block.block().entries,
+            );
+            assert_eq!(format!("{state:?}"), before);
+            let result = state.apply(&block);
+            assert_eq!(projection.is_ok(), result.is_ok());
+            if let Ok(projected) = projection {
+                assert_eq!(
+                    format!("{:?}", projected.domains()),
+                    format!("{:?}", state.domains())
+                );
+            }
             if case["expected"] == "accepted" {
                 assert!(result.is_ok(), "{}: {result:?}", case["name"]);
                 if let Some(domains) = case.get("expected_domains") {
@@ -161,17 +179,19 @@ fn delta_scope_stays_with_its_authenticated_declaration_source() {
             fn parse(doc: &Value) -> wist_core::objects::Publisher {
                 clave::declaration::publisher_of(doc).unwrap()
             }
-            let admission = match domain.window() {
-                Some(window) => vec![
-                    parse(window.before().envelope()),
-                    parse(window.owner().envelope()),
-                ],
-                None => vec![parse(domain.current().envelope())],
-            };
+            let admission = domain
+                .delta_admission_sources()
+                .into_iter()
+                .map(|source| parse(source.envelope()))
+                .collect();
             sources.insert((name.clone(), height, "admission"), admission);
             sources.insert(
                 (name.clone(), height, "sealing"),
-                vec![parse(domain.current().envelope())],
+                domain
+                    .delta_sealing_source()
+                    .map(|source| parse(source.envelope()))
+                    .into_iter()
+                    .collect(),
             );
             for settlement in effects.settlements {
                 assert_eq!(settlement.domain, "example.com");
@@ -377,9 +397,34 @@ fn probe(blocks: &[Value], probe: &Value) -> (Declarations, Result<Effects, Stri
             .count() as u64;
     }
     let before = format!("{state:?}");
-    let result = state
-        .apply(&history.next_block().unwrap().unwrap())
-        .map_err(|e| e.to_string());
+    let candidate = history.next_block().unwrap().unwrap();
+    let projection = state.project(
+        &candidate.block().header.sealed_at,
+        history
+            .schedule()
+            .unwrap()
+            .value_at("recovery_window_days", candidate.sealed_at_s())
+            .unwrap(),
+        &candidate.block().entries,
+    );
+    assert_eq!(format!("{state:?}"), before);
+    let result = state.apply(&candidate).map_err(|e| e.to_string());
+    match (&projection, &result) {
+        (Ok(projected), Ok(effects)) => {
+            assert_eq!(
+                format!("{:?}", projected.domains()),
+                format!("{:?}", state.domains())
+            );
+            assert_eq!(format!("{:?}", projected.effects()), format!("{effects:?}"));
+            assert_eq!(
+                projected.block_number(),
+                candidate.block().header.block_number
+            );
+            assert_eq!(projected.sealed_at_s(), candidate.sealed_at_s());
+        }
+        (Err(projected), Err(applied)) => assert_eq!(projected.to_string(), *applied),
+        _ => panic!("projection disagrees with authenticated application"),
+    }
     if let Ok(effects) = &result {
         windows += effects
             .installations
@@ -870,4 +915,182 @@ fn legacy_recovery_owners_require_authenticated_matching_history() {
             }
         }
     }
+}
+
+#[test]
+fn candidate_sources_keep_settlement_separate_from_deadline_replacements() {
+    let vector = vector("wist1/recovery-scope");
+    let key_id = vector["log_key"]["key_id"].as_str().unwrap();
+    for history in vector["histories"].as_object().unwrap().values() {
+        let blocks = history["blocks"].as_array().unwrap();
+        let fixture = Fixture::with_key_id(&blocks[..169], key_id);
+        let state = fixture.restore().unwrap();
+        let before = format!("{state:?}");
+        let domain = &state.domains()["example.com"];
+        assert_eq!(domain.current().envelope()["publisher"]["seq"], 5);
+        assert_eq!(
+            domain.window().unwrap().head().envelope()["publisher"]["seq"],
+            4
+        );
+        let deadline = i64::try_from(domain.window().unwrap().end_s()).unwrap();
+        let prior = state.project(&timestamp(deadline - 1), 7, &[]).unwrap();
+        assert!(prior.effects().settlements.is_empty());
+        let domain = &prior.domains()["example.com"];
+        assert!(domain.delta_sealing_source().is_none());
+        assert_eq!(
+            domain
+                .delta_admission_sources()
+                .iter()
+                .map(|source| source.envelope()["publisher"]["seq"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+
+        let empty = state.project(&timestamp(deadline), 7, &[]).unwrap();
+        let restored = &empty.domains()["example.com"];
+        assert_eq!(
+            restored.delta_sealing_source().unwrap().envelope()["publisher"]["seq"],
+            4
+        );
+        assert_eq!(restored.highest_accepted_seq(), 5);
+        assert_eq!(restored.reset(), domain.reset());
+        assert_eq!(empty.effects().settlements.len(), 1);
+        assert!(empty.effects().installations.is_empty());
+        assert_eq!(
+            empty.effects().settlements[0]
+                .superseded
+                .iter()
+                .map(|source| source.envelope()["publisher"]["seq"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            [3, 5]
+        );
+
+        let replacement = state
+            .project(
+                blocks[169]["header"]["sealed_at"].as_str().unwrap(),
+                7,
+                blocks[169]["entries"].as_array().unwrap(),
+            )
+            .unwrap();
+        let settlement = &replacement.effects().settlements[0];
+        assert_eq!(settlement.restored.envelope()["publisher"]["seq"], 4);
+        assert_eq!(
+            settlement.restored.envelope()["publisher"]["subdomain_scope"],
+            json!(["old.example", "retained.example", "follower.example"])
+        );
+        let current = &replacement.domains()["example.com"];
+        assert_eq!(current.highest_accepted_seq(), 6);
+        assert_eq!(
+            current.delta_sealing_source().unwrap().envelope()["publisher"]["seq"],
+            6
+        );
+        assert!(
+            current.delta_sealing_source().unwrap().envelope()["publisher"]
+                .get("subdomain_scope")
+                .is_none()
+        );
+        assert_eq!(current.delta_admission_sources().len(), 1);
+        assert_eq!(replacement.block_number(), 169);
+        assert_eq!(replacement.sealed_at_s(), deadline);
+        assert_eq!(format!("{state:?}"), before);
+
+        let mut corrupted = blocks[169]["entries"].as_array().unwrap().clone();
+        let signature = corrupted[0]["body"]["sig"]["value"].as_str().unwrap();
+        corrupted[0]["body"]["sig"]["value"] = format!(
+            "{}{}",
+            if signature.starts_with('A') { "B" } else { "A" },
+            &signature[1..]
+        )
+        .into();
+        assert!(state
+            .project(&timestamp(deadline), 7, &corrupted)
+            .unwrap_err()
+            .to_string()
+            .contains("WIST1-E01"));
+        assert_eq!(format!("{state:?}"), before);
+        assert_eq!(
+            format!("{:?}", state.project(&timestamp(deadline), 7, &[]).unwrap()),
+            format!("{empty:?}")
+        );
+        assert_eq!(format!("{:?}", fixture.restore().unwrap()), before);
+    }
+}
+
+#[test]
+fn unsealed_candidate_followers_do_not_advance_recovery_authority() {
+    let vector = vector("wist1/recovery-scope");
+    let key_id = vector["log_key"]["key_id"].as_str().unwrap();
+    for history in vector["histories"].as_object().unwrap().values() {
+        let blocks = history["blocks"].as_array().unwrap();
+        let fixture = Fixture::with_key_id(&blocks[..3], key_id);
+        let state = fixture.restore().unwrap();
+        let before = format!("{state:?}");
+        let candidate = state
+            .project(
+                blocks[3]["header"]["sealed_at"].as_str().unwrap(),
+                7,
+                blocks[3]["entries"].as_array().unwrap(),
+            )
+            .unwrap();
+        let projected = &candidate.domains()["example.com"];
+        assert_eq!(
+            projected.window().unwrap().head().envelope()["publisher"]["seq"],
+            4
+        );
+        assert_eq!(projected.highest_accepted_seq(), 4);
+        assert!(projected.delta_sealing_source().is_none());
+        assert_eq!(
+            projected
+                .delta_admission_sources()
+                .iter()
+                .map(|source| source.envelope()["publisher"]["seq"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+        let domain = &state.domains()["example.com"];
+        assert_eq!(
+            domain.window().unwrap().head().envelope()["publisher"]["seq"],
+            2
+        );
+        assert_eq!(domain.highest_accepted_seq(), 3);
+        let deadline = i64::try_from(domain.window().unwrap().end_s()).unwrap();
+        let settled = state.project(&timestamp(deadline), 7, &[]).unwrap();
+        assert_eq!(
+            settled.effects().settlements[0].restored.envelope()["publisher"]["seq"],
+            2
+        );
+        assert_eq!(settled.domains()["example.com"].highest_accepted_seq(), 3);
+        assert_eq!(format!("{state:?}"), before);
+        assert_eq!(format!("{:?}", fixture.restore().unwrap()), before);
+    }
+}
+
+#[test]
+fn candidate_projection_requires_valid_time_profile_and_entry_order() {
+    let vector = vector("wist1/recovery-heads");
+    let blocks = vector["blocks"].as_array().unwrap();
+    let state = Fixture::new(&blocks[..2]).restore().unwrap();
+    let before = format!("{state:?}");
+    let at = blocks[2]["header"]["sealed_at"].as_str().unwrap();
+    for invalid in [
+        blocks[0]["header"]["sealed_at"].as_str().unwrap(),
+        blocks[1]["header"]["sealed_at"].as_str().unwrap(),
+        "2026-08-04T02:00:60Z",
+        "2026-08-04T02:00:00.0Z",
+        "2026-08-04T02:00:00+00:00",
+    ] {
+        assert!(state.project(invalid, 7, &[]).is_err());
+    }
+    assert!(state.project(at, 0, &[]).is_err());
+    assert!(state.project(at, i64::MAX, &[]).is_err());
+    let malformed = json!({"type":"publisher_declaration","body":null});
+    assert!(state.project(at, 7, &[malformed]).is_err());
+    let mut entries = vec![
+        json!({"type":"audit_record","body":{}}),
+        blocks[2]["entries"][0].clone(),
+    ];
+    assert!(state.project(at, 7, &entries).is_err());
+    entries.reverse();
+    assert!(state.project(at, 7, &entries).is_ok());
+    assert_eq!(format!("{state:?}"), before);
 }

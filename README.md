@@ -276,6 +276,40 @@ the sequence floor or resetting identity. Returned installation and settlement
 effects identify resets, window openings and superseded competitors. They do
 not apply database, queue or sanction changes.
 
+`Declarations::project(sealed_at, recovery_window_days, entries)` evaluates
+one proposed next Block without changing the accepted prefix. Pass its complete
+Entries in canonical storage order after packing, and the recovery-window
+parameter from the authenticated schedule in force at that proposed instant.
+The method validates the parameter's value, timestamp profile and forward
+ordering, Entry wrappers/order, and Declaration fields, authors and acceptance.
+It does not authenticate the supplied parameter profile, check the cadence or
+Block size, or validate other Entry bodies. A successful projection is therefore
+conditional on those checks. Recompute it if the timestamp, profile or selected
+Entries change.
+
+The returned `Projection` exposes proposed domain state and effects, without
+an accepted head or a way to install it as authenticated history. Its Declaration
+positions, sealing times, identity resets and window openings are prospective.
+Only `apply(VerifiedBlock)` advances replay, using the same transition logic.
+Projection failure exposes no state or settlement effects. An unsealed follower
+cannot change the accepted recovery head, sequence floor or future settlement.
+
+`Domain::delta_admission_sources()` returns the frozen predecessor and owner
+while that state's window is open, otherwise its current Declaration.
+`delta_sealing_source()` returns no source during an open window, because its
+Deltas must queue. At a deadline, `Projection::effects().settlements` retains
+the sealed recovery head used to revalidate existing queued copies before any
+candidate Declaration applies. The projected domain's sources reflect all
+candidate replacements afterward. A deadline-Block replacement can therefore
+change sealing authority without changing the queue's settlement authority.
+These accessors describe the supplied prefix or projection; they do not refresh
+live admission state, settle SQLite queues, or perform Delta eligibility checks.
+
+Signed recovery probes exercise candidate rejection, retained sequence floors,
+unsealed follower isolation, deadline boundaries, distinct settlement/sealing
+scope and restart reconstruction. Live admission and sealing still require
+projection integration with durable queue, status and chain-tip updates.
+
 `Domain::appeal_declaration()` selects the signing-key source after the current
 Block’s Declaration stage. Callers must separately establish notice eligibility
 and freeze that notice’s complete key bindings; this accessor does not validate
