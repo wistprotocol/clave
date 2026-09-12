@@ -468,7 +468,9 @@ pub fn run_with_clock(
                     floor,
                     &value,
                 ) {
-                    Ok(Decision::Unchanged) => {}
+                    Ok(Decision::Unchanged) => {
+                        db.mark_declaration_fetched(host, now)?;
+                    }
                     Ok(decision) => {
                         let (key_id, public_key) = value
                             .pointer("/publisher/keys/0")
@@ -496,12 +498,12 @@ pub fn run_with_clock(
                             }
                         }
                         current_doc = value;
+                        db.mark_declaration_fetched(host, now)?;
                     }
                     Err((code, detail)) => {
                         record_rejection(db, host, code, now, None, &detail)?;
                     }
                 }
-                db.mark_declaration_fetched(host, now)?;
                 mutation.commit()?;
             }
             // WIST-1 §5.1: a cached Key Set is valid for at most
@@ -509,7 +511,11 @@ pub fn run_with_clock(
             // leaves no Key Set to validate against and the pull fails
             // closed with WIST1-E02 rather than sealing under a
             // declaration of any age.
-            Ok(None) => {}
+            Ok(None) => {
+                db.set_walk_suspended(host, true)?;
+                report.suspended = true;
+                return Ok(report);
+            }
             Err(e) => {
                 if key_set_cache_expired(db, host, now)? {
                     record_rejection(
@@ -524,6 +530,18 @@ pub fn run_with_clock(
                 }
             }
         }
+    }
+
+    if known && key_set_cache_expired(db, host, now)? {
+        record_rejection(
+            db,
+            host,
+            "WIST1-E02",
+            now,
+            None,
+            "Key Set cache expired without an accepted Declaration refresh",
+        )?;
+        return Ok(report);
     }
 
     match declaration::publisher_of(&current_doc) {

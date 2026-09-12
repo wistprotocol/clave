@@ -95,6 +95,12 @@ authenticated pinned Block prefix and retained current/pending admission rows;
 corrupt history rejects restoration before any floor is written. Retained
 admission rows are local accepted state, not authenticated Log inclusion.
 
+Only an accepted replacement or a valid unchanged re-serve renews the cached
+Declaration's discovery timestamp. Rejected or unavailable responses preserve
+that timestamp; after attempted discovery, an expired cache stops the pull
+with WIST1-E02 before fetching the Feed. An exhausted discovery budget preserves
+walk suspension. Restart preserves the same expiry basis.
+
 During recovery, a replacement may name either the current Declaration or
 the accepted recovery-chain head. Its named predecessor determines signer
 classification and recovery-key protection. Only an ordinary or recovery
