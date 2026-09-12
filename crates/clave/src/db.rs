@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS ingest_meter(domain TEXT NOT NULL, day TEXT NOT NULL,
 CREATE TABLE IF NOT EXISTS walk_state(domain TEXT PRIMARY KEY, suspended INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS governance(update_id TEXT PRIMARY KEY, action TEXT NOT NULL, domain TEXT NOT NULL, level INTEGER, notice_id TEXT, outcome TEXT, sealed_at TEXT NOT NULL, block_number INTEGER NOT NULL, kind TEXT);
 CREATE TABLE IF NOT EXISTS recovery_windows(domain TEXT PRIMARY KEY, declaration_json BLOB NOT NULL, prior_declaration_json BLOB NOT NULL, owner_declaration_json BLOB NOT NULL, opened_block INTEGER, window_end TEXT);
+CREATE TABLE IF NOT EXISTS recovery_settlements(domain TEXT NOT NULL, owner_hash TEXT NOT NULL, PRIMARY KEY(domain, owner_hash));
 CREATE TABLE IF NOT EXISTS sealed_declarations(domain TEXT NOT NULL, seq INTEGER NOT NULL, block_number INTEGER NOT NULL, sealed_at TEXT NOT NULL, declaration_json BLOB NOT NULL, PRIMARY KEY(domain, seq));
 CREATE TABLE IF NOT EXISTS roster_acts(block_number INTEGER NOT NULL, act_index INTEGER NOT NULL, sealed_at TEXT NOT NULL, action TEXT NOT NULL, auditor_id TEXT NOT NULL, key_id TEXT NOT NULL, public_key TEXT NOT NULL, for_cause INTEGER NOT NULL, PRIMARY KEY(block_number, act_index));
 CREATE TABLE IF NOT EXISTS queued_deltas(rowid INTEGER PRIMARY KEY AUTOINCREMENT, domain TEXT NOT NULL, delta_id TEXT NOT NULL, entry_json BLOB NOT NULL, url TEXT NOT NULL, chain_pos INTEGER NOT NULL, acceptance_order INTEGER);
@@ -819,6 +820,30 @@ impl Db {
         let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Error::Db)
+    }
+
+    pub(crate) fn recovery_settled(&self, domain: &str, owner_hash: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM recovery_settlements WHERE domain = ?1 AND owner_hash = ?2)",
+            (domain, owner_hash),
+            |row| row.get(0),
+        )?)
+    }
+
+    pub(crate) fn mark_recovery_settled(&self, domain: &str, owner_hash: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO recovery_settlements(domain, owner_hash) VALUES (?1, ?2)",
+            (domain, owner_hash),
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn remove_pending_declaration(&self, rowid: i64) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM pending_entries WHERE rowid = ?1 AND entry_type = 'publisher_declaration'",
+            [rowid],
+        )?;
+        Ok(())
     }
 
     pub fn close_recovery_window(&self, domain: &str) -> Result<()> {

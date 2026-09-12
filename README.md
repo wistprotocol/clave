@@ -78,8 +78,19 @@ the head from authenticated sealed history and pending followers, preserving
 unsealed continuations after partial packing and ignoring stale head summaries.
 Pending recovery owners are verified against their retained predecessor.
 This admission head does not replace the sealed authority used to settle
-queued Deltas. Admission-time deadline settlement and reconciliation of
-post-settlement pending replacements remain unimplemented.
+queued Deltas.
+
+Before admission, `recovery::settle` authenticates the pinned Block prefix and
+closes due windows. It restores the accepted recovery head, retains legitimate
+pending followers and the sequence floor, and removes pending competitors and
+their descendants. Queued Deltas are revalidated against the distinct sealed
+head. Queue, rejection, seen-ID, Publisher-URL tip, current Declaration and
+per-owner settlement-marker changes commit atomically. Markers survive reopen
+and prevent later pulls or sealing from overwriting subsequent admissions.
+Pulls that cross a deadline refresh authority before Declaration admission,
+Delta verification and final queue insertion. The entry point replays the full
+prefix on each pull; bounded replay state and crash recovery across database
+and published files remain separate requirements.
 
 Admission and Declaration history replay validate complete Envelope fields
 before sequencing, conflicts, idempotence or signer resolution (WIST1-E14).
@@ -145,7 +156,10 @@ Declaration projection is recomputed after Entry filtering. Recovery lengths
 come from the authenticated schedule at the candidate instant, and existing
 window ends remain frozen. Successful seals refresh stored recovery heads and
 frozen sources from the projected state, without synthesizing a re-served
-Declaration at settlement.
+Declaration at settlement. A retained recovery-signed follower first sealed
+after the deadline can own a new window; later Entries use that projection.
+Sealing rejects a cadence slot before a completed admission settlement's
+deadline, preserving closure until a valid deadline slot is available.
 
 Database mutations for a seal share one transaction, including queue movement,
 status rejections, stored recovery state and the committed Block head. A failed
@@ -155,8 +169,8 @@ Snapshot generation do not share SQLite's transaction; crash recovery across
 those stores remains a separate requirement. The history reader also rejects
 prefixes produced off the signed cadence grid by local cadence overrides.
 
-Admission's predecessor choices, accepted sequence floor and remaining
-deadline-settlement limitations are described at the start of
+Admission's predecessor choices, accepted sequence floor and deadline
+settlement are described at the start of
 [Declaration key binding](#declaration-key-binding).
 
 Pending and recovery copies share a persistent acceptance counter. Queue
@@ -197,8 +211,12 @@ chain head for the owner.
 The signed `recovery-bindings.json` corpus exercises complete binding checks,
 authenticated source reconstruction and owner migration. Live tests cover
 followers, database reopen, admission diagnostics, settlement rejection and
-actual survivor sealing. Full authenticated Delta chains, deadline-triggered
-settlement during admission, signature-failure Declaration re-fetches, sealed
+actual survivor sealing. `recovery-admission.json` also exercises all eleven
+signed pending-Declaration cases through SQLite reopen, exact deadline
+settlement, repeated calls and candidate projection. Live tests cover new
+post-deadline admissions, retained followers opening another window, injected
+transaction failure and cadence rounding after admission closure.
+Full authenticated Delta chains, signature-failure Declaration re-fetches, sealed
 Feed key provenance and notice-era appeal authority remain incomplete.
 
 Delta key-time checks compare `observed_at` and `valid_from` as instants,

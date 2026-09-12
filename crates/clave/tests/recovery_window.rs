@@ -2,7 +2,7 @@ mod common;
 
 use common::*;
 
-const T0: i64 = 1_754_740_800; // 2026-08-09T12:00:00Z
+const T0: i64 = 1_786_276_800;
 const DAY: i64 = 86400;
 
 struct Rig {
@@ -2315,4 +2315,419 @@ fn failed_recovery_head_write_rolls_back_declaration_floor_and_pending_entry() {
         r.db.count_pending_entries("publisher_declaration").unwrap(),
         1
     );
+}
+
+#[test]
+fn admission_deadline_preserves_pending_followers_and_later_replacements() {
+    for recovery_follower in [false, true] {
+        let (mut r, start, owner) = sealed_recovery();
+        let owner_envelope = current_declaration(&r.p);
+        let rejected = add_delta_signed(
+            &r.p,
+            "https://example.com/old",
+            "old",
+            None,
+            "2026-08-09T14:00:00Z",
+            "k1",
+            &K1_SEED,
+        );
+        write_feed_signed(
+            &r.p,
+            &r.host,
+            std::slice::from_ref(&rejected),
+            "2026-08-09T14:00:00Z",
+            "k2",
+            &K2_SEED,
+        );
+        assert_eq!(
+            ingest(&r, "2026-08-09T14:00:00Z").queued,
+            vec![rejected.clone()]
+        );
+        let mut competitor = owner.clone();
+        competitor["seq"] = 2.into();
+        competitor["prev_declaration"] = declaration_hash(&owner_envelope).into();
+        competitor["keys"] = serde_json::json!([key_entry("x1", &X1_SEED, "2026-08-09T13:00:00Z")]);
+        write_declaration(&r.p, &competitor, "x1", &X1_SEED);
+        write_feed_signed(&r.p, &r.host, &[], "2026-08-09T15:00:00Z", "x1", &X1_SEED);
+        ingest(&r, "2026-08-09T15:00:00Z");
+        let mut follower = owner;
+        follower["seq"] = 3.into();
+        follower["prev_declaration"] = declaration_hash(&owner_envelope).into();
+        follower["keys"] = serde_json::json!([key_entry("k1", &K1_SEED, "2026-08-09T13:00:00Z")]);
+        let (signer, seed) = if recovery_follower {
+            ("r1", &R1_SEED)
+        } else {
+            ("k2", &K2_SEED)
+        };
+        write_declaration(&r.p, &follower, signer, seed);
+        let follower_envelope = current_declaration(&r.p);
+        write_feed_signed(&r.p, &r.host, &[], "2026-08-09T16:00:00Z", "k1", &K1_SEED);
+        ingest(&r, "2026-08-09T16:00:00Z");
+        let deadline = "2026-08-16T13:00:00Z";
+        r.db = clave::db::Db::open(&r.data.path().join("clave.sqlite")).unwrap();
+        ingest(&r, deadline);
+        assert_eq!(
+            r.db.count_pending_entries("publisher_declaration").unwrap(),
+            1
+        );
+        assert_eq!(
+            r.db.highest_accepted_declaration_seq(&r.host).unwrap(),
+            Some(3)
+        );
+        assert!(r.db.get_recovery_window(&r.host).unwrap().is_none());
+        assert!(r
+            .db
+            .list_rejections(&r.host)
+            .unwrap()
+            .iter()
+            .any(|rejection| rejection.delta_id.as_ref() == Some(&rejected)
+                && rejection.code == "WIST1-E13"));
+        assert!(!r.db.is_delta_seen_for(&rejected, &r.host).unwrap());
+        assert!(r
+            .db
+            .url_tip(&r.host, "https://example.com/old")
+            .unwrap()
+            .is_none());
+        competitor["seq"] = 4.into();
+        competitor["prev_declaration"] = declaration_hash(&follower_envelope).into();
+        write_declaration(&r.p, &competitor, "x1", &X1_SEED);
+        let replacement = current_declaration(&r.p);
+        let accepted = add_delta_signed(
+            &r.p,
+            "https://example.com/after",
+            "after",
+            None,
+            deadline,
+            "x1",
+            &X1_SEED,
+        );
+        write_feed_signed(
+            &r.p,
+            &r.host,
+            std::slice::from_ref(&accepted),
+            deadline,
+            "x1",
+            &X1_SEED,
+        );
+        assert_eq!(ingest(&r, deadline).accepted, vec![accepted.clone()]);
+        r.db = clave::db::Db::open(&r.data.path().join("clave.sqlite")).unwrap();
+        ingest(&r, deadline);
+        let report = clave::seal::run(&r.db, r.data.path(), &r.sk, start + 3600 + 7 * DAY).unwrap();
+        let state = clave::history::declarations::Declarations::reconstruct(
+            r.data.path(),
+            r.db.last_block().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(state.domains()[&r.host].current().envelope(), &replacement);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(
+                &r.db.get_publisher_declaration(&r.host).unwrap().unwrap()
+            )
+            .unwrap(),
+            replacement
+        );
+        assert_eq!(
+            r.db.highest_accepted_declaration_seq(&r.host).unwrap(),
+            Some(4)
+        );
+        assert_eq!(
+            r.db.get_record("https://example.com/after", &r.host)
+                .unwrap()
+                .is_some(),
+            !recovery_follower
+        );
+        if recovery_follower {
+            let window = state.domains()[&r.host].window().unwrap();
+            assert_eq!(window.owner().envelope(), &follower_envelope);
+            assert_eq!(window.owner().position().block_number, report.block_number);
+            assert_eq!(
+                r.db.drain_queued_deltas(&r.host).unwrap()[0].delta_id,
+                accepted
+            );
+        } else {
+            assert!(state.domains()[&r.host].window().is_none());
+        }
+    }
+}
+
+#[test]
+fn failed_admission_settlement_rolls_back_every_database_effect() {
+    let (mut r, _, _) = sealed_recovery();
+    let rejected = add_delta_signed(
+        &r.p,
+        "https://example.com/old",
+        "old",
+        None,
+        "2026-08-09T14:00:00Z",
+        "k1",
+        &K1_SEED,
+    );
+    write_feed_signed(
+        &r.p,
+        &r.host,
+        std::slice::from_ref(&rejected),
+        "2026-08-09T14:00:00Z",
+        "k2",
+        &K2_SEED,
+    );
+    ingest(&r, "2026-08-09T14:00:00Z");
+    let path = r.data.path().join("clave.sqlite");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("CREATE TRIGGER refuse_settlement BEFORE INSERT ON recovery_settlements BEGIN SELECT RAISE(ABORT, 'injected failure'); END;").unwrap();
+    assert!(clave::ingest::run(
+        &r.db,
+        &r.client,
+        r.data.path(),
+        &r.host,
+        "2026-08-16T13:00:00Z"
+    )
+    .is_err());
+    r.db = clave::db::Db::open(&path).unwrap();
+    assert!(r.db.get_recovery_window(&r.host).unwrap().is_some());
+    assert!(r.db.is_delta_seen_for(&rejected, &r.host).unwrap());
+    assert_eq!(
+        r.db.url_tip(&r.host, "https://example.com/old")
+            .unwrap()
+            .as_deref(),
+        Some(rejected.as_str())
+    );
+    assert!(r.db.list_rejections(&r.host).unwrap().is_empty());
+    conn.execute_batch("DROP TRIGGER refuse_settlement;")
+        .unwrap();
+    ingest(&r, "2026-08-16T13:00:00Z");
+    assert!(!r.db.is_delta_seen_for(&rejected, &r.host).unwrap());
+    assert!(r.db.get_recovery_window(&r.host).unwrap().is_none());
+}
+
+#[test]
+fn cadence_rounding_cannot_reopen_a_settled_admission_window() {
+    let r = rig(make_publisher_with_recovery);
+    let at = |seconds| jiff::Timestamp::from_second(seconds).unwrap().to_string();
+    r.db.set_param("block_cadence_seconds", 3600).unwrap();
+    write_feed(&r.p, &r.host, &[], &at(T0));
+    ingest(&r, &at(T0));
+    let effective = T0 + 30 * DAY;
+    let update = wist_core::envelope::sign_envelope(&serde_json::json!({
+        "wist_version": "1.0.0", "action": "parameter_change", "subject": "block_cadence_seconds",
+        "details": {"parameter": "block_cadence_seconds", "value": 3599}, "effective_at": at(effective)
+    }), "update", "log1", &r.sk).unwrap();
+    r.db.insert_pending_entry("registry_update", "", &update, 0)
+        .unwrap();
+    let report = clave::seal::run(&r.db, r.data.path(), &r.sk, T0).unwrap();
+    assert!(report.dropped.is_empty(), "{:?}", report.dropped);
+    clave::seal::run(&r.db, r.data.path(), &r.sk, effective).unwrap();
+    let prior = current_declaration(&r.p);
+    let mut owner = prior["publisher"].clone();
+    owner["seq"] = 1.into();
+    owner["prev_declaration"] = declaration_hash(&prior).into();
+    owner["keys"] = serde_json::json!([key_entry("k2", &K2_SEED, "2026-08-09T13:00:00Z")]);
+    write_declaration(&r.p, &owner, "r1", &R1_SEED);
+    let opened = (effective.div_euclid(3599) + 1) * 3599;
+    write_feed_signed(&r.p, &r.host, &[], &at(opened), "k2", &K2_SEED);
+    ingest(&r, &at(opened));
+    clave::seal::run(&r.db, r.data.path(), &r.sk, opened).unwrap();
+    let survivor = add_delta_signed(
+        &r.p,
+        "https://example.com/survivor",
+        "body",
+        None,
+        &at(opened),
+        "k2",
+        &K2_SEED,
+    );
+    write_feed_signed(
+        &r.p,
+        &r.host,
+        std::slice::from_ref(&survivor),
+        &at(opened),
+        "k2",
+        &K2_SEED,
+    );
+    assert_eq!(ingest(&r, &at(opened)).queued, vec![survivor.clone()]);
+    let deadline = opened + 7 * DAY;
+    ingest(&r, &at(deadline));
+    assert!(r.db.get_recovery_window(&r.host).unwrap().is_none());
+    let error = clave::seal::run(&r.db, r.data.path(), &r.sk, deadline)
+        .err()
+        .unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("predates completed recovery settlement"),
+        "{error}"
+    );
+    assert!(r.db.get_recovery_window(&r.host).unwrap().is_none());
+    assert_eq!(r.db.count_pending_entries("publisher_delta").unwrap(), 1);
+    let next = (deadline.div_euclid(3599) + 1) * 3599;
+    clave::seal::run(&r.db, r.data.path(), &r.sk, next).unwrap();
+    assert!(r.db.get_recovery_window(&r.host).unwrap().is_none());
+    assert_eq!(
+        r.db.get_record("https://example.com/survivor", &r.host)
+            .unwrap()
+            .unwrap()
+            .delta_id,
+        survivor
+    );
+    clave::history::declarations::Declarations::reconstruct(
+        r.data.path(),
+        r.db.last_block().unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn pulls_crossing_the_deadline_refresh_authority_before_admission() {
+    for crossing_call in [0, 1, 2, 3, 5] {
+        let (r, _, _) = sealed_recovery();
+        let delta = add_delta_signed(
+            &r.p,
+            "https://example.com/crossing",
+            "body",
+            None,
+            "2026-08-16T12:59:59Z",
+            "k1",
+            &K1_SEED,
+        );
+        write_feed_signed(
+            &r.p,
+            &r.host,
+            std::slice::from_ref(&delta),
+            "2026-08-16T12:59:59Z",
+            "k2",
+            &K2_SEED,
+        );
+        let calls = std::cell::Cell::new(0);
+        let report = clave::ingest::run_with_clock(
+            &r.db,
+            &r.client,
+            r.data.path(),
+            &r.host,
+            "2026-08-16T12:59:59Z",
+            || {
+                let call = calls.get();
+                calls.set(call + 1);
+                if call < crossing_call {
+                    "2026-08-16T12:59:59Z"
+                } else {
+                    "2026-08-16T13:00:00Z"
+                }
+                .parse()
+                .unwrap()
+            },
+        )
+        .unwrap();
+        assert_eq!(report.rejected, vec![(delta.clone(), "WIST1-E02".into())]);
+        assert!(report.queued.is_empty());
+        assert!(report.accepted.is_empty());
+        assert!(r.db.get_recovery_window(&r.host).unwrap().is_none());
+        assert!(!r.db.is_delta_seen_for(&delta, &r.host).unwrap());
+        assert!(r
+            .db
+            .url_tip(&r.host, "https://example.com/crossing")
+            .unwrap()
+            .is_none());
+    }
+}
+
+#[test]
+fn deadline_retries_seen_copies_and_retrieves_a_settled_predecessor() {
+    for with_child in [false, true] {
+        let (r, _, _) = sealed_recovery();
+        let url = "https://example.com/retry";
+        let parent = add_delta_signed(
+            &r.p,
+            url,
+            "parent",
+            None,
+            "2026-08-09T14:00:00Z",
+            "k1",
+            &K1_SEED,
+        );
+        write_feed_signed(
+            &r.p,
+            &r.host,
+            std::slice::from_ref(&parent),
+            "2026-08-09T14:00:00Z",
+            "k2",
+            &K2_SEED,
+        );
+        assert_eq!(
+            ingest(&r, "2026-08-09T14:00:00Z").queued,
+            vec![parent.clone()]
+        );
+        let path =
+            r.p.dir
+                .path()
+                .join(format!(".well-known/wist/deltas/{}.json", &parent[7..]));
+        let old: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let replacement = wist_core::envelope::sign_envelope(
+            &old["delta"],
+            "delta",
+            "k2",
+            &wist_core::crypto::SigningKey::from_seed(&K2_SEED),
+        )
+        .unwrap();
+        std::fs::write(path, serde_json::to_vec(&replacement).unwrap()).unwrap();
+        let requested = if with_child {
+            add_delta_signed(
+                &r.p,
+                url,
+                "child",
+                Some(&parent),
+                "2026-08-16T12:59:59Z",
+                "k2",
+                &K2_SEED,
+            )
+        } else {
+            parent.clone()
+        };
+        write_feed_signed(
+            &r.p,
+            &r.host,
+            std::slice::from_ref(&requested),
+            "2026-08-16T12:59:59Z",
+            "k2",
+            &K2_SEED,
+        );
+        let calls = std::cell::Cell::new(0);
+        let report = clave::ingest::run_with_clock(
+            &r.db,
+            &r.client,
+            r.data.path(),
+            &r.host,
+            "2026-08-16T12:59:59Z",
+            || {
+                let call = calls.get();
+                calls.set(call + 1);
+                if call < if with_child { 5 } else { 1 } {
+                    "2026-08-16T12:59:59Z"
+                } else {
+                    "2026-08-16T13:00:00Z"
+                }
+                .parse()
+                .unwrap()
+            },
+        )
+        .unwrap();
+        let expected = if with_child {
+            vec![parent.clone(), requested.clone()]
+        } else {
+            vec![parent.clone()]
+        };
+        assert_eq!(report.accepted, expected);
+        assert!(report.queued.is_empty());
+        assert!(report.rejected.is_empty());
+        assert_eq!(
+            r.db.url_tip(&r.host, url).unwrap().as_deref(),
+            Some(requested.as_str())
+        );
+        assert!(r
+            .db
+            .list_rejections(&r.host)
+            .unwrap()
+            .iter()
+            .any(|rejection| rejection.delta_id.as_ref() == Some(&parent)
+                && rejection.code == "WIST1-E13"));
+    }
 }

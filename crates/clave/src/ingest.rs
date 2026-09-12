@@ -248,6 +248,42 @@ fn accepted_recovery_head(
     Ok(head)
 }
 
+fn settle_before_admission(
+    db: &Db,
+    data_dir: &Path,
+    host: &str,
+    clock: &impl Fn() -> jiff::Timestamp,
+) -> Result<()> {
+    if db
+        .get_recovery_window(host)?
+        .is_some_and(|window| window.opened_block.is_some())
+    {
+        crate::recovery::settle(db, data_dir, &clock().to_string())?;
+    }
+    Ok(())
+}
+
+fn delta_admission_sources(db: &Db, host: &str) -> Result<(bool, Vec<Publisher>)> {
+    let window = db.get_recovery_window(host)?;
+    let raw = match &window {
+        Some(window) => vec![
+            window.prior_declaration_json.clone(),
+            window.owner_declaration_json.clone(),
+        ],
+        None => vec![db.get_publisher_declaration(host)?.ok_or_else(|| {
+            crate::error::Error::History("missing Delta admission Declaration".into())
+        })?],
+    };
+    let sources = raw
+        .iter()
+        .map(|raw| {
+            let doc: Value = serde_json::from_slice(raw)?;
+            declaration::publisher_of(&doc).map_err(crate::error::Error::History)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((window.is_some(), sources))
+}
+
 fn onboard_publisher(
     db: &Db,
     client: &Client,
@@ -367,6 +403,7 @@ pub fn run_with_clock(
         return Ok(report);
     };
     let host = host.as_str();
+    crate::recovery::settle(db, data_dir, now)?;
     if crate::sanctions::sanction_level(db, host, now)? >= 3 {
         return Ok(report);
     }
@@ -404,6 +441,7 @@ pub fn run_with_clock(
         let publisher_url = format!("{base}publisher.json");
         match meter.get(client, &publisher_url) {
             Ok(Some((raw, value))) => {
+                settle_before_admission(db, data_dir, host, &clock)?;
                 let mutation = db.mutation()?;
                 let stored_raw = db.get_publisher_declaration(host)?.ok_or_else(|| {
                     crate::error::Error::History(
@@ -488,36 +526,14 @@ pub fn run_with_clock(
         }
     }
 
-    let current_p: Publisher = match declaration::publisher_of(&current_doc) {
-        Ok(p) => p,
+    match declaration::publisher_of(&current_doc) {
+        Ok(_) => {}
         Err(e) => {
             record_rejection(db, host, "WIST2-E04", now, None, &e)?;
             report.noise = Some("WIST2-E04");
             return Ok(report);
         }
     };
-    let window = db.get_recovery_window(host)?;
-    let window_open = window.is_some();
-    let recovery_sources = window
-        .as_ref()
-        .map(|window| {
-            [
-                &window.prior_declaration_json,
-                &window.owner_declaration_json,
-            ]
-            .into_iter()
-            .map(|raw| {
-                let doc: Value = serde_json::from_slice(raw)?;
-                declaration::publisher_of(&doc).map_err(crate::error::Error::History)
-            })
-            .collect::<Result<Vec<_>>>()
-        })
-        .transpose()?;
-    let delta_sources: Vec<_> = match &recovery_sources {
-        Some(sources) => sources.iter().collect(),
-        None => vec![&current_p],
-    };
-    let feed_keys: Vec<_> = current_p.keys.iter().collect();
 
     let page_key_sets = page_declarations(db, host, &current_doc)?;
     let mut pages: Vec<FeedEnvelope> = Vec::new();
@@ -537,9 +553,22 @@ pub fn run_with_clock(
             }
         };
         let (_, feed_value) = fetched;
+        settle_before_admission(db, data_dir, host, &clock)?;
         let live_page = pages.is_empty();
         let verified = if live_page {
-            declaration::verify_signed(&feed_keys, &feed_value, "feed", None).is_ok()
+            let raw = db.get_publisher_declaration(host)?.ok_or_else(|| {
+                crate::error::Error::History("missing Feed admission Declaration".into())
+            })?;
+            let doc = serde_json::from_slice(&raw)?;
+            let publisher =
+                declaration::publisher_of(&doc).map_err(crate::error::Error::History)?;
+            declaration::verify_signed(
+                &publisher.keys.iter().collect::<Vec<_>>(),
+                &feed_value,
+                "feed",
+                None,
+            )
+            .is_ok()
         } else {
             let generated_at = feed_value["feed"]["generated_at"]
                 .as_str()
@@ -628,6 +657,7 @@ pub fn run_with_clock(
     'process: while position < delta_ids.len() {
         let id = &delta_ids[position].clone();
         position += 1;
+        settle_before_admission(db, data_dir, host, &clock)?;
         if db.is_delta_seen_for(id, host)? {
             continue;
         }
@@ -685,7 +715,11 @@ pub fn run_with_clock(
             report.rejected.push((id.clone(), code.into()));
             continue;
         }
-        if let Err(code) = declaration::verify_delta_authority(&delta_sources, &delta_value) {
+        settle_before_admission(db, data_dir, host, &clock)?;
+        let (_, sources) = delta_admission_sources(db, host)?;
+        if let Err(code) =
+            declaration::verify_delta_authority(&sources.iter().collect::<Vec<_>>(), &delta_value)
+        {
             record_rejection(
                 db,
                 host,
@@ -802,7 +836,7 @@ pub fn run_with_clock(
             continue;
         }
 
-        if let Some(commitment) = &delta_env.delta.payload {
+        let payload_raw = if let Some(commitment) = &delta_env.delta.payload {
             let payload_url = format!("{base}payloads/{hex}.json");
             let (payload_raw, payload_value) = match meter.get(client, &payload_url) {
                 Ok(Some(v)) => v,
@@ -871,11 +905,38 @@ pub fn run_with_clock(
                 continue;
             }
 
+            Some(payload_raw)
+        } else {
+            None
+        };
+
+        settle_before_admission(db, data_dir, host, &clock)?;
+        let (window_open, sources) = delta_admission_sources(db, host)?;
+        if let Err(code) =
+            declaration::verify_delta_authority(&sources.iter().collect::<Vec<_>>(), &delta_value)
+        {
+            record_rejection(
+                db,
+                host,
+                code,
+                now,
+                Some(id),
+                "Delta authority changed before admission",
+            )?;
+            report.rejected.push((id.clone(), code.into()));
+            continue;
+        }
+        if delta_env.delta.prev != db.url_tip(host, &delta_env.delta.url)? {
+            resolved_prev.remove(id);
+            prefetched.insert(id.clone(), delta_value);
+            position -= 1;
+            continue;
+        }
+        if let Some(raw) = payload_raw {
             let payloads_dir = data_dir.join("payloads");
             std::fs::create_dir_all(&payloads_dir)?;
-            std::fs::write(payloads_dir.join(format!("{hex}.json")), &payload_raw)?;
+            std::fs::write(payloads_dir.join(format!("{hex}.json")), &raw)?;
         }
-
         if window_open {
             db.queue_delta(host, id, &delta_value, &delta_env.delta.url, id, chain_pos)?;
             report.queued.push(id.clone());

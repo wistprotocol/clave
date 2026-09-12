@@ -838,55 +838,6 @@ fn resolve_record_updates(
     Ok(updates)
 }
 
-fn settle_recovery_windows(db: &Db, projection: &Projection, sealed_at: &str) -> Result<()> {
-    for settlement in &projection.effects().settlements {
-        let domain = &settlement.domain;
-        let doc = settlement.restored.envelope();
-        let chain_head = serde_json::to_vec(doc)?;
-        let publisher: wist_core::objects::Publisher =
-            serde_json::from_value(doc["publisher"].clone())
-                .map_err(|e| Error::Seal(format!("stored declaration unparsable: {e}")))?;
-        let mut rejected = Vec::new();
-        for q in db.drain_queued_deltas(domain)? {
-            let verified = crate::declaration::delta_publisher(&q.entry_json)
-                .and_then(|author| {
-                    if author == domain {
-                        Ok(())
-                    } else {
-                        Err("WIST1-E02")
-                    }
-                })
-                .and_then(|()| {
-                    crate::declaration::verify_delta_authority(&[&publisher], &q.entry_json)
-                });
-            match verified {
-                Ok(()) => db.release_queued_delta(domain, &q)?,
-                Err(code) => rejected.push((
-                    q.entry_json,
-                    if code == "WIST1-E14" {
-                        code
-                    } else {
-                        "WIST1-E13"
-                    },
-                )),
-            }
-        }
-        db.reject_delta_copies(domain, &rejected, sealed_at)?;
-        let (key_id, public_key) = doc
-            .pointer("/publisher/keys/0")
-            .map(|k| {
-                (
-                    k["key_id"].as_str().unwrap_or_default().to_string(),
-                    k["public_key"].as_str().unwrap_or_default().to_string(),
-                )
-            })
-            .unwrap_or_default();
-        db.restore_publisher_declaration(domain, &chain_head, &key_id, &public_key)?;
-        db.close_recovery_window(domain)?;
-    }
-    Ok(())
-}
-
 pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<SealReport> {
     let now_at = jiff::Timestamp::from_second(now_epoch)
         .map_err(|_| Error::Seal("now out of range".into()))?
@@ -922,6 +873,17 @@ pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<
     while let Some(block) = history.next_block()? {
         declarations.apply(&block)?;
     }
+    for (domain, state) in declarations.domains() {
+        if let Some(window) = state.window() {
+            if window.end_s() > i128::from(sealed_epoch)
+                && db.recovery_settled(domain, window.owner().hash())?
+            {
+                return Err(Error::Seal(
+                    "cadence slot predates completed recovery settlement".into(),
+                ));
+            }
+        }
+    }
     let recovery_days = history
         .schedule()
         .and_then(|schedule| schedule.value_at("recovery_window_days", sealed_epoch))
@@ -931,17 +893,21 @@ pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<
                 .default
                 .unwrap()
         });
+    crate::recovery::settle_due(db, &declarations, &sealed_at)?;
     divert_recovery_deltas(
         db,
         &declarations
             .domains()
             .iter()
-            .filter(|(_, state)| state.window().is_some())
+            .filter(|(_, state)| {
+                state
+                    .window()
+                    .is_some_and(|window| window.end_s() > i128::from(sealed_epoch))
+            })
             .map(|(domain, _)| domain.as_str())
             .collect(),
     )?;
     let settlement = declarations.project(&sealed_at, recovery_days, &[])?;
-    settle_recovery_windows(db, &settlement, &sealed_at)?;
 
     let (peeked, _up_to_rowid) = db.peek_pending_entries()?;
     let peeked = restate_appeal_deadlines(db, sk, peeked, &sealed_at, sealed_epoch)?;

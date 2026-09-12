@@ -15,6 +15,7 @@ pub mod keys;
 pub mod mirrors;
 pub mod param_change;
 pub mod quota;
+pub mod recovery;
 pub mod registry;
 pub mod sanctions;
 pub mod seal;
