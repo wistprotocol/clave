@@ -699,7 +699,7 @@ pub fn run_with_clock(
             },
         };
         let association = match declaration::delta_publisher(&delta_value) {
-            Err(_) => Err("WIST1-E14"),
+            Err(code) => Err(code),
             Ok(domain) if domain != host => Err("WIST2-E03"),
             Ok(_) => Ok(()),
         };
@@ -737,6 +737,26 @@ pub fn run_with_clock(
         )
         .map_err(|e| crate::error::Error::Clock(e.to_string()))?
         .to_string();
+        let url_cap = registry::effective(db, "url_cap_bytes", &profile_at)?;
+        let commitment_cap = ["extract_cap_bytes", "summary_cap_bytes", "links_cap_bytes"]
+            .into_iter()
+            .try_fold(32i128, |sum, name| -> Result<i128> {
+                Ok(sum + i128::from(registry::effective(db, name, &profile_at)?))
+            })?;
+        if let Err(code) =
+            declaration::delta::validate_static(&delta_value, url_cap, commitment_cap)
+        {
+            record_rejection(
+                db,
+                host,
+                code,
+                now,
+                Some(id),
+                "Delta static validation failed",
+            )?;
+            report.rejected.push((id.clone(), code.into()));
+            continue;
+        }
         let allowance_s = registry::effective(db, "clock_skew_seconds", &profile_at)?;
         if let Err(code) =
             declaration::verify_delta_clock(&delta_value, validation_clock, allowance_s)
@@ -752,21 +772,22 @@ pub fn run_with_clock(
             report.rejected.push((id.clone(), code.to_string()));
             continue;
         }
-        let delta_env: DeltaEnvelope = match serde_json::from_value(delta_value.clone()) {
-            Ok(d) => d,
-            Err(e) => {
-                record_rejection(
-                    db,
-                    host,
-                    "WIST2-E03",
-                    now,
-                    Some(id.as_str()),
-                    &e.to_string(),
-                )?;
-                report.rejected.push((id.clone(), "WIST2-E03".to_string()));
-                continue;
-            }
-        };
+        let delta_env: DeltaEnvelope =
+            match serde_json::from_slice(&wist_core::jcs::canonicalize(&delta_value)?) {
+                Ok(d) => d,
+                Err(e) => {
+                    record_rejection(
+                        db,
+                        host,
+                        "WIST2-E03",
+                        now,
+                        Some(id.as_str()),
+                        &e.to_string(),
+                    )?;
+                    report.rejected.push((id.clone(), "WIST2-E03".to_string()));
+                    continue;
+                }
+            };
         let computed_id = match delta_id(&delta_value["delta"]) {
             Ok(v) => v,
             Err(e) => {

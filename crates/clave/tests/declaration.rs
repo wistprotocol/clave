@@ -416,7 +416,7 @@ fn signed_objects_exclude_unusable_keys_before_signature_verification() {
         for key in &publisher.keys {
             if !clave::declaration::usable_keys(std::slice::from_ref(key)).any(|_| true) {
                 let doc = wist_core::envelope::sign_envelope(
-                    &json!({"publisher":publisher.domain, "observed_at":"2026-08-04T12:00:00Z"}),
+                    &json!({"wist_version":"1.0.0", "publisher":publisher.domain, "url":"https://example.com/a", "change_type":"delete", "prev":format!("sha256:{}", "0".repeat(64)), "meta":{"lang":"en"}, "observed_at":"2026-08-04T12:00:00Z"}),
                     "delta",
                     &key.key_id,
                     &SigningKey::from_seed(&K1),

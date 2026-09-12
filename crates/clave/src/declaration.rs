@@ -4,6 +4,7 @@ use wist_core::crypto::{b64u_decode, b64u_encode, PublicKey};
 use wist_core::envelope::verify_envelope;
 use wist_core::objects::{Publisher, PublisherEnvelope, PublisherKey};
 
+pub mod delta;
 mod time;
 
 pub fn verify_delta_predecessor(doc: &Value, predecessor: &Value) -> Result<(), &'static str> {
@@ -256,16 +257,8 @@ pub fn publisher_of(doc: &Value) -> Result<Publisher, String> {
 }
 
 pub fn delta_publisher(doc: &Value) -> Result<&str, &'static str> {
-    let domain = wist_core::delta::publisher(&doc["delta"]).map_err(|_| "WIST1-E14")?;
-    if !doc["delta"]["observed_at"]
-        .as_str()
-        .is_some_and(time::valid)
-    {
-        return Err("WIST1-E14");
-    }
-    canonical_encoding(doc["sig"]["value"].as_str().ok_or("WIST1-E14")?, 64)
-        .map_err(|_| "WIST1-E14")?;
-    Ok(domain)
+    delta::validate_fields(doc)?;
+    Ok(doc["delta"]["publisher"].as_str().unwrap())
 }
 
 pub fn verify_delta_authority(sources: &[&Publisher], doc: &Value) -> Result<(), &'static str> {

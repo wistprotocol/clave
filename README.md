@@ -1,6 +1,6 @@
 # clave
 
-The signed Delta format targets [WIST specification revision `8785c62e9e121037473d6144685fc547fa08a1b7`](https://github.com/wistprotocol/spec/tree/8785c62e9e121037473d6144685fc547fa08a1b7). Object version `1.0.0` alone does not identify a compatible draft.
+The signed Delta format targets [WIST specification revision `dc0e6f06d413de8cf666ae8180f097821135f7b7`](https://github.com/wistprotocol/spec/tree/dc0e6f06d413de8cf666ae8180f097821135f7b7). Object version `1.0.0` alone does not identify a compatible draft.
 
 Delta ingestion checks the signed canonical `publisher` against the logical Feed domain before source selection and duplicate suppression, including fetched predecessors. Chain tips use `(publisher, url)` and persist across reopen; legacy index restoration is described under [Delta index reconciliation](#delta-index-reconciliation). Sealing and recovery settlement reject mismatches between queue ownership and the signed author. Complete authenticated Delta eligibility and Audit Record derivation remain separate validation requirements.
 
@@ -46,6 +46,23 @@ window's end settles the queue — survivors become eligible for sealing,
 failures surface as WIST1-E13 on the status endpoint. Snapshots carry tier0 SQLite and
 tier1 Parquet (extracts + link graph), optionally sharded
 (`snapshot_shard_count` in the local params table).
+
+## Delta field validation
+
+`declaration::delta::validate_fields` enforces WIST-1 §7's complete Delta
+Envelope field checks before Feed association, authority or signature use.
+`validate_static` checks content/predecessor presence and URL/commitment caps;
+its caller supplies valid stage-specific caps. The helper does not select or
+authenticate parameter profiles. Live ingestion supplies the effective caps
+at its validation clock, including the sum defining the commitment cap.
+
+Typed ingestion reads a canonical temporary copy so integral decimal numbers
+remain admissible; stored and verified signed objects retain their original
+values. Rejected Deltas receive persistent typed status entries without
+recording accepted IDs, changing URL tips or writing Payload files. `delta-fields.json` exercises
+field and diagnostic boundaries; live tests cover rejection across reopen,
+active URL caps and decimal byte counts. These checks do not establish complete
+authenticated Delta history, version support or live refresh/retrieval behavior.
 
 ## Declaration key binding
 
