@@ -301,3 +301,195 @@ fn an_accepted_tip_without_its_envelope_stops_the_pull() {
         .exists());
     assert!(db.list_rejections(&host).unwrap().is_empty());
 }
+
+fn write_envelope(p: &TestPub, body: &Value) -> String {
+    let id = wist_core::delta::delta_id(body).unwrap();
+    let envelope = wist_core::envelope::sign_envelope(body, "delta", "k1", &p.sk).unwrap();
+    std::fs::write(
+        p.dir
+            .path()
+            .join(format!(".well-known/wist/deltas/{}.json", &id[7..])),
+        serde_json::to_vec(&envelope).unwrap(),
+    )
+    .unwrap();
+    id
+}
+
+#[test]
+fn malformed_retrieved_predecessors_keep_field_diagnostics_despite_older_missing_links() {
+    for malformed in ["timestamp", "prev", "root"] {
+        let (listener, host, client) = reserve_addr();
+        let p = make_publisher(&host);
+        let first = add(&p, None, "2026-08-09T12:00:00Z");
+        write_feed(&p, &host, std::slice::from_ref(&first), NOW);
+        serve_static(listener, p.dir.path().to_path_buf());
+        let data = tempfile::tempdir().unwrap();
+        clave::init::run(&host, data.path()).unwrap();
+        let path = data.path().join("clave.sqlite");
+        let db = Db::open(&path).unwrap();
+        let report = clave::ingest::run(&db, &client, data.path(), &host, NOW).unwrap();
+        assert_eq!(report.accepted, std::slice::from_ref(&first));
+        let mut body = json!({
+            "wist_version": "1.0.0", "publisher": host, "url": URL,
+            "change_type": "attest", "observed_at": "2026-08-09T12:00:01Z",
+            "prev": format!("sha256:{}", "a".repeat(64)), "meta": {"lang": "en"}
+        });
+        match malformed {
+            "timestamp" => body["observed_at"] = json!("invalid"),
+            "prev" => body["prev"] = json!("sha256:invalid"),
+            "root" => {
+                body.as_object_mut().unwrap().remove("prev");
+                body["meta"] = json!({"lang": "INVALID"});
+            }
+            _ => unreachable!(),
+        }
+        let invalid = write_envelope(&p, &body);
+        let descendant = add(&p, Some(&invalid), "2026-08-09T12:00:02Z");
+        write_feed(&p, &host, std::slice::from_ref(&descendant), NOW);
+        for _ in 0..2 {
+            let db = Db::open(&path).unwrap();
+            let report = clave::ingest::run(&db, &client, data.path(), &host, NOW).unwrap();
+            assert_eq!(
+                report.rejected,
+                [
+                    (invalid.clone(), "WIST1-E14".into()),
+                    (descendant.clone(), "WIST1-E07".into()),
+                ],
+                "{malformed}"
+            );
+            assert!(report.accepted.is_empty() && report.queued.is_empty());
+            assert!(!report.suspended);
+            assert_rejected(&db, data.path(), &descendant, &first);
+            assert!(!db.is_delta_seen(&invalid).unwrap());
+            assert!(!data
+                .path()
+                .join(format!("payloads/{}.json", &invalid[7..]))
+                .exists());
+        }
+    }
+}
+
+#[test]
+fn unavailable_older_predecessor_rejects_each_fetched_descendant_and_remains_retryable() {
+    let (listener, host, client) = reserve_addr();
+    let p = make_publisher(&host);
+    let first = add(&p, None, "2026-08-09T12:00:00Z");
+    let middle = add(&p, Some(&first), "2026-08-09T12:00:01Z");
+    let last = add(&p, Some(&middle), "2026-08-09T12:00:02Z");
+    let first_path = p
+        .dir
+        .path()
+        .join(format!(".well-known/wist/deltas/{}.json", &first[7..]));
+    let first_bytes = std::fs::read(&first_path).unwrap();
+    std::fs::remove_file(&first_path).unwrap();
+    write_feed(&p, &host, std::slice::from_ref(&last), NOW);
+    serve_static(listener, p.dir.path().to_path_buf());
+    let data = tempfile::tempdir().unwrap();
+    clave::init::run(&host, data.path()).unwrap();
+    let path = data.path().join("clave.sqlite");
+    let db = Db::open(&path).unwrap();
+    let report = clave::ingest::run(&db, &client, data.path(), &host, NOW).unwrap();
+    assert_eq!(
+        report.rejected,
+        [
+            (middle.clone(), "WIST1-E07".into()),
+            (last.clone(), "WIST1-E07".into()),
+        ]
+    );
+    assert!(report.accepted.is_empty() && report.queued.is_empty());
+    assert!(!report.suspended);
+    assert!(db.url_tip(&host, URL).unwrap().is_none());
+    for id in [&first, &middle, &last] {
+        assert!(!db.is_delta_seen(id).unwrap());
+        assert!(!data
+            .path()
+            .join(format!("payloads/{}.json", &id[7..]))
+            .exists());
+    }
+    drop(db);
+    std::fs::write(first_path, first_bytes).unwrap();
+    let db = Db::open(&path).unwrap();
+    let report = clave::ingest::run(&db, &client, data.path(), &host, NOW).unwrap();
+    assert_eq!(report.accepted, [first, middle, last.clone()]);
+    assert!(report.rejected.is_empty());
+    assert_eq!(db.url_tip(&host, URL).unwrap(), Some(last));
+}
+
+#[test]
+fn retrieved_delta_keeps_its_own_url_chain_when_the_requested_relationship_is_invalid() {
+    let (listener, host, client) = reserve_addr();
+    let p = make_publisher(&host);
+    let first = add(&p, None, "2026-08-09T12:00:00Z");
+    write_feed(&p, &host, std::slice::from_ref(&first), NOW);
+    serve_static(listener, p.dir.path().to_path_buf());
+    let data = tempfile::tempdir().unwrap();
+    clave::init::run(&host, data.path()).unwrap();
+    let path = data.path().join("clave.sqlite");
+    let db = Db::open(&path).unwrap();
+    let report = clave::ingest::run(&db, &client, data.path(), &host, NOW).unwrap();
+    assert_eq!(report.accepted, std::slice::from_ref(&first));
+    let other_url = "https://localhost/b";
+    let other = add_delta_signed(
+        &p,
+        other_url,
+        "other",
+        None,
+        "2026-08-09T12:00:01Z",
+        "k1",
+        &K1_SEED,
+    );
+    let invalid = add(&p, Some(&other), "2026-08-09T12:00:02Z");
+    write_feed(&p, &host, std::slice::from_ref(&invalid), NOW);
+    let report = clave::ingest::run(&db, &client, data.path(), &host, NOW).unwrap();
+    assert_eq!(report.accepted, std::slice::from_ref(&other));
+    assert_eq!(report.rejected, [(invalid.clone(), "WIST1-E07".into())]);
+    assert_rejected(&db, data.path(), &invalid, &first);
+    drop(db);
+    let db = Db::open(&path).unwrap();
+    assert_eq!(db.url_tip(&host, other_url).unwrap(), Some(other.clone()));
+    assert!(db.is_delta_seen_for(&other, &host).unwrap());
+    assert_rejected(&db, data.path(), &invalid, &first);
+}
+
+#[test]
+fn predecessor_retrieval_suspends_without_rejection_and_resumes_after_restart() {
+    let (listener, host, client) = reserve_addr();
+    let p = make_publisher(&host);
+    let first = add(&p, None, "2026-08-09T12:00:00Z");
+    let middle = add(&p, Some(&first), "2026-08-09T12:00:01Z");
+    let last = add(&p, Some(&middle), "2026-08-09T12:00:02Z");
+    write_feed(&p, &host, std::slice::from_ref(&last), NOW);
+    let wk = p.dir.path().join(".well-known/wist");
+    let budget: u64 = [
+        "feed.json".into(),
+        format!("deltas/{}.json", &last[7..]),
+        format!("deltas/{}.json", &middle[7..]),
+    ]
+    .iter()
+    .map(|path| std::fs::metadata(wk.join(path)).unwrap().len())
+    .sum();
+    serve_static(listener, p.dir.path().to_path_buf());
+    let data = tempfile::tempdir().unwrap();
+    clave::init::run(&host, data.path()).unwrap();
+    let path = data.path().join("clave.sqlite");
+    let db = Db::open(&path).unwrap();
+    db.set_param("ingest_budget_bytes_day", budget as i64)
+        .unwrap();
+    let report = clave::ingest::run(&db, &client, data.path(), &host, NOW).unwrap();
+    assert!(report.suspended);
+    assert!(report.rejected.is_empty() && report.accepted.is_empty() && report.queued.is_empty());
+    assert!(db.url_tip(&host, URL).unwrap().is_none());
+    for id in [&first, &middle, &last] {
+        assert!(!db.is_delta_seen(id).unwrap());
+    }
+    drop(db);
+    let db = Db::open(&path).unwrap();
+    assert!(db.walk_suspended(&host).unwrap());
+    db.set_param("ingest_budget_bytes_day", 1_000_000).unwrap();
+    let report = clave::ingest::run(&db, &client, data.path(), &host, NOW).unwrap();
+    assert_eq!(report.accepted, [first, middle, last.clone()]);
+    assert!(report.rejected.is_empty());
+    assert!(!report.suspended);
+    assert!(!db.walk_suspended(&host).unwrap());
+    assert_eq!(db.url_tip(&host, URL).unwrap(), Some(last));
+}

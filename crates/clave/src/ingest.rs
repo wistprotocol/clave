@@ -74,72 +74,6 @@ fn record_rejection(
     db.insert_rejection(domain, code, now, id, Some(detail))
 }
 
-/// WIST-2 §3.2: a sealed Page is verified against the Key Set current at
-/// its `generated_at`, or, where that set does not hold the signing key,
-/// against the Key Set of the first Declaration sealed after it. A Page
-/// verifying under neither is `WIST2-E04`; one MUST NOT be rejected
-/// merely because its key has since been retired, because Pages are
-/// immutable and never re-signed on rotation.
-enum PrevChain {
-    Resolved(Vec<String>),
-    Unresolved,
-    BudgetExhausted,
-}
-
-/// WIST-2 §5 step 3 with WIST-1 §3.5: walk back from a Delta's `prev`
-/// through Deltas the Aggregator has not sealed until the chain reaches
-/// the tip it holds, fetching each under the per-domain budget. The
-/// bodies are kept so the caller validates each in chain order without
-/// paying for the fetch twice.
-#[allow(clippy::too_many_arguments)]
-fn retrieve_prev_chain(
-    db: &Db,
-    client: &Client,
-    meter: &Meter<'_>,
-    base: &str,
-    domain: &str,
-    prev: Option<&str>,
-    tip: Option<&str>,
-    prefetched: &mut std::collections::HashMap<String, Value>,
-) -> Result<PrevChain> {
-    let mut chain = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    let mut cursor = prev.map(str::to_string);
-    loop {
-        let Some(id) = cursor else {
-            // A chain that starts here links up only when the Aggregator
-            // holds no tip for the URL; otherwise it is a fork.
-            if tip.is_some() {
-                return Ok(PrevChain::Unresolved);
-            }
-            break;
-        };
-        if Some(id.as_str()) == tip || db.is_delta_seen_for(&id, domain)? {
-            break;
-        }
-        if !seen.insert(id.clone()) {
-            return Ok(PrevChain::Unresolved);
-        }
-        let Some(hex) = id.strip_prefix("sha256:") else {
-            return Ok(PrevChain::Unresolved);
-        };
-        let fetched = match meter.get(client, &format!("{base}deltas/{hex}.json")) {
-            Ok(Some((_, value))) => value,
-            Ok(None) => return Ok(PrevChain::BudgetExhausted),
-            Err(_) => return Ok(PrevChain::Unresolved),
-        };
-        let rejected_source = declaration::delta_publisher(&fetched) != Ok(domain);
-        cursor = fetched["delta"]["prev"].as_str().map(str::to_string);
-        prefetched.insert(id.clone(), fetched);
-        chain.push(id);
-        if rejected_source {
-            break;
-        }
-    }
-    chain.reverse();
-    Ok(PrevChain::Resolved(chain))
-}
-
 fn page_declarations(
     db: &Db,
     host: &str,
@@ -887,31 +821,26 @@ pub fn run_with_clock(
 
         let expected_prev = db.url_tip(host, &delta_env.delta.url)?;
         if delta_env.delta.prev != expected_prev {
-            // WIST-2 §5 step 3: retrieve and validate any `prev` not yet
-            // sealed, in chain order, before the Delta naming it.
             if resolved_prev.insert(id.clone()) {
-                match retrieve_prev_chain(
-                    db,
-                    client,
-                    &meter,
-                    &base,
-                    host,
-                    delta_env.delta.prev.as_deref(),
-                    expected_prev.as_deref(),
-                    &mut prefetched,
-                )? {
-                    PrevChain::Resolved(ancestors) if !ancestors.is_empty() => {
-                        let at = position - 1;
-                        prefetched.insert(id.clone(), delta_value);
-                        delta_ids.splice(at..at, ancestors);
-                        position = at;
-                        continue;
+                if let Some(prev) = delta_env.delta.prev.as_deref() {
+                    if !db.is_delta_seen_for(prev, host)? {
+                        let prev_url = format!("{base}deltas/{}.json", &prev[7..]);
+                        match meter.get(client, &prev_url) {
+                            Ok(Some((_, predecessor))) => {
+                                let at = position - 1;
+                                prefetched.insert(id.clone(), delta_value);
+                                prefetched.insert(prev.into(), predecessor);
+                                delta_ids.insert(at, prev.into());
+                                position = at;
+                                continue;
+                            }
+                            Ok(None) => {
+                                suspended = true;
+                                break 'process;
+                            }
+                            Err(_) => {}
+                        }
                     }
-                    PrevChain::BudgetExhausted => {
-                        suspended = true;
-                        break 'process;
-                    }
-                    _ => {}
                 }
             }
             record_rejection(

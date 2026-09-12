@@ -318,7 +318,15 @@ strictly later signed `observed_at`, using the exact Publisher timestamp
 comparison in WIST-1 §3.4. Equal instants, including equivalent offsets and
 trailing fractional zeros, reject with WIST1-E07. Rejection leaves the ID
 unseen, the tip unchanged and the Payload unstored; neither queue receives it.
-Retrieved predecessors undergo the same admission checks before descendants.
+
+An unseen predecessor is fetched into the same admission loop before its
+links are followed. Each fetched Envelope receives its own validation and
+rejection disposition, even when an older predecessor is unavailable or its
+chain cannot join the requesting Delta's Publisher/URL tip. Valid predecessors
+enter their own chains before descendants. An unavailable predecessor rejects
+otherwise eligible fetched dependents with WIST1-E07; content-budget exhaustion
+suspends the pull without concluding unavailability. Fetched Envelopes are reused within that
+attempt; later pulls can retrieve rejected or suspended chains again.
 
 The predecessor Envelope comes from retained pending/recovery admissions or
 the complete authenticated Block prefix pinned to the database head. Lookup
@@ -337,7 +345,8 @@ Log positions or select the canonical chain tip.
 
 Signed `declaration-fields.json` relation cases and live tests cover exact
 fractions, offset equality, both queues, restart, sealed evidence despite altered
-materialized timestamps, fetched predecessors and corrupt history. Lookup scans
+materialized timestamps, fetched predecessors, missing older links, independent
+URL chains, budget suspension/resumption and corrupt history. Lookup scans
 retained domain admissions and, when needed, the full pinned Block prefix for
 each predecessor; bounded lookup and complete authenticated Delta replay remain
 separate requirements. Existing accepted or sealed chains receive no retroactive
