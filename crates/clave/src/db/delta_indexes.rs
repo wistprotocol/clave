@@ -16,29 +16,14 @@ struct Delta {
 
 impl Delta {
     fn read(envelope: &Value) -> Result<Self> {
+        declaration::delta::validate_version(envelope).map_err(failure)?;
         let body = &envelope["delta"];
         let domain = wist_core::delta::publisher(body).map_err(|e| failure(&e.to_string()))?;
-        if body["wist_version"] != crate::WIST_VERSION {
-            return Err(failure("unsupported retained Delta version"));
-        }
         let url = body["url"]
             .as_str()
             .filter(|url| !url.is_empty())
             .ok_or_else(|| failure("retained Delta has no URL"))?;
-        let prev = match body.get("prev") {
-            None => None,
-            Some(Value::String(id))
-                if id.strip_prefix("sha256:").is_some_and(|hex| {
-                    hex.len() == 64
-                        && hex
-                            .bytes()
-                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-                }) =>
-            {
-                Some(id.clone())
-            }
-            _ => return Err(failure("retained Delta has malformed prev")),
-        };
+        let prev = body["prev"].as_str().map(str::to_string);
         Ok(Self {
             id: wist_core::delta::delta_id(body)?,
             domain: domain.into(),

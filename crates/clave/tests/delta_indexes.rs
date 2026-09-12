@@ -372,3 +372,147 @@ fn discarded_copy_can_be_served_again_after_upgrade_and_restart() {
         Some(id.as_str())
     );
 }
+
+#[test]
+fn supported_versions_restore_chains_across_sealed_and_both_unsealed_stores() {
+    for version in [
+        "1.0.1".into(),
+        "1.1.0".into(),
+        format!("1.{}.{}", "9".repeat(80), "9".repeat(80)),
+    ] {
+        let f = Fixture::new();
+        let publisher = make_publisher("example.com");
+        let url = "https://example.com/";
+        let mut chain = Vec::new();
+        for state in ["sealed", "pending", "recovery"] {
+            let prev = chain.last().map(|(id, _): &(String, Value)| id.as_str());
+            let (_, mut envelope) = delta(&publisher, url, state, prev);
+            envelope["delta"]["wist_version"] = json!(version);
+            let envelope = wist_core::envelope::sign_envelope(
+                &envelope["delta"],
+                "delta",
+                "k1",
+                &publisher.sk,
+            )
+            .unwrap();
+            let id = wist_core::delta::delta_id(&envelope["delta"]).unwrap();
+            match state {
+                "sealed" => f.append(vec![declaration(&publisher), entry(envelope.clone())]),
+                "pending" => {
+                    f.db.record_accepted_delta(&publisher.domain, &id, &envelope, 0, url, &id)
+                        .unwrap()
+                }
+                _ => {
+                    f.db.queue_delta(&publisher.domain, &id, &envelope, url, &id, 1)
+                        .unwrap()
+                }
+            }
+            chain.push((id, envelope));
+        }
+        let block_path = f.directory.path().join("log/blocks/000000000.json.zst");
+        let block_bytes = std::fs::read(&block_path).unwrap();
+        f.connection()
+            .execute_batch("DELETE FROM seen_deltas; DELETE FROM url_tips;")
+            .unwrap();
+        f.legacy();
+        for _ in 0..2 {
+            let db = f.reopen().unwrap();
+            for (id, _) in &chain {
+                assert!(
+                    db.is_delta_seen_for(id, &publisher.domain).unwrap(),
+                    "{version}"
+                );
+            }
+            assert_eq!(
+                db.url_tip(&publisher.domain, url).unwrap().as_deref(),
+                Some(chain[2].0.as_str())
+            );
+            assert_eq!(std::fs::read(&block_path).unwrap(), block_bytes);
+            assert_eq!(
+                db.peek_pending_entries().unwrap().0[0].entry_json,
+                chain[1].1
+            );
+            let raw: Vec<u8> = f
+                .connection()
+                .query_row("SELECT entry_json FROM queued_deltas", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(raw, serde_json::to_vec(&chain[2].1).unwrap());
+            let completed: i64 = f
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM delta_index_reconciliation",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(completed, 1);
+        }
+    }
+}
+
+#[test]
+fn retained_version_and_field_failures_preserve_indexes_and_precedence() {
+    for state in ["sealed", "pending", "recovery"] {
+        for (version, malformed_field, expected) in [
+            ("2.0.0".into(), false, "WIST1-E15"),
+            (format!("{}.0.0", "9".repeat(80)), false, "WIST1-E15"),
+            ("1.01.0".into(), false, "WIST1-E14"),
+            ("1.0.0+build".into(), false, "WIST1-E14"),
+            ("1.0.0".into(), true, "WIST1-E14"),
+            ("2.0.0".into(), true, "WIST1-E14"),
+        ] {
+            let f = Fixture::new();
+            let publisher = make_publisher("example.com");
+            let url = "https://example.com/";
+            let (_, mut envelope) = delta(&publisher, url, "body", None);
+            envelope["delta"]["wist_version"] = json!(version);
+            if malformed_field {
+                envelope["delta"]["meta"]["lang"] = json!("EN");
+            }
+            let envelope = wist_core::envelope::sign_envelope(
+                &envelope["delta"],
+                "delta",
+                "k1",
+                &publisher.sk,
+            )
+            .unwrap();
+            let id = wist_core::delta::delta_id(&envelope["delta"]).unwrap();
+            match state {
+                "sealed" => f.append(vec![declaration(&publisher), entry(envelope)]),
+                "pending" => {
+                    f.db.record_accepted_delta(&publisher.domain, &id, &envelope, 0, url, &id)
+                        .unwrap()
+                }
+                _ => {
+                    f.db.queue_delta(&publisher.domain, &id, &envelope, url, &id, 0)
+                        .unwrap()
+                }
+            }
+            f.connection()
+                .execute_batch("DELETE FROM seen_deltas; DELETE FROM url_tips;")
+                .unwrap();
+            f.db.insert_seen_delta("residue", &publisher.domain)
+                .unwrap();
+            f.db.set_url_tip(url, &publisher.domain, "residue").unwrap();
+            f.legacy();
+            for _ in 0..2 {
+                let error = match f.reopen() {
+                    Ok(_) => panic!("accepted {state}: {version}, malformed={malformed_field}"),
+                    Err(error) => error.to_string(),
+                };
+                assert!(
+                    error.contains(expected),
+                    "{state}: {version}, malformed={malformed_field}: {error}"
+                );
+                assert!(f.db.is_delta_seen("residue").unwrap());
+                assert!(!f.db.is_delta_seen(&id).unwrap());
+                assert_eq!(
+                    f.db.url_tip(&publisher.domain, url).unwrap().as_deref(),
+                    Some("residue")
+                );
+                let completed: bool = f.connection().query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'delta_index_reconciliation')", [], |row| row.get(0)).unwrap();
+                assert!(!completed);
+            }
+        }
+    }
+}

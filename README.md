@@ -351,12 +351,15 @@ pending/recovery admissions. This removes orphaned IDs left by discarded copies
 and restores pairs overwritten by the former URL-only table. The Anchor and
 database head are operator-trusted inputs, as in [Authenticated history](#authenticated-history).
 
-Sealed sources come from Declaration replay at each Block. Restoration checks
-Delta signing bindings, key-time bounds and scope, then follows predecessor
+Every retained Envelope passes the field and version checks in
+[Delta field validation](#delta-field-validation). Sealed sources come from
+Declaration replay at each Block. Restoration checks Delta signing bindings,
+key-time bounds and scope, then follows predecessor
 links within that Block. Retained unsealed copies follow persistent acceptance
 positions across both queues; their Envelopes remain trusted local admission
-state, without Log authentication or renewed admission validation. They must
-agree with their stored ownership, ID and URL and extend their pair's tip.
+state, without Log authentication or renewed authority, clock or Payload
+checks. They must agree with their stored ownership, ID and URL and extend
+their pair's tip.
 
 Missing or corrupt history, unsupported versions/key transitions, invalid
 sealed authority, duplicate IDs, forks, disconnected chains or invalid
@@ -370,10 +373,13 @@ Index replacement and its completion marker commit under one SQLite write
 transaction after the pinned prefix validates. Failure preserves both indexes;
 retry repeats restoration. Subsequent opens skip this completed repair. Queues,
 Payloads and rejection history are preserved. The repair retains all seen IDs
-in memory and does not establish full Delta schema/timestamp eligibility,
-governance replay, general legacy-state revalidation or crash-safe publication.
-Signed tests cover shared URLs, intra-Block chains, both queues, reopen,
-corrupt heads/files, invalid authors/scope and rollback after a write failure.
+in memory and does not establish complete Delta eligibility or predecessor-time
+validation, governance replay, general legacy-state revalidation or crash-safe
+publication.
+
+Signed restart tests cover chain and ownership restoration, preserved versioned
+Envelopes across all three stores, field/version diagnostic precedence,
+corrupt history, invalid authority and atomic failure.
 
 ## Parameter schedules and Block sizes
 
