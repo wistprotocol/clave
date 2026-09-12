@@ -76,28 +76,38 @@ fn record_rejection(
 
 fn page_declarations(
     db: &Db,
+    data_dir: &Path,
     host: &str,
-    current: &Value,
 ) -> Result<Vec<(i64, u64, Vec<wist_core::objects::PublisherKey>)>> {
-    let mut out = Vec::new();
-    for d in db.sealed_declarations(host)? {
-        let Ok(at) = d.sealed_at.parse::<jiff::Timestamp>() else {
-            continue;
-        };
-        let doc: Value = serde_json::from_slice(&d.declaration_json)?;
-        if let Ok(publisher) = declaration::publisher_of(&doc) {
-            out.push((at.as_second(), d.seq, publisher.keys));
+    let mut history = crate::history::History::open(data_dir, db.last_block()?)?;
+    let mut state = crate::history::declarations::Declarations::default();
+    let mut sources = Vec::new();
+    let mut superseded = std::collections::BTreeSet::new();
+    while let Some(block) = history.next_block()? {
+        let effects = state.apply(&block)?;
+        for settlement in effects.settlements {
+            if settlement.domain == host {
+                for source in settlement.superseded {
+                    superseded.insert(source.hash().to_string());
+                }
+            }
+        }
+        for entry in block.block().entries.iter().filter(|entry| {
+            entry["type"] == "publisher_declaration" && entry["body"]["publisher"]["domain"] == host
+        }) {
+            let source = &entry["body"];
+            let publisher =
+                declaration::publisher_of(source).map_err(crate::error::Error::History)?;
+            sources.push((
+                declaration::inner_hash(source).map_err(crate::error::Error::History)?,
+                (block.sealed_at_s(), publisher.seq, publisher.keys),
+            ));
         }
     }
-    // A Declaration the Aggregator has accepted but not yet sealed seals
-    // after every Page already cut, so it is the last candidate for
-    // §3.2's second resolution.
-    if let Ok(publisher) = declaration::publisher_of(current) {
-        if !out.iter().any(|(_, seq, _)| *seq == publisher.seq) {
-            out.push((i64::MAX, publisher.seq, publisher.keys));
-        }
-    }
-    Ok(out)
+    Ok(sources
+        .into_iter()
+        .filter_map(|(hash, source)| (!superseded.contains(&hash)).then_some(source))
+        .collect())
 }
 
 fn verify_sealed_page(
@@ -526,7 +536,7 @@ pub fn run_with_clock(
         }
     };
 
-    let mut page_key_sets = page_declarations(db, host, &current_doc)?;
+    let mut page_key_sets = None;
     let mut pages: Vec<FeedEnvelope> = Vec::new();
     let mut page_url = format!("{base}feed.json");
     let mut unseen_any = false;
@@ -549,11 +559,14 @@ pub fn run_with_clock(
         let mut verified = if live_page {
             verify_live_feed(db, host, &feed_value)?
         } else {
+            if page_key_sets.is_none() {
+                page_key_sets = Some(page_declarations(db, data_dir, host)?);
+            }
             let generated_at = feed_value["feed"]["generated_at"]
                 .as_str()
                 .unwrap_or_default()
                 .to_string();
-            verify_sealed_page(&page_key_sets, &feed_value, &generated_at)
+            verify_sealed_page(page_key_sets.as_ref().unwrap(), &feed_value, &generated_at)
         };
         if live_page && !verified {
             if let Ok((raw, value)) =
@@ -563,11 +576,6 @@ pub fn run_with_clock(
             }
             settle_before_admission(db, data_dir, host, &clock)?;
             verified = verify_live_feed(db, host, &feed_value)?;
-            let raw = db.get_publisher_declaration(host)?.ok_or_else(|| {
-                crate::error::Error::History("missing refreshed Feed Declaration".into())
-            })?;
-            current_doc = serde_json::from_slice(&raw)?;
-            page_key_sets = page_declarations(db, host, &current_doc)?;
         }
         if !verified {
             record_rejection(

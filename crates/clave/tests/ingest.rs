@@ -251,6 +251,7 @@ fn ingest_walks_feed_pages_and_backfills_oldest_first() {
     let tmp = tempfile::tempdir().unwrap();
     clave::init::run(&host, tmp.path()).unwrap();
     let db = clave::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+    seal_page_authority(&db, &client, tmp.path(), &p);
 
     let report =
         clave::ingest::run(&db, &client, tmp.path(), &host, "2026-08-09T12:00:05Z").unwrap();
@@ -292,6 +293,7 @@ fn ingest_budget_suspends_walk_and_resumes_when_budget_allows() {
     let tmp = tempfile::tempdir().unwrap();
     clave::init::run(&host, tmp.path()).unwrap();
     let db = clave::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+    seal_page_authority(&db, &client, tmp.path(), &p);
     db.set_param("ingest_budget_bytes_day", 1).unwrap();
 
     let report =
@@ -307,6 +309,39 @@ fn ingest_budget_suspends_walk_and_resumes_when_budget_allows() {
     assert_eq!(resumed.accepted, vec![id1.clone(), id2.clone()]);
     assert!(!resumed.suspended);
     assert!(!db.walk_suspended(&host).unwrap());
+}
+
+fn seal_page_authority(
+    db: &clave::db::Db,
+    client: &clave::fetch::Client,
+    directory: &std::path::Path,
+    publisher: &common::TestPub,
+) {
+    let path = publisher.dir.path().join(".well-known/wist/feed.json");
+    let feed = std::fs::read(&path).unwrap();
+    write_feed(publisher, &publisher.domain, &[], "2026-08-09T09:00:00Z");
+    let report = clave::ingest::run(
+        db,
+        client,
+        directory,
+        &publisher.domain,
+        "2026-08-09T09:00:00Z",
+    )
+    .unwrap();
+    assert!(report.rejected.is_empty());
+    assert_eq!(report.noise, Some("WIST2-E02"));
+    let signing = clave::keys::load(&directory.join("keys/seed")).unwrap();
+    clave::seal::run(
+        db,
+        directory,
+        &signing,
+        "2026-08-09T09:00:00Z"
+            .parse::<jiff::Timestamp>()
+            .unwrap()
+            .as_second(),
+    )
+    .unwrap();
+    std::fs::write(path, feed).unwrap();
 }
 
 #[test]

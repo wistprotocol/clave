@@ -123,9 +123,9 @@ live HTTP, including ordinary rotation, reused identifiers, absent, excluded
 and future bindings, separate Feed/Delta/predecessor attempts, unsuccessful
 responses and content-budget boundaries. Additional tests cover
 recovery, frozen sources, settlement during Payload fetching, cache expiry,
-rollback and restart. Sealed-Page retry/source eligibility, complete Feed
-fields and bounded fetch/work remain incomplete; the content budget does not
-bound Declaration traffic.
+rollback and restart. Page authority is described under
+[Page source verification](#page-source-verification); the content budget
+does not bound Declaration traffic.
 
 During recovery, a replacement may name either the current Declaration or
 the accepted recovery-chain head. Its named predecessor determines signer
@@ -310,6 +310,32 @@ Log timestamps retain their distinct whole-second profile.
 Binding and scope checks precede clock, chain and Payload checks;
 WIST-1 §7 permits any established applicable semantic diagnostic after mandatory
 field checks. Signed `publisher` determines attribution under WIST-1 §3.8.
+
+## Page source verification
+
+Sealed Page keys come from the complete authenticated Block prefix pinned by
+the database head, using WIST-2 §3.2's current and first-next Declaration
+cutoffs. Accepted unsealed Declarations supply no Page authority; first-contact
+and rotation Pages can require another pull after their Declaration seals.
+The `sealed_declarations` database summary supplies no verification evidence.
+
+Declaration replay authenticates every source and excludes competitors when
+recovery settles in that prefix; admission-time settlement alone changes no
+Page source. Repeated idempotent Declaration
+Entries retain their own Block times; the first-next search cannot skip them
+to borrow a later rotation. Each selected source retains its complete signing
+bindings, including reused identifiers. Missing or invalid pinned history
+stops the pull before Page-derived Deltas enter admission. Trust inputs and
+unsupported history transitions follow [Authenticated history](#authenticated-history).
+
+Signed HTTP/restart tests cover unsealed-to-sealed authority, retired and reused
+keys, multiple Declarations in one Block, idempotent repetitions, recovery
+supersession and forged or absent database summaries. Reconstruction runs once
+when a pull first reaches a sealed Page and retains that prefix for the walk;
+bounded replay/cache work remains unimplemented. Complete Feed fields and
+timestamps, sealed-Page signature-failure refresh and durable selected-source
+provenance remain incomplete. Alias-renaming fallback retains the provisional
+named-binding reading recorded in specification `CONFORMANCE.md`.
 
 ## Delta predecessor admission
 
