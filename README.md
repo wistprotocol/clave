@@ -142,12 +142,29 @@ Live admission still advances its recovery head on acceptance, evaluates only
 the current predecessor, does not settle expired windows before ingest, and
 must preserve its accepted sequence floor separately from sealed history.
 Post-settlement admission state must also reconcile replacements that sealed
-or remain pending. Dropped queue copies still leave seen-ID and chain-tip
-state that can obstruct permitted re-serving. Queue movement must retain the
-original acceptance order across already-pending and newly queued Deltas;
-cap-deferred pending copies must enter recovery settlement even if they never
-fit an intermediate Block. These requirements remain open, including correct
-E13 diagnostics and inclusion-turn accounting for those deferred copies.
+or remain pending.
+
+Pending and recovery copies share a persistent acceptance counter. Queue
+transfers retain that order and clear pre-window inclusion turns; every pending
+copy enters recovery when its window opens, including copies excluded by either
+Block cap. Settlement survivors become eligible in acceptance order, with the
+per-domain capacity determining their turns from the deadline onward. Rejected
+copies release their seen IDs and rewind Publisher/URL tips to surviving
+predecessors; accepted descendants of a rejected copy receive WIST1-E07. These
+changes and status rejections commit together, allowing the same signed Deltas
+to be re-served under later eligible authority after restart.
+
+Legacy queue rowids cannot establish original acceptance order: earlier
+transfers could insert copies in leaf order and propagate that order back to
+pending entries. An upgrade with multiple outstanding Deltas for one domain
+and missing acceptance positions stops without assigning positions or deleting
+copies. Restore independently retained admission-order evidence before
+reopening; do not infer positions from queue rowids, leaf hashes or observation
+timestamps. Stores with at most one outstanding Delta per domain can upgrade
+without deciding an unknown within-domain order. Already discarded legacy
+copies whose Envelopes are gone require separate reconciliation of their stale
+seen IDs and tips; new rejection handling cannot reconstruct that lost history.
+
 Exact recovery ends outside the supported timestamp range stop sealing before
 publication; full-range Snapshot representation requires specification resolution.
 Correct sealing source selection does not establish complete recovery admission,

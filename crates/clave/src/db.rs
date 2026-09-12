@@ -7,7 +7,7 @@ use wist_core::objects::{PublisherState, StatusRejection};
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS publishers(domain TEXT PRIMARY KEY, declaration_json BLOB NOT NULL, key_id TEXT NOT NULL, public_key TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'new', last_pull_at TEXT, declaration_fetched_at TEXT);
 CREATE TABLE IF NOT EXISTS seen_deltas(delta_id TEXT PRIMARY KEY, domain TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS pending_entries(rowid INTEGER PRIMARY KEY AUTOINCREMENT, entry_type TEXT NOT NULL, domain TEXT NOT NULL, entry_json BLOB NOT NULL, chain_pos INTEGER NOT NULL, turn_block INTEGER);
+CREATE TABLE IF NOT EXISTS pending_entries(rowid INTEGER PRIMARY KEY AUTOINCREMENT, entry_type TEXT NOT NULL, domain TEXT NOT NULL, entry_json BLOB NOT NULL, chain_pos INTEGER NOT NULL, turn_block INTEGER, acceptance_order INTEGER);
 CREATE TABLE IF NOT EXISTS records(url TEXT NOT NULL, publisher TEXT NOT NULL, delta_id TEXT NOT NULL, observed_at TEXT NOT NULL, weight TEXT NOT NULL, title TEXT NOT NULL, abstract TEXT, lang TEXT NOT NULL, sealed_at TEXT NOT NULL DEFAULT '', PRIMARY KEY(url, publisher));
 CREATE TABLE IF NOT EXISTS blocks(block_number INTEGER PRIMARY KEY, block_hash TEXT NOT NULL, sealed_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS rejections(domain TEXT NOT NULL, code TEXT NOT NULL, at TEXT NOT NULL, delta_id TEXT, detail TEXT);
@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS governance(update_id TEXT PRIMARY KEY, action TEXT NO
 CREATE TABLE IF NOT EXISTS recovery_windows(domain TEXT PRIMARY KEY, declaration_json BLOB NOT NULL, prior_declaration_json BLOB NOT NULL, owner_declaration_json BLOB NOT NULL, opened_block INTEGER, window_end TEXT);
 CREATE TABLE IF NOT EXISTS sealed_declarations(domain TEXT NOT NULL, seq INTEGER NOT NULL, block_number INTEGER NOT NULL, sealed_at TEXT NOT NULL, declaration_json BLOB NOT NULL, PRIMARY KEY(domain, seq));
 CREATE TABLE IF NOT EXISTS roster_acts(block_number INTEGER NOT NULL, act_index INTEGER NOT NULL, sealed_at TEXT NOT NULL, action TEXT NOT NULL, auditor_id TEXT NOT NULL, key_id TEXT NOT NULL, public_key TEXT NOT NULL, for_cause INTEGER NOT NULL, PRIMARY KEY(block_number, act_index));
-CREATE TABLE IF NOT EXISTS queued_deltas(rowid INTEGER PRIMARY KEY AUTOINCREMENT, domain TEXT NOT NULL, delta_id TEXT NOT NULL, entry_json BLOB NOT NULL, url TEXT NOT NULL, chain_pos INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS queued_deltas(rowid INTEGER PRIMARY KEY AUTOINCREMENT, domain TEXT NOT NULL, delta_id TEXT NOT NULL, entry_json BLOB NOT NULL, url TEXT NOT NULL, chain_pos INTEGER NOT NULL, acceptance_order INTEGER);
 ";
 
 fn add_missing_columns(conn: &Connection) -> Result<()> {
@@ -30,6 +30,8 @@ fn add_missing_columns(conn: &Connection) -> Result<()> {
         "ALTER TABLE records ADD COLUMN sealed_at TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE publishers ADD COLUMN declaration_fetched_at TEXT",
         "ALTER TABLE pending_entries ADD COLUMN turn_block INTEGER",
+        "ALTER TABLE pending_entries ADD COLUMN acceptance_order INTEGER",
+        "ALTER TABLE queued_deltas ADD COLUMN acceptance_order INTEGER",
         "ALTER TABLE param_changes ADD COLUMN entry_index INTEGER",
         "ALTER TABLE blocks ADD COLUMN decompressed_bytes INTEGER",
         "ALTER TABLE recovery_windows ADD COLUMN owner_declaration_json BLOB",
@@ -41,6 +43,46 @@ fn add_missing_columns(conn: &Connection) -> Result<()> {
             Err(e) => return Err(Error::Db(e)),
         }
     }
+    Ok(())
+}
+
+fn restore_acceptance_order(conn: &Connection) -> Result<()> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let ambiguous: bool = tx.query_row(
+        "SELECT EXISTS(SELECT domain FROM (SELECT domain, acceptance_order FROM pending_entries WHERE entry_type = 'publisher_delta' UNION ALL SELECT domain, acceptance_order FROM queued_deltas) GROUP BY domain HAVING COUNT(*) > 1 AND COUNT(acceptance_order) < COUNT(*))",
+        [],
+        |row| row.get(0),
+    )?;
+    if ambiguous {
+        return Err(Error::History(
+            "legacy Delta copies lack a provable acceptance order; restore an independently retained admission order before reopening".into(),
+        ));
+    }
+    tx.execute_batch("CREATE TABLE IF NOT EXISTS acceptance_clock(id INTEGER PRIMARY KEY CHECK(id = 1), position INTEGER NOT NULL CHECK(typeof(position) = 'integer' AND position >= 0));
+        INSERT OR IGNORE INTO acceptance_clock VALUES (1, 0);
+        UPDATE acceptance_clock SET position = MAX(position, COALESCE((SELECT MAX(acceptance_order) FROM pending_entries), 0), COALESCE((SELECT MAX(acceptance_order) FROM queued_deltas), 0));")?;
+    for table in ["pending_entries", "queued_deltas"] {
+        let rows = tx
+            .prepare(&format!(
+                "SELECT rowid FROM {table} WHERE acceptance_order IS NULL ORDER BY rowid"
+            ))?
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for rowid in rows {
+            tx.execute("UPDATE acceptance_clock SET position = position + 1", [])?;
+            tx.execute(&format!(
+                "UPDATE {table} SET acceptance_order = (SELECT position FROM acceptance_clock) WHERE rowid = ?1"
+            ), [rowid])?;
+        }
+        tx.execute_batch(&format!(
+            "CREATE UNIQUE INDEX IF NOT EXISTS {table}_acceptance_order ON {table}(acceptance_order);
+            CREATE TRIGGER IF NOT EXISTS {table}_assign_order AFTER INSERT ON {table} WHEN NEW.acceptance_order IS NULL BEGIN
+                UPDATE acceptance_clock SET position = position + 1;
+                UPDATE {table} SET acceptance_order = (SELECT position FROM acceptance_clock) WHERE rowid = NEW.rowid;
+            END;"
+        ))?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -203,6 +245,7 @@ pub struct QueuedDeltaRow {
     pub entry_json: Value,
     pub url: String,
     pub chain_pos: i64,
+    pub(crate) acceptance_order: i64,
 }
 
 pub struct RecordUpsert<'a> {
@@ -295,6 +338,7 @@ impl Db {
         let _mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
         conn.execute_batch(SCHEMA)?;
         add_missing_columns(&conn)?;
+        restore_acceptance_order(&conn)?;
         let old_tips: bool = conn.query_row(
             "SELECT pk = 0 FROM pragma_table_info('url_tips') WHERE name = 'domain'",
             [],
@@ -734,21 +778,23 @@ impl Db {
     /// A Delta already accepted and pending when its domain's recovery
     /// window opens: it is moved into the queue rather than sealed, and
     /// its `seen` and chain-tip state is already recorded.
-    pub fn requeue_pending_delta(
-        &self,
-        rowid: i64,
-        domain: &str,
-        delta_id: &str,
-        entry_json: &Value,
-        url: &str,
-        chain_pos: i64,
-    ) -> Result<()> {
-        let bytes = serde_json::to_vec(entry_json)?;
+    pub(crate) fn requeue_pending_delta(&self, entry: &PendingEntryRow) -> Result<()> {
+        let delta = &entry.entry_json["delta"];
+        let delta_id = wist_core::delta::delta_id(delta)?;
+        let url = delta["url"].as_str().unwrap_or_default();
         let tx = self.mutation()?;
-        tx.execute("DELETE FROM pending_entries WHERE rowid = ?1", [rowid])?;
+        let moved = tx.execute(
+            "INSERT INTO queued_deltas(domain, delta_id, entry_json, url, chain_pos, acceptance_order) SELECT domain, ?2, entry_json, ?3, chain_pos, acceptance_order FROM pending_entries WHERE rowid = ?1 AND entry_type = 'publisher_delta' AND domain = ?4",
+            (entry.rowid, delta_id, url, &entry.domain),
+        )?;
+        if moved != 1 {
+            return Err(Error::History(
+                "pending Delta copy unavailable for recovery diversion".into(),
+            ));
+        }
         tx.execute(
-            "INSERT INTO queued_deltas(domain, delta_id, entry_json, url, chain_pos) VALUES (?1, ?2, ?3, ?4, ?5)",
-            (domain, delta_id, bytes, url, chain_pos),
+            "DELETE FROM pending_entries WHERE rowid = ?1",
+            [entry.rowid],
         )?;
         tx.commit()?;
         Ok(())
@@ -758,7 +804,7 @@ impl Db {
         let tx = self.mutation()?;
         let rows = {
             let mut stmt = tx.prepare(
-                "SELECT delta_id, entry_json, url, chain_pos FROM queued_deltas WHERE domain = ?1 ORDER BY rowid",
+                "SELECT delta_id, entry_json, url, chain_pos, acceptance_order FROM queued_deltas WHERE domain = ?1 ORDER BY acceptance_order",
             )?;
             let mapped = stmt.query_map([domain], |row| {
                 Ok((
@@ -766,6 +812,7 @@ impl Db {
                     row.get::<_, Vec<u8>>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
                 ))
             })?;
             mapped.collect::<rusqlite::Result<Vec<_>>>()?
@@ -773,15 +820,131 @@ impl Db {
         tx.execute("DELETE FROM queued_deltas WHERE domain = ?1", [domain])?;
         tx.commit()?;
         rows.into_iter()
-            .map(|(delta_id, blob, url, chain_pos)| {
+            .map(|(delta_id, blob, url, chain_pos, acceptance_order)| {
                 Ok(QueuedDeltaRow {
                     delta_id,
                     entry_json: serde_json::from_slice(&blob)?,
                     url,
                     chain_pos,
+                    acceptance_order,
                 })
             })
             .collect()
+    }
+
+    pub(crate) fn reject_delta_copies(
+        &self,
+        domain: &str,
+        rejected: &[(Value, &str)],
+        at: &str,
+    ) -> Result<Vec<String>> {
+        if rejected.is_empty() {
+            return Ok(Vec::new());
+        }
+        let tx = self.mutation()?;
+        let mut dropped = std::collections::BTreeMap::new();
+        for (envelope, code) in rejected {
+            let delta = &envelope["delta"];
+            dropped.insert(
+                wist_core::delta::delta_id(delta)?,
+                (delta["prev"].as_str().map(str::to_owned), *code),
+            );
+        }
+        let mut statement = tx.prepare(
+            "SELECT entry_json FROM pending_entries WHERE entry_type = 'publisher_delta' AND domain = ?1 UNION ALL SELECT entry_json FROM queued_deltas WHERE domain = ?1",
+        )?;
+        let copies = statement
+            .query_map([domain], |row| row.get::<_, Vec<u8>>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .map(|raw| serde_json::from_slice::<Value>(&raw))
+            .collect::<serde_json::Result<Vec<_>>>()?;
+        drop(statement);
+        loop {
+            let count = dropped.len();
+            for envelope in &copies {
+                let delta = &envelope["delta"];
+                let id = wist_core::delta::delta_id(delta)?;
+                if !dropped.contains_key(&id)
+                    && delta["prev"]
+                        .as_str()
+                        .is_some_and(|prev| dropped.contains_key(prev))
+                {
+                    dropped.insert(id, (delta["prev"].as_str().map(str::to_owned), "WIST1-E07"));
+                }
+            }
+            if dropped.len() == count {
+                break;
+            }
+        }
+        let mut tip_statement = tx.prepare("SELECT url, tip FROM url_tips WHERE domain = ?1")?;
+        let tips = tip_statement
+            .query_map([domain], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(tip_statement);
+        for (url, tip) in tips {
+            if !dropped.contains_key(&tip) {
+                continue;
+            }
+            let mut restored = Some(tip);
+            let mut visited = std::collections::HashSet::new();
+            while let Some(id) = &restored {
+                if !visited.insert(id.clone()) {
+                    return Err(Error::History("accepted Delta predecessor cycle".into()));
+                }
+                let Some((prev, _)) = dropped.get(id) else {
+                    break;
+                };
+                restored = prev.clone();
+            }
+            match restored {
+                Some(id) if self.is_delta_seen_for(&id, domain)? => {
+                    exec_set_url_tip(&tx, &url, domain, &id)?
+                }
+                _ => {
+                    tx.execute(
+                        "DELETE FROM url_tips WHERE domain = ?1 AND url = ?2",
+                        (domain, &url),
+                    )?;
+                }
+            }
+        }
+        let mut report = Vec::new();
+        for (id, (_, code)) in &dropped {
+            self.insert_rejection(domain, code, at, Some(id), Some("accepted Delta copy rejected; dependent copies cannot resolve their predecessor"))?;
+            tx.execute(
+                "DELETE FROM seen_deltas WHERE domain = ?1 AND delta_id = ?2",
+                (domain, &id),
+            )?;
+            tx.execute(
+                "DELETE FROM queued_deltas WHERE domain = ?1 AND delta_id = ?2",
+                (domain, &id),
+            )?;
+            report.push(format!("{id}: {code}"));
+        }
+        for entry in self.peek_pending_entries()?.0 {
+            if entry.entry_type == "publisher_delta"
+                && entry.domain == domain
+                && dropped.contains_key(&wist_core::delta::delta_id(&entry.entry_json["delta"])?)
+            {
+                tx.execute(
+                    "DELETE FROM pending_entries WHERE rowid = ?1",
+                    [entry.rowid],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(report)
+    }
+
+    pub(crate) fn release_queued_delta(&self, domain: &str, delta: &QueuedDeltaRow) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO pending_entries(entry_type, domain, entry_json, chain_pos, acceptance_order) VALUES ('publisher_delta', ?1, ?2, ?3, ?4)",
+            (domain, serde_json::to_vec(&delta.entry_json)?, delta.chain_pos, delta.acceptance_order),
+        )?;
+        Ok(())
     }
 
     pub fn set_publisher_pulled(&self, domain: &str, now: &str) -> Result<()> {
@@ -880,7 +1043,7 @@ impl Db {
 
     pub fn peek_pending_entries(&self) -> Result<(Vec<PendingEntryRow>, i64)> {
         let mut stmt = self.conn.prepare(
-            "SELECT rowid, entry_type, domain, entry_json, turn_block FROM pending_entries ORDER BY rowid ASC",
+            "SELECT rowid, entry_type, domain, entry_json, turn_block FROM pending_entries ORDER BY acceptance_order ASC",
         )?;
         type PendingRow = (i64, String, String, Vec<u8>, Option<i64>);
         let rows: Vec<PendingRow> = stmt

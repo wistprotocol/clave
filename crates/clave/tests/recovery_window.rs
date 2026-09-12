@@ -1523,3 +1523,278 @@ fn sealed_recovery_sources_ignore_corrupt_summaries_and_local_window_lengths() {
         delta
     );
 }
+
+#[test]
+fn recovery_preserves_cross_queue_order_and_defers_every_capped_copy() {
+    for retain_old_key in [true, false] {
+        let mut r = rig(make_publisher_with_recovery);
+        let start = "2026-08-09T12:00:00Z"
+            .parse::<jiff::Timestamp>()
+            .unwrap()
+            .as_second();
+        write_feed(&r.p, &r.host, &[], "2026-08-09T12:00:00Z");
+        ingest(&r, "2026-08-09T12:00:00Z");
+        clave::seal::run(&r.db, r.data.path(), &r.sk, start).unwrap();
+        let mut older = vec![
+            add_delta(&r.p, "https://example.com/older-a", "a", None),
+            add_delta(&r.p, "https://example.com/older-b", "b", None),
+        ];
+        older.sort_by_cached_key(|id| {
+            let body: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(r.p.dir.path().join(format!(
+                    ".well-known/wist/deltas/{}.json",
+                    id.strip_prefix("sha256:").unwrap()
+                )))
+                .unwrap(),
+            )
+            .unwrap();
+            std::cmp::Reverse(wist_core::merkle::leaf_hash(
+                &wist_core::jcs::canonicalize(
+                    &serde_json::json!({"type": "publisher_delta", "body": body}),
+                )
+                .unwrap(),
+            ))
+        });
+        write_feed(&r.p, &r.host, &older, "2026-08-09T12:00:00Z");
+        assert_eq!(ingest(&r, "2026-08-09T12:00:05Z").accepted, older);
+        for entry in r.db.peek_pending_entries().unwrap().0 {
+            r.db.set_turn_block(entry.rowid, 0).unwrap();
+        }
+        let prior = current_declaration(&r.p);
+        let mut owner = prior["publisher"].clone();
+        owner["seq"] = 1.into();
+        owner["prev_declaration"] = declaration_hash(&prior).into();
+        owner["keys"] = serde_json::json!([key_entry("k2", &K2_SEED, "2026-08-09T13:00:00Z")]);
+        if retain_old_key {
+            owner["keys"]
+                .as_array_mut()
+                .unwrap()
+                .push(prior["publisher"]["keys"][0].clone());
+        }
+        write_declaration(&r.p, &owner, "r1", &R1_SEED);
+        let newer = add_delta_signed(
+            &r.p,
+            "https://example.com/newer",
+            "newer",
+            None,
+            "2026-08-09T13:00:00Z",
+            "k2",
+            &K2_SEED,
+        );
+        write_feed_signed(
+            &r.p,
+            &r.host,
+            std::slice::from_ref(&newer),
+            "2026-08-09T13:00:00Z",
+            "k2",
+            &K2_SEED,
+        );
+        assert_eq!(
+            ingest(&r, "2026-08-09T13:00:00Z").queued,
+            vec![newer.clone()]
+        );
+        let mut opening = stored_block(&r, 0);
+        opening["entries"][0]["body"] = current_declaration(&r.p);
+        opening["header"]["prev_block_hash"] =
+            r.db.last_block().unwrap().unwrap().block_hash.into();
+        let cap = wist_core::jcs::canonicalize(&opening).unwrap().len() as i64;
+        let normal_cap = r.db.param("block_decompressed_cap_bytes").unwrap();
+        r.db.set_param("block_decompressed_cap_bytes", cap).unwrap();
+        r.db.set_param("domain_block_entries_max", 1).unwrap();
+        clave::seal::run(&r.db, r.data.path(), &r.sk, start + 3600).unwrap();
+        r.db.set_param("block_decompressed_cap_bytes", normal_cap)
+            .unwrap();
+        assert_eq!(r.db.count_pending_entries("publisher_delta").unwrap(), 0);
+        r.db = clave::db::Db::open(&r.data.path().join("clave.sqlite")).unwrap();
+        for hour in [2, 3, 4, 168] {
+            assert!(
+                clave::seal::run(&r.db, r.data.path(), &r.sk, start + hour * 3600)
+                    .unwrap()
+                    .late
+                    .is_empty()
+            );
+        }
+        let expected = if retain_old_key {
+            vec![older[0].clone(), older[1].clone(), newer]
+        } else {
+            vec![newer]
+        };
+        for (index, id) in expected.iter().enumerate() {
+            let height = 6 + index as u64;
+            let report = clave::seal::run(
+                &r.db,
+                r.data.path(),
+                &r.sk,
+                start + (169 + index as i64) * 3600,
+            )
+            .unwrap();
+            assert!(report.late.is_empty());
+            let block = stored_block(&r, height);
+            let ids: Vec<_> = block["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry["type"] == "publisher_delta")
+                .map(|entry| wist_core::delta::delta_id(&entry["body"]["delta"]).unwrap())
+                .collect();
+            assert_eq!(ids, vec![id.clone()]);
+            r.db = clave::db::Db::open(&r.data.path().join("clave.sqlite")).unwrap();
+        }
+        if !retain_old_key {
+            for id in older {
+                assert!(!r.db.is_delta_seen_for(&id, &r.host).unwrap());
+                assert!(r
+                    .db
+                    .list_rejections(&r.host)
+                    .unwrap()
+                    .iter()
+                    .any(|rejection| rejection.delta_id.as_deref() == Some(&id)
+                        && rejection.code == "WIST1-E13"));
+            }
+            assert!(r
+                .db
+                .url_tip(&r.host, "https://example.com/older-a")
+                .unwrap()
+                .is_none());
+            assert!(r
+                .db
+                .url_tip(&r.host, "https://example.com/older-b")
+                .unwrap()
+                .is_none());
+        }
+    }
+}
+
+#[test]
+fn settlement_rejects_dependent_copies_restores_tip_and_allows_reserving() {
+    let mut r = rig(make_publisher_with_recovery);
+    let start = "2026-08-09T12:00:00Z"
+        .parse::<jiff::Timestamp>()
+        .unwrap()
+        .as_second();
+    let url = "https://example.com/retry";
+    let base = add_delta(&r.p, url, "base", None);
+    write_feed(
+        &r.p,
+        &r.host,
+        std::slice::from_ref(&base),
+        "2026-08-09T12:00:00Z",
+    );
+    assert_eq!(
+        ingest(&r, "2026-08-09T12:00:05Z").accepted,
+        vec![base.clone()]
+    );
+    clave::seal::run(&r.db, r.data.path(), &r.sk, start).unwrap();
+    let prior = current_declaration(&r.p);
+    let mut owner = prior["publisher"].clone();
+    owner["seq"] = 1.into();
+    owner["prev_declaration"] = declaration_hash(&prior).into();
+    owner["keys"] = serde_json::json!([key_entry("k2", &K2_SEED, "2026-08-09T13:00:00Z")]);
+    write_declaration(&r.p, &owner, "r1", &R1_SEED);
+    write_feed_signed(&r.p, &r.host, &[], "2026-08-09T13:00:00Z", "k2", &K2_SEED);
+    ingest(&r, "2026-08-09T13:00:00Z");
+    clave::seal::run(&r.db, r.data.path(), &r.sk, start + 3600).unwrap();
+    let root = add_delta_signed(
+        &r.p,
+        url,
+        "old authority",
+        Some(&base),
+        "2026-08-09T14:00:00Z",
+        "k1",
+        &K1_SEED,
+    );
+    let child = add_delta_signed(
+        &r.p,
+        url,
+        "dependent",
+        Some(&root),
+        "2026-08-09T15:00:00Z",
+        "k2",
+        &K2_SEED,
+    );
+    write_feed_signed(
+        &r.p,
+        &r.host,
+        &[root.clone(), child.clone()],
+        "2026-08-09T15:00:00Z",
+        "k2",
+        &K2_SEED,
+    );
+    assert_eq!(
+        ingest(&r, "2026-08-09T15:00:00Z").queued,
+        vec![root.clone(), child.clone()]
+    );
+    for hour in [2, 169] {
+        clave::seal::run(&r.db, r.data.path(), &r.sk, start + hour * 3600).unwrap();
+    }
+    r.db = clave::db::Db::open(&r.data.path().join("clave.sqlite")).unwrap();
+    assert_eq!(r.db.url_tip(&r.host, url).unwrap(), Some(base.clone()));
+    assert!(r.db.is_delta_seen_for(&base, &r.host).unwrap());
+    let rejected = r.db.list_rejections(&r.host).unwrap();
+    for (id, code) in [(&root, "WIST1-E13"), (&child, "WIST1-E07")] {
+        assert!(!r.db.is_delta_seen_for(id, &r.host).unwrap());
+        assert!(rejected
+            .iter()
+            .any(|entry| entry.delta_id.as_deref() == Some(id) && entry.code == code));
+    }
+    assert_eq!(r.db.count_pending_entries("publisher_delta").unwrap(), 0);
+    let predecessor = current_declaration(&r.p);
+    let mut replacement = predecessor["publisher"].clone();
+    replacement["seq"] = 2.into();
+    replacement["prev_declaration"] = declaration_hash(&predecessor).into();
+    replacement["keys"]
+        .as_array_mut()
+        .unwrap()
+        .push(prior["publisher"]["keys"][0].clone());
+    write_declaration(&r.p, &replacement, "k2", &K2_SEED);
+    let report = ingest(&r, "2026-08-16T14:00:00Z");
+    assert_eq!(report.accepted, vec![root.clone(), child.clone()]);
+    assert!(report.rejected.is_empty());
+    clave::seal::run(&r.db, r.data.path(), &r.sk, start + 170 * 3600).unwrap();
+    assert_eq!(r.db.url_tip(&r.host, url).unwrap(), Some(child.clone()));
+    assert_eq!(
+        r.db.get_record(url, &r.host).unwrap().unwrap().delta_id,
+        child
+    );
+    assert!(r.db.is_delta_seen_for(&root, &r.host).unwrap());
+}
+
+#[test]
+fn pending_copy_in_an_expired_window_receives_settlement_rejection() {
+    let (mut r, start, _) = sealed_recovery();
+    let url = "https://example.com/deferred";
+    let id = add_delta_signed(
+        &r.p,
+        url,
+        "deferred",
+        None,
+        "2026-08-09T14:00:00Z",
+        "k1",
+        &K1_SEED,
+    );
+    let body: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(r.p.dir.path().join(format!(
+            ".well-known/wist/deltas/{}.json",
+            id.strip_prefix("sha256:").unwrap()
+        )))
+        .unwrap(),
+    )
+    .unwrap();
+    r.db.record_accepted_delta(&r.host, &id, &body, 0, url, &id)
+        .unwrap();
+    for entry in r.db.peek_pending_entries().unwrap().0 {
+        if entry.entry_type == "publisher_delta" {
+            r.db.set_turn_block(entry.rowid, 0).unwrap();
+        }
+    }
+    r.db = clave::db::Db::open(&r.data.path().join("clave.sqlite")).unwrap();
+    let report = clave::seal::run(&r.db, r.data.path(), &r.sk, start + 169 * 3600).unwrap();
+    assert!(report.late.is_empty());
+    assert!(r.db.get_record(url, &r.host).unwrap().is_none());
+    assert!(!r.db.is_delta_seen_for(&id, &r.host).unwrap());
+    assert!(r.db.url_tip(&r.host, url).unwrap().is_none());
+    let rejections = r.db.list_rejections(&r.host).unwrap();
+    assert_eq!(rejections.len(), 1);
+    assert_eq!(rejections[0].delta_id.as_deref(), Some(id.as_str()));
+    assert_eq!(rejections[0].code, "WIST1-E13");
+}

@@ -271,29 +271,14 @@ fn roster_act_of(update: &Value) -> Option<(RosterAction, String, String, String
     Some((action, auditor_id, key_id, public_key))
 }
 
-fn divert_deltas_into_opening_windows(
-    db: &Db,
-    entries: Vec<SealEntry>,
-    projection: &Projection,
-) -> Result<Vec<SealEntry>> {
-    let opening: HashSet<_> = projection
-        .domains()
-        .iter()
-        .filter(|(_, state)| state.window().is_some())
-        .map(|(domain, _)| domain.as_str())
-        .collect();
-    let mut kept = Vec::with_capacity(entries.len());
-    for e in entries {
-        if e.entry_type != "publisher_delta" || !opening.contains(e.domain.as_str()) {
-            kept.push(e);
+fn divert_recovery_deltas(db: &Db, domains: &HashSet<&str>) -> Result<()> {
+    for entry in db.peek_pending_entries()?.0 {
+        if entry.entry_type != "publisher_delta" || !domains.contains(entry.domain.as_str()) {
             continue;
         }
-        let delta = &e.body["delta"];
-        let delta_id = wist_core::delta::delta_id(delta).unwrap_or_default();
-        let url = delta["url"].as_str().unwrap_or_default().to_string();
-        db.requeue_pending_delta(e.rowid, &e.domain, &delta_id, &e.body, &url, 0)?;
+        db.requeue_pending_delta(&entry)?;
     }
-    Ok(kept)
+    Ok(())
 }
 
 fn check_roster_acts(
@@ -426,6 +411,7 @@ fn revalidate_queued_deltas(
     let mut kept = Vec::with_capacity(entries.len());
     let mut dropped_rowids = Vec::new();
     let mut dropped = Vec::new();
+    let mut rejections = std::collections::BTreeMap::<String, Vec<(Value, &str)>>::new();
     for e in entries {
         if e.entry_type != "publisher_delta" {
             kept.push(e);
@@ -449,17 +435,22 @@ fn revalidate_queued_deltas(
             Err(code @ ("WIST1-E14" | "WIST1-E03")) => code,
             Err(_) => "WIST1-E02",
         };
-        let delta_id = wist_core::delta::delta_id(&e.body["delta"]).unwrap_or_default();
-        db.insert_rejection(
-            &e.domain,
-            code,
-            sealed_at,
-            Some(&delta_id),
-            Some("Delta fields, signing or scope authority fail at sealing"),
-        )?;
-        dropped.push(format!("{delta_id}: {code} at sealing"));
+        rejections
+            .entry(e.domain.clone())
+            .or_default()
+            .push((e.body, code));
         dropped_rowids.push(e.rowid);
     }
+    for (domain, rejected) in rejections {
+        dropped.extend(db.reject_delta_copies(&domain, &rejected, sealed_at)?);
+    }
+    let retained: HashSet<_> = db
+        .peek_pending_entries()?
+        .0
+        .into_iter()
+        .map(|entry| entry.rowid)
+        .collect();
+    kept.retain(|entry| retained.contains(&entry.rowid));
     Ok((kept, dropped_rowids, dropped))
 }
 
@@ -855,6 +846,7 @@ fn settle_recovery_windows(db: &Db, projection: &Projection, sealed_at: &str) ->
         let publisher: wist_core::objects::Publisher =
             serde_json::from_value(doc["publisher"].clone())
                 .map_err(|e| Error::Seal(format!("stored declaration unparsable: {e}")))?;
+        let mut rejected = Vec::new();
         for q in db.drain_queued_deltas(domain)? {
             let verified = crate::declaration::delta_publisher(&q.entry_json)
                 .and_then(|author| {
@@ -868,18 +860,18 @@ fn settle_recovery_windows(db: &Db, projection: &Projection, sealed_at: &str) ->
                     crate::declaration::verify_delta_authority(&[&publisher], &q.entry_json)
                 });
             match verified {
-                Ok(()) => {
-                    db.insert_pending_entry("publisher_delta", domain, &q.entry_json, q.chain_pos)?
-                }
-                Err(code) => db.insert_rejection(
-                    domain,
-                    if code == "WIST1-E14" { code } else { "WIST1-E13" },
-                    sealed_at,
-                    Some(&q.delta_id),
-                    Some("queued Delta fails signing or scope authority at the recovery window's end"),
-                )?,
+                Ok(()) => db.release_queued_delta(domain, &q)?,
+                Err(code) => rejected.push((
+                    q.entry_json,
+                    if code == "WIST1-E14" {
+                        code
+                    } else {
+                        "WIST1-E13"
+                    },
+                )),
             }
         }
+        db.reject_delta_copies(domain, &rejected, sealed_at)?;
         let (key_id, public_key) = doc
             .pointer("/publisher/keys/0")
             .map(|k| {
@@ -939,6 +931,15 @@ pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<
                 .default
                 .unwrap()
         });
+    divert_recovery_deltas(
+        db,
+        &declarations
+            .domains()
+            .iter()
+            .filter(|(_, state)| state.window().is_some())
+            .map(|(domain, _)| domain.as_str())
+            .collect(),
+    )?;
     let settlement = declarations.project(&sealed_at, recovery_days, &[])?;
     settle_recovery_windows(db, &settlement, &sealed_at)?;
 
@@ -1001,7 +1002,19 @@ pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<
             .map(|entry| entry.wrapped.clone())
             .collect::<Vec<_>>(),
     )?;
-    let seal_entries = divert_deltas_into_opening_windows(db, seal_entries, &projection)?;
+    let recovering: HashSet<_> = projection
+        .domains()
+        .iter()
+        .filter(|(_, state)| state.window().is_some())
+        .map(|(domain, _)| domain.as_str())
+        .collect();
+    divert_recovery_deltas(db, &recovering)?;
+    let seal_entries = seal_entries
+        .into_iter()
+        .filter(|entry| {
+            entry.entry_type != "publisher_delta" || !recovering.contains(entry.domain.as_str())
+        })
+        .collect();
     let (seal_entries, retired_rowids, retired) =
         revalidate_queued_deltas(db, seal_entries, &sealed_at, &projection)?;
     let (seal_entries, roster_rowids, roster_dropped) = check_roster_acts(
