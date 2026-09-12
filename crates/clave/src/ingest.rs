@@ -9,6 +9,8 @@ use wist_core::objects::{DeltaEnvelope, FeedEnvelope, Payload, Publisher};
 use crate::declaration::{self, Decision};
 use crate::registry;
 
+mod feed;
+
 #[derive(Debug, Default)]
 pub struct IngestReport {
     pub accepted: Vec<String>,
@@ -115,10 +117,9 @@ fn verify_sealed_page(
     doc: &Value,
     generated_at: &str,
 ) -> bool {
-    let Ok(cut) = generated_at.parse::<jiff::Timestamp>() else {
+    let Ok(cut) = registry::epoch(generated_at) else {
         return false;
     };
-    let cut = cut.as_second();
     let current = declarations
         .iter()
         .filter(|(at, _, _)| *at <= cut)
@@ -555,6 +556,25 @@ pub fn run_with_clock(
             }
         };
         let (_, feed_value) = fetched;
+        let feed_parsed = match feed::validate_fields(&feed_value) {
+            Ok(feed) => feed,
+            Err(detail) => {
+                record_rejection(db, host, "WIST2-E01", now, None, detail)?;
+                return Ok(report);
+            }
+        };
+        if feed_parsed.feed.domain != host {
+            record_rejection(
+                db,
+                host,
+                "WIST2-E04",
+                now,
+                None,
+                "feed domain does not match the host it was fetched from",
+            )?;
+            report.noise = Some("WIST2-E04");
+            return Ok(report);
+        }
         settle_before_admission(db, data_dir, host, &clock)?;
         let live_page = pages.is_empty();
         let mut verified = if live_page {
@@ -601,26 +621,6 @@ pub fn run_with_clock(
             report.noise = Some("WIST2-E04");
             return Ok(report);
         }
-        let feed_parsed: FeedEnvelope = match serde_json::from_value(feed_value) {
-            Ok(f) => f,
-            Err(e) => {
-                record_rejection(db, host, "WIST2-E01", now, None, &e.to_string())?;
-                return Ok(report);
-            }
-        };
-        if feed_parsed.feed.domain != host {
-            record_rejection(
-                db,
-                host,
-                "WIST2-E04",
-                now,
-                None,
-                "feed domain does not match the host it was fetched from",
-            )?;
-            report.noise = Some("WIST2-E04");
-            return Ok(report);
-        }
-
         let mut page_has_unseen = false;
         for id in &feed_parsed.feed.deltas {
             if !db.is_delta_seen_for(id, host)? {

@@ -135,7 +135,7 @@ fn validate_structure(doc: &Value, envelope: &PublisherEnvelope) -> Result<(), S
     Ok(())
 }
 
-fn canonical_encoding(value: &str, length: usize) -> Result<(), String> {
+pub(crate) fn canonical_encoding(value: &str, length: usize) -> Result<(), String> {
     let bytes = b64u_decode(value).map_err(|e| e.to_string())?;
     if bytes.len() != length || b64u_encode(&bytes) != value {
         return Err(format!(

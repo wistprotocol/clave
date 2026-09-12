@@ -311,6 +311,24 @@ Binding and scope checks precede clock, chain and Payload checks;
 WIST-1 §7 permits any established applicable semantic diagnostic after mandatory
 field checks. Signed `publisher` determines attribution under WIST-1 §3.8.
 
+## Feed field validation
+
+Ingestion applies WIST-2 §5/ADR-0032's complete Feed Envelope field gate
+before domain comparison, signature verification or Page source replay.
+It checks required/unknown members, Canonical Host spelling, unbounded
+release components, exact Gregorian Log timestamps, unique Delta IDs and
+the 1000-entry cap, nullable `next` syntax and canonical signature fields.
+Signed values remain unchanged. Field failures receive WIST2-E01 without
+noise or a failure-triggered Declaration retry; field-valid foreign domains
+receive WIST2-E04 without retry, even with a bad signature.
+
+`feed-fields.json` supplies 134 signed probes; live HTTP tests exercise 133
+through first contact and restart, checking persisted diagnostics, noise and
+request counts. Page field regressions stop before Delta/Payload admission.
+The schema gate does not establish complete `next` URL/authority validation,
+Feed timestamp-regression state, exact Page cardinality, publication/history
+partitioning, supported-major policy or durable selected-source provenance.
+
 ## Page source verification
 
 Sealed Page keys come from the complete authenticated Block prefix pinned by
@@ -344,8 +362,10 @@ exclusion, and independent Delta retries. A restart regression preserves the
 discovered rotation, renews the next pull's attempt and admits the unchanged
 Page only after its authorizing Declaration seals.
 
-Complete Feed fields/timestamps and durable selected-source provenance remain
-incomplete. WIST-2 §3.2 named-entry fallback is covered by
+Page cutoff comparison uses the strict Log timestamp parser, including year
+zero and the final second of year 9999. Field checks and remaining Feed/Page
+obligations are described under [Feed field validation](#feed-field-validation).
+WIST-2 §3.2 named-entry fallback is covered by
 all 16 signed `page-bindings.json` probes, including excluded entries and
 rejection of aliases or public bytes available only from a later source.
 
