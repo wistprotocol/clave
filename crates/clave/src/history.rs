@@ -1,4 +1,5 @@
 pub mod declarations;
+pub mod payloads;
 
 use crate::db::BlockRow;
 use crate::error::{Error, Result};

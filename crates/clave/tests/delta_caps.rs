@@ -116,6 +116,48 @@ fn signed_cap_profiles_follow_authenticated_prefixes_and_survive_later_amendment
     }
 }
 
+#[test]
+fn historical_payload_sources_keep_the_committing_profile_after_restart() {
+    use clave::history::payloads::PayloadSource;
+
+    let vector = fixture();
+    let data = tempfile::tempdir().unwrap();
+    anchor(data.path());
+    let head = write_blocks(data.path(), vector["blocks"].as_array().unwrap());
+    for probe in vector["reference_probes"].as_array().unwrap() {
+        let object = &vector["objects"][probe["reference"].as_str().unwrap()];
+        let id = wist_core::delta::delta_id(&object["envelope"]["delta"]).unwrap();
+        let raw = serde_json::to_vec(&object["payload"]).unwrap();
+        for _ in 0..2 {
+            let source = PayloadSource::reconstruct(data.path(), Some(head.clone()), &id).unwrap();
+            assert_eq!(source.envelope(), &object["envelope"]);
+            assert_eq!(json!(source.block_number()), object["sealed_height"]);
+            assert_eq!(json!(source.size_caps()), probe["expected_profile"]);
+            assert_eq!(json!(source.validate(&raw).err()), probe["expected"]);
+        }
+    }
+    for case in vector["invalid_blocks"].as_array().unwrap() {
+        let doc = &case["block"];
+        let height = doc["header"]["block_number"].as_u64().unwrap() as usize;
+        let head = write_blocks(data.path(), std::slice::from_ref(doc));
+        let id = wist_core::delta::delta_id(&doc["entries"][0]["body"]["delta"]).unwrap();
+        let error = match PayloadSource::reconstruct(data.path(), Some(head), &id) {
+            Ok(source) => source
+                .validate(&serde_json::to_vec(&case["payload"]).unwrap())
+                .err()
+                .unwrap()
+                .to_string(),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains(case["expected"].as_str().unwrap()),
+            "{}: {error}",
+            case["name"]
+        );
+        write_blocks(data.path(), std::slice::from_ref(&vector["blocks"][height]));
+    }
+}
+
 fn amend(db: &Db, data: &std::path::Path, parameter: &str, value: i64) {
     let sk = clave::keys::load(&data.join("keys/seed")).unwrap();
     clave::param_change::run(

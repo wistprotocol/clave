@@ -197,6 +197,40 @@ checks atomic failure, preserved dependent and independent chains, and repair
 before successful sealing. Previously sealed Payloads and recovery-held copies
 that are not candidates receive no new validation from these checks.
 
+## Historical Payload validation
+
+`history::payloads::PayloadSource::reconstruct(directory, pinned_head, delta_id)`
+authenticates the complete pinned Block/parameter and Declaration history before
+returning a source for one included Delta. Trust inputs and unsupported Log
+transitions follow [Authenticated history](#authenticated-history). The source
+retains the original Delta Envelope, its Block height, commitment and
+[committing size profile](#delta-size-cap-profiles).
+
+The selected Delta passes fields, version, declared-size and historical
+Declaration authority checks, including signed Publisher scope, key-time bounds,
+recovery-window exclusion and deadline-Block replacements. Later scope/key changes
+do not revise that source. Missing or repeated target IDs, contentless targets,
+invalid authority or any failure in the pinned prefix return no source.
+
+`PayloadSource::validate(raw)` applies the complete
+[Payload validator](#retained-payload-validation) to supplied bytes with the retained
+commitment, signed Publisher and caps. Reconstructing after restart selects the
+same profile; an Audit Record's or another Delta's profile cannot replace it.
+Invalid bytes return a Payload error without mutating the source or stored state,
+allowing another copy to be checked. Both methods leave retained files unchanged.
+
+This API neither fetches Payloads nor establishes Delta chain/clock eligibility,
+Audit Record reference eligibility or availability/withdrawal obligations. It
+validates no other Delta's body and does not update indexes, sanctions or service
+admission. Each reconstruction scans the full prefix and retains Declaration
+replay state; bounded lookup and integration into complete Delta/Audit Record
+replay remain required. `verify-history` keeps its existing scope.
+
+Signed tests cover 103 default-profile Payload field cases, original-byte and
+numeric-value preservation, historical cap references and invalid cap Blocks,
+scope/key changes, recovery deadlines, missing/duplicate targets, full-prefix
+failures, restart and repair/retry.
+
 ## Declaration key binding
 
 Declaration admission rejects repeated key identifiers, including identical
@@ -610,9 +644,8 @@ retry repeats restoration. Subsequent opens skip this completed repair. Queues,
 Payloads and rejection history are preserved. The repair retains all seen IDs
 in memory plus each tip's signed observation time. It does not establish
 complete Delta eligibility, governance replay, general legacy-state revalidation
-or crash-safe publication. Historical size-cap selection awaits the temporal
-anchor resolution in specification `CONFORMANCE.md`; no current/default cap
-is substituted during restoration.
+or crash-safe publication. Historical size-cap selection follows
+[Delta size-cap profiles](#delta-size-cap-profiles).
 
 Signed restart tests cover chain and ownership restoration, preserved versioned
 Envelopes across all three stores, field/version diagnostic precedence,
