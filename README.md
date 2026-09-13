@@ -89,7 +89,7 @@ their effective instant. Delta URL/declared-byte failures retain WIST1-E11/E04;
 Payload cap failures use WIST2-E03 during pulls and WIST1-E04 at sealing.
 Sealing removes rejected copies and dependent successors under
 [Declaration key binding](#declaration-key-binding). Missing or
-unparseable stored Payloads abort sealing and roll back SQLite changes.
+invalid stored Payloads follow [Retained Payload validation](#retained-payload-validation).
 
 `VerifiedBlock::delta_size_caps` retains the committing Block's profile for
 later Payload or reference validation. `SizeCaps::validate_payload_sizes`
@@ -122,10 +122,9 @@ more links could fit: only a page audit can verify the declared prefix.
 
 `payload-links.json` supplies 31 signed commitment-valid probes. Live tests
 cover their pull dispositions, restart, accepted-byte preservation through
-sealing, scoped subjects and rejection of a retrieved predecessor. Previously
-accepted queues and sealed history are not retroactively checked by this
-admission change. Field/version admission is covered below; historical
-validation remains outstanding.
+sealing, scoped subjects and rejection of a retrieved predecessor.
+Field/version admission and retained validation are described below;
+historical validation remains outstanding.
 
 ## JSON input eligibility
 
@@ -165,9 +164,38 @@ of the Python reference. Live tests exercise 103 default-profile candidates,
 restart, fetched predecessors, same-ID retry after version rejection,
 record materialization and original-byte preservation through sealing.
 Field vectors supply cap contexts; [Delta size-cap profiles](#delta-size-cap-profiles)
-covers authenticated profile timing. Previously accepted queues and historical
-Payloads require separate revalidation; historical retrieval and Audit Record
+covers authenticated profile timing. Historical retrieval and Audit Record
 reference eligibility remain incomplete.
+
+## Retained Payload validation
+
+Sealing validates each candidate's retained Payload fields, version, commitment,
+exact content length, links and candidate-Block caps before publication. Missing,
+unparseable or invalid retained content aborts the transaction, preserving
+queued Envelopes, seen IDs, chain tips and rejection history for repair and
+retry. Size-cap failures retain the exclusion and successor handling under
+[Delta size-cap profiles](#delta-size-cap-profiles). A local Payload mismatch
+does not reject its signed Delta (WIST-1 §7).
+
+Record materialization repeats validation when reading content and aborts on
+failure before publishing the Block or Checkpoint. Accepted Payload files and
+signed Envelopes retain their original bytes; successful retry after repair
+materializes the retained chains.
+Crash-safe publication and concurrent filesystem mutation remain outside this
+validation contract.
+
+`payload::validate` applies the same complete checks during ingestion and
+sealing and returns a typed Payload from a canonical temporary copy. Callers
+supply an eligible Delta's commitment, authenticated Publisher and
+stage-specific caps; the helper establishes neither Delta eligibility nor
+parameter provenance. Raw-input requirements follow
+[JSON input eligibility](#json-input-eligibility).
+
+Signed field vectors exercise the helper's permitted diagnostics and retained
+queue failures through restart. A same-length content substitution regression
+checks atomic failure, preserved dependent and independent chains, and repair
+before successful sealing. Previously sealed Payloads and recovery-held copies
+that are not candidates receive no new validation from these checks.
 
 ## Declaration key binding
 

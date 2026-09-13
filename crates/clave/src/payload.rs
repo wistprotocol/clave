@@ -1,6 +1,27 @@
 use serde_json::Value;
 use std::collections::HashSet;
-use wist_core::objects::PayloadLinks;
+use wist_core::objects::{DeltaPayloadCommitment, Payload, PayloadLinks};
+
+pub fn validate(
+    payload: &Value,
+    commitment: &DeltaPayloadCommitment,
+    publisher: &str,
+    caps: &crate::declaration::delta::SizeCaps,
+) -> Result<Payload, &'static str> {
+    validate_version(payload)?;
+    let canonical = wist_core::jcs::canonicalize(payload).map_err(|_| "WIST1-E05")?;
+    let typed: Payload = serde_json::from_slice(&canonical).map_err(|_| "WIST1-E14")?;
+    wist_core::delta::verify_commitment(&typed.salt, &payload["content"], &commitment.commitment)
+        .map_err(|_| "WIST1-E10")?;
+    if wist_core::delta::content_bytes(&payload["content"]).map_err(|_| "WIST1-E05")?
+        != commitment.bytes
+    {
+        return Err("WIST1-E10");
+    }
+    validate_links(&typed.content.links, publisher)?;
+    caps.validate_payload_sizes(payload)?;
+    Ok(typed)
+}
 
 pub fn validate_json(raw: &[u8]) -> Result<(), &'static str> {
     crate::json::validate(raw).map_err(|_| "WIST1-E05")

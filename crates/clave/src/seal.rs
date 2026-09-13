@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use wist_core::crypto::{hex_encode, SigningKey};
 use wist_core::envelope::sign_envelope;
-use wist_core::objects::{Block, BlockHeader, ChangeType, Checkpoint, Payload, Sig};
+use wist_core::objects::{Block, BlockHeader, ChangeType, Checkpoint, Sig};
 use wist_core::roster::{Roster, RosterAct, RosterAction};
 use wist_core::{jcs, merkle};
 
@@ -438,7 +438,22 @@ fn revalidate_queued_deltas(
                         let bytes =
                             std::fs::read(data_dir.join(format!("payloads/{}.json", &id[7..])))?;
                         let payload: Value = crate::json::parse(&bytes)?;
-                        size_caps.validate_payload_sizes(&payload)
+                        let delta: wist_core::objects::Delta =
+                            serde_json::from_slice(&jcs::canonicalize(&e.body["delta"])?)?;
+                        match crate::payload::validate(
+                            &payload,
+                            delta.payload.as_ref().unwrap(),
+                            &delta.publisher,
+                            size_caps,
+                        ) {
+                            Ok(_) => Ok(()),
+                            Err("WIST1-E04") => Err("WIST1-E04"),
+                            Err(code) => {
+                                return Err(Error::Seal(format!(
+                                    "retained Payload {id} failed validation: {code}"
+                                )));
+                            }
+                        }
                     }
                     result => result,
                 };
@@ -811,6 +826,7 @@ fn chain_order(mut remaining: Vec<DeltaApply>) -> Vec<DeltaApply> {
 
 fn resolve_record_updates(
     data_dir: &Path,
+    size_caps: &crate::declaration::delta::SizeCaps,
     seal_entries: &[SealEntry],
 ) -> Result<Vec<OwnedRecordUpsert>> {
     let mut deltas = Vec::new();
@@ -838,17 +854,20 @@ fn resolve_record_updates(
         }
         let hex = d.id.strip_prefix("sha256:").unwrap_or(&d.id);
         let payload_path = data_dir.join("payloads").join(format!("{hex}.json"));
-        let Ok(payload_bytes) = std::fs::read(&payload_path) else {
-            continue;
-        };
-        let Ok(payload_value) = crate::json::parse(&payload_bytes) else {
-            continue;
-        };
-        let Ok(payload) =
-            serde_json::from_slice::<Payload>(&wist_core::jcs::canonicalize(&payload_value)?)
-        else {
-            continue;
-        };
+        let payload_bytes = std::fs::read(&payload_path)?;
+        let payload_value = crate::json::parse(&payload_bytes)?;
+        let payload = crate::payload::validate(
+            &payload_value,
+            delta.payload.as_ref().unwrap(),
+            &delta.publisher,
+            size_caps,
+        )
+        .map_err(|code| {
+            Error::Seal(format!(
+                "retained Payload {} failed validation: {code}",
+                d.id
+            ))
+        })?;
         updates.push(OwnedRecordUpsert {
             url: delta.url,
             publisher: delta.publisher,
@@ -1005,15 +1024,16 @@ pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<
             entry.entry_type != "publisher_delta" || !recovering.contains(entry.domain.as_str())
         })
         .collect();
+    let size_caps = crate::declaration::delta::SizeCaps::from_schedule(
+        history
+            .schedule()
+            .unwrap_or(&wist_core::parameters::Schedule::new(sealed_epoch)),
+        sealed_epoch,
+    );
     let (seal_entries, retired_rowids, retired) = revalidate_queued_deltas(
         db,
         data_dir,
-        &crate::declaration::delta::SizeCaps::from_schedule(
-            history
-                .schedule()
-                .unwrap_or(&wist_core::parameters::Schedule::new(sealed_epoch)),
-            sealed_epoch,
-        ),
+        &size_caps,
         seal_entries,
         &sealed_at,
         &projection,
@@ -1095,7 +1115,7 @@ pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    let record_updates = resolve_record_updates(data_dir, &seal_entries)?;
+    let record_updates = resolve_record_updates(data_dir, &size_caps, &seal_entries)?;
 
     let blocks_dir = data_dir.join("log/blocks");
     std::fs::create_dir_all(&blocks_dir)?;

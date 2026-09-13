@@ -7,6 +7,16 @@ use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use wist_core::{crypto::PublicKey, delta, envelope, objects::Payload};
 
+fn caps(case: &Value) -> SizeCaps {
+    SizeCaps {
+        url_cap_bytes: 2048,
+        extract_cap_bytes: case["caps"]["extract_cap_bytes"].as_i64().unwrap_or(32768),
+        links_cap_bytes: case["caps"]["links_cap_bytes"].as_i64().unwrap_or(4096),
+        link_url_cap_bytes: case["caps"]["link_url_cap_bytes"].as_i64().unwrap_or(2048),
+        summary_cap_bytes: case["caps"]["summary_cap_bytes"].as_i64().unwrap_or(2048),
+    }
+}
+
 fn fixture() -> Value {
     serde_json::from_slice(
         &std::fs::read(spec_dir().join("vectors/wist1/payload-fields.json")).unwrap(),
@@ -61,18 +71,22 @@ fn signed_payload_fields_and_semantic_diagnostics_match_vectors() {
             {
                 errors.insert("WIST1-E10");
             }
-            let caps = SizeCaps {
-                url_cap_bytes: 2048,
-                extract_cap_bytes: case["caps"]["extract_cap_bytes"].as_i64().unwrap_or(32768),
-                links_cap_bytes: case["caps"]["links_cap_bytes"].as_i64().unwrap_or(4096),
-                link_url_cap_bytes: case["caps"]["link_url_cap_bytes"].as_i64().unwrap_or(2048),
-                summary_cap_bytes: case["caps"]["summary_cap_bytes"].as_i64().unwrap_or(2048),
-            };
+            let caps = caps(case);
             if let Err(code) = caps.validate_payload_sizes(payload) {
                 errors.insert(code);
             }
         }
         assert_eq!(json!(errors), case["allowed"], "{}", case["name"]);
+        let commitment =
+            serde_json::from_slice(&wist_core::jcs::canonicalize(&body["payload"]).unwrap())
+                .unwrap();
+        let result = clave::payload::validate_json(&raw).and_then(|()| {
+            clave::payload::validate(payload, &commitment, "example.com", &caps(case))
+        });
+        match result {
+            Ok(_) => assert!(errors.is_empty(), "{}", case["name"]),
+            Err(code) => assert!(errors.contains(code), "{}: {code}", case["name"]),
+        }
         assert_eq!(*case, original);
     }
 }
@@ -95,6 +109,10 @@ fn publish(p: &TestPub, case: &Value, suffix: &str, prev: Option<&str>) -> Strin
         delta::make_commitment(preimage["salt"].as_str().unwrap(), &preimage["content"])
             .unwrap()
             .into();
+    body["payload"]["bytes"] = (body["payload"]["bytes"].as_u64().unwrap() as i64
+        + delta::content_bytes(&preimage["content"]).unwrap() as i64
+        - delta::content_bytes(&case["preimage"]["content"]).unwrap() as i64)
+        .into();
     if let Some(prev) = prev {
         body["prev"] = prev.into();
         body["change_type"] = "update".into();
@@ -267,4 +285,147 @@ fn fetched_predecessor_payload_version_rejects_and_retries_without_changing_delt
         db.url_tip(&host, "https://localhost/chain").unwrap(),
         Some(child)
     );
+}
+
+#[test]
+fn invalid_retained_payload_vectors_stop_sealing_without_rejecting_deltas() {
+    let (listener, host, client) = reserve_addr();
+    let p = make_publisher(&host);
+    serve_static(listener, p.dir.path().to_path_buf());
+    write_feed(&p, &host, &[], "2026-08-09T12:00:00Z");
+    let vector = fixture();
+    let now = "2026-08-09T12:00:03Z"
+        .parse::<jiff::Timestamp>()
+        .unwrap()
+        .as_second();
+    for (i, case) in vector["cases"].as_array().unwrap().iter().enumerate() {
+        if case.get("caps").is_some() || case["allowed"].as_array().unwrap().is_empty() {
+            continue;
+        }
+        let data = tempfile::tempdir().unwrap();
+        clave::init::run(&host, data.path()).unwrap();
+        let path = data.path().join("clave.sqlite");
+        let db = Db::open(&path).unwrap();
+        clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:02Z").unwrap();
+        let id = publish(&p, case, &format!("retained-{i}"), None);
+        let base = p.dir.path().join(".well-known/wist");
+        let signed: Value = serde_json::from_slice(
+            &std::fs::read(base.join(format!("deltas/{}.json", &id[7..]))).unwrap(),
+        )
+        .unwrap();
+        let url = signed["delta"]["url"].as_str().unwrap();
+        db.record_accepted_delta(&host, &id, &signed, 0, url, &id)
+            .unwrap();
+        let payload = data.path().join(format!("payloads/{}.json", &id[7..]));
+        std::fs::copy(base.join(format!("payloads/{}.json", &id[7..])), &payload).unwrap();
+        let original = std::fs::read(&payload).unwrap();
+        let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
+        drop(db);
+        for _ in 0..2 {
+            let db = Db::open(&path).unwrap();
+            let error = clave::seal::run(&db, data.path(), &sk, now)
+                .err()
+                .unwrap_or_else(|| panic!("{} sealed", case["name"]));
+            if !case["allowed"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("WIST1-E05"))
+            {
+                assert!(
+                    case["allowed"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|code| { error.to_string().contains(code.as_str().unwrap()) }),
+                    "{}: {error}",
+                    case["name"]
+                );
+            }
+            assert!(db.last_block().unwrap().is_none(), "{}", case["name"]);
+            assert_eq!(db.count_pending_entries("publisher_delta").unwrap(), 1);
+            assert_eq!(
+                db.url_tip(&host, url).unwrap().as_deref(),
+                Some(id.as_str())
+            );
+            assert!(db.is_delta_seen(&id).unwrap());
+            assert!(db.list_rejections(&host).unwrap().is_empty());
+            assert!(db.list_records().unwrap().is_empty());
+            assert!(!data.path().join("log/blocks/000000000.json.zst").exists());
+            assert!(!data.path().join("log/checkpoint.json").exists());
+            assert_eq!(std::fs::read(&payload).unwrap(), original);
+            assert_eq!(
+                db.peek_pending_entries()
+                    .unwrap()
+                    .0
+                    .iter()
+                    .find(|entry| entry.entry_type == "publisher_delta")
+                    .unwrap()
+                    .entry_json,
+                signed
+            );
+        }
+    }
+}
+
+#[test]
+fn altered_retained_payload_preserves_chains_until_repaired_after_restart() {
+    let (listener, host, client) = reserve_addr();
+    let p = make_publisher(&host);
+    serve_static(listener, p.dir.path().to_path_buf());
+    let data = tempfile::tempdir().unwrap();
+    clave::init::run(&host, data.path()).unwrap();
+    let path = data.path().join("clave.sqlite");
+    let db = Db::open(&path).unwrap();
+    let first = add_delta(&p, "https://localhost/chain", "first", None);
+    let child = add_delta(&p, "https://localhost/chain", "child", Some(&first));
+    let other = add_delta(&p, "https://localhost/other", "other", None);
+    let ids = [first.clone(), child.clone(), other.clone()];
+    write_feed(&p, &host, &ids, "2026-08-09T12:00:00Z");
+    let report =
+        clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:02Z").unwrap();
+    assert_eq!(report.accepted, ids);
+    let payload = data.path().join(format!("payloads/{}.json", &first[7..]));
+    let original = std::fs::read(&payload).unwrap();
+    let mut altered: Value = serde_json::from_slice(&original).unwrap();
+    altered["content"]["extract"] = "wrong".into();
+    std::fs::write(&payload, serde_json::to_vec(&altered).unwrap()).unwrap();
+    let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
+    let now = "2026-08-09T12:00:03Z"
+        .parse::<jiff::Timestamp>()
+        .unwrap()
+        .as_second();
+    let error = clave::seal::run(&db, data.path(), &sk, now).err().unwrap();
+    assert!(error.to_string().contains("WIST1-E10"), "{error}");
+    assert!(db.last_block().unwrap().is_none());
+    assert_eq!(db.count_pending_entries("publisher_delta").unwrap(), 3);
+    assert_eq!(
+        db.url_tip(&host, "https://localhost/chain").unwrap(),
+        Some(child.clone())
+    );
+    for id in &ids {
+        assert!(db.is_delta_seen(id).unwrap());
+    }
+    assert!(db.list_rejections(&host).unwrap().is_empty());
+    drop(db);
+    let db = Db::open(&path).unwrap();
+    assert!(clave::seal::run(&db, data.path(), &sk, now).is_err());
+    std::fs::write(&payload, &original).unwrap();
+    let report = clave::seal::run(&db, data.path(), &sk, now).unwrap();
+    assert!(report.dropped.is_empty());
+    assert_eq!(db.count_pending_entries("publisher_delta").unwrap(), 0);
+    assert_eq!(
+        db.get_record("https://localhost/chain", &host)
+            .unwrap()
+            .unwrap()
+            .delta_id,
+        child
+    );
+    assert_eq!(
+        db.get_record("https://localhost/other", &host)
+            .unwrap()
+            .unwrap()
+            .delta_id,
+        other
+    );
+    assert_eq!(std::fs::read(&payload).unwrap(), original);
 }

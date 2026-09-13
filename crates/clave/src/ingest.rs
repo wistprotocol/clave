@@ -3,8 +3,8 @@ use crate::error::Result;
 use crate::fetch::Client;
 use serde_json::Value;
 use std::path::Path;
-use wist_core::delta::{content_bytes, delta_id, verify_commitment};
-use wist_core::objects::{DeltaEnvelope, FeedEnvelope, Payload, Publisher};
+use wist_core::delta::delta_id;
+use wist_core::objects::{DeltaEnvelope, FeedEnvelope, Publisher};
 
 use crate::declaration::{self, Decision};
 use crate::registry;
@@ -931,87 +931,13 @@ pub fn run_with_clock(
                     continue;
                 }
             };
-            if let Err(code) = crate::payload::validate_version(&payload_value) {
-                record_rejection(db, host, "WIST2-E03", now, Some(id), code)?;
-                report.rejected.push((id.clone(), "WIST2-E03".into()));
-                continue;
-            }
-            let payload_typed: Payload =
-                match serde_json::from_slice(&wist_core::jcs::canonicalize(&payload_value)?) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        record_rejection(
-                            db,
-                            host,
-                            "WIST2-E03",
-                            now,
-                            Some(id.as_str()),
-                            &e.to_string(),
-                        )?;
-                        report.rejected.push((id.clone(), "WIST2-E03".to_string()));
-                        continue;
-                    }
-                };
-            if verify_commitment(
-                &payload_typed.salt,
-                &payload_value["content"],
-                &commitment.commitment,
-            )
-            .is_err()
-            {
-                record_rejection(
-                    db,
-                    host,
-                    "WIST2-E03",
-                    now,
-                    Some(id.as_str()),
-                    "commitment verification failed",
-                )?;
-                report.rejected.push((id.clone(), "WIST2-E03".to_string()));
-                continue;
-            }
-            let bytes_ok =
-                matches!(content_bytes(&payload_value["content"]), Ok(b) if b == commitment.bytes);
-            if !bytes_ok {
-                record_rejection(
-                    db,
-                    host,
-                    "WIST2-E03",
-                    now,
-                    Some(id.as_str()),
-                    "content bytes mismatch",
-                )?;
-                report.rejected.push((id.clone(), "WIST2-E03".to_string()));
-                continue;
-            }
-
-            if crate::payload::validate_links(
-                &payload_typed.content.links,
+            if let Err(code) = crate::payload::validate(
+                &payload_value,
+                commitment,
                 &delta_env.delta.publisher,
-            )
-            .is_err()
-            {
-                record_rejection(
-                    db,
-                    host,
-                    "WIST2-E03",
-                    now,
-                    Some(id),
-                    "Payload links violate WIST1-E12",
-                )?;
-                report.rejected.push((id.clone(), "WIST2-E03".into()));
-                continue;
-            }
-
-            if size_caps.validate_payload_sizes(&payload_value).is_err() {
-                record_rejection(
-                    db,
-                    host,
-                    "WIST2-E03",
-                    now,
-                    Some(id),
-                    "Payload exceeds the attempt size caps",
-                )?;
+                &size_caps,
+            ) {
+                record_rejection(db, host, "WIST2-E03", now, Some(id), code)?;
                 report.rejected.push((id.clone(), "WIST2-E03".into()));
                 continue;
             }
