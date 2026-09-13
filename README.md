@@ -311,7 +311,7 @@ commitment, Publisher and committing caps under
 [Historical Payload validation](#historical-payload-validation). Extraction keeps
 the audited Delta's [profile](#historical-audit-extraction-profiles), available
 through `audited()`. [Historical Payload retrieval](#historical-payload-retrieval)
-checks copies from disk or an explicitly selected URL. Availability, withdrawal,
+checks configured disk and HTTP candidates. Availability, withdrawal,
 sanctions and verdict derivation remain separate requirements.
 
 Reconstruction scans the pinned prefix twice and retains the selected chain's
@@ -348,8 +348,9 @@ URL; WIST-3 §6.1 permits copies from any source because the commitment
 authenticates the content. Both methods apply
 [Historical Payload validation](#historical-payload-validation) before returning
 a `RetrievedPayload`. Its `source()` retains the authenticated Delta bindings,
-`raw()` exposes the original file bytes, and `payload()` exposes the checked
-typed content. Preserve `raw()` when storing a copy; serializing `payload()`
+`location()` records the file path or requested URL, `raw()` exposes the original
+file bytes, and `payload()` exposes the checked typed content.
+Preserve `raw()` when storing a copy; serializing `payload()`
 does not preserve the original representation.
 
 Invalid bytes return `Error::Payload` with the WIST-1 diagnostic. Disk and
@@ -359,17 +360,36 @@ write no files or history state and retain no failure cache, so callers can
 retry another copy. A resolved audit reference uses its `payload_source()`;
 an `attest` or `delete` reference has no own Payload to retrieve.
 
+`retrieve(client, candidates)` tries `PayloadLocation` file paths or URLs in
+caller-supplied order, stopping at the first verified copy. `retained_location`
+derives the local path; `distribution_location` appends the WIST-3 §6.1 path
+to a configured HTTP(S) origin, preserving its port; `publisher_location`
+derives the WIST-2 §3.1 path from the Delta's signed Publisher. Each uses the
+Payload source's Delta ID, including when a contentless audit reference resolves
+to an earlier anchor. Parsed distribution origins must be bare, without
+credentials, query strings or fragments; the client enforces transport eligibility
+when fetching.
+
+Source order is caller policy under WIST-3 §6.1's permission to use any copy.
+The successful result's `failed_attempts()` retains earlier locations and typed
+errors; exhausted or empty candidates return `PayloadRetrievalError` with all attempts.
+These diagnostics describe retrieval attempts, not protocol fault findings.
+The selected location is an in-memory transport locator, not evidence of authorship
+or the final redirect destination. Every copy retains the same authenticated
+commitment and historical caps regardless of location.
+
 HTTP retrieval uses the client's HTTPS guard, explicit loopback HTTP opt-in,
 30-second request timeout and five-hop redirect limit within the same Canonical
-Host. Response and file reads remain unbounded. Callers select sources and enforce withdrawal,
-availability and Record eligibility before using or retaining content; automatic
-discovery, fallback, durable replication and those policy integrations remain
-unimplemented.
+Host. Response and file reads remain unbounded. Callers supply candidates and enforce
+withdrawal, availability and Record eligibility before using or retaining content;
+source discovery, durable replication and those policy integrations remain unimplemented.
 
 Tests exercise 103 signed Payload field cases through disk and HTTP, historical
 cap amendments after reconstruction, named references including contentless
 successors, malformed and substituted copies, missing files/HTTP responses,
-retry, exact-byte preservation and unchanged authenticated history.
+retry, exact-byte preservation and unchanged authenticated history. Fallback tests
+cover local and HTTP failures, Publisher attribution across scoped hosts, early
+termination, preserved diagnostics, historical caps and reconstruction after restart.
 
 ## Declaration key binding
 

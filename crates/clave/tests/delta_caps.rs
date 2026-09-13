@@ -142,6 +142,21 @@ fn historical_payload_sources_keep_the_committing_profile_after_restart() {
             for result in [
                 source.read(data.path()),
                 source.fetch(&client, &format!("http://{host}/{name}")),
+                source
+                    .retrieve(
+                        &client,
+                        [
+                            source.retained_location(&data.path().join("missing")),
+                            source
+                                .distribution_location(&format!("http://{host}/"))
+                                .unwrap(),
+                        ],
+                    )
+                    .map_err(|failure| {
+                        assert_eq!(failure.attempts.len(), 2);
+                        assert!(matches!(failure.attempts[0].error, clave::Error::Io(_)));
+                        failure.attempts.into_iter().last().unwrap().error
+                    }),
             ] {
                 let code = match result {
                     Ok(copy) => {
