@@ -2042,6 +2042,234 @@ fn historical_sources_resolve_contentless_deltas_and_recreation_in_chain_order()
 }
 
 #[test]
+fn included_record_evidence_fields_enforce_measured_and_unmeasured_contracts() {
+    let example: Value = serde_json::from_slice(
+        &std::fs::read(spec_dir().join("examples/audit-record.json")).unwrap(),
+    )
+    .unwrap();
+    let commitments: Value = serde_json::from_slice(
+        &std::fs::read(spec_dir().join("vectors/wist4/audit-commitments.json")).unwrap(),
+    )
+    .unwrap();
+    let unmeasured: Value = serde_json::from_slice(
+        &std::fs::read(spec_dir().join("vectors/wist4/unauditable.json")).unwrap(),
+    )
+    .unwrap();
+    let fields = [
+        "response_commitment",
+        "credit_commitment",
+        "ref_extract_commitment",
+        "evidence_commitment",
+    ];
+    for field in fields {
+        assert_eq!(
+            example["record"][field],
+            commitments["commitments"][field]["value"]
+        );
+    }
+    let mut probes = std::collections::BTreeMap::new();
+    let mut push = |label: String, body: Value, expected: bool| {
+        let record = envelope::sign_envelope(
+            &body,
+            "record",
+            "r1",
+            &crypto::SigningKey::from_seed(&[17; 32]),
+        )
+        .unwrap();
+        probes.insert(
+            jcs::canonicalize(&record).unwrap(),
+            (label, record, expected),
+        );
+    };
+    for verdict in [
+        "consistent",
+        "dynamic_variance",
+        "inconsistent",
+        "link_variance",
+        "link_inconsistent",
+        "unreachable",
+        "not_auditable",
+    ] {
+        let measured = !matches!(verdict, "unreachable" | "not_auditable");
+        let mut base = example["record"].clone();
+        base["verdict"] = json!(verdict);
+        base.as_object_mut().unwrap().remove("link_agreement");
+        if matches!(verdict, "link_variance" | "link_inconsistent") {
+            base["link_agreement"] = json!(0);
+        }
+        if !measured {
+            for field in fields.into_iter().chain(["similarity"]) {
+                base.as_object_mut().unwrap().remove(field);
+            }
+        }
+        if verdict == "not_auditable" {
+            base["unmeasured"] = json!("observed");
+        }
+        push(verdict.into(), base.clone(), true);
+        for field in fields {
+            let mut missing = base.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            push(format!("{verdict}/{field}/absent"), missing, !measured);
+            for value in [
+                Value::Null,
+                json!(false),
+                json!(0),
+                json!([]),
+                json!({}),
+                json!(""),
+                json!(format!("sha256:{}", "a".repeat(64))),
+                json!(format!("hmac-sha256:{}", "A".repeat(64))),
+                json!(format!("hmac-sha256:{}", "a".repeat(63))),
+                json!(format!("hmac-sha256:{}", "a".repeat(65))),
+                json!(format!("hmac-sha256:{}\n", "a".repeat(64))),
+                json!(format!("hmac-sha256:{}", "g".repeat(64))),
+                example["record"][field].clone(),
+            ] {
+                let valid = value == example["record"][field];
+                let mut body = base.clone();
+                body[field] = value;
+                push(format!("{verdict}/{field}"), body, measured && valid);
+            }
+        }
+        for field in ["similarity", "link_agreement"] {
+            let mut missing = base.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            let optional = if field == "similarity" {
+                !measured
+            } else {
+                !matches!(verdict, "link_variance" | "link_inconsistent")
+            };
+            push(format!("{verdict}/{field}/absent"), missing, optional);
+            for literal in [
+                "0",
+                "-0",
+                "0.0",
+                "6e5",
+                "1000000.0",
+                "1000001",
+                "-1",
+                "0.5",
+                "null",
+                "false",
+                "[]",
+                "{}",
+                "\"600000\"",
+            ] {
+                let value: Value = serde_json::from_str(literal).unwrap();
+                let valid = matches!(literal, "0" | "-0" | "0.0" | "6e5" | "1000000.0");
+                let mut body = base.clone();
+                body[field] = value;
+                push(
+                    format!("{verdict}/{field}/{literal}"),
+                    body,
+                    measured && valid,
+                );
+            }
+        }
+        for value in [
+            json!(true),
+            json!(false),
+            Value::Null,
+            json!("true"),
+            json!(1),
+        ] {
+            let mut body = base.clone();
+            body["robots_excluded"] = value.clone();
+            push(
+                format!("{verdict}/robots_excluded"),
+                body,
+                verdict == "unreachable" && value == true,
+            );
+        }
+        let mut absent = base.clone();
+        absent.as_object_mut().unwrap().remove("unmeasured");
+        push(
+            format!("{verdict}/unmeasured/absent"),
+            absent,
+            verdict != "not_auditable",
+        );
+        for value in [
+            json!("observed"),
+            json!("reference"),
+            json!("mirror"),
+            Value::Null,
+            json!(false),
+        ] {
+            let mut body = base.clone();
+            body["unmeasured"] = value.clone();
+            push(
+                format!("{verdict}/unmeasured"),
+                body,
+                verdict == "not_auditable"
+                    && matches!(value.as_str(), Some("observed" | "reference")),
+            );
+        }
+    }
+    for value in [
+        Value::Null,
+        json!("unknown"),
+        json!(1),
+        json!([]),
+        json!({}),
+    ] {
+        let mut body = example["record"].clone();
+        body["verdict"] = value;
+        push("invalid verdict".into(), body, false);
+    }
+    for side in unmeasured["fetch_budget"]["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(unmeasured["fetch_transport"]["cases"].as_array().unwrap())
+    {
+        let mut body = example["record"].clone();
+        for field in fields.into_iter().chain(["similarity", "link_agreement"]) {
+            body.as_object_mut().unwrap().remove(field);
+        }
+        for (field, value) in side["record"].as_object().unwrap() {
+            body[field] = value.clone();
+        }
+        push("unauditable vector".into(), body, true);
+    }
+    let mut forged = example.clone();
+    forged["sig"]["value"] = json!("A".repeat(86));
+    probes.insert(
+        jcs::canonicalize(&forged).unwrap(),
+        ("forged signature".into(), forged, true),
+    );
+    let mut f = Fixture::new();
+    f.append(
+        probes
+            .values()
+            .map(|(_, record, _)| entry("audit_record", record))
+            .collect(),
+    );
+    let retained = std::fs::read(f.path(0)).unwrap();
+    for _ in 0..2 {
+        let records = IncludedRecord::reconstruct_all(f.data.path(), f.head.clone()).unwrap();
+        assert_eq!(records.len(), probes.len());
+        for record in records {
+            let raw = jcs::canonicalize(record.envelope()).unwrap();
+            let (label, _, expected) = &probes[&raw];
+            let signature = envelope::verify_envelope(
+                record.envelope(),
+                "record",
+                &crypto::SigningKey::from_seed(&[17; 32]).public(),
+            );
+            assert_eq!(signature.is_ok(), label != "forged signature");
+            assert_eq!(
+                record.evidence_fields_valid(),
+                *expected,
+                "{label}: {}",
+                record.envelope()
+            );
+            assert_eq!(jcs::canonicalize(record.envelope()).unwrap(), raw);
+        }
+        assert_eq!(std::fs::read(f.path(0)).unwrap(), retained);
+    }
+}
+
+#[test]
 fn included_record_scores_use_reference_change_and_reject_malformed_readings() {
     let p = make_publisher_with_scope("parent.example", &["shared.example"]);
     let (root, _) = content(&p);

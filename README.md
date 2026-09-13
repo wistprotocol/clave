@@ -407,6 +407,31 @@ endpoints, same-Block references, contentless anchors, malformed fields/times,
 forged Record signature preservation, identical hashes under different Anchors,
 alternate directories, later invalid history, restart and file repair.
 
+## Included Record evidence fields
+
+`IncludedRecord::evidence_fields_valid()` checks WIST-4 §5 and
+`audit-record.schema.json`'s evidence fields without resolving a reference or
+retrieving content. Measured verdicts require all four HMAC-SHA256 commitments
+and an integral similarity in 0 … 1,000,000; unmeasured verdicts forbid those
+fields and link scores. Link verdicts require an in-range link score.
+`robots_excluded`, when present, must be `true` on `unreachable`;
+`unmeasured` must be `observed` or `reference` on exactly `not_auditable`.
+
+The boolean reports this field relation only. It assigns no error code,
+reputation weight or coverage discharge, and leaves the included Envelope
+unchanged on either outcome. Complete Envelope fields, version support,
+signatures, standing and measurement truth require separate validation;
+reference-dependent checks follow [Included Record verdict scores](#included-record-verdict-scores).
+Replay uses canonical Block bytes, so equivalent integral JSON spellings
+reach this predicate as the same number.
+
+Signed-history tests use the example Record, commitment vectors and unauditable
+fetch cases. They exercise every verdict, missing/null/malformed commitments,
+score boundaries and numeric spellings, conditional evidence markers, forged
+signatures, reconstruction after restart and preservation of retained Blocks.
+The supplied unmeasured causes establish field eligibility, not fetch outcomes
+or the unauditable horizon.
+
 ## Included Record verdict scores
 
 `RecordReference::validate_verdict_scores()` applies WIST-4 §§3/5's
