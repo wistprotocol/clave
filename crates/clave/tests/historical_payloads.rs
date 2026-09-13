@@ -1,7 +1,7 @@
 mod common;
 
 use clave::db::BlockRow;
-use clave::history::{deltas::DeltaSource, payloads::PayloadSource};
+use clave::history::{deltas::DeltaSource, payloads::PayloadSource, references::AuditChain};
 use common::*;
 use serde_json::{json, Value};
 use wist_core::{block, crypto, envelope, jcs, merkle};
@@ -193,7 +193,12 @@ fn authenticated_audit_profiles_reproduce_vectors_across_amendments_and_restart(
                 "{}",
                 case["label"],
             );
-            let reference_source = f.source(&reference).unwrap();
+            let chain = AuditChain::reconstruct(f.data.path(), f.head.clone(), &id).unwrap();
+            let resolved = chain
+                .resolve(&reference_id, &f.head.as_ref().unwrap().sealed_at)
+                .unwrap();
+            assert_eq!(chain.audited().audit_profile(), profile);
+            let reference_source = resolved.payload_source().unwrap();
             let payload = reference_source.validate(&raw).unwrap();
             if case["audited_delta_sealed_at_s"].as_i64().unwrap() < 604800 {
                 assert_ne!(profile, reference_source.delta_source().audit_profile());
@@ -631,10 +636,26 @@ fn historical_payloads_require_authenticated_ancestors_and_all_later_delta_chain
         }
         for _ in 0..2 {
             assert_eq!(f.source(&target).is_ok(), fault == "none", "{fault}");
+            assert_eq!(
+                AuditChain::reconstruct(
+                    f.data.path(),
+                    f.head.clone(),
+                    &wist_core::delta::delta_id(&target["delta"]).unwrap(),
+                )
+                .is_ok(),
+                fault == "none",
+                "{fault}",
+            );
         }
         if fault.starts_with("late_") {
             f.head = good_prefix;
             f.source(&target).unwrap();
+            AuditChain::reconstruct(
+                f.data.path(),
+                f.head.clone(),
+                &wist_core::delta::delta_id(&target["delta"]).unwrap(),
+            )
+            .unwrap();
         }
     }
 }
@@ -682,6 +703,25 @@ fn historical_sources_preserve_chain_ownership_across_identity_resets() {
                 assert_eq!(delta.declaration().envelope(), &replacement);
                 assert_eq!(delta.identity_start(), delta.declaration().position());
                 assert_eq!(delta.identity_start().block_number, 1);
+                let chain = AuditChain::reconstruct(
+                    f.data.path(),
+                    f.head.clone(),
+                    &wist_core::delta::delta_id(&root_a["delta"]).unwrap(),
+                )
+                .unwrap();
+                let at = &f.head.as_ref().unwrap().sealed_at;
+                let reference = chain.resolve(delta.id(), at).unwrap();
+                assert_eq!(reference.delta().declaration().envelope(), &replacement);
+                assert_eq!(
+                    chain.audited().declaration().envelope(),
+                    &current_declaration(&a)
+                );
+                assert!(chain
+                    .resolve(&wist_core::delta::delta_id(&root_b["delta"]).unwrap(), at,)
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("WIST4-E02"));
                 for (root, publisher) in [(&root_a, &a), (&root_b, &b)] {
                     let earlier = f.delta_source(root).unwrap();
                     assert_eq!(earlier.identity_start(), earlier.declaration().position());
@@ -726,6 +766,17 @@ fn historical_sources_resolve_contentless_deltas_and_recreation_in_chain_order()
         if same_block {
             f.append(entries);
         }
+        let references = AuditChain::reconstruct(
+            f.data.path(),
+            f.head.clone(),
+            &wist_core::delta::delta_id(&chain[0]["delta"]).unwrap(),
+        )
+        .unwrap();
+        let at = &f.head.as_ref().unwrap().sealed_at;
+        assert_eq!(
+            references.newest_at(at).unwrap().unwrap().envelope(),
+            chain.last().unwrap()
+        );
         for (i, delta) in chain.iter().enumerate() {
             let source = f.delta_source(delta).unwrap();
             assert_eq!(source.envelope(), delta);
@@ -733,6 +784,10 @@ fn historical_sources_resolve_contentless_deltas_and_recreation_in_chain_order()
                 source.position().block_number,
                 if same_block { 0 } else { i as u64 }
             );
+            let reference = references.resolve(source.id(), at).unwrap();
+            let anchor = reference.payload_source().unwrap();
+            assert_eq!(anchor.envelope(), if i == 3 { delta } else { &chain[0] });
+            anchor.validate(&payload).unwrap();
             if i == 0 || i == 3 {
                 f.source(delta).unwrap().validate(&payload).unwrap();
             } else {
@@ -745,4 +800,154 @@ fn historical_sources_resolve_contentless_deltas_and_recreation_in_chain_order()
             }
         }
     }
+}
+
+#[test]
+fn authenticated_reference_vectors_resolve_named_and_newest_deltas() {
+    let vector: Value = serde_json::from_slice(
+        &std::fs::read(spec_dir().join("vectors/wist4/superseded-audit.json")).unwrap(),
+    )
+    .unwrap();
+    let p = make_publisher_with_scope("parent.example", &["shared.example"]);
+    let mut f = Fixture::new();
+    let (root, _) = content(&p);
+    let mut other_root = root["delta"].clone();
+    other_root["url"] = json!("https://shared.example/other");
+    let other_root = envelope::sign_envelope(&other_root, "delta", "k1", &p.sk).unwrap();
+    f.append_at(
+        vec![
+            entry("publisher_declaration", &current_declaration(&p)),
+            entry("publisher_delta", &root),
+            entry("publisher_delta", &other_root),
+        ],
+        -3600,
+    );
+    let mut named = std::collections::BTreeMap::<String, Value>::new();
+    let mut payloads = std::collections::BTreeMap::<String, Vec<u8>>::new();
+    for (name, url, first) in [
+        ("chain", "https://shared.example/page", &root),
+        ("other_chain", "https://shared.example/other", &other_root),
+    ] {
+        let mut prev = wist_core::delta::delta_id(&first["delta"]).unwrap();
+        for (i, description) in vector[name].as_array().unwrap().iter().enumerate() {
+            let content_name = description["payload"].as_str().unwrap_or("unused");
+            let id = add_delta_signed(
+                &p,
+                url,
+                content_name,
+                Some(&prev),
+                &format!("2026-08-09T12:00:{:02}Z", i + 1),
+                "k1",
+                &K1_SEED,
+            );
+            let base = p.dir.path().join(".well-known/wist");
+            let doc: Value = serde_json::from_slice(
+                &std::fs::read(base.join(format!("deltas/{}.json", &id[7..]))).unwrap(),
+            )
+            .unwrap();
+            let mut body = doc["delta"].clone();
+            body["change_type"] = description["change"].clone();
+            if description["payload"].is_null() {
+                body.as_object_mut().unwrap().remove("payload");
+            } else {
+                payloads.insert(
+                    content_name.into(),
+                    std::fs::read(base.join(format!("payloads/{}.json", &id[7..]))).unwrap(),
+                );
+            }
+            prev = wist_core::delta::delta_id(&body).unwrap();
+            named.insert(
+                description["id"].as_str().unwrap().into(),
+                envelope::sign_envelope(&body, "delta", "k1", &p.sk).unwrap(),
+            );
+        }
+    }
+    for height in 1..=10 {
+        let entries = vector["chain"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(vector["other_chain"].as_array().unwrap())
+            .filter(|description| description["height"] == height)
+            .map(|description| {
+                entry(
+                    "publisher_delta",
+                    &named[description["id"].as_str().unwrap()],
+                )
+            })
+            .collect();
+        f.append_at(entries, (height - 1) * 3600);
+    }
+    let id = |name: &str| wist_core::delta::delta_id(&named[name]["delta"]).unwrap();
+    let cases = vector["cases"].as_array().unwrap();
+    assert_eq!(cases.len(), 10);
+    for _ in 0..2 {
+        for case in cases {
+            let chain = AuditChain::reconstruct(
+                f.data.path(),
+                f.head.clone(),
+                &id(case["audited"].as_str().unwrap()),
+            )
+            .unwrap();
+            let at = jiff::Timestamp::from_second(
+                1_800_000_000 + case["fetched_at_s"].as_i64().unwrap(),
+            )
+            .unwrap()
+            .to_string();
+            assert_eq!(
+                chain.newest_at(&at).unwrap().unwrap().id(),
+                id(case["expected_reference"].as_str().unwrap()),
+                "{}",
+                case["label"],
+            );
+            let result = chain.resolve(&id(case["reference"].as_str().unwrap()), &at);
+            if case["valid"] != true {
+                assert!(result.err().unwrap().to_string().contains("WIST4-E02"));
+                continue;
+            }
+            let reference = result.unwrap();
+            assert_eq!(
+                reference.delta().envelope()["delta"]["change_type"],
+                case["reading_change"],
+            );
+            let payload_name = case["resolved_payload"].as_str().unwrap();
+            let source = reference.payload_source().unwrap();
+            assert_eq!(
+                source
+                    .validate(&payloads[payload_name])
+                    .unwrap()
+                    .content
+                    .extract,
+                payload_name,
+            );
+            let wrong = if payload_name == "P1" { "P2" } else { "P1" };
+            assert!(source.validate(&payloads[wrong]).is_err());
+        }
+    }
+    let chain = AuditChain::reconstruct(f.data.path(), f.head.clone(), &id("d1")).unwrap();
+    assert!(chain.newest_at("0000-01-01T00:00:00Z").unwrap().is_none());
+    assert_eq!(
+        chain
+            .newest_at("9999-12-31T23:59:59Z")
+            .unwrap()
+            .unwrap()
+            .id(),
+        id("d5")
+    );
+    for at in [
+        "2026-08-09T12:00:60Z",
+        "2026-08-09T12:00:00.0Z",
+        "2026-08-09T12:00:00+00:00",
+    ] {
+        assert!(chain.newest_at(at).is_err());
+        assert!(chain.resolve(&id("d1"), at).is_err());
+    }
+    let path = f.path(10);
+    let bytes = std::fs::read(&path).unwrap();
+    std::fs::write(&path, b"broken").unwrap();
+    for _ in 0..2 {
+        assert!(AuditChain::reconstruct(f.data.path(), f.head.clone(), &id("d1")).is_err());
+    }
+    std::fs::write(path, bytes).unwrap();
+    AuditChain::reconstruct(f.data.path(), f.head.clone(), &id("d1")).unwrap();
 }

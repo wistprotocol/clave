@@ -9,9 +9,12 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::Path;
 
+#[derive(Clone)]
 pub struct DeltaSource {
+    id: String,
     envelope: Value,
     position: Position,
+    sealed_at_s: i64,
     declaration: Declaration,
     identity_start: Position,
     caps: SizeCaps,
@@ -20,28 +23,42 @@ pub struct DeltaSource {
 
 impl DeltaSource {
     pub fn reconstruct(directory: &Path, head: Option<BlockRow>, delta_id: &str) -> Result<Self> {
+        Self::reconstruct_matching(directory, head, |id, _| id == delta_id)?
+            .pop()
+            .ok_or_else(|| failure("requested Delta is absent from the pinned history"))
+    }
+
+    pub(crate) fn reconstruct_matching(
+        directory: &Path,
+        head: Option<BlockRow>,
+        select: impl Fn(&str, &Value) -> bool,
+    ) -> Result<Vec<Self>> {
         let mut history = History::open(directory, head)?;
         let mut declarations = Declarations::default();
         let mut chains = Chains::default();
-        let mut found = None;
+        let mut found = Vec::new();
         while let Some(block) = history.next_block()? {
             declarations.apply(&block)?;
             chains.apply(&block, &declarations)?;
             for (entry_index, entry) in block.block().entries.iter().enumerate() {
-                if entry["type"] != "publisher_delta"
-                    || wist_core::delta::delta_id(&entry["body"]["delta"])? != delta_id
-                {
+                if entry["type"] != "publisher_delta" {
                     continue;
                 }
                 let envelope = &entry["body"];
+                let id = wist_core::delta::delta_id(&envelope["delta"])?;
+                if !select(&id, envelope) {
+                    continue;
+                }
                 let domain =
                     &declarations.domains()[envelope["delta"]["publisher"].as_str().unwrap()];
-                found = Some(Self {
+                found.push(Self {
+                    id,
                     envelope: envelope.clone(),
                     position: Position {
                         block_number: block.block().header.block_number,
                         entry_index,
                     },
+                    sealed_at_s: block.sealed_at_s(),
                     declaration: domain.delta_sealing_source().unwrap().clone(),
                     identity_start: domain.reset().unwrap_or(domain.first()),
                     caps: block.delta_size_caps().clone(),
@@ -49,7 +66,15 @@ impl DeltaSource {
                 });
             }
         }
-        found.ok_or_else(|| failure("requested Delta is absent from the pinned history"))
+        Ok(found)
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn sealed_at_s(&self) -> i64 {
+        self.sealed_at_s
     }
 
     pub fn envelope(&self) -> &Value {

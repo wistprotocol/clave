@@ -1,6 +1,7 @@
 pub mod declarations;
 pub mod deltas;
 pub mod payloads;
+pub mod references;
 
 use crate::db::BlockRow;
 use crate::error::{Error, Result};

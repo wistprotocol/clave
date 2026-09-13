@@ -215,8 +215,9 @@ observations stop reconstruction, including failures after the requested Delta.
 This is a strict integrity check of the Aggregator's retained history; it does
 not implement Consumer ignored-Entry dispositions.
 
-The source retains the original Envelope, canonical Entry position, authenticating
-Declaration, identity's first-installation or latest reset position, committing
+The source retains its Delta ID, original Envelope, canonical Entry position,
+Block sealing time, authenticating Declaration, identity's first-installation
+or latest reset position, committing
 size caps and [audit extraction profile](#historical-audit-extraction-profiles).
 Later history cannot change those bindings. Contentless `attest`
 and `delete` Deltas are supported. Sealed-predecessor admission uses this source;
@@ -256,6 +257,41 @@ outcomes before and at amendment effectiveness. Tests cover later reference
 Payloads, subsequent parameter resets, reconstruction after restart, corrupt
 later Blocks with repair/retry, and rejected signature, value and grace-period
 amendments.
+
+## Historical audit references
+
+`history::references::AuditChain::reconstruct(directory, pinned_head, audited_id)`
+authenticates the audited Delta and its complete Publisher/URL chain under
+[Historical Delta sources](#historical-delta-sources). Predecessor links order
+Deltas within each Block; rotations and identity resets preserve chain ownership.
+The result retains each Delta's original authority, sealing time and parameter
+profiles. Reconstruction exposes no state until the complete pinned prefix passes,
+including unrelated or later Delta checks.
+
+`newest_at(fetched_at)` selects WIST-4 §5's newest Delta sealed at or before that
+instant, or returns none if no chain member qualifies. `resolve(reference_id,
+fetched_at)` checks the named reference under §3: another chain, a predecessor of
+the audited Delta or a Delta sealed after the fetch rejects with WIST4-E02.
+An older eligible reference remains valid evidence under that relation. Both
+methods require the strict whole-second Log timestamp profile. Callers must
+separately establish the Record's fetch interval, standing, authorship and remaining
+eligibility; these methods do not validate an Audit Record.
+
+The resolved `Reference` exposes its named `delta()` and `payload_source()`:
+the reference's own Payload for `new`/`update`, otherwise the last content-bearing
+predecessor's. The Payload source validates supplied bytes with its original
+commitment, Publisher and committing caps under
+[Historical Payload validation](#historical-payload-validation). Extraction keeps
+the audited Delta's [profile](#historical-audit-extraction-profiles), available
+through `audited()`. Retrieval, availability, withdrawal, sanctions and verdict
+derivation remain separate requirements.
+
+Reconstruction scans the pinned prefix twice and retains the selected chain's
+Envelopes and bindings, in addition to the underlying replay state; bounded work
+and caches remain unimplemented. Tests embed all ten `superseded-audit.json`
+reference cases in signed histories and cover same-Block chain order, historical
+caps and extraction profiles, shared-host Publishers, identity resets, malformed
+fetch timestamps, invalid ancestors/later Entries, restart and repair/retry.
 
 ## Historical Payload validation
 

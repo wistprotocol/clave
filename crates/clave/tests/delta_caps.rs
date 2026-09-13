@@ -134,6 +134,17 @@ fn historical_payload_sources_keep_the_committing_profile_after_restart() {
             assert_eq!(json!(source.block_number()), object["sealed_height"]);
             assert_eq!(json!(source.size_caps()), probe["expected_profile"]);
             assert_eq!(json!(source.validate(&raw).err()), probe["expected"]);
+            let chain = clave::history::references::AuditChain::reconstruct(
+                data.path(),
+                Some(head.clone()),
+                &id,
+            )
+            .unwrap();
+            let reference = chain.resolve(&id, &head.sealed_at).unwrap();
+            let anchor = reference.payload_source().unwrap();
+            assert_eq!(anchor.envelope(), &object["envelope"]);
+            assert_eq!(json!(anchor.size_caps()), probe["expected_profile"]);
+            assert_eq!(json!(anchor.validate(&raw).err()), probe["expected"]);
         }
     }
     for case in vector["invalid_blocks"].as_array().unwrap() {

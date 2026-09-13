@@ -14,6 +14,10 @@ pub struct PayloadSource {
 impl PayloadSource {
     pub fn reconstruct(directory: &Path, head: Option<BlockRow>, delta_id: &str) -> Result<Self> {
         let delta = DeltaSource::reconstruct(directory, head, delta_id)?;
+        Self::from_delta(delta)
+    }
+
+    pub(crate) fn from_delta(delta: DeltaSource) -> Result<Self> {
         let commitment = delta.envelope()["delta"]
             .get("payload")
             .ok_or_else(|| failure("requested Delta has no Payload commitment"))?;
