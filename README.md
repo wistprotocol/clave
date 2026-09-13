@@ -285,6 +285,32 @@ profile. Rejected signatures, values and grace periods supply no thresholds;
 replay, automatic source selection and availability/withdrawal enforcement
 remain required.
 
+## Historical sampling inputs
+
+`DeltaSource::sampling_constants()` retains `sampling_floor`, `sampling_ceiling`
+and `sampling_slope` from the accepted parameter schedule at the Delta's sealing
+Block under WIST-4 §§4/9. Amendments apply at their exact effective instant;
+later Blocks and audit references cannot replace that profile.
+`VerifiedBlock::sampling_constants()` supplies the same values for streaming
+callers under [Authenticated history](#authenticated-history).
+
+`DeltaSource::block_hash()` retains the authenticated committing Block Hash.
+Pass it to core's `sampling::alpha_from_block_hash` for the VRF input, then use
+the full `DeltaSource::id()` for the draw. Reconstruction validates the complete
+pinned prefix before returning either binding, including for Block 0.
+
+These inputs do not establish Auditor standing or selection. Callers must
+derive Publisher reputation and sanction/escalation state at the preceding
+height, using the audited Block's applicable parameters, and enforce roster,
+self-audit, selection-domain and extension rules before accepting a Record.
+Those replay integrations remain unimplemented.
+
+Signed-history tests cover increases and decreases of each constant before,
+at and after effectiveness, negative slopes and zero, later references and resets,
+reconstruction, VRF proof binding to the original Block, corrupt-prefix repair
+and rejected signature/value/grace amendments. Default profiles reproduce
+`sampling.json`'s rate cases, including sanction and escalation overrides.
+
 ## Historical audit references
 
 `history::references::AuditChain::reconstruct(directory, pinned_head, audited_id)`

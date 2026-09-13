@@ -23,6 +23,7 @@ pub struct VerifiedBlock {
     delta_size_caps: crate::declaration::delta::SizeCaps,
     audit_profile: wist_core::canary::ScoringProfile,
     verdict_thresholds: wist_core::verdict::Thresholds,
+    sampling_constants: wist_core::sampling::SamplingConstants,
 }
 
 impl VerifiedBlock {
@@ -52,6 +53,10 @@ impl VerifiedBlock {
 
     pub fn verdict_thresholds(&self) -> &wist_core::verdict::Thresholds {
         &self.verdict_thresholds
+    }
+
+    pub fn sampling_constants(&self) -> &wist_core::sampling::SamplingConstants {
+        &self.sampling_constants
     }
 
     pub fn rejected_parameters(&self) -> &[usize] {
@@ -226,6 +231,11 @@ impl History {
                 as u64,
             link_variance_floor: schedule.value_at("link_variance_floor", at).unwrap() as u64,
         };
+        let sampling_constants = wist_core::sampling::SamplingConstants {
+            floor_1e7: schedule.value_at("sampling_floor", at).unwrap() as u64,
+            ceiling_1e7: schedule.value_at("sampling_ceiling", at).unwrap() as u64,
+            slope_per_micro: schedule.value_at("sampling_slope", at).unwrap(),
+        };
         self.schedule = Some(schedule);
         Ok(Some(VerifiedBlock {
             block,
@@ -237,6 +247,7 @@ impl History {
             delta_size_caps,
             audit_profile,
             verdict_thresholds,
+            sampling_constants,
         }))
     }
 

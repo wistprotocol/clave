@@ -15,11 +15,13 @@ pub struct DeltaSource {
     envelope: Value,
     position: Position,
     sealed_at_s: i64,
+    block_hash: String,
     declaration: Declaration,
     identity_start: Position,
     caps: SizeCaps,
     audit_profile: wist_core::canary::ScoringProfile,
     verdict_thresholds: wist_core::verdict::Thresholds,
+    sampling_constants: wist_core::sampling::SamplingConstants,
 }
 
 impl DeltaSource {
@@ -60,11 +62,13 @@ impl DeltaSource {
                         entry_index,
                     },
                     sealed_at_s: block.sealed_at_s(),
+                    block_hash: block.hash().into(),
                     declaration: domain.delta_sealing_source().unwrap().clone(),
                     identity_start: domain.reset().unwrap_or(domain.first()),
                     caps: block.delta_size_caps().clone(),
                     audit_profile: *block.audit_profile(),
                     verdict_thresholds: *block.verdict_thresholds(),
+                    sampling_constants: *block.sampling_constants(),
                 });
             }
         }
@@ -77,6 +81,14 @@ impl DeltaSource {
 
     pub fn sealed_at_s(&self) -> i64 {
         self.sealed_at_s
+    }
+
+    pub fn block_hash(&self) -> &str {
+        &self.block_hash
+    }
+
+    pub fn sampling_constants(&self) -> &wist_core::sampling::SamplingConstants {
+        &self.sampling_constants
     }
 
     pub fn envelope(&self) -> &Value {

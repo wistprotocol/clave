@@ -121,6 +121,290 @@ fn profile_change(f: &Fixture, parameter: &str, value: i64, effective_s: i64) ->
 }
 
 #[test]
+fn historical_sampling_inputs_freeze_at_the_audited_block() {
+    use wist_core::sampling::{self, SamplingConstants};
+
+    for (parameter, value, expected, rate) in [
+        (
+            "sampling_floor",
+            400_000,
+            SamplingConstants {
+                floor_1e7: 400_000,
+                ..SamplingConstants::default()
+            },
+            1_900_000,
+        ),
+        (
+            "sampling_floor",
+            100_000,
+            SamplingConstants {
+                floor_1e7: 100_000,
+                ..SamplingConstants::default()
+            },
+            1_600_000,
+        ),
+        (
+            "sampling_ceiling",
+            6_000_000,
+            SamplingConstants {
+                ceiling_1e7: 6_000_000,
+                ..SamplingConstants::default()
+            },
+            1_700_000,
+        ),
+        (
+            "sampling_ceiling",
+            4_000_000,
+            SamplingConstants {
+                ceiling_1e7: 4_000_000,
+                ..SamplingConstants::default()
+            },
+            1_700_000,
+        ),
+        (
+            "sampling_slope",
+            1,
+            SamplingConstants {
+                slope_per_micro: 1,
+                ..SamplingConstants::default()
+            },
+            700_000,
+        ),
+        (
+            "sampling_slope",
+            7,
+            SamplingConstants {
+                slope_per_micro: 7,
+                ..SamplingConstants::default()
+            },
+            3_700_000,
+        ),
+        (
+            "sampling_slope",
+            -9_007_199_254_740_991,
+            SamplingConstants {
+                slope_per_micro: -9_007_199_254_740_991,
+                ..SamplingConstants::default()
+            },
+            200_000,
+        ),
+        (
+            "sampling_slope",
+            0,
+            SamplingConstants {
+                slope_per_micro: 0,
+                ..SamplingConstants::default()
+            },
+            200_000,
+        ),
+    ] {
+        for offset in [-3600, 0, 3600] {
+            let p = make_publisher_with_scope("parent.example", &["shared.example"]);
+            let (delta, _) = content(&p);
+            let mut f = Fixture::new();
+            let change = profile_change(&f, parameter, value, 604_800);
+            f.append_at(
+                vec![
+                    entry("publisher_declaration", &current_declaration(&p)),
+                    entry("registry_update", &change),
+                ],
+                0,
+            );
+            f.append_at(vec![entry("publisher_delta", &delta)], 604_800 + offset);
+            let audited_head = f.head.clone().unwrap();
+            let frozen = f.delta_source(&delta).unwrap();
+            let constants = if offset < 0 {
+                SamplingConstants::default()
+            } else {
+                expected
+            };
+            assert_eq!(
+                *frozen.sampling_constants(),
+                constants,
+                "{parameter} at {offset}"
+            );
+            assert_eq!(frozen.block_hash(), audited_head.block_hash);
+            let alpha = sampling::alpha_from_block_hash(frozen.block_hash()).unwrap();
+            let proof = wist_core::vrf::prove(&K1_SEED, &alpha).unwrap();
+            let public_key: [u8; 32] = crypto::b64u_decode(&p.sk.public().to_b64u())
+                .unwrap()
+                .try_into()
+                .unwrap();
+            let beta = wist_core::vrf::verify(&public_key, &alpha, &proof).unwrap();
+            let draw = sampling::draw(&beta, frozen.id());
+            assert_eq!(
+                sampling::p_1e7(500_000, false, false, &constants),
+                if offset < 0 { 1_700_000 } else { rate }
+            );
+            for (sanction, escalation) in [(true, false), (false, true), (true, true)] {
+                assert_eq!(
+                    sampling::p_1e7(1_000_000, sanction, escalation, &constants),
+                    constants.ceiling_1e7
+                );
+            }
+            let reset = profile_change(
+                &f,
+                parameter,
+                clave::registry::spec(parameter).unwrap().default.unwrap(),
+                1_296_000,
+            );
+            let mut successor = delta["delta"].clone();
+            successor["prev"] = json!(frozen.id());
+            successor["observed_at"] = json!("2026-08-09T12:00:01Z");
+            let successor = envelope::sign_envelope(&successor, "delta", "k1", &p.sk).unwrap();
+            f.append_at(
+                vec![
+                    entry("registry_update", &reset),
+                    entry("publisher_delta", &successor),
+                ],
+                691_200,
+            );
+            let reference_head = f.head.clone().unwrap();
+            f.append_at(vec![], 1_296_000);
+            for _ in 0..2 {
+                let chain =
+                    AuditChain::reconstruct(f.data.path(), f.head.clone(), frozen.id()).unwrap();
+                let audited = chain.audited();
+                assert_eq!(*audited.sampling_constants(), constants);
+                assert_eq!(audited.block_hash(), audited_head.block_hash);
+                assert_eq!(
+                    sampling::draw(
+                        &wist_core::vrf::verify(
+                            &public_key,
+                            &sampling::alpha_from_block_hash(audited.block_hash()).unwrap(),
+                            &proof
+                        )
+                        .unwrap(),
+                        audited.id()
+                    ),
+                    draw
+                );
+                let reference = chain
+                    .resolve(
+                        &wist_core::delta::delta_id(&successor["delta"]).unwrap(),
+                        &f.head.as_ref().unwrap().sealed_at,
+                    )
+                    .unwrap();
+                assert_eq!(*reference.delta().sampling_constants(), expected);
+                assert_eq!(reference.delta().block_hash(), reference_head.block_hash);
+                assert!(wist_core::vrf::verify(
+                    &public_key,
+                    &sampling::alpha_from_block_hash(reference.delta().block_hash()).unwrap(),
+                    &proof
+                )
+                .is_err());
+                let mut history =
+                    clave::history::History::open(f.data.path(), f.head.clone()).unwrap();
+                let mut profiles = Vec::new();
+                while let Some(block) = history.next_block().unwrap() {
+                    profiles.push(*block.sampling_constants());
+                }
+                assert_eq!(
+                    profiles,
+                    [
+                        SamplingConstants::default(),
+                        constants,
+                        expected,
+                        SamplingConstants::default()
+                    ]
+                );
+            }
+            let path = f.path(3);
+            let bytes = std::fs::read(&path).unwrap();
+            std::fs::write(&path, b"corrupt").unwrap();
+            assert!(f.delta_source(&delta).is_err());
+            std::fs::write(&path, bytes).unwrap();
+            assert_eq!(
+                *f.delta_source(&delta).unwrap().sampling_constants(),
+                constants
+            );
+            assert_eq!(*frozen.sampling_constants(), constants);
+            assert_eq!(frozen.block_hash(), audited_head.block_hash);
+        }
+    }
+}
+
+#[test]
+fn historical_sampling_defaults_match_rate_vectors() {
+    use wist_core::sampling;
+
+    let p = make_publisher_with_scope("parent.example", &["shared.example"]);
+    let (delta, _) = content(&p);
+    let mut f = Fixture::new();
+    f.append(vec![
+        entry("publisher_declaration", &current_declaration(&p)),
+        entry("publisher_delta", &delta),
+    ]);
+    let source = f.delta_source(&delta).unwrap();
+    assert_eq!(source.position().block_number, 0);
+    assert_eq!(source.block_hash(), f.head.as_ref().unwrap().block_hash);
+    let vector: Value = serde_json::from_slice(
+        &std::fs::read(spec_dir().join("vectors/wist4/sampling.json")).unwrap(),
+    )
+    .unwrap();
+    for case in vector["rate_cases"].as_array().unwrap() {
+        let elevated = case["level1_or_escalation"].as_bool().unwrap();
+        for (sanction, escalation) in [(elevated, false), (false, elevated)] {
+            assert_eq!(
+                sampling::p_1e7(
+                    case["reputation_u"].as_u64().unwrap(),
+                    sanction,
+                    escalation,
+                    source.sampling_constants()
+                ),
+                case["p_1e7"].as_u64().unwrap(),
+                "{}",
+                case["label"]
+            );
+        }
+    }
+}
+
+#[test]
+fn rejected_amendments_cannot_supply_sampling_constants() {
+    for (parameter, value, invalid) in [
+        ("sampling_floor", 400_000, 0),
+        ("sampling_ceiling", 6_000_000, 100_000),
+        ("sampling_slope", 1, 0),
+    ] {
+        for fault in ["signature", "value", "grace"] {
+            let p = make_publisher_with_scope("parent.example", &["shared.example"]);
+            let (delta, _) = content(&p);
+            let mut f = Fixture::new();
+            let mut change = profile_change(
+                &f,
+                parameter,
+                if fault == "value" { invalid } else { value },
+                if fault == "grace" { 86_400 } else { 604_800 },
+            );
+            if fault == "value" && parameter == "sampling_slope" {
+                change["update"]["details"]["value"] = json!("1");
+                let key = clave::keys::load(&f.data.path().join("keys/seed")).unwrap();
+                change =
+                    envelope::sign_envelope(&change["update"], "update", "log1", &key).unwrap();
+            }
+            if fault == "signature" {
+                change =
+                    envelope::sign_envelope(&change["update"], "update", "log1", &p.sk).unwrap();
+            }
+            f.append_at(
+                vec![
+                    entry("publisher_declaration", &current_declaration(&p)),
+                    entry("registry_update", &change),
+                ],
+                0,
+            );
+            f.append_at(vec![entry("publisher_delta", &delta)], 604_800);
+            assert_eq!(
+                *f.delta_source(&delta).unwrap().sampling_constants(),
+                wist_core::sampling::SamplingConstants::default(),
+                "{parameter}: {fault}"
+            );
+        }
+    }
+}
+
+#[test]
 fn authenticated_audit_profiles_reproduce_vectors_across_amendments_and_restart() {
     let vector: Value = serde_json::from_slice(
         &std::fs::read(spec_dir().join("vectors/wist4/canary.json")).unwrap(),
