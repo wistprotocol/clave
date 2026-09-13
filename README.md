@@ -101,9 +101,8 @@ Payloads or recalculate completed unsealed admissions' original profiles.
 reference profiles and invalid candidate Blocks. Live regressions cover
 Payload/predecessor timing, repeated rejected IDs, restart, dependent rejection,
 missing/corrupt Payload rollback and signed authority despite changed local
-summaries. Full-prefix reconstruction per attempt remains unbounded; complete
-Payload field validation, historical retrieval and Audit Record use remain
-separate obligations.
+summaries. Full-prefix reconstruction per attempt remains unbounded; historical
+retrieval and Audit Record use remain separate obligations.
 
 ## Payload link admission
 
@@ -124,9 +123,35 @@ more links could fit: only a page audit can verify the declared prefix.
 cover their pull dispositions, restart, accepted-byte preservation through
 sealing, scoped subjects and rejection of a retrieved predecessor. Previously
 accepted queues and sealed history are not retroactively checked by this
-admission change; complete Payload fields/version eligibility and historical
-validation remain outstanding (specification `CONFORMANCE.md`, Payload field
-and version eligibility).
+admission change. Field/version admission is covered below; historical
+validation remains outstanding.
+
+## Payload field and version admission
+
+Ingestion applies WIST-1 §§3.1/3.6/7 and ADR-0030/0034 before commitment,
+link or size checks. `payload::validate_json` rejects malformed JSON,
+invalid Unicode, nonfinite numbers and duplicate decoded member names,
+including nested and escaped duplicates, with E05. Raw validation must
+precede parsed-field checks, which cannot recover discarded duplicates.
+`payload::validate_fields` checks parsed JCS eligibility and complete fields;
+`payload::validate_version` adds supported-major validation after E14 field
+precedence. Callers separately check links, integrity and active caps. Pulls
+retain the WIST2-E03 disposition in [Payload link admission](#payload-link-admission).
+
+Canonical parsing during ingestion and record materialization accepts
+integer-valued decimal/exponent forms without changing stored Payload bytes.
+Same-major minor/patch components have no numeric bound and need not match
+the Delta's version. Active octet caps govern extract and URL lengths;
+summary scalar limits remain independent of its octet cap.
+
+`payload-fields.json` supplies 128 signed candidates, consumed independently
+of the Python reference. Live tests exercise 103 default-profile candidates,
+restart, fetched predecessors, same-ID retry after version rejection,
+record materialization and original-byte preservation through sealing.
+Field vectors supply cap contexts; [Delta size-cap profiles](#delta-size-cap-profiles)
+covers authenticated profile timing. Previously accepted queues and historical
+Payloads require separate revalidation; historical retrieval and Audit Record
+reference eligibility remain incomplete.
 
 ## Declaration key binding
 

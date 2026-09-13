@@ -64,7 +64,7 @@ pub fn add_delta_with_links(
     links: &[&str],
 ) -> String {
     let salt = wist_core::crypto::b64u_encode(&[5u8; 16]);
-    let content = serde_json::json!({"extract": extract, "links": {"total": links.len(), "urls": links}, "summary": {"title": url}});
+    let content = serde_json::json!({"extract": extract, "links": {"total": links.len(), "urls": links}, "summary": {"title": url.chars().take(256).collect::<String>()}});
     let payload = serde_json::json!({"wist_version": "1.0.0", "salt": salt, "content": content});
     let mut delta = serde_json::json!({
         "wist_version": "1.0.0", "publisher": p.domain, "url": url,
@@ -278,7 +278,7 @@ pub fn add_delta_signed(
     signer_seed: &[u8; 32],
 ) -> String {
     let salt = wist_core::crypto::b64u_encode(&[5u8; 16]);
-    let content = serde_json::json!({"extract": extract, "links": {"total": 0, "urls": []}, "summary": {"title": url}});
+    let content = serde_json::json!({"extract": extract, "links": {"total": 0, "urls": []}, "summary": {"title": url.chars().take(256).collect::<String>()}});
     let payload = serde_json::json!({"wist_version": "1.0.0", "salt": salt, "content": content});
     let mut delta = serde_json::json!({
         "wist_version": "1.0.0", "publisher": p.domain, "url": url,

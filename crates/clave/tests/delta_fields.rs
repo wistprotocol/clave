@@ -224,10 +224,15 @@ fn decimal_byte_counts_and_active_url_caps_use_canonical_values() {
         .parse::<jiff::Timestamp>()
         .unwrap()
         .as_second();
-    for parameter in ["url_cap_bytes", "summary_cap_bytes"] {
-        clave::param_change::run(&db, &sk, parameter, 4096, Some("2026-08-16T12:00:00Z"), now)
-            .unwrap();
-    }
+    clave::param_change::run(
+        &db,
+        &sk,
+        "url_cap_bytes",
+        4096,
+        Some("2026-08-16T12:00:00Z"),
+        now,
+    )
+    .unwrap();
     clave::seal::run(&db, data.path(), &sk, now).unwrap();
     let accepted =
         clave::ingest::run(&db, &client, data.path(), &host, "2026-08-16T12:00:00Z").unwrap();

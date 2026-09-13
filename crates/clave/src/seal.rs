@@ -840,7 +840,12 @@ fn resolve_record_updates(
         let Ok(payload_bytes) = std::fs::read(&payload_path) else {
             continue;
         };
-        let Ok(payload) = serde_json::from_slice::<Payload>(&payload_bytes) else {
+        let Ok(payload_value) = serde_json::from_slice::<Value>(&payload_bytes) else {
+            continue;
+        };
+        let Ok(payload) =
+            serde_json::from_slice::<Payload>(&wist_core::jcs::canonicalize(&payload_value)?)
+        else {
             continue;
         };
         updates.push(OwnedRecordUpsert {

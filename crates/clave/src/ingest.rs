@@ -926,21 +926,29 @@ pub fn run_with_clock(
                     continue;
                 }
             };
-            let payload_typed: Payload = match serde_json::from_value(payload_value.clone()) {
-                Ok(p) => p,
-                Err(e) => {
-                    record_rejection(
-                        db,
-                        host,
-                        "WIST2-E03",
-                        now,
-                        Some(id.as_str()),
-                        &e.to_string(),
-                    )?;
-                    report.rejected.push((id.clone(), "WIST2-E03".to_string()));
-                    continue;
-                }
-            };
+            if let Err(code) = crate::payload::validate_json(&payload_raw)
+                .and_then(|()| crate::payload::validate_version(&payload_value))
+            {
+                record_rejection(db, host, "WIST2-E03", now, Some(id), code)?;
+                report.rejected.push((id.clone(), "WIST2-E03".into()));
+                continue;
+            }
+            let payload_typed: Payload =
+                match serde_json::from_slice(&wist_core::jcs::canonicalize(&payload_value)?) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        record_rejection(
+                            db,
+                            host,
+                            "WIST2-E03",
+                            now,
+                            Some(id.as_str()),
+                            &e.to_string(),
+                        )?;
+                        report.rejected.push((id.clone(), "WIST2-E03".to_string()));
+                        continue;
+                    }
+                };
             if verify_commitment(
                 &payload_typed.salt,
                 &payload_value["content"],
