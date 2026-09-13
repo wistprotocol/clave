@@ -392,8 +392,9 @@ binding or state mutation; a new attempt rereads repaired files.
 
 The returned `RecordReference` retains `record()`, `audited()`, `reference()`
 and `payload_source()`, preserving the original Envelope, identity, confirmation
-profile and each Delta's committing parameters. Retrieve or validate the Payload
-through [Historical Payload retrieval](#historical-payload-retrieval).
+profile and each Delta's committing parameters. Retrieve content through
+[Included Record Payload retrieval](#included-record-payload-retrieval), or
+validate supplied bytes through [Historical Payload validation](#historical-payload-validation).
 
 This relation establishes no Record signature, complete field eligibility,
 Auditor standing, verdict or finding. Extension standing must additionally
@@ -406,6 +407,36 @@ eight `link-agreement.json` amendment contexts. Regressions cover inclusive fetc
 endpoints, same-Block references, contentless anchors, malformed fields/times,
 forged Record signature preservation, identical hashes under different Anchors,
 alternate directories, later invalid history, restart and file repair.
+
+## Included Record Payload retrieval
+
+`RecordReference::retrieve_payload(client, directory, independent_origins,
+mirror_list_origins)` discovers and retrieves the named reference's anchor
+through [Historical Payload source discovery](#historical-payload-source-discovery)
+and [Historical Payload retrieval](#historical-payload-retrieval). The directory
+selects local copies and hints; it cannot replace the authenticated history or
+the Payload's committing parameters. Remote hint discovery completes before
+Payload attempts, including when a valid local copy exists.
+
+The returned `RecordPayloadRetrieval` retains `reference()`, discovered
+`locations()` and `result()`. Successful results preserve original Payload bytes,
+the selected location and earlier fetch failures. Exhaustion retains every
+attempt; discovery failures remain separately available on either outcome.
+No anchor returns `None` before discovery. Each call rereads sources, allowing
+repair and retry without caching failures or writing content or history.
+
+Retrieval establishes content integrity only. It assigns no verdict, serving
+fault, coverage discharge or finding, and does not validate the Record's
+signature or remaining eligibility. Callers must enforce withdrawal and
+availability policy before use; automatic admission/replay integration and
+durable evidence retention remain unimplemented. Resource limits follow the
+linked discovery and retrieval contracts.
+
+Signed histories exercise the `superseded-audit.json` reference cases through
+independent origins and remote Mirror hints, including contentless references
+and reconstruction after restart. Regressions cover malformed lists, corrupt
+copies, Publisher fallback, exhaustion, repair, unchanged Record/Block bytes
+and Payload caps predating a reduction at Record inclusion.
 
 ## Included Record evidence fields
 
@@ -601,7 +632,9 @@ available. List retrieval does not fetch Payloads.
 another call observes repairs or configuration changes. Remote list reads share
 the [retrieval limits](#historical-payload-retrieval); neither signing-key time
 authentication nor durable selected-source provenance is implemented. Service
-and Audit Record integration remain unimplemented. Signed-history tests cover
+admission/replay integration remains unimplemented; the Record-bound API is
+described under [Included Record Payload retrieval](#included-record-payload-retrieval).
+Signed-history tests cover
 independent/Mirror/Publisher fallback, malformed and duplicate-member lists,
 origin and request deduplication, explicit-only discovery, corruption, repair,
 restart, historical caps and contentless reference anchors.

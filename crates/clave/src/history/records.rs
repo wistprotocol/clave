@@ -1,5 +1,8 @@
 use super::{
-    declarations::Position, deltas::DeltaSource, payloads::PayloadSource, references::AuditChain,
+    declarations::Position,
+    deltas::DeltaSource,
+    payloads::{PayloadLocations, PayloadRetrievalError, PayloadSource, RetrievedPayload},
+    references::AuditChain,
     History,
 };
 use crate::db::BlockRow;
@@ -28,6 +31,26 @@ pub struct RecordReference {
     audited: DeltaSource,
     reference: DeltaSource,
     payload: Option<PayloadSource>,
+}
+
+pub struct RecordPayloadRetrieval<'a> {
+    reference: &'a RecordReference,
+    locations: PayloadLocations,
+    result: std::result::Result<RetrievedPayload<'a>, PayloadRetrievalError>,
+}
+
+impl RecordPayloadRetrieval<'_> {
+    pub fn reference(&self) -> &RecordReference {
+        self.reference
+    }
+
+    pub fn locations(&self) -> &PayloadLocations {
+        &self.locations
+    }
+
+    pub fn result(&self) -> std::result::Result<&RetrievedPayload<'_>, &PayloadRetrievalError> {
+        self.result.as_ref()
+    }
 }
 
 impl IncludedRecord {
@@ -188,6 +211,28 @@ impl RecordReference {
 
     pub fn payload_source(&self) -> Option<&PayloadSource> {
         self.payload.as_ref()
+    }
+
+    pub fn retrieve_payload(
+        &self,
+        client: &crate::fetch::Client,
+        directory: &Path,
+        independent_origins: &[String],
+        mirror_list_origins: &[String],
+    ) -> Option<RecordPayloadRetrieval<'_>> {
+        let source = self.payload_source()?;
+        let locations = source.discover_with_remote_mirrors(
+            client,
+            directory,
+            independent_origins,
+            mirror_list_origins,
+        );
+        let result = source.retrieve(client, locations.locations().iter().cloned());
+        Some(RecordPayloadRetrieval {
+            reference: self,
+            locations,
+            result,
+        })
     }
 
     pub fn validate_verdict_scores(&self) -> Result<()> {

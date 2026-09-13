@@ -2607,6 +2607,132 @@ fn included_record_references_pin_history_and_recover_after_file_repair() {
 }
 
 #[test]
+fn included_record_payload_retrieval_preserves_failures_and_retries_after_reopen() {
+    let p = make_publisher_with_scope("localhost", &["shared.example"]);
+    let (delta, raw) = content(&p);
+    let id = wist_core::delta::delta_id(&delta["delta"]).unwrap();
+    let name = format!("payloads/{}.json", &id[7..]);
+    let published = p.dir.path().join(".well-known/wist").join(&name);
+    let (listener, host, client) = reserve_addr();
+    serve_static(listener, p.dir.path().to_owned());
+    let mut f = Fixture::new();
+    let amendment = profile_change(&f, "extract_cap_bytes", 2, 604_800);
+    f.append(vec![
+        entry("publisher_declaration", &current_declaration(&p)),
+        entry("publisher_delta", &delta),
+        entry("registry_update", &amendment),
+    ]);
+    let mut record = reference_record(&id, &id, &f.head.as_ref().unwrap().sealed_at);
+    record["sig"]["value"] = json!("forged");
+    f.append_at(vec![entry("audit_record", &record)], 604_800);
+    let retained = f.data.path().join(&name);
+    let local_list = f.data.path().join("log/mirrors.json");
+    let remote_list = p.dir.path().join("log/mirrors.json");
+    let remote_payload = p.dir.path().join(&name);
+    std::fs::create_dir_all(remote_list.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(remote_payload.parent().unwrap()).unwrap();
+    let blocks: Vec<_> = (0..=1)
+        .map(|height| std::fs::read(f.path(height)).unwrap())
+        .collect();
+    let origins = ["http://unrequested.example/".into()];
+    let lists = [format!("http://{host}/")];
+    let mut exact = b" \n".to_vec();
+    exact.extend_from_slice(&raw);
+    exact.extend_from_slice(b"\n ");
+    for _ in 0..2 {
+        let records = IncludedRecord::reconstruct_all(f.data.path(), f.head.clone()).unwrap();
+        let bound = records[0].resolve_reference(f.data.path()).unwrap();
+        let source = bound.payload_source().unwrap();
+        assert!(source.size_caps().extract_cap_bytes > 2);
+        let mut history = clave::history::History::open(f.data.path(), f.head.clone()).unwrap();
+        history.next_block().unwrap();
+        assert_eq!(
+            history
+                .next_block()
+                .unwrap()
+                .unwrap()
+                .delta_size_caps()
+                .extract_cap_bytes,
+            2
+        );
+        std::fs::write(&retained, b"not JSON").unwrap();
+        std::fs::write(&local_list, b"not JSON").unwrap();
+        std::fs::write(&remote_list, br#"{"mirrors":{"mirror_urls":[null]}}"#).unwrap();
+        std::fs::write(&published, &exact).unwrap();
+        let retrieval = bound
+            .retrieve_payload(&client, f.data.path(), &origins, &lists)
+            .unwrap();
+        assert!(std::ptr::eq(retrieval.reference(), &bound));
+        assert_eq!(retrieval.reference().record().envelope(), &record);
+        assert_eq!(retrieval.locations().discovery_failures().len(), 2);
+        let copy = retrieval.result().unwrap();
+        assert_eq!(copy.location(), &source.publisher_location(&client));
+        assert_eq!(copy.raw(), exact);
+        assert_eq!(copy.failed_attempts().len(), 2);
+        assert!(matches!(
+            copy.failed_attempts()[0].error,
+            clave::Error::Payload("WIST1-E05")
+        ));
+        assert!(matches!(
+            copy.failed_attempts()[1].error,
+            clave::Error::Fetch(_)
+        ));
+        assert!(std::ptr::eq(copy.source(), source));
+
+        std::fs::remove_file(&published).unwrap();
+        let exhausted = bound
+            .retrieve_payload(&client, f.data.path(), &origins, &lists)
+            .unwrap();
+        let failure = exhausted.result().err().unwrap();
+        assert_eq!(failure.attempts.len(), 3);
+        assert_eq!(exhausted.locations().discovery_failures().len(), 2);
+        for (attempt, location) in failure
+            .attempts
+            .iter()
+            .zip(exhausted.locations().locations())
+        {
+            assert_eq!(&attempt.location, location);
+        }
+        assert_eq!(bound.record().envelope(), &record);
+
+        std::fs::remove_file(&local_list).unwrap();
+        std::fs::write(
+            &remote_list,
+            serde_json::to_vec(&json!({"mirrors":{"mirror_urls":[format!("http://{host}/")]}}))
+                .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(&remote_payload, &exact).unwrap();
+        let repaired = bound
+            .retrieve_payload(&client, f.data.path(), &origins, &lists)
+            .unwrap();
+        assert!(repaired.locations().discovery_failures().is_empty());
+        let copy = repaired.result().unwrap();
+        assert_eq!(
+            copy.location(),
+            &source
+                .distribution_location(&format!("http://{host}/"))
+                .unwrap()
+        );
+        assert_eq!(copy.raw(), exact);
+        assert_eq!(copy.failed_attempts().len(), 2);
+        assert_eq!(std::fs::read(&retained).unwrap(), b"not JSON");
+
+        std::fs::write(&retained, &exact).unwrap();
+        let local = bound
+            .retrieve_payload(&client, f.data.path(), &origins, &[])
+            .unwrap();
+        let copy = local.result().unwrap();
+        assert_eq!(copy.location(), &source.retained_location(f.data.path()));
+        assert!(copy.failed_attempts().is_empty());
+        assert_eq!(copy.raw(), exact);
+        for (height, original) in blocks.iter().enumerate() {
+            assert_eq!(&std::fs::read(f.path(height as u64)).unwrap(), original);
+        }
+    }
+}
+
+#[test]
 fn included_record_references_resolve_same_block_contentless_sources() {
     let p = make_publisher_with_scope("parent.example", &["shared.example"]);
     let (root, payload) = content(&p);
@@ -2844,6 +2970,21 @@ fn authenticated_reference_vectors_resolve_named_and_newest_deltas() {
             );
             assert!(remote.discovery_failures().is_empty());
             assert_eq!(remote.locations(), discovered.locations());
+            for (origins, lists) in [
+                (vec![format!("http://{host}/")], vec![]),
+                (vec![], vec![format!("http://{host}/")]),
+            ] {
+                let retrieval = bound
+                    .retrieve_payload(&client, missing.path(), &origins, &lists)
+                    .unwrap();
+                assert!(std::ptr::eq(retrieval.reference(), &bound));
+                assert!(retrieval.locations().discovery_failures().is_empty());
+                assert_eq!(retrieval.locations().locations(), discovered.locations());
+                let copy = retrieval.result().unwrap();
+                assert_eq!(copy.raw(), payloads[payload_name]);
+                assert_eq!(copy.failed_attempts().len(), 1);
+                assert!(std::ptr::eq(copy.source(), bound_source));
+            }
             for copy in [
                 source.read(f.data.path()).unwrap(),
                 source
