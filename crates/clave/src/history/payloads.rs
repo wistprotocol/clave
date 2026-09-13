@@ -37,6 +37,36 @@ pub struct PayloadRetrievalError {
     pub attempts: Vec<PayloadAttemptFailure>,
 }
 
+#[derive(Debug)]
+pub struct PayloadLocations {
+    locations: Vec<PayloadLocation>,
+    discovery_failures: Vec<PayloadAttemptFailure>,
+}
+
+impl PayloadLocations {
+    pub fn locations(&self) -> &[PayloadLocation] {
+        &self.locations
+    }
+
+    pub fn discovery_failures(&self) -> &[PayloadAttemptFailure] {
+        &self.discovery_failures
+    }
+
+    fn add_origin(&mut self, source: &PayloadSource, origin: &str) {
+        match source.distribution_location(origin) {
+            Ok(location) => {
+                if !self.locations.contains(&location) {
+                    self.locations.push(location);
+                }
+            }
+            Err(error) => self.discovery_failures.push(PayloadAttemptFailure {
+                location: PayloadLocation::Url(origin.into()),
+                error,
+            }),
+        }
+    }
+}
+
 impl PayloadSource {
     pub fn reconstruct(directory: &Path, head: Option<BlockRow>, delta_id: &str) -> Result<Self> {
         let delta = DeltaSource::reconstruct(directory, head, delta_id)?;
@@ -118,6 +148,41 @@ impl PayloadSource {
             "{scheme}://{publisher}/.well-known/wist/{}",
             self.relative_path(),
         ))
+    }
+
+    pub fn discover(
+        &self,
+        client: &crate::fetch::Client,
+        directory: &Path,
+        independent_origins: &[String],
+    ) -> PayloadLocations {
+        let mut discovered = PayloadLocations {
+            locations: vec![self.retained_location(directory)],
+            discovery_failures: Vec::new(),
+        };
+        for origin in independent_origins {
+            discovered.add_origin(self, origin);
+        }
+        let path = directory.join("log/mirrors.json");
+        let mirrors = std::fs::read(&path).map_err(Error::from).and_then(|raw| {
+            let doc = crate::json::parse(&raw)?;
+            serde_json::from_value::<Vec<String>>(doc["mirrors"]["mirror_urls"].clone())
+                .map_err(Error::from)
+        });
+        match mirrors {
+            Ok(origins) => {
+                for origin in origins {
+                    discovered.add_origin(self, &origin);
+                }
+            }
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => (),
+            Err(error) => discovered.discovery_failures.push(PayloadAttemptFailure {
+                location: PayloadLocation::File(path),
+                error,
+            }),
+        }
+        discovered.locations.push(self.publisher_location(client));
+        discovered
     }
 
     pub fn retrieve(

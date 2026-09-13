@@ -139,19 +139,17 @@ fn historical_payload_sources_keep_the_committing_profile_after_restart() {
             assert_eq!(json!(source.block_number()), object["sealed_height"]);
             assert_eq!(json!(source.size_caps()), probe["expected_profile"]);
             assert_eq!(json!(source.validate(&raw).err()), probe["expected"]);
+            let discovered = source.discover(
+                &client,
+                &data.path().join("missing"),
+                &[format!("http://{host}/")],
+            );
+            assert!(discovered.discovery_failures().is_empty());
             for result in [
                 source.read(data.path()),
                 source.fetch(&client, &format!("http://{host}/{name}")),
                 source
-                    .retrieve(
-                        &client,
-                        [
-                            source.retained_location(&data.path().join("missing")),
-                            source
-                                .distribution_location(&format!("http://{host}/"))
-                                .unwrap(),
-                        ],
-                    )
+                    .retrieve(&client, discovered.locations().iter().take(2).cloned())
                     .map_err(|failure| {
                         assert_eq!(failure.attempts.len(), 2);
                         assert!(matches!(failure.attempts[0].error, clave::Error::Io(_)));

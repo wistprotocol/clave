@@ -692,6 +692,166 @@ fn historical_payload_fallback_preserves_failures_and_the_signed_publisher_locat
 }
 
 #[test]
+fn historical_payload_discovery_uses_independent_origins_mirror_hints_and_signed_publisher() {
+    let p = make_publisher_with_scope("localhost", &["shared.example"]);
+    let (delta, raw) = content(&p);
+    let mut f = Fixture::new();
+    f.append(vec![
+        entry("publisher_declaration", &current_declaration(&p)),
+        entry("publisher_delta", &delta),
+    ]);
+    let block_bytes = std::fs::read(f.path(0)).unwrap();
+    let (listener, _, client) = reserve_addr();
+    serve_static(listener, p.dir.path().to_owned());
+    let mirror = tempfile::tempdir().unwrap();
+    let (mirror_listener, _, _) = reserve_addr();
+    let mirror_origin = format!("http://{}/", mirror_listener.local_addr().unwrap());
+    serve_static(mirror_listener, mirror.path().to_owned());
+    let relative = format!(
+        "payloads/{}.json",
+        &wist_core::delta::delta_id(&delta["delta"]).unwrap()[7..],
+    );
+    let retained = f.data.path().join(&relative);
+    let distributed = p.dir.path().join(&relative);
+    let mirrored = mirror.path().join(&relative);
+    std::fs::create_dir_all(distributed.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(mirrored.parent().unwrap()).unwrap();
+    let mirror_file = f.data.path().join("log/mirrors.json");
+    let hints = json!({"mirrors":{"mirror_urls":[
+        "http://localhost/", mirror_origin, "https://user@unusable.example/", mirror_origin
+    ]},"sig":{"value":"untrusted"}});
+    let hint_bytes = serde_json::to_vec(&hints).unwrap();
+    std::fs::write(&mirror_file, &hint_bytes).unwrap();
+    for _ in 0..2 {
+        let source = f.source(&delta).unwrap();
+        let discovered = source.discover(
+            &client,
+            f.data.path(),
+            &["file:///invalid/".into(), "http://LOCALHOST:80/".into()],
+        );
+        assert_eq!(
+            discovered.locations(),
+            &[
+                PayloadLocation::File(retained.clone()),
+                PayloadLocation::Url(format!("http://localhost/{relative}")),
+                PayloadLocation::Url(format!("{mirror_origin}{relative}")),
+                PayloadLocation::Url(format!("http://localhost/.well-known/wist/{relative}")),
+            ],
+        );
+        assert_eq!(discovered.discovery_failures().len(), 2);
+        assert_eq!(
+            discovered.discovery_failures()[0].location,
+            PayloadLocation::Url("file:///invalid/".into()),
+        );
+        assert_eq!(
+            discovered.discovery_failures()[1].location,
+            PayloadLocation::Url("https://user@unusable.example/".into()),
+        );
+        assert!(discovered
+            .discovery_failures()
+            .iter()
+            .all(|failure| matches!(failure.error, clave::Error::Fetch(_))));
+        for local_valid in [false, true] {
+            std::fs::write(
+                &retained,
+                if local_valid {
+                    raw.as_slice()
+                } else {
+                    b"bad local"
+                },
+            )
+            .unwrap();
+            std::fs::write(&distributed, b"bad distributed").unwrap();
+            std::fs::write(&mirrored, b"bad mirror").unwrap();
+            let copy = source
+                .retrieve(&client, discovered.locations().iter().cloned())
+                .unwrap();
+            let selected = if local_valid { 0 } else { 3 };
+            assert_eq!(copy.location(), &discovered.locations()[selected]);
+            assert_eq!(copy.failed_attempts().len(), selected);
+            assert_eq!(copy.raw(), raw);
+            assert_eq!(copy.source().envelope(), &delta);
+            assert_eq!(std::fs::read(&distributed).unwrap(), b"bad distributed");
+        }
+        std::fs::remove_file(&retained).unwrap();
+        std::fs::write(&distributed, &raw).unwrap();
+        let copy = source
+            .retrieve(&client, discovered.locations().iter().cloned())
+            .unwrap();
+        assert_eq!(copy.location(), &discovered.locations()[1]);
+        assert_eq!(copy.failed_attempts().len(), 1);
+        std::fs::remove_file(&distributed).unwrap();
+        std::fs::write(&mirrored, &raw).unwrap();
+        let copy = source
+            .retrieve(&client, discovered.locations().iter().cloned())
+            .unwrap();
+        assert_eq!(copy.location(), &discovered.locations()[2]);
+        assert_eq!(copy.failed_attempts().len(), 2);
+        assert_eq!(copy.raw(), raw);
+        assert!(!retained.exists());
+        assert_eq!(std::fs::read(&mirror_file).unwrap(), hint_bytes);
+        assert_eq!(std::fs::read(f.path(0)).unwrap(), block_bytes);
+    }
+}
+
+#[test]
+fn historical_payload_discovery_preserves_fallback_when_optional_mirror_hints_fail() {
+    let p = make_publisher_with_scope("localhost", &["shared.example"]);
+    let (delta, raw) = content(&p);
+    let mut f = Fixture::new();
+    f.append(vec![
+        entry("publisher_declaration", &current_declaration(&p)),
+        entry("publisher_delta", &delta),
+    ]);
+    let (listener, _, client) = reserve_addr();
+    serve_static(listener, p.dir.path().to_owned());
+    let path = f.data.path().join("log/mirrors.json");
+    let source = f.source(&delta).unwrap();
+    for hints in [
+        None,
+        Some("not JSON"),
+        Some("{}"),
+        Some(r#"{"mirrors":{"mirror_urls":["https://mirror.example/",false]}}"#),
+        Some(r#"{"mirrors":{"mirror_urls":[],"mirror\u005furls":[]}}"#),
+    ] {
+        if let Some(raw) = hints {
+            std::fs::write(&path, raw).unwrap();
+        }
+        let discovered = source.discover(&client, f.data.path(), &[]);
+        assert_eq!(discovered.locations().len(), 2);
+        assert_eq!(
+            discovered.discovery_failures().len(),
+            usize::from(hints.is_some())
+        );
+        if let Some(failure) = discovered.discovery_failures().first() {
+            assert_eq!(failure.location, PayloadLocation::File(path.clone()));
+            assert!(matches!(failure.error, clave::Error::Json(_)));
+        }
+        let copy = source
+            .retrieve(&client, discovered.locations().iter().cloned())
+            .unwrap();
+        assert_eq!(copy.location(), &source.publisher_location(&client));
+        assert_eq!(copy.raw(), raw);
+    }
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    let discovered = source.discover(&client, f.data.path(), &[]);
+    assert!(matches!(
+        discovered.discovery_failures()[0].error,
+        clave::Error::Io(_)
+    ));
+    std::fs::remove_dir(&path).unwrap();
+    std::fs::write(
+        &path,
+        r#"{"mirrors":{"mirror_urls":["http://localhost/"]}}"#,
+    )
+    .unwrap();
+    let repaired = source.discover(&client, f.data.path(), &[]);
+    assert!(repaired.discovery_failures().is_empty());
+    assert_eq!(repaired.locations().len(), 3);
+}
+
+#[test]
 fn historical_payload_distribution_locations_require_origins_and_preserve_ports() {
     let p = make_publisher_with_scope("parent.example", &["shared.example"]);
     let (delta, _) = content(&p);
@@ -1224,6 +1384,7 @@ fn authenticated_reference_vectors_resolve_named_and_newest_deltas() {
     .unwrap();
     let p = make_publisher_with_scope("parent.example", &["shared.example"]);
     let mut f = Fixture::new();
+    let missing = tempfile::tempdir().unwrap();
     let (listener, host, client) = reserve_addr();
     serve_static(listener, f.data.path().to_owned());
     let (root, _) = content(&p);
@@ -1339,18 +1500,12 @@ fn authenticated_reference_vectors_resolve_named_and_newest_deltas() {
                 )
                 .unwrap();
             }
+            let discovered = source.discover(&client, missing.path(), &[format!("http://{host}/")]);
+            assert!(discovered.discovery_failures().is_empty());
             for copy in [
                 source.read(f.data.path()).unwrap(),
                 source
-                    .retrieve(
-                        &client,
-                        [
-                            PayloadLocation::Url(format!("http://{host}/missing.json")),
-                            source
-                                .distribution_location(&format!("http://{host}/"))
-                                .unwrap(),
-                        ],
-                    )
+                    .retrieve(&client, discovered.locations().iter().cloned())
                     .unwrap(),
                 source
                     .fetch(&client, &format!("http://{host}/{name}"))

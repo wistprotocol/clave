@@ -380,9 +380,9 @@ commitment and historical caps regardless of location.
 
 HTTP retrieval uses the client's HTTPS guard, explicit loopback HTTP opt-in,
 30-second request timeout and five-hop redirect limit within the same Canonical
-Host. Response and file reads remain unbounded. Callers supply candidates and enforce
-withdrawal, availability and Record eligibility before using or retaining content;
-source discovery, durable replication and those policy integrations remain unimplemented.
+Host. Response and file reads remain unbounded. Callers enforce withdrawal,
+availability and Record eligibility before using or retaining content;
+durable replication and those policy integrations remain unimplemented.
 
 Tests exercise 103 signed Payload field cases through disk and HTTP, historical
 cap amendments after reconstruction, named references including contentless
@@ -390,6 +390,34 @@ successors, malformed and substituted copies, missing files/HTTP responses,
 retry, exact-byte preservation and unchanged authenticated history. Fallback tests
 cover local and HTTP failures, Publisher attribution across scoped hosts, early
 termination, preserved diagnostics, historical caps and reconstruction after restart.
+
+## Historical Payload source discovery
+
+`PayloadSource::discover(client, directory, independent_origins)` returns
+`PayloadLocations` in this local policy order: retained file, independent origins
+in supplied order, origins from `directory/log/mirrors.json` in listed order,
+then the signed Publisher's well-known path. Pass `locations().iter().cloned()`
+to `retrieve` under [Historical Payload retrieval](#historical-payload-retrieval).
+Origins producing identical parsed URLs are tried once, preserving the first
+position. Every path uses the authenticated Payload anchor, including references
+through `attest` or `delete`.
+
+The optional local Mirror list supplies untrusted location hints under WIST-3
+§6.1's permission to obtain any copy. Discovery reads only its `mirror_urls`
+string array; it neither verifies the Envelope nor asserts list authorship,
+Log membership or administrative independence. Raw JSON eligibility still
+applies. Missing lists are normal; unreadable/malformed lists and invalid origins
+appear in `discovery_failures()` without suppressing other sources. A malformed
+array contributes no entries; individually invalid origins leave valid siblings
+available. Discovery errors name the list file or supplied origin and are
+separate from retrieval failures.
+
+Discovery performs no network requests or writes and retains no cache; another
+call observes repairs or configuration changes. It does not fetch remote Mirror
+lists, authenticate their signing-key time or persist selected-source provenance.
+Service and Audit Record integration remain unimplemented. Signed-history tests
+cover independent/Mirror/Publisher fallback, malformed and duplicate-member lists,
+origin deduplication, corruption, repair, restart and contentless reference anchors.
 
 ## Declaration key binding
 
