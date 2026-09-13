@@ -341,6 +341,36 @@ reconstruction, VRF proof binding to the original Block, corrupt-prefix repair
 and rejected signature/value/grace amendments. Default profiles reproduce
 `sampling.json`'s rate cases, including sanction and escalation overrides.
 
+## Historical coverage clocks
+
+`history::coverage::CoverageClock::reconstruct(directory, pinned_head, duty_hash)`
+authenticates the complete pinned prefix and freezes `coverage_deadline_hours`
+and `record_seal_blocks` at the named Block's sealing instant (WIST-4 §§4/9).
+The caller selects the audited Block for ordinary selection or B₁ for an
+extension pair. `VerifiedBlock::coverage_profile()` exposes the same accepted
+parameters; an amendment effective exactly at the anchor is included.
+
+`deadline_s()` returns the exact deadline in epoch seconds as `i128`.
+`unattested_height()` identifies the retained seal count's actual successor
+Block strictly after that deadline, or returns `None` when the pinned prefix
+has too few successors. A Block at the deadline does not count; later parameter
+and cadence changes neither move the deadline nor replace the frozen count.
+The result retains its duty Block, query head and Log Anchor fingerprint.
+
+Missing duties or invalid history fail without exposing a partial clock,
+including corruption after the allowance has elapsed. Reconstruction rereads
+repaired files and writes no state. It scans the prefix once, retains one clock
+and otherwise inherits [Authenticated history](#authenticated-history)'s limits.
+
+The clock establishes no Auditor duty, discharge, pull-attestation eligibility
+or coverage failure. Complete roster, selection, Record and attestation replay
+must establish those predicates before using this timing input.
+
+Tests embed the coverage clock and unattested establishing-height vectors in
+signed histories. They cover exact activation, increases and reductions,
+cadence changes, irregular Block gaps, rejected amendments, shorter pinned
+prefixes, restart and corrupt/missing-file repair.
+
 ## Historical Record inclusion and confirmation profiles
 
 `history::records::IncludedRecord::reconstruct_all(directory, pinned_head)`

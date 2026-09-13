@@ -1,4 +1,5 @@
 use clave::db::{BlockRow, Db};
+use clave::history::coverage::{CoverageClock, CoverageProfile};
 use clave::history::records::IncludedRecord;
 use clave::history::History;
 use serde_json::{json, Value};
@@ -129,6 +130,308 @@ impl Fixture {
         )
         .unwrap();
         json!({"type":"audit_record", "body":body})
+    }
+}
+
+#[test]
+fn coverage_clocks_freeze_signed_vector_profiles() {
+    let spec = std::env::var_os("WIST_SPEC_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../spec")
+        });
+    let vectors: Value = serde_json::from_slice(
+        &std::fs::read(spec.join("vectors/wist4/parameter-combinations.json")).unwrap(),
+    )
+    .unwrap();
+    let mut exercised = 0;
+    for case in vectors["clock_cases"].as_array().unwrap() {
+        if !matches!(
+            case["label"].as_str().unwrap(),
+            "coverage retains deadline"
+                | "coverage retains seal count"
+                | "effective at anchor is included"
+        ) {
+            continue;
+        }
+        exercised += 1;
+        let f = Fixture::new();
+        let base = START + 8 * DAY;
+        let parameter = case["parameter"].as_str().unwrap();
+        if parameter == "record_seal_blocks" {
+            f.append(START, vec![f.parameter("confirm_window_hours", 96, base)]);
+        }
+        for change in case["changes"].as_array().unwrap() {
+            f.append(
+                START + 7200,
+                vec![f.parameter(
+                    change["parameter"].as_str().unwrap(),
+                    change["value"].as_i64().unwrap(),
+                    base + change["effective_at_s"].as_i64().unwrap() * 3600,
+                )],
+            );
+        }
+        let at = base + case["anchor_s"].as_i64().unwrap() * 3600;
+        let doc = f.append(at, vec![]);
+        let duty = block::block_hash(&doc["header"]).unwrap();
+        let frozen =
+            CoverageClock::reconstruct(f.data.path(), f.db.last_block().unwrap(), &duty).unwrap();
+        f.append(base + case["query_s"].as_i64().unwrap() * 3600, vec![]);
+        let reopened = Db::open(&f.data.path().join("clave.sqlite")).unwrap();
+        let clock =
+            CoverageClock::reconstruct(f.data.path(), reopened.last_block().unwrap(), &duty)
+                .unwrap();
+        let value = if parameter == "coverage_deadline_hours" {
+            clock.profile().deadline_hours
+        } else {
+            clock.profile().seal_blocks
+        };
+        assert_eq!(
+            value,
+            case["selected_value"].as_u64().unwrap(),
+            "{}",
+            case["label"]
+        );
+        assert_eq!(clock.profile(), frozen.profile());
+        assert_eq!(clock.deadline_s(), frozen.deadline_s());
+        assert_eq!(
+            clock.deadline_s(),
+            i128::from(at) + i128::from(clock.profile().deadline_hours) * 3600
+        );
+        assert_eq!(clock.anchor_hash(), frozen.anchor_hash());
+        assert_eq!(clock.duty_block().block_hash, duty);
+        assert_eq!(
+            clock.through().block_hash,
+            reopened.last_block().unwrap().unwrap().block_hash
+        );
+        assert_eq!(clock.unattested_height(), None);
+        let mut history = f.history();
+        while let Some(block) = history.next_block().unwrap() {
+            assert!(block.rejected_parameters().is_empty(), "{}", case["label"]);
+            if block.hash() == duty {
+                assert_eq!(block.coverage_profile(), clock.profile());
+            }
+        }
+    }
+    assert_eq!(exercised, 3);
+}
+
+#[test]
+fn coverage_unattested_height_matches_signed_history_vectors() {
+    let spec = std::env::var_os("WIST_SPEC_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../spec")
+        });
+    let vectors: Value =
+        serde_json::from_slice(&std::fs::read(spec.join("vectors/wist4/coverage.json")).unwrap())
+            .unwrap();
+    let mut exercised = 0;
+    for case in vectors["establishing_cases"].as_array().unwrap() {
+        if !case["attestation_height"].is_null() {
+            continue;
+        }
+        exercised += 1;
+        let f = Fixture::new();
+        let base = START + 8 * DAY;
+        let seal_blocks = case["record_seal_blocks"].as_u64().unwrap();
+        f.append(
+            START,
+            vec![f.parameter("record_seal_blocks", seal_blocks as i64, base)],
+        );
+        let anchor_height = case["audited_block"]["height"].as_u64().unwrap();
+        let last_height = case["blocks"].as_array().unwrap().last().unwrap()["height"]
+            .as_u64()
+            .unwrap();
+        let mut duty = String::new();
+        for height in 1..=last_height {
+            let doc = f.append(base + height as i64 * 3600, vec![]);
+            if height == anchor_height {
+                duty = block::block_hash(&doc["header"]).unwrap();
+            }
+        }
+        let clock =
+            CoverageClock::reconstruct(f.data.path(), f.db.last_block().unwrap(), &duty).unwrap();
+        assert_eq!(
+            clock.unattested_height(),
+            case["establishing_height"].as_u64(),
+            "{}",
+            case["label"]
+        );
+        assert_eq!(
+            clock.deadline_s(),
+            i128::from(base + case["coverage_deadline_s"].as_i64().unwrap())
+        );
+        assert_eq!(
+            clock.profile(),
+            &CoverageProfile {
+                deadline_hours: case["coverage_deadline_hours"].as_u64().unwrap(),
+                seal_blocks,
+            }
+        );
+        for probe in case["counts_at"].as_array().unwrap() {
+            let height = probe["height"].as_u64().unwrap();
+            let raw = std::fs::read(f.path(height)).unwrap();
+            let doc: Value = serde_json::from_slice(&zstd::decode_all(&raw[..]).unwrap()).unwrap();
+            let head = BlockRow {
+                block_number: height,
+                block_hash: block::block_hash(&doc["header"]).unwrap(),
+                sealed_at: doc["header"]["sealed_at"].as_str().unwrap().into(),
+            };
+            let prefix = CoverageClock::reconstruct(f.data.path(), Some(head), &duty).unwrap();
+            assert_eq!(
+                prefix.unattested_height().is_some(),
+                probe["counts"].as_bool().unwrap()
+            );
+        }
+    }
+    assert_eq!(exercised, 2);
+}
+
+#[test]
+fn coverage_clocks_count_actual_blocks_through_cadence_changes_and_later_reductions() {
+    let f = Fixture::new();
+    let effective = START + 8 * DAY;
+    f.append(START, vec![f.parameter("record_seal_blocks", 4, effective)]);
+    f.append(
+        START + 3600,
+        vec![f.parameter("confirm_window_hours", 48, effective + 3600)],
+    );
+    f.append(
+        START + 7200,
+        sorted(vec![
+            f.parameter("record_seal_blocks", 2, effective + 3600),
+            f.parameter("coverage_deadline_hours", 48, effective + 3600),
+        ]),
+    );
+    f.append(
+        START + 10800,
+        vec![f.parameter("block_cadence_seconds", 1800, effective + 3600)],
+    );
+    let mut duties = Vec::new();
+    for at in [
+        effective - 3600,
+        effective,
+        effective + 3600,
+        effective + 5400,
+    ] {
+        let doc = f.append(at, vec![]);
+        duties.push(block::block_hash(&doc["header"]).unwrap());
+    }
+    let deadline = effective + 72 * 3600;
+    f.append(deadline, vec![]);
+    let exact = f.db.last_block().unwrap().unwrap().block_number;
+    for (offset, expected) in [
+        (1800, None),
+        (7200, None),
+        (9000, None),
+        (14400, Some(exact + 4)),
+    ] {
+        f.append(deadline + offset, vec![]);
+        let clock =
+            CoverageClock::reconstruct(f.data.path(), f.db.last_block().unwrap(), &duties[1])
+                .unwrap();
+        assert_eq!(clock.deadline_s(), i128::from(deadline));
+        assert_eq!(clock.profile().seal_blocks, 4);
+        assert_eq!(clock.unattested_height(), expected);
+    }
+    for (duty, profile) in duties.iter().zip([
+        CoverageProfile {
+            deadline_hours: 72,
+            seal_blocks: 24,
+        },
+        CoverageProfile {
+            deadline_hours: 72,
+            seal_blocks: 4,
+        },
+        CoverageProfile {
+            deadline_hours: 48,
+            seal_blocks: 2,
+        },
+        CoverageProfile {
+            deadline_hours: 48,
+            seal_blocks: 2,
+        },
+    ]) {
+        let clock =
+            CoverageClock::reconstruct(f.data.path(), f.db.last_block().unwrap(), duty).unwrap();
+        assert_eq!(*clock.profile(), profile);
+    }
+    let mut history = f.history();
+    while let Some(block) = history.next_block().unwrap() {
+        assert!(block.rejected_parameters().is_empty());
+    }
+}
+
+#[test]
+fn coverage_clocks_reject_invalid_prefixes_and_retry_repaired_files() {
+    let f = Fixture::new();
+    assert!(CoverageClock::reconstruct(f.data.path(), None, "absent").is_err());
+    let duty = f.append(START, vec![]);
+    let duty = block::block_hash(&duty["header"]).unwrap();
+    f.append(START + 72 * 3600, vec![]);
+    for hour in 73..=97 {
+        f.append(START + hour * 3600, vec![]);
+    }
+    let head = f.db.last_block().unwrap();
+    let clock = CoverageClock::reconstruct(f.data.path(), head.clone(), &duty).unwrap();
+    assert_eq!(clock.unattested_height(), Some(25));
+    assert!(CoverageClock::reconstruct(f.data.path(), head.clone(), "absent").is_err());
+    for height in [0, 12, 26] {
+        let path = f.path(height);
+        let raw = std::fs::read(&path).unwrap();
+        std::fs::write(&path, b"corrupt").unwrap();
+        assert!(CoverageClock::reconstruct(f.data.path(), head.clone(), &duty).is_err());
+        std::fs::remove_file(&path).unwrap();
+        assert!(CoverageClock::reconstruct(f.data.path(), head.clone(), &duty).is_err());
+        std::fs::write(&path, raw).unwrap();
+        let reopened = Db::open(&f.data.path().join("clave.sqlite")).unwrap();
+        let replayed =
+            CoverageClock::reconstruct(f.data.path(), reopened.last_block().unwrap(), &duty)
+                .unwrap();
+        assert_eq!(replayed.unattested_height(), clock.unattested_height());
+        assert_eq!(replayed.deadline_s(), clock.deadline_s());
+    }
+}
+
+#[test]
+fn rejected_amendments_cannot_supply_coverage_clocks() {
+    for (parameter, value) in [("coverage_deadline_hours", 96), ("record_seal_blocks", 4)] {
+        for rejection in ["signature", "value", "grace"] {
+            let f = Fixture::new();
+            let effective = START + 8 * DAY;
+            let change = match rejection {
+                "signature" => {
+                    let mut change = f.parameter(parameter, value, effective);
+                    change["body"]["sig"]["value"] = json!("invalid");
+                    change
+                }
+                "value" => f.parameter(parameter, 0, effective),
+                "grace" => f.parameter(parameter, value, START + DAY),
+                _ => unreachable!(),
+            };
+            f.append(START, vec![change]);
+            let doc = f.append(effective, vec![]);
+            let duty = block::block_hash(&doc["header"]).unwrap();
+            let clock =
+                CoverageClock::reconstruct(f.data.path(), f.db.last_block().unwrap(), &duty)
+                    .unwrap();
+            assert_eq!(
+                *clock.profile(),
+                CoverageProfile {
+                    deadline_hours: 72,
+                    seal_blocks: 24
+                }
+            );
+            assert_eq!(
+                f.history()
+                    .next_block()
+                    .unwrap()
+                    .unwrap()
+                    .rejected_parameters(),
+                &[0]
+            );
+        }
     }
 }
 

@@ -1,3 +1,4 @@
+pub mod coverage;
 pub mod declarations;
 pub mod deltas;
 pub mod payloads;
@@ -27,6 +28,7 @@ pub struct VerifiedBlock {
     verdict_thresholds: wist_core::verdict::Thresholds,
     sampling_constants: wist_core::sampling::SamplingConstants,
     confirmation_profile: records::ConfirmationProfile,
+    coverage_profile: coverage::CoverageProfile,
     clock_skew_seconds: i64,
 }
 
@@ -65,6 +67,10 @@ impl VerifiedBlock {
 
     pub fn confirmation_profile(&self) -> &records::ConfirmationProfile {
         &self.confirmation_profile
+    }
+
+    pub fn coverage_profile(&self) -> &coverage::CoverageProfile {
+        &self.coverage_profile
     }
 
     pub fn clock_skew_seconds(&self) -> i64 {
@@ -254,6 +260,10 @@ impl History {
             auditors: schedule.value_at("confirm_auditors", at).unwrap() as u64,
             window_hours: schedule.value_at("confirm_window_hours", at).unwrap() as u64,
         };
+        let coverage_profile = coverage::CoverageProfile {
+            deadline_hours: schedule.value_at("coverage_deadline_hours", at).unwrap() as u64,
+            seal_blocks: schedule.value_at("record_seal_blocks", at).unwrap() as u64,
+        };
         self.schedule = Some(schedule);
         Ok(Some(VerifiedBlock {
             block,
@@ -267,6 +277,7 @@ impl History {
             verdict_thresholds,
             sampling_constants,
             confirmation_profile,
+            coverage_profile,
             clock_skew_seconds: self
                 .schedule
                 .as_ref()
