@@ -311,6 +311,36 @@ reconstruction, VRF proof binding to the original Block, corrupt-prefix repair
 and rejected signature/value/grace amendments. Default profiles reproduce
 `sampling.json`'s rate cases, including sanction and escalation overrides.
 
+## Historical Record inclusion and confirmation profiles
+
+`history::records::IncludedRecord::reconstruct_all(directory, pinned_head)`
+returns every `audit_record` Entry in canonical Log order after the complete
+pinned Block prefix passes [Authenticated history](#authenticated-history).
+Each result preserves the original Envelope, Entry position, Block Hash and
+sealing time; reconstruction fails without returning a partial set if any Block
+is missing or invalid. A fresh attempt rereads repaired files.
+
+`confirmation_profile()` retains `confirm_auditors` and `confirm_window_hours`
+from the accepted schedule at that Record's sealing instant, including amendments
+effective exactly then. `VerifiedBlock::confirmation_profile()` exposes the same
+binding. WIST-4 §§5/9 evaluate each candidate using its own profile and preserve
+the earliest established confirmation; later profiles cannot re-evaluate earlier
+candidates. These bindings are independent of database parameter summaries.
+
+Inclusion establishes no Record authorship, field validity, standing, reference
+eligibility or finding. Malformed and incorrectly signed Record Envelopes remain
+in the returned sequence for subsequent eligibility classification. The API
+does not derive identity-scoped confirming sets, reputation or sanctions, and
+retains all included Record Envelopes in memory without a work/cache bound.
+
+Tests embed the four `parameter-combinations.json` confirmation-clock cases in
+signed histories with accepted prerequisite amendments. They cover quorum and
+window changes, activation boundaries, preservation through later amendments
+and restart, rejected signature/value/grace amendments, original Entries and
+positions, pinned-prefix exclusion, corrupt-history failure and repair/retry.
+The supplied candidate sets exercise profile timing without establishing Record
+eligibility or complete finding replay.
+
 ## Historical audit references
 
 `history::references::AuditChain::reconstruct(directory, pinned_head, audited_id)`

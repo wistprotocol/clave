@@ -1,6 +1,7 @@
 pub mod declarations;
 pub mod deltas;
 pub mod payloads;
+pub mod records;
 pub mod references;
 
 use crate::db::BlockRow;
@@ -24,6 +25,7 @@ pub struct VerifiedBlock {
     audit_profile: wist_core::canary::ScoringProfile,
     verdict_thresholds: wist_core::verdict::Thresholds,
     sampling_constants: wist_core::sampling::SamplingConstants,
+    confirmation_profile: records::ConfirmationProfile,
 }
 
 impl VerifiedBlock {
@@ -57,6 +59,10 @@ impl VerifiedBlock {
 
     pub fn sampling_constants(&self) -> &wist_core::sampling::SamplingConstants {
         &self.sampling_constants
+    }
+
+    pub fn confirmation_profile(&self) -> &records::ConfirmationProfile {
+        &self.confirmation_profile
     }
 
     pub fn rejected_parameters(&self) -> &[usize] {
@@ -236,6 +242,10 @@ impl History {
             ceiling_1e7: schedule.value_at("sampling_ceiling", at).unwrap() as u64,
             slope_per_micro: schedule.value_at("sampling_slope", at).unwrap(),
         };
+        let confirmation_profile = records::ConfirmationProfile {
+            auditors: schedule.value_at("confirm_auditors", at).unwrap() as u64,
+            window_hours: schedule.value_at("confirm_window_hours", at).unwrap() as u64,
+        };
         self.schedule = Some(schedule);
         Ok(Some(VerifiedBlock {
             block,
@@ -248,6 +258,7 @@ impl History {
             audit_profile,
             verdict_thresholds,
             sampling_constants,
+            confirmation_profile,
         }))
     }
 

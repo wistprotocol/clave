@@ -1,4 +1,5 @@
 use clave::db::{BlockRow, Db};
+use clave::history::records::IncludedRecord;
 use clave::history::History;
 use serde_json::{json, Value};
 use wist_core::crypto::{hex_encode, SigningKey};
@@ -116,6 +117,287 @@ impl Fixture {
         .unwrap();
         json!({"type":"registry_update", "body":body})
     }
+
+    fn record(&self, auditor: &str, at: i64) -> Value {
+        let body = envelope::sign_envelope(
+            &json!({"auditor_id":auditor, "fetched_at":ts(at),
+                "audited_delta":format!("sha256:{}", "a".repeat(64)),
+                "verdict":"inconsistent", "similarity":10_000}),
+            "record",
+            "record1",
+            &SigningKey::from_seed(&[17; 32]),
+        )
+        .unwrap();
+        json!({"type":"audit_record", "body":body})
+    }
+}
+
+#[test]
+fn included_records_bind_confirmation_clock_vectors_to_signed_history() {
+    let spec = std::env::var_os("WIST_SPEC_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../spec")
+        });
+    let vectors: Value = serde_json::from_slice(
+        &std::fs::read(spec.join("vectors/wist4/parameter-combinations.json")).unwrap(),
+    )
+    .unwrap();
+    for case in vectors["confirmation_clock_cases"].as_array().unwrap() {
+        let f = Fixture::new();
+        let base = START + 8 * DAY;
+        f.append(START, vec![f.parameter("record_seal_blocks", 1, base)]);
+        let mut changes = Vec::new();
+        for change in case["changes"].as_array().unwrap() {
+            changes.push(f.parameter(
+                change["parameter"].as_str().unwrap(),
+                change["value"].as_i64().unwrap(),
+                base + change["effective_at_s"].as_i64().unwrap(),
+            ));
+        }
+        f.append(START + 3600, sorted(changes));
+        let mut expected = Vec::new();
+        for (index, at) in case["record_times_s"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+        {
+            let at = base + at.as_i64().unwrap();
+            let entry = f.record(&format!("audit.site{index}.test"), at);
+            let doc = f.append(at, vec![entry.clone()]);
+            expected.push((
+                entry["body"].clone(),
+                block::block_hash(&doc["header"]).unwrap(),
+            ));
+        }
+        let head = f.db.last_block().unwrap();
+        let records = IncludedRecord::reconstruct_all(f.data.path(), head.clone()).unwrap();
+        assert_eq!(records.len(), expected.len());
+        let mut candidates = Vec::new();
+        let mut confirming = None;
+        for (index, source) in records.iter().enumerate() {
+            assert_eq!(source.envelope(), &expected[index].0);
+            assert_eq!(source.block_hash(), expected[index].1);
+            assert_eq!(source.position().block_number, index as u64 + 2);
+            assert_eq!(source.position().entry_index, 0);
+            let relative = source.sealed_at_s() - base;
+            let expected_parameter = |name: &str, default| {
+                case["changes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .rev()
+                    .find(|change| {
+                        change["parameter"] == name
+                            && change["effective_at_s"].as_i64().unwrap() <= relative
+                    })
+                    .map_or(default, |change| change["value"].as_u64().unwrap())
+            };
+            let profile = source.confirmation_profile();
+            assert_eq!(profile.auditors, expected_parameter("confirm_auditors", 2));
+            assert_eq!(
+                profile.window_hours,
+                expected_parameter("confirm_window_hours", 72)
+            );
+            candidates.push(wist_core::confirmation::CandidateRecord {
+                block_height: source.position().block_number,
+                entry_index: source.position().entry_index as u64,
+                block_sealed_at_s: source.sealed_at_s(),
+                auditor_id: source.envelope()["record"]["auditor_id"].as_str().unwrap(),
+                effective_similarity: 10_000,
+            });
+            if confirming.is_none()
+                && wist_core::confirmation::confirming_index_with_quorum(
+                    &candidates,
+                    profile.window_hours,
+                    profile.auditors,
+                )
+                .unwrap()
+                    == Some(index)
+            {
+                confirming = Some(index);
+            }
+        }
+        assert_eq!(
+            confirming,
+            case["confirming_index"].as_u64().map(|i| i as usize),
+            "{}",
+            case["label"]
+        );
+        let mut history = f.history();
+        while let Some(block) = history.next_block().unwrap() {
+            assert!(block.rejected_parameters().is_empty(), "{}", case["label"]);
+        }
+        f.db.set_param("confirm_auditors", 99).unwrap();
+        drop(f.db);
+        let reopened = Db::open(&f.data.path().join("clave.sqlite")).unwrap();
+        let replayed =
+            IncludedRecord::reconstruct_all(f.data.path(), reopened.last_block().unwrap()).unwrap();
+        for (source, replayed) in records.iter().zip(replayed) {
+            assert_eq!(source.envelope(), replayed.envelope());
+            assert_eq!(
+                source.confirmation_profile(),
+                replayed.confirmation_profile()
+            );
+            assert_eq!(source.block_hash(), replayed.block_hash());
+        }
+    }
+}
+
+#[test]
+fn included_records_preserve_entries_without_claiming_authorship_or_eligibility() {
+    let f = Fixture::new();
+    let mut forged = f.record("audit.example.test", START);
+    forged["body"]["sig"]["value"] = json!("invalid");
+    let malformed = json!({"type":"audit_record", "body":{"unparsed":true}});
+    let declaration = json!({"type":"publisher_declaration", "body":{"unparsed":true}});
+    let doc = f.append(START, sorted(vec![forged, malformed, declaration]));
+    let pinned = f.db.last_block().unwrap();
+    let expected: Vec<_> = doc["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry["type"] == "audit_record")
+        .collect();
+    let records = IncludedRecord::reconstruct_all(f.data.path(), pinned.clone()).unwrap();
+    assert_eq!(records.len(), 2);
+    for (record, (index, entry)) in records.iter().zip(expected) {
+        assert_eq!(record.position().entry_index, index);
+        assert_eq!(record.envelope(), &entry["body"]);
+    }
+    f.append(
+        START + 3600,
+        vec![f.record("later.example.test", START + 3600)],
+    );
+    assert_eq!(
+        IncludedRecord::reconstruct_all(f.data.path(), pinned)
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        IncludedRecord::reconstruct_all(f.data.path(), f.db.last_block().unwrap())
+            .unwrap()
+            .len(),
+        3
+    );
+    assert!(IncludedRecord::reconstruct_all(f.data.path(), None)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn confirmation_profiles_freeze_activation_boundaries_and_later_reductions() {
+    let f = Fixture::new();
+    let first = START + 7 * DAY;
+    let second = START + 14 * DAY;
+    f.append(
+        START,
+        sorted(vec![
+            f.parameter("confirm_auditors", 4, first),
+            f.parameter("confirm_window_hours", 48, first),
+        ]),
+    );
+    for at in [first - 3600, first, first + 3600] {
+        f.append(at, vec![f.record("audit.example.test", at)]);
+    }
+    f.append(
+        first + 7200,
+        sorted(vec![
+            f.parameter("confirm_auditors", 2, second + 7200),
+            f.parameter("confirm_window_hours", 72, second + 7200),
+        ]),
+    );
+    for at in [second + 3600, second + 7200, second + 10800] {
+        f.append(at, vec![f.record("audit.example.test", at)]);
+    }
+    let expected = [(2, 72), (4, 48), (4, 48), (4, 48), (2, 72), (2, 72)];
+    let records =
+        IncludedRecord::reconstruct_all(f.data.path(), f.db.last_block().unwrap()).unwrap();
+    assert_eq!(records.len(), expected.len());
+    for (source, (auditors, window_hours)) in records.iter().zip(expected) {
+        assert_eq!(source.confirmation_profile().auditors, auditors);
+        assert_eq!(source.confirmation_profile().window_hours, window_hours);
+    }
+    let mut history = f.history();
+    while let Some(block) = history.next_block().unwrap() {
+        assert!(block.rejected_parameters().is_empty());
+    }
+}
+
+#[test]
+fn rejected_amendments_supply_no_record_confirmation_profile() {
+    for parameter in ["confirm_auditors", "confirm_window_hours"] {
+        for rejection in ["signature", "value", "grace"] {
+            let f = Fixture::new();
+            let effective = START + 7 * DAY;
+            let mut change = f.parameter(
+                parameter,
+                if parameter == "confirm_auditors" {
+                    3
+                } else {
+                    48
+                },
+                effective,
+            );
+            match rejection {
+                "signature" => change["body"]["sig"]["value"] = json!("invalid"),
+                "value" => change = f.parameter(parameter, 0, effective),
+                "grace" => {
+                    change = f.parameter(
+                        parameter,
+                        if parameter == "confirm_auditors" {
+                            3
+                        } else {
+                            48
+                        },
+                        START + DAY,
+                    )
+                }
+                _ => unreachable!(),
+            }
+            f.append(START, vec![change]);
+            f.append(effective, vec![f.record("audit.example.test", effective)]);
+            let mut history = f.history();
+            assert_eq!(
+                history.next_block().unwrap().unwrap().rejected_parameters(),
+                &[0]
+            );
+            let block = history.next_block().unwrap().unwrap();
+            let records =
+                IncludedRecord::reconstruct_all(f.data.path(), f.db.last_block().unwrap()).unwrap();
+            assert_eq!(
+                records[0].confirmation_profile(),
+                block.confirmation_profile()
+            );
+            assert_eq!(records[0].confirmation_profile().auditors, 2);
+            assert_eq!(records[0].confirmation_profile().window_hours, 72);
+        }
+    }
+}
+
+#[test]
+fn included_record_reconstruction_requires_the_complete_pinned_prefix_and_can_retry() {
+    let f = Fixture::new();
+    f.append(START, vec![f.record("audit.example.test", START)]);
+    f.append(START + 3600, vec![]);
+    let final_block = f.append(START + 7200, vec![]);
+    let head = f.db.last_block().unwrap();
+    let retained = std::fs::read(f.path(2)).unwrap();
+    std::fs::remove_file(f.path(2)).unwrap();
+    assert!(IncludedRecord::reconstruct_all(f.data.path(), head.clone()).is_err());
+    let mut corrupt = final_block.clone();
+    corrupt["sig"]["value"] = json!("invalid");
+    f.write(2, &corrupt);
+    assert!(IncludedRecord::reconstruct_all(f.data.path(), head.clone()).is_err());
+    std::fs::write(f.path(2), retained).unwrap();
+    let records = IncludedRecord::reconstruct_all(f.data.path(), head.clone()).unwrap();
+    assert_eq!(records.len(), 1);
+    let mut wrong_head = head.unwrap();
+    wrong_head.block_hash = format!("sha256:{}", "0".repeat(64));
+    assert!(IncludedRecord::reconstruct_all(f.data.path(), Some(wrong_head)).is_err());
 }
 
 #[test]
