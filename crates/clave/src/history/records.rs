@@ -98,62 +98,18 @@ impl IncludedRecord {
     }
 
     pub fn evidence_fields_valid(&self) -> bool {
-        let body = &self.envelope["record"];
-        let Some(verdict) = body["verdict"].as_str() else {
-            return false;
-        };
-        let measured = match verdict {
-            "consistent" | "dynamic_variance" | "inconsistent" | "link_variance"
-            | "link_inconsistent" => true,
-            "unreachable" | "not_auditable" => false,
-            _ => return false,
-        };
-        for field in [
-            "response_commitment",
-            "credit_commitment",
-            "ref_extract_commitment",
-            "evidence_commitment",
-        ] {
-            match body.get(field) {
-                Some(value) if measured => {
-                    if !value
-                        .as_str()
-                        .and_then(|value| value.strip_prefix("hmac-sha256:"))
-                        .is_some_and(|hex| {
-                            hex.len() == 64
-                                && hex
-                                    .bytes()
-                                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-                        })
-                    {
-                        return false;
-                    }
-                }
-                None if !measured => {}
-                _ => return false,
-            }
-        }
-        let micro = |value: &Value| value.as_u64().is_some_and(|n| n <= 1_000_000);
-        if body.get("similarity").is_some_and(micro) != measured
-            || (!measured && body.get("similarity").is_some())
-            || body
-                .get("link_agreement")
-                .is_some_and(|value| !measured || !micro(value))
-            || (matches!(verdict, "link_variance" | "link_inconsistent")
-                && body.get("link_agreement").is_none())
-            || body
-                .get("robots_excluded")
-                .is_some_and(|value| verdict != "unreachable" || value != true)
-        {
-            return false;
-        }
-        match body.get("unmeasured") {
-            Some(value) => {
-                verdict == "not_auditable"
-                    && matches!(value.as_str(), Some("observed" | "reference"))
-            }
-            None => verdict != "not_auditable",
-        }
+        crate::record::evidence_fields_valid(&self.envelope)
+    }
+
+    pub fn field_validation(&self) -> crate::record::FieldValidation {
+        crate::record::RecordEnvelope::from_included(&self.envelope).fields()
+    }
+
+    pub fn disposition(
+        &self,
+        context: &crate::record::ReplayContext<'_>,
+    ) -> crate::record::Disposition {
+        crate::record::RecordEnvelope::from_included(&self.envelope).disposition(context)
     }
 
     pub fn resolve_reference(&self, directory: &Path) -> Result<RecordReference> {

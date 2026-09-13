@@ -17,6 +17,7 @@ pub mod mirrors;
 pub mod param_change;
 pub mod payload;
 pub mod quota;
+pub mod record;
 pub mod recovery;
 pub mod registry;
 pub mod sanctions;

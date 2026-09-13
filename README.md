@@ -468,30 +468,60 @@ and reconstruction after restart. Regressions cover malformed lists, corrupt
 copies, Publisher fallback, exhaustion, repair, unchanged Record/Block bytes
 and Payload caps predating a reduction at Record inclusion.
 
+## Audit Record fields and dispositions
+
+`record::RecordEnvelope::parse()` rejects ineligible raw JSON as WIST1-E05,
+including duplicate decoded names at any depth, trailing input and non-JCS
+values. It preserves the parsed signed object and its numeric values without
+typed deserialization or version rewriting. `fields()` applies WIST-4 §10.1:
+non-evidence defects return WIST4-E09 before evidence defects return WIST4-E02.
+`FieldValidation::supported_major()` checks the Record's own version spelling
+and major independently of the evidence result; all minor/patch components of
+major 1 are supported without machine-integer limits.
+
+`disposition()` returns a diagnostic and a separate conditional coverage result.
+It verifies the signature over the original Record against the supplied
+`SigningBinding`, including exact Auditor identity and key ID. Non-evidence
+failure, unsupported major, failed authentication or `Duty::Absent` prevents
+discharge even when an evidence-field error takes diagnostic precedence.
+`Duty::RemovedAfterAnchor` and coverage failure preserve WIST-4 §3's discharge
+carve-outs while rejecting the Record for reputation, confirmation and extension
+triggers. After field checks, this implementation reports unsupported major
+before standing/authenticity and semantic evidence errors; §10.1 permits any
+applicable semantic diagnostic.
+
+`ReplayContext` supplies predicates that callers must establish from the same
+authenticated Log prefix: the admitted signing binding, ordinary or extension
+duty, removal relative to its anchor, coverage failure at sealing and semantic
+evidence failures. `Duty::Active` requires every duty premise, including valid
+selection/extension proof, selection-domain membership and absence of self-audit;
+`RemovedAfterAnchor` requires those premises and removal only after that duty's
+anchor. A missing duty premise requires `Absent`. The field validator
+reconstructs none of these facts; admission and process replay must derive them
+before consuming its conditional results.
+
+`IncludedRecord::field_validation()` and `disposition()` apply the same checks
+to Envelopes retained in authenticated Blocks. Rejection leaves the Record and
+Block available for separate evidence/coverage handling. These APIs do not
+drive pulling, sealing, reputation, coverage transitions or accepted findings.
+
+The implementation independently consumes `vectors/wist4/record-fields.json`
+for raw parsing, signatures, complete fields, versions and conditional discharge.
+Signed Block tests exercise its object Envelopes through history reconstruction,
+preserve retained bytes and repeat after reopening, using supplied contexts
+within the limits above.
+
 ## Included Record evidence fields
 
-`IncludedRecord::evidence_fields_valid()` checks WIST-4 §5 and
-`audit-record.schema.json`'s evidence fields without resolving a reference or
-retrieving content. Measured verdicts require all four HMAC-SHA256 commitments
-and an integral similarity in 0 … 1,000,000; unmeasured verdicts forbid those
-fields and link scores. Link verdicts require an in-range link score.
-`robots_excluded`, when present, must be `true` on `unreachable`;
-`unmeasured` must be `observed` or `reference` on exactly `not_auditable`.
+`IncludedRecord::evidence_fields_valid()` reports only WIST-4 §10.1's evidence
+field validity, including reference-ID spelling and actual whole-second UTC
+fetch instants. It assigns no diagnostic, reputation weight or coverage discharge;
+complete validation follows [Audit Record fields and dispositions](#audit-record-fields-and-dispositions).
+Reference-dependent checks follow [Included Record verdict scores](#included-record-verdict-scores).
 
-The boolean reports this field relation only. It assigns no error code,
-reputation weight or coverage discharge, and leaves the included Envelope
-unchanged on either outcome. Complete Envelope fields, version support,
-signatures, standing and measurement truth require separate validation;
-reference-dependent checks follow [Included Record verdict scores](#included-record-verdict-scores).
-Replay uses canonical Block bytes, so equivalent integral JSON spellings
-reach this predicate as the same number.
-
-Signed-history tests use the example Record, commitment vectors and unauditable
-fetch cases. They exercise every verdict, missing/null/malformed commitments,
-score boundaries and numeric spellings, conditional evidence markers, forged
-signatures, reconstruction after restart and preservation of retained Blocks.
-The supplied unmeasured causes establish field eligibility, not fetch outcomes
-or the unauditable horizon.
+Signed-history tests additionally cover every verdict, commitment and score
+boundaries, conditional evidence markers and unauditable fetch-vector fields.
+Those fields establish no fetch outcome or unauditable horizon.
 
 ## Included Record verdict scores
 

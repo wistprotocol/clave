@@ -3043,3 +3043,97 @@ fn authenticated_reference_vectors_resolve_named_and_newest_deltas() {
     std::fs::write(path, bytes).unwrap();
     AuditChain::reconstruct(f.data.path(), f.head.clone(), &id("d1")).unwrap();
 }
+
+#[test]
+fn included_record_field_rejections_preserve_the_block_and_survive_restart() {
+    use clave::record::{Duty, RecordEnvelope, ReplayContext, SigningBinding};
+    use std::collections::BTreeMap;
+
+    let vectors: Value = serde_json::from_slice(
+        &std::fs::read(spec_dir().join("vectors/wist4/record-fields.json")).unwrap(),
+    )
+    .unwrap();
+    let public_key = crypto::PublicKey::from_b64u(vectors["public_key"].as_str().unwrap()).unwrap();
+    let mut cases = BTreeMap::<Vec<u8>, (Value, Vec<&Value>)>::new();
+    for case in vectors["cases"].as_array().unwrap() {
+        let Ok(parsed) = RecordEnvelope::parse(case["record_json"].as_str().unwrap().as_bytes())
+        else {
+            continue;
+        };
+        if !parsed.envelope().is_object() {
+            continue;
+        }
+        cases
+            .entry(jcs::canonicalize(parsed.envelope()).unwrap())
+            .or_insert_with(|| (parsed.envelope().clone(), Vec::new()))
+            .1
+            .push(case);
+    }
+    let mut fixture = Fixture::new();
+    fixture.append(
+        cases
+            .values()
+            .map(|(record, _)| entry("audit_record", record))
+            .collect(),
+    );
+    let retained = std::fs::read(fixture.path(0)).unwrap();
+    for _ in 0..2 {
+        let records =
+            IncludedRecord::reconstruct_all(fixture.data.path(), fixture.head.clone()).unwrap();
+        assert_eq!(records.len(), cases.len());
+        for record in records {
+            let canonical = jcs::canonicalize(record.envelope()).unwrap();
+            for case in &cases[&canonical].1 {
+                let source: Value =
+                    serde_json::from_str(case["record_json"].as_str().unwrap()).unwrap();
+                let supplied = &case["context"];
+                let context = ReplayContext {
+                    signing: (supplied["identity"] == true).then(|| SigningBinding {
+                        auditor_id: source["record"]["auditor_id"].as_str().unwrap_or(""),
+                        key_id: source["sig"]["key_id"].as_str().unwrap_or(""),
+                        public_key: &public_key,
+                    }),
+                    duty: if supplied["duty"] != true {
+                        Duty::Absent
+                    } else if supplied["removed"] == true {
+                        Duty::RemovedAfterAnchor
+                    } else {
+                        Duty::Active
+                    },
+                    coverage_failure: supplied["coverage_failure"] == true,
+                    semantic_evidence_error: supplied["semantic_evidence_error"] == true,
+                };
+                let disposition = record.disposition(&context);
+                let allowed = case["allowed"].as_array().unwrap();
+                assert_eq!(
+                    disposition.diagnostic.is_none(),
+                    allowed.is_empty(),
+                    "{}",
+                    case["name"]
+                );
+                if let Some(code) = disposition.diagnostic {
+                    assert!(
+                        allowed.iter().any(|value| value == code),
+                        "{}: {code}",
+                        case["name"]
+                    );
+                }
+                assert_eq!(
+                    disposition.discharges_coverage, case["discharge"],
+                    "{}",
+                    case["name"]
+                );
+                let fields = record.field_validation();
+                if let Some(code) = fields.diagnostic() {
+                    assert!(
+                        allowed.iter().any(|value| value == code),
+                        "{}: {code}",
+                        case["name"]
+                    );
+                }
+                assert_eq!(jcs::canonicalize(record.envelope()).unwrap(), canonical);
+            }
+        }
+        assert_eq!(std::fs::read(fixture.path(0)).unwrap(), retained);
+    }
+}
