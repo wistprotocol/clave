@@ -23,6 +23,7 @@ pub struct DeltaSource {
     audit_profile: wist_core::canary::ScoringProfile,
     verdict_thresholds: wist_core::verdict::Thresholds,
     sampling_constants: wist_core::sampling::SamplingConstants,
+    clock_skew_seconds: i64,
 }
 
 impl DeltaSource {
@@ -71,6 +72,7 @@ impl DeltaSource {
                     audit_profile: *block.audit_profile(),
                     verdict_thresholds: *block.verdict_thresholds(),
                     sampling_constants: *block.sampling_constants(),
+                    clock_skew_seconds: block.clock_skew_seconds(),
                 });
             }
         }
@@ -95,6 +97,10 @@ impl DeltaSource {
 
     pub fn sampling_constants(&self) -> &wist_core::sampling::SamplingConstants {
         &self.sampling_constants
+    }
+
+    pub fn clock_skew_seconds(&self) -> i64 {
+        self.clock_skew_seconds
     }
 
     pub fn envelope(&self) -> &Value {
@@ -218,6 +224,8 @@ impl Chains {
         block: &VerifiedBlock,
         declarations: &Declarations,
     ) -> Result<()> {
+        let clock = jiff::Timestamp::from_second(block.sealed_at_s())
+            .map_err(|e| failure(&e.to_string()))?;
         let mut deltas = Vec::new();
         for entry in block
             .block()
@@ -231,6 +239,8 @@ impl Chains {
                 .validate_delta(envelope)
                 .map_err(failure)?;
             let delta = Delta::read(envelope)?;
+            declaration::verify_delta_clock(envelope, clock, block.clock_skew_seconds())
+                .map_err(failure)?;
             let source = declarations
                 .domains()
                 .get(&delta.domain)

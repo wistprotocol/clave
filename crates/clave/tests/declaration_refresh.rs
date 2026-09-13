@@ -954,3 +954,70 @@ fn settlement_after_payload_fetch_retries_before_final_delta_admission() {
         assert_eq!(db.is_delta_seen_for(&id, &host).unwrap(), repaired);
     }
 }
+
+#[test]
+fn delta_clock_stays_frozen_through_refresh_and_resets_after_restart() {
+    let (listener, host, client) = reserve_addr();
+    let p = make_publisher_with_recovery(&host);
+    let previous = current_declaration(&p);
+    let next = replacement(&p, "k2", false);
+    let id = add_delta_signed(
+        &p,
+        "https://localhost/future",
+        "future",
+        None,
+        "2026-08-09T14:10:00.00000000000000000001Z",
+        "k2",
+        &K2_SEED,
+    );
+    write_feed_signed(&p, &host, std::slice::from_ref(&id), NOW, "k1", &K1_SEED);
+    let requests = serve_sequence(
+        listener,
+        p.dir.path().into(),
+        vec![response(&previous), response(&next)],
+    );
+    let data = tempfile::tempdir().unwrap();
+    clave::init::run(&host, data.path()).unwrap();
+    let path = data.path().join("clave.sqlite");
+    let db = Db::open(&path).unwrap();
+    let report = clave::ingest::run_with_clock(&db, &client, data.path(), &host, NOW, || {
+        let refreshed = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|path| path.ends_with("publisher.json"))
+            .count()
+            >= 2;
+        if refreshed {
+            "2026-08-09T14:00:01Z"
+        } else {
+            NOW
+        }
+        .parse()
+        .unwrap()
+    })
+    .unwrap();
+    assert!(report.accepted.is_empty());
+    assert_eq!(report.rejected, [(id.clone(), "WIST1-E06".into())]);
+    assert_eq!(stored(&db), next);
+    assert!(!db.is_delta_seen(&id).unwrap());
+    assert!(!requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|path| path.contains("/payloads/")));
+    drop(db);
+    let db = Db::open(&path).unwrap();
+    write_feed_signed(
+        &p,
+        &host,
+        std::slice::from_ref(&id),
+        "2026-08-09T14:00:01Z",
+        "k2",
+        &K2_SEED,
+    );
+    let report =
+        clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T14:00:01Z").unwrap();
+    assert_eq!(report.accepted, [id]);
+    assert!(report.rejected.is_empty());
+}

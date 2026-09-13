@@ -325,3 +325,34 @@ pub fn write_feed_signed(
     )
     .unwrap();
 }
+
+pub fn serve_crossing(
+    listener: std::net::TcpListener,
+    directory: std::path::PathBuf,
+    suffix: String,
+) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+    let crossed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = crossed.clone();
+    std::thread::spawn(move || {
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async move {
+                let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+                    let path = directory.join(uri.path().trim_start_matches('/'));
+                    if uri.path().ends_with(&suffix) {
+                        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    async move {
+                        match std::fs::read(path) {
+                            Ok(bytes) => (axum::http::StatusCode::OK, bytes),
+                            Err(_) => (axum::http::StatusCode::NOT_FOUND, Vec::new()),
+                        }
+                    }
+                });
+                axum::serve(tokio::net::TcpListener::from_std(listener).unwrap(), app)
+                    .await
+                    .unwrap();
+            });
+    });
+    crossed
+}

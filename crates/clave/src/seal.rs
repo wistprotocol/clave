@@ -394,10 +394,14 @@ fn revalidate_queued_deltas(
     db: &Db,
     data_dir: &Path,
     size_caps: &crate::declaration::delta::SizeCaps,
+    clock_skew_seconds: i64,
     entries: Vec<SealEntry>,
     sealed_at: &str,
     projection: &Projection,
 ) -> Result<(Vec<SealEntry>, Vec<i64>, Vec<String>)> {
+    let clock = sealed_at
+        .parse::<jiff::Timestamp>()
+        .map_err(|e| Error::Clock(e.to_string()))?;
     let sources = projection
         .domains()
         .iter()
@@ -431,7 +435,9 @@ fn revalidate_queued_deltas(
             .and_then(|()| crate::declaration::verify_delta_authority(&source, &e.body));
         let code = match verified {
             Ok(()) => {
-                let sizes = size_caps.validate_delta(&e.body);
+                let sizes = size_caps.validate_delta(&e.body).and_then(|()| {
+                    crate::declaration::verify_delta_clock(&e.body, clock, clock_skew_seconds)
+                });
                 let sizes = match sizes {
                     Ok(()) if e.body["delta"].get("payload").is_some() => {
                         let id = wist_core::delta::delta_id(&e.body["delta"])?;
@@ -1024,16 +1030,18 @@ pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<
             entry.entry_type != "publisher_delta" || !recovering.contains(entry.domain.as_str())
         })
         .collect();
-    let size_caps = crate::declaration::delta::SizeCaps::from_schedule(
-        history
-            .schedule()
-            .unwrap_or(&wist_core::parameters::Schedule::new(sealed_epoch)),
-        sealed_epoch,
-    );
+    let default_schedule = wist_core::parameters::Schedule::new(sealed_epoch);
+    let sealing_schedule = history.schedule().unwrap_or(&default_schedule);
+    let size_caps =
+        crate::declaration::delta::SizeCaps::from_schedule(sealing_schedule, sealed_epoch);
+    let clock_skew_seconds = sealing_schedule
+        .value_at("clock_skew_seconds", sealed_epoch)
+        .unwrap();
     let (seal_entries, retired_rowids, retired) = revalidate_queued_deltas(
         db,
         data_dir,
         &size_caps,
+        clock_skew_seconds,
         seal_entries,
         &sealed_at,
         &projection,

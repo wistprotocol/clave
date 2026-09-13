@@ -1,5 +1,7 @@
 mod common;
 
+const SEAL_START: i64 = 1_786_276_800;
+
 use common::{add_delta, make_publisher_with_scope, reserve_addr, serve_static, write_feed};
 use sha2::{Digest, Sha256};
 use wist_core::objects::StateEntry;
@@ -38,7 +40,7 @@ fn snapshot_build_produces_verifiable_tier0_state_and_signed_artifacts() {
     clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
 
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
-    let report = clave::seal::run(&db, data.path(), &sk, 1_754_740_800).unwrap();
+    let report = clave::seal::run(&db, data.path(), &sk, SEAL_START).unwrap();
     assert_eq!(report.block_number, 0);
 
     let raw = std::fs::read(data.path().join("log/blocks/000000000.json.zst")).unwrap();
@@ -53,9 +55,9 @@ fn snapshot_build_produces_verifiable_tier0_state_and_signed_artifacts() {
     let snapshots = idx["index"]["snapshots"].as_array().unwrap();
     assert_eq!(snapshots.len(), 1);
     let entry = &snapshots[0];
-    assert_eq!(entry["snapshot_date"], "2025-08-09");
+    assert_eq!(entry["snapshot_date"], "2026-08-09");
     assert_eq!(entry["log_position"], 0);
-    assert_eq!(entry["manifest_url"], "/snapshots/2025-08-09/manifest.json");
+    assert_eq!(entry["manifest_url"], "/snapshots/2026-08-09/manifest.json");
 
     let man_path = data.path().join(
         entry["manifest_url"]
@@ -68,7 +70,7 @@ fn snapshot_build_produces_verifiable_tier0_state_and_signed_artifacts() {
     wist_core::envelope::verify_envelope(&man, "manifest", &sk.public()).unwrap();
 
     assert_eq!(man["manifest"]["wist_version"], "1.0.0");
-    assert_eq!(man["manifest"]["snapshot_date"], "2025-08-09");
+    assert_eq!(man["manifest"]["snapshot_date"], "2026-08-09");
     assert_eq!(man["manifest"]["log_position"], 0);
     assert_eq!(man["manifest"]["anchor_block_hash"], block_hash);
     assert_eq!(man["manifest"]["content_digest"], entry["content_digest"]);
@@ -202,8 +204,8 @@ fn snapshot_index_replaces_same_date_entry_on_reseal() {
     clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
 
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
-    clave::seal::run(&db, data.path(), &sk, 1_754_740_800).unwrap();
-    let r1 = clave::seal::run(&db, data.path(), &sk, 1_754_744_400).unwrap();
+    clave::seal::run(&db, data.path(), &sk, SEAL_START).unwrap();
+    let r1 = clave::seal::run(&db, data.path(), &sk, SEAL_START + 3600).unwrap();
     assert_eq!(r1.block_number, 1);
 
     let idx: serde_json::Value =
@@ -216,7 +218,7 @@ fn snapshot_index_replaces_same_date_entry_on_reseal() {
         1,
         "same-day reseal must replace, not duplicate, the index entry"
     );
-    assert_eq!(snapshots[0]["snapshot_date"], "2025-08-09");
+    assert_eq!(snapshots[0]["snapshot_date"], "2026-08-09");
     assert_eq!(snapshots[0]["log_position"], 1);
 }
 
@@ -242,7 +244,7 @@ fn tier1_fixture(shards: Option<i64>) -> (common::TestPub, tempfile::TempDir, St
     }
     clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
-    clave::seal::run(&db, data.path(), &sk, 1_754_740_800).unwrap();
+    clave::seal::run(&db, data.path(), &sk, SEAL_START).unwrap();
     (p, data, host, id)
 }
 
@@ -268,7 +270,7 @@ fn read_parquet_rows(path: &std::path::Path) -> Vec<Vec<String>> {
 #[test]
 fn snapshot_includes_tier1_extracts_and_link_graph() {
     let (_p, data, host, id) = tier1_fixture(None);
-    let dir = data.path().join("snapshots/2025-08-09");
+    let dir = data.path().join("snapshots/2026-08-09");
 
     let extracts = read_parquet_rows(&dir.join("tier1/extracts.parquet"));
     assert_eq!(
@@ -314,7 +316,7 @@ fn snapshot_includes_tier1_extracts_and_link_graph() {
 #[test]
 fn sharded_snapshot_declares_count_digests_and_shard_labels() {
     let (_p, data, host, _id) = tier1_fixture(Some(2));
-    let dir = data.path().join("snapshots/2025-08-09");
+    let dir = data.path().join("snapshots/2026-08-09");
     let manifest: serde_json::Value =
         serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
     let m = &manifest["manifest"];
@@ -367,7 +369,7 @@ fn the_state_artifact_carries_every_kind_with_live_instances() {
     db.set_param("block_cadence_seconds", 1).unwrap();
     clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
-    clave::seal::run(&db, data.path(), &sk, 1_754_740_800).unwrap();
+    clave::seal::run(&db, data.path(), &sk, SEAL_START).unwrap();
 
     let admit = serde_json::json!({
         "wist_version": "1.0.0",
@@ -390,16 +392,16 @@ fn the_state_artifact_carries_every_kind_with_live_instances() {
             format!("sha256:{}", "2".repeat(64)),
         ],
         None,
-        1_754_744_400,
+        SEAL_START + 3600,
     )
     .unwrap();
-    clave::seal::run(&db, data.path(), &sk, 1_754_744_400).unwrap();
+    clave::seal::run(&db, data.path(), &sk, SEAL_START + 3600).unwrap();
 
     // The record for the deleted URL is gone, but its chain tip is not.
     db.delete_record_by_delta(&doomed).unwrap();
 
-    clave::seal::run(&db, data.path(), &sk, 1_754_748_000).unwrap();
-    let date = &jiff::Timestamp::from_second(1_754_748_000)
+    clave::seal::run(&db, data.path(), &sk, SEAL_START + 7200).unwrap();
+    let date = &jiff::Timestamp::from_second(SEAL_START + 7200)
         .unwrap()
         .to_string()[..10];
     let state_env: serde_json::Value = serde_json::from_slice(

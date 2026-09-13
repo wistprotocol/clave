@@ -2,6 +2,8 @@ mod common;
 
 use common::{add_delta, make_publisher_with_scope, reserve_addr, serve_static, write_feed};
 
+const SEAL_START: i64 = 1_786_276_800;
+
 #[test]
 fn seal_produces_verifiable_chain() {
     let (listener, host, client) = reserve_addr();
@@ -22,7 +24,7 @@ fn seal_produces_verifiable_chain() {
     clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
 
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
-    let r0 = clave::seal::run(&db, data.path(), &sk, 1_754_740_800).unwrap();
+    let r0 = clave::seal::run(&db, data.path(), &sk, SEAL_START).unwrap();
     assert_eq!(r0.block_number, 0);
     assert_eq!(r0.entry_count, 2);
     let raw = std::fs::read(data.path().join("log/blocks/000000000.json.zst")).unwrap();
@@ -45,8 +47,8 @@ fn seal_produces_verifiable_chain() {
     assert_eq!(record.title, "https://example.com/a");
     assert_eq!(record.lang, "en");
 
-    assert!(clave::seal::run(&db, data.path(), &sk, 1_754_740_800).is_err());
-    let r1 = clave::seal::run(&db, data.path(), &sk, 1_754_740_801).unwrap();
+    assert!(clave::seal::run(&db, data.path(), &sk, SEAL_START).is_err());
+    let r1 = clave::seal::run(&db, data.path(), &sk, SEAL_START + 1).unwrap();
     assert_eq!(r1.block_number, 1);
     assert_eq!(r1.entry_count, 0);
     let b1: serde_json::Value = serde_json::from_slice(
@@ -87,7 +89,7 @@ fn seal_orders_same_type_entries_by_ascending_leaf_hash() {
     clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
 
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
-    let report = clave::seal::run(&db, data.path(), &sk, 1_754_740_800).unwrap();
+    let report = clave::seal::run(&db, data.path(), &sk, SEAL_START).unwrap();
     assert_eq!(report.entry_count, 3);
 
     let raw = std::fs::read(data.path().join("log/blocks/000000000.json.zst")).unwrap();
@@ -160,7 +162,7 @@ fn seal_applies_chained_deltas_in_chain_order_regardless_of_storage_order() {
     clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
 
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
-    let report = clave::seal::run(&db, data.path(), &sk, 1_754_740_800).unwrap();
+    let report = clave::seal::run(&db, data.path(), &sk, SEAL_START).unwrap();
     assert_eq!(report.entry_count, 3);
 
     let record = db
@@ -266,7 +268,7 @@ fn the_per_domain_block_cap_defers_the_surplus_in_acceptance_order() {
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
 
     let mut sealed: Vec<String> = Vec::new();
-    for (i, at) in [1_754_740_800i64, 1_754_744_400, 1_754_748_000]
+    for (i, at) in [SEAL_START, SEAL_START + 3600, SEAL_START + 7200]
         .into_iter()
         .enumerate()
     {
@@ -323,7 +325,7 @@ fn a_delta_held_past_the_inclusion_ceiling_is_reported() {
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
 
     let mut late = Vec::new();
-    for at in (1_754_740_800i64..1_754_762_400).step_by(3600) {
+    for at in (SEAL_START..SEAL_START + 21600).step_by(3600) {
         let report = clave::seal::run(&db, data.path(), &sk, at).unwrap();
         late.extend(report.late);
     }
@@ -357,14 +359,14 @@ fn a_roster_act_the_e07_rules_reject_is_not_sealed() {
     let envelope = wist_core::envelope::sign_envelope(&admit, "update", "log1", &sk).unwrap();
     db.insert_pending_entry("registry_update", "", &envelope, 0)
         .unwrap();
-    let first = clave::seal::run(&db, data.path(), &sk, 1_754_740_800).unwrap();
+    let first = clave::seal::run(&db, data.path(), &sk, SEAL_START).unwrap();
     assert_eq!(first.entry_count, 1, "dropped {:?}", first.dropped);
 
     let again = roster_update("auditor_admit", "audit.example.net", "a2", "pk-a2");
     let envelope = wist_core::envelope::sign_envelope(&again, "update", "log1", &sk).unwrap();
     db.insert_pending_entry("registry_update", "", &envelope, 0)
         .unwrap();
-    let second = clave::seal::run(&db, data.path(), &sk, 1_754_740_801).unwrap();
+    let second = clave::seal::run(&db, data.path(), &sk, SEAL_START + 1).unwrap();
     assert_eq!(second.entry_count, 0, "dropped {:?}", second.dropped);
     assert!(
         second.dropped.iter().any(|d| d.contains("WIST4-E07")),

@@ -188,20 +188,6 @@ impl SizeCaps {
         }
     }
 
-    pub(crate) fn for_admission(
-        db: &crate::db::Db,
-        data_dir: &std::path::Path,
-        at: i64,
-    ) -> crate::error::Result<Self> {
-        let mut history = crate::history::History::open(data_dir, db.last_block()?)?;
-        while history.next_block()?.is_some() {}
-        let initial = wist_core::parameters::Schedule::new(at);
-        Ok(Self::from_schedule(
-            history.schedule().unwrap_or(&initial),
-            at,
-        ))
-    }
-
     pub fn validate_delta(&self, envelope: &Value) -> Result<(), &'static str> {
         validate_static(envelope, self.url_cap_bytes, self.commitment_cap())
     }
@@ -240,5 +226,30 @@ impl SizeCaps {
         } else {
             Ok(())
         }
+    }
+}
+
+pub(crate) struct AdmissionProfile {
+    pub sizes: SizeCaps,
+    pub clock: jiff::Timestamp,
+    pub clock_skew_seconds: i64,
+}
+
+impl AdmissionProfile {
+    pub fn start(
+        db: &crate::db::Db,
+        data_dir: &std::path::Path,
+        clock: jiff::Timestamp,
+    ) -> crate::error::Result<Self> {
+        let at = clock.as_nanosecond().div_euclid(1_000_000_000) as i64;
+        let mut history = crate::history::History::open(data_dir, db.last_block()?)?;
+        while history.next_block()?.is_some() {}
+        let initial = wist_core::parameters::Schedule::new(at);
+        let schedule = history.schedule().unwrap_or(&initial);
+        Ok(Self {
+            sizes: SizeCaps::from_schedule(schedule, at),
+            clock,
+            clock_skew_seconds: schedule.value_at("clock_skew_seconds", at).unwrap(),
+        })
     }
 }

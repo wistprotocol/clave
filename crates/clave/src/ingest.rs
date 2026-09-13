@@ -681,8 +681,8 @@ pub fn run_with_clock(
     };
     let mut delta_ids = delta_ids;
     let mut prefetched: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
-    let mut size_profiles =
-        std::collections::HashMap::<String, declaration::delta::SizeCaps>::new();
+    let mut attempt_profiles =
+        std::collections::HashMap::<String, declaration::delta::AdmissionProfile>::new();
     let mut resolved_prev: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut refreshed_deltas = std::collections::HashSet::new();
     let mut position = 0usize;
@@ -730,14 +730,11 @@ pub fn run_with_clock(
                 }
             },
         };
-        let size_caps = match size_profiles.remove(id) {
-            Some(caps) => caps,
-            None => declaration::delta::SizeCaps::for_admission(
-                db,
-                data_dir,
-                clock().as_nanosecond().div_euclid(1_000_000_000) as i64,
-            )?,
+        let attempt = match attempt_profiles.remove(id) {
+            Some(profile) => profile,
+            None => declaration::delta::AdmissionProfile::start(db, data_dir, clock())?,
         };
+        let size_caps = &attempt.sizes;
         let association = match declaration::delta_publisher(&delta_value) {
             Err(code) => Err(code),
             Ok(domain) if domain != host => Err("WIST2-E03"),
@@ -792,15 +789,8 @@ pub fn run_with_clock(
             report.rejected.push((id.clone(), code.into()));
             continue;
         }
-        let validation_clock = clock();
-        let profile_at = jiff::Timestamp::from_second(
-            validation_clock.as_nanosecond().div_euclid(1_000_000_000) as i64,
-        )
-        .map_err(|e| crate::error::Error::Clock(e.to_string()))?
-        .to_string();
-        let allowance_s = registry::effective(db, "clock_skew_seconds", &profile_at)?;
         if let Err(code) =
-            declaration::verify_delta_clock(&delta_value, validation_clock, allowance_s)
+            declaration::verify_delta_clock(&delta_value, attempt.clock, attempt.clock_skew_seconds)
         {
             record_rejection(
                 db,
@@ -866,7 +856,7 @@ pub fn run_with_clock(
                         match meter.get(client, &prev_url) {
                             Ok(Some((_, predecessor))) => {
                                 let at = position - 1;
-                                size_profiles.insert(id.clone(), size_caps);
+                                attempt_profiles.insert(id.clone(), attempt);
                                 prefetched.insert(id.clone(), delta_value);
                                 prefetched.insert(prev.into(), predecessor);
                                 delta_ids.insert(at, prev.into());
@@ -935,7 +925,7 @@ pub fn run_with_clock(
                 &payload_value,
                 commitment,
                 &delta_env.delta.publisher,
-                &size_caps,
+                size_caps,
             ) {
                 record_rejection(db, host, "WIST2-E03", now, Some(id), code)?;
                 report.rejected.push((id.clone(), "WIST2-E03".into()));
@@ -973,7 +963,7 @@ pub fn run_with_clock(
         }
         if delta_env.delta.prev != db.url_tip(host, &delta_env.delta.url)? {
             resolved_prev.remove(id);
-            size_profiles.insert(id.clone(), size_caps);
+            attempt_profiles.insert(id.clone(), attempt);
             prefetched.insert(id.clone(), delta_value);
             position -= 1;
             continue;

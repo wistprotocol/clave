@@ -384,11 +384,11 @@ fn ingest_samples_each_delta_clock_and_uses_the_parameter_effective_then() {
             || {
                 let i = calls.get();
                 calls.set(i + 1);
-                clocks[i / 2].parse().unwrap()
+                clocks[i].parse().unwrap()
             },
         )
         .unwrap();
-        assert_eq!(calls.get(), 6);
+        assert_eq!(calls.get(), 3);
         assert_eq!(report.accepted, [ids[0].clone(), ids[2].clone()]);
         assert_eq!(report.rejected, [(ids[1].clone(), "WIST1-E06".into())]);
         assert!(!db.is_delta_seen(&ids[1]).unwrap());

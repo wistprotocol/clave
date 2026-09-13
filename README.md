@@ -79,9 +79,9 @@ WIST-1 §3.6 and ADR-0020 determine size-cap timing. Ingestion reconstructs the
 pinned authenticated schedule when each fetched Delta begins validation and
 retains its five caps through Declaration refresh, predecessor retrieval,
 Payload validation and admission rechecks. Predecessors and attempts after
-rejection or restart obtain fresh profiles; clock-skew validation keeps its
-separate clock. Local parameter overrides and amendment summaries cannot
-replace signed size-cap authority.
+rejection or restart obtain fresh profiles. The same captured clock and
+authenticated schedule supply [Delta clock eligibility](#delta-clock-eligibility).
+Local parameter overrides and amendment summaries cannot replace either profile.
 
 Sealing checks each candidate Delta and its stored Payload against the
 candidate Block's authenticated profile. Pending amendments apply only from
@@ -199,13 +199,43 @@ checks atomic failure, preserved dependent and independent chains, and repair
 before successful sealing. Previously sealed Payloads and recovery-held copies
 that are not candidates receive no new validation from these checks.
 
+## Delta clock eligibility
+
+WIST-1 §3.4 and ADR-0020 govern clock selection. Ingestion captures one
+validator clock and authenticated allowance when each fetched Delta begins
+validation. Declaration retries, Payload retrieval and waiting for predecessors
+retain that attempt; a predecessor starts its own. Rejection or restart permits
+a new attempt. Mutable parameter summaries cannot replace the signed schedule.
+
+Sealing repeats the check against the candidate Block's `sealed_at` and
+allowance. WIST1-E06 rejections release the queued copy and dependent successors
+through [Declaration key binding](#declaration-key-binding), allowing later
+pulls to retry. Historical Delta replay and sealed index restoration use each
+committing Block's time and allowance. `VerifiedBlock::clock_skew_seconds()`
+and `DeltaSource::clock_skew_seconds()` expose the authenticated value; a
+verified Block alone still establishes no Delta eligibility.
+
+The exact inclusive comparison preserves arbitrary Publisher timestamp
+fractions, signed allowances and bounds outside the written year range.
+Later Blocks, parameter amendments or wall time cannot repair a clock-invalid
+sealed Delta. Historical failure stops the complete pinned reconstruction
+without a partial result, following [Historical Delta sources](#historical-delta-sources).
+Completed index repairs still skip rebuilding; this is not general legacy-state
+revalidation, Consumer ignored-Entry replay or proof of the Log clock's accuracy.
+
+`delta-clock-time.json` supplies 96 signed clock probes, exercised with
+authenticated parameter histories. Signed Delta histories cover committing
+profiles, rejected amendments, later Blocks, restart and corrupt-file repair.
+Live tests exercise fractional rejection across Declaration refresh, fresh
+attempts after restart, predecessor waits and queued chains crossing a reduction.
+
 ## Historical Delta sources
 
 `history::deltas::DeltaSource::reconstruct(directory, pinned_head, delta_id)`
 returns one included Delta only after authenticating the entire pinned
 Block/parameter and Declaration prefix and checking every included Delta's
-fields, version, committing size caps, historical authority and predecessor
-chain. Authority uses [Declaration history replay](#declaration-history-replay)
+fields, version, committing size caps, [clock eligibility](#delta-clock-eligibility),
+historical authority and predecessor chain. Authority uses [Declaration history replay](#declaration-history-replay)
 and [Declaration key binding](#declaration-key-binding); trust inputs and
 unsupported transitions follow [Authenticated history](#authenticated-history).
 
@@ -230,8 +260,8 @@ and [Delta index reconciliation](#delta-index-reconciliation).
 
 Reconstruction changes no retained state and exposes no partial result. It scans
 the full prefix, retaining Declaration state, every seen ID and each Publisher/URL
-tip; bounded lookup remains required. It does not check validator-clock skew,
-Payload bodies, sanctions, materialization or Audit Record eligibility, and does
+tip; bounded lookup remains required. It does not check Payload bodies,
+sanctions, materialization or Audit Record eligibility, and does
 not replace live admission or `verify-history`.
 
 Signed tests cover exact predecessor vectors in same-Block and cross-Block chains,
@@ -937,8 +967,9 @@ Every retained Envelope passes the field and version checks in
 without a `payload` commitment stops restoration with WIST1-E09;
 an `update`, `delete` or `attest` without `prev` stops it with WIST1-E07.
 Field/version checks run first. Sealed sources come from Declaration replay
-at each Block. Sealed size checks follow
-[Delta size-cap profiles](#delta-size-cap-profiles). Restoration checks Delta
+at each Block. Sealed size and clock checks follow
+[Delta size-cap profiles](#delta-size-cap-profiles) and
+[Delta clock eligibility](#delta-clock-eligibility). Restoration checks Delta
 signing bindings, key-time bounds and scope, then follows predecessor links
 within that Block. Retained unsealed copies follow persistent acceptance
 positions across both queues; their Envelopes remain trusted local admission

@@ -27,6 +27,7 @@ pub struct VerifiedBlock {
     verdict_thresholds: wist_core::verdict::Thresholds,
     sampling_constants: wist_core::sampling::SamplingConstants,
     confirmation_profile: records::ConfirmationProfile,
+    clock_skew_seconds: i64,
 }
 
 impl VerifiedBlock {
@@ -64,6 +65,10 @@ impl VerifiedBlock {
 
     pub fn confirmation_profile(&self) -> &records::ConfirmationProfile {
         &self.confirmation_profile
+    }
+
+    pub fn clock_skew_seconds(&self) -> i64 {
+        self.clock_skew_seconds
     }
 
     pub fn rejected_parameters(&self) -> &[usize] {
@@ -262,6 +267,12 @@ impl History {
             verdict_thresholds,
             sampling_constants,
             confirmation_profile,
+            clock_skew_seconds: self
+                .schedule
+                .as_ref()
+                .unwrap()
+                .value_at("clock_skew_seconds", at)
+                .unwrap(),
         }))
     }
 
