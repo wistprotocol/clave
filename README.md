@@ -105,6 +105,29 @@ summaries. Full-prefix reconstruction per attempt remains unbounded; complete
 Payload field validation, historical retrieval and Audit Record use remain
 separate obligations.
 
+## Payload link admission
+
+Ingestion enforces WIST-1 §3.6's WIST1-E12 checks before retaining a
+Payload or accepting its Delta: URL uniqueness, byte-identical normalization,
+external-host membership and `len(urls) <= total`. Externality uses the
+Delta's authenticated signed Publisher, including for scoped subject URLs;
+Declaration scope does not redefine internal links. A failed Payload rejects
+the pull with WIST2-E03, leaving its ID retryable, its chain tip unchanged
+and its content unstored. Fetched predecessors undergo the same checks.
+
+`payload::validate_links` requires typed links and an already validated
+Canonical Publisher host. It checks neither fields, commitments nor size
+caps. It preserves URL order and accepts an incomplete prefix even when
+more links could fit: only a page audit can verify the declared prefix.
+
+`payload-links.json` supplies 31 signed commitment-valid probes. Live tests
+cover their pull dispositions, restart, accepted-byte preservation through
+sealing, scoped subjects and rejection of a retrieved predecessor. Previously
+accepted queues and sealed history are not retroactively checked by this
+admission change; complete Payload fields/version eligibility and historical
+validation remain outstanding (specification `CONFORMANCE.md`, Payload field
+and version eligibility).
+
 ## Declaration key binding
 
 Declaration admission rejects repeated key identifiers, including identical

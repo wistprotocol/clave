@@ -974,6 +974,24 @@ pub fn run_with_clock(
                 continue;
             }
 
+            if crate::payload::validate_links(
+                &payload_typed.content.links,
+                &delta_env.delta.publisher,
+            )
+            .is_err()
+            {
+                record_rejection(
+                    db,
+                    host,
+                    "WIST2-E03",
+                    now,
+                    Some(id),
+                    "Payload links violate WIST1-E12",
+                )?;
+                report.rejected.push((id.clone(), "WIST2-E03".into()));
+                continue;
+            }
+
             if size_caps.validate_payload_sizes(&payload_value).is_err() {
                 record_rejection(
                     db,
