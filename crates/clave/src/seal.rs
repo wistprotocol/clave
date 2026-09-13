@@ -829,7 +829,8 @@ fn resolve_record_updates(
 
     let mut updates = Vec::new();
     for d in chain_order(deltas) {
-        let delta: wist_core::objects::Delta = serde_json::from_value(d.body["delta"].clone())?;
+        let delta: wist_core::objects::Delta =
+            serde_json::from_slice(&jcs::canonicalize(&d.body["delta"])?)?;
         if !matches!(delta.change_type, ChangeType::New | ChangeType::Update)
             || delta.payload.is_none()
         {

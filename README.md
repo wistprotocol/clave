@@ -59,9 +59,10 @@ URL/commitment caps. Its caller supplies valid stage-specific caps; the helper
 does not authenticate parameter profiles. Profile selection follows
 [Delta size-cap profiles](#delta-size-cap-profiles).
 
-Typed ingestion reads a canonical temporary copy so integral decimal numbers
-remain admissible; stored and verified signed objects retain their original
-values. Rejected Deltas receive persistent typed status entries without
+Typed ingestion and record materialization read canonical temporary copies so
+integral decimal/exponent byte counts remain admissible through fetched chains,
+restart and sealing; retained Envelopes and Payload files remain unchanged.
+Rejected Deltas receive persistent typed status entries without
 recording accepted IDs, changing URL tips or writing Payload files. Sealing
 retains E15 for unsupported queued Deltas and releases their accepted indexes.
 

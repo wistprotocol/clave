@@ -410,3 +410,111 @@ fn sealing_preserves_version_diagnostics_and_supported_signed_values() {
         .iter()
         .any(|entry| entry.delta_id.as_deref() == Some(&bad_id) && entry.code == "WIST1-E15"));
 }
+
+#[test]
+fn integral_byte_spellings_materialize_fetched_chains_through_restart_and_sealing() {
+    for suffix in [".0", "e0"] {
+        for restart in [false, true] {
+            let (listener, host, client) = reserve_addr();
+            let p = make_publisher(&host);
+            serve_static(listener, p.dir.path().to_path_buf());
+            let data = tempfile::tempdir().unwrap();
+            clave::init::run(&host, data.path()).unwrap();
+            let path = data.path().join("clave.sqlite");
+            let mut db = clave::db::Db::open(&path).unwrap();
+            let url = "https://localhost/article";
+            let first = add_delta(&p, url, "initial body", None);
+            let second = add_delta(&p, url, "updated body", Some(&first));
+            let mut originals = Vec::new();
+            for id in [&first, &second] {
+                let source = p
+                    .dir
+                    .path()
+                    .join(format!(".well-known/wist/deltas/{}.json", &id[7..]));
+                let raw = std::fs::read_to_string(&source).unwrap();
+                let doc: Value = serde_json::from_str(&raw).unwrap();
+                let count = doc["delta"]["payload"]["bytes"].as_u64().unwrap();
+                let raw = raw.replace(
+                    &format!("\"bytes\":{count}"),
+                    &format!("\"bytes\":{count}{suffix}"),
+                );
+                let changed: Value = serde_json::from_str(&raw).unwrap();
+                assert!(changed["delta"]["payload"]["bytes"].as_u64().is_none());
+                assert_eq!(wist_core::delta::delta_id(&changed["delta"]).unwrap(), *id);
+                assert_eq!(
+                    wist_core::jcs::canonicalize(&changed).unwrap(),
+                    wist_core::jcs::canonicalize(&doc).unwrap(),
+                );
+                std::fs::write(&source, &raw).unwrap();
+                originals.push((source, raw, changed));
+            }
+            write_feed(
+                &p,
+                &host,
+                std::slice::from_ref(&second),
+                "2026-08-09T12:00:01Z",
+            );
+            let report =
+                clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:02Z")
+                    .unwrap();
+            assert_eq!(report.accepted, [first.clone(), second.clone()]);
+            assert!(report.rejected.is_empty());
+            if restart {
+                drop(db);
+                db = clave::db::Db::open(&path).unwrap();
+            }
+            for (id, (_, _, original)) in [&first, &second].into_iter().zip(&originals) {
+                assert_eq!(retained_delta(&db, id), *original);
+            }
+            let key = clave::keys::load(&data.path().join("keys/seed")).unwrap();
+            let now = "2026-08-09T13:00:00Z"
+                .parse::<jiff::Timestamp>()
+                .unwrap()
+                .as_second();
+            let sealed = clave::seal::run(&db, data.path(), &key, now).unwrap();
+            assert_eq!(sealed.entry_count, 3);
+            assert!(sealed.dropped.is_empty());
+            let record = db.get_record(url, &host).unwrap().unwrap();
+            assert_eq!(record.delta_id, second);
+            assert_eq!(record.observed_at, "2026-08-09T12:00:01Z");
+            assert_eq!(record.title, url);
+            let mut history =
+                clave::history::History::open(data.path(), db.last_block().unwrap()).unwrap();
+            let block = history.next_block().unwrap().unwrap();
+            for (id, (source, raw, original)) in [&first, &second].into_iter().zip(&originals) {
+                let sealed = block
+                    .block()
+                    .entries
+                    .iter()
+                    .find(|entry| {
+                        entry["type"] == "publisher_delta"
+                            && wist_core::delta::delta_id(&entry["body"]["delta"]).unwrap() == *id
+                    })
+                    .unwrap();
+                assert_eq!(
+                    wist_core::jcs::canonicalize(&sealed["body"]).unwrap(),
+                    wist_core::jcs::canonicalize(original).unwrap(),
+                );
+                assert_eq!(std::fs::read_to_string(source).unwrap(), *raw);
+                assert_eq!(
+                    std::fs::read(data.path().join(format!("payloads/{}.json", &id[7..]))).unwrap(),
+                    std::fs::read(
+                        p.dir
+                            .path()
+                            .join(format!(".well-known/wist/payloads/{}.json", &id[7..]))
+                    )
+                    .unwrap(),
+                );
+            }
+            assert!(history.next_block().unwrap().is_none());
+            drop(db);
+            rusqlite::Connection::open(&path).unwrap().execute_batch(
+                "DROP TABLE delta_index_reconciliation; DELETE FROM seen_deltas; DELETE FROM url_tips;",
+            ).unwrap();
+            let db = clave::db::Db::open(&path).unwrap();
+            assert_eq!(db.url_tip(&host, url).unwrap(), Some(second.clone()));
+            assert!(db.is_delta_seen(&first).unwrap());
+            assert_eq!(db.get_record(url, &host).unwrap().unwrap().delta_id, second);
+        }
+    }
+}
