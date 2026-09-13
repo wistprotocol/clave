@@ -218,7 +218,8 @@ not implement Consumer ignored-Entry dispositions.
 The source retains its Delta ID, original Envelope, canonical Entry position,
 Block sealing time, authenticating Declaration, identity's first-installation
 or latest reset position, committing
-size caps and [audit extraction profile](#historical-audit-extraction-profiles).
+size caps, [audit extraction profile](#historical-audit-extraction-profiles)
+and [verdict thresholds](#historical-verdict-thresholds).
 Later history cannot change those bindings. Contentless `attest`
 and `delete` Deltas are supported. Sealed-predecessor admission uses this source;
 index reconciliation shares its sealed Delta checks. Their unsealed-state
@@ -248,8 +249,8 @@ Use the audited Delta's source when producing or recomputing extract similarity
 and hard hits. A reference Payload retains its own committing size caps under
 [Historical Payload validation](#historical-payload-validation); its Delta's
 extraction profile does not replace the audited Delta's. These APIs do not
-establish reference selection, Record eligibility, link thresholds or complete
-verdicts.
+establish reference selection, Record eligibility or complete verdicts.
+Link thresholds follow [Historical verdict thresholds](#historical-verdict-thresholds).
 
 Eight `canary.json` scoring-profile cases run through signed Block, amendment,
 Declaration and Delta histories, reproducing extraction scores and hard-hit
@@ -257,6 +258,29 @@ outcomes before and at amendment effectiveness. Tests cover later reference
 Payloads, subsequent parameter resets, reconstruction after restart, corrupt
 later Blocks with repair/retry, and rejected signature, value and grace-period
 amendments.
+
+## Historical verdict thresholds
+
+`DeltaSource::verdict_thresholds()` exposes core's `verdict::Thresholds` from
+that Delta's accepted sealing-Block schedule under WIST-4 §§5/9. It combines
+the [extraction profile](#historical-audit-extraction-profiles)'s similarity
+thresholds and mass guard with `link_agreement_consistent` and
+`link_variance_floor`. `VerifiedBlock::verdict_thresholds()` provides the same
+binding for streaming callers under [Authenticated history](#authenticated-history).
+
+Use `AuditChain::audited().verdict_thresholds()` for verdict derivation; a
+resolved reference's thresholds cannot replace the audited Delta's. Core's
+`verdict::resolve` separately takes the reference change type, availability
+and observation; these APIs do not establish those inputs or Record eligibility.
+Hard-hit scoring retains its extract-only rules.
+
+Signed histories consume eight `link-agreement.json` amendment contexts with
+increases, decreases, inclusive activation, link boundaries, all reference
+change types and extract-band precedence. Later references, parameter resets,
+reconstruction after restart and corrupt-prefix repair preserve the audited
+profile. Rejected signatures, values and grace periods supply no thresholds;
+`canary.json` histories also check shared extraction bindings. Full Record
+replay, live retrieval and availability/withdrawal enforcement remain required.
 
 ## Historical audit references
 

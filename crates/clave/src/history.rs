@@ -22,6 +22,7 @@ pub struct VerifiedBlock {
     recovery_window_days: i64,
     delta_size_caps: crate::declaration::delta::SizeCaps,
     audit_profile: wist_core::canary::ScoringProfile,
+    verdict_thresholds: wist_core::verdict::Thresholds,
 }
 
 impl VerifiedBlock {
@@ -47,6 +48,10 @@ impl VerifiedBlock {
 
     pub fn audit_profile(&self) -> &wist_core::canary::ScoringProfile {
         &self.audit_profile
+    }
+
+    pub fn verdict_thresholds(&self) -> &wist_core::verdict::Thresholds {
+        &self.verdict_thresholds
     }
 
     pub fn rejected_parameters(&self) -> &[usize] {
@@ -213,6 +218,14 @@ impl History {
         let audit_profile = wist_core::canary::ScoringProfile::at_audited_delta(at, |name, at| {
             schedule.value_at(name, at).unwrap() as u64
         });
+        let verdict_thresholds = wist_core::verdict::Thresholds {
+            similarity_consistent: audit_profile.similarity_consistent,
+            similarity_variance_floor: audit_profile.similarity_variance_floor,
+            min_observed_words: audit_profile.min_observed_words,
+            link_agreement_consistent: schedule.value_at("link_agreement_consistent", at).unwrap()
+                as u64,
+            link_variance_floor: schedule.value_at("link_variance_floor", at).unwrap() as u64,
+        };
         self.schedule = Some(schedule);
         Ok(Some(VerifiedBlock {
             block,
@@ -223,6 +236,7 @@ impl History {
             recovery_window_days,
             delta_size_caps,
             audit_profile,
+            verdict_thresholds,
         }))
     }
 

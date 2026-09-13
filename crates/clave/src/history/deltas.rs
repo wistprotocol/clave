@@ -19,6 +19,7 @@ pub struct DeltaSource {
     identity_start: Position,
     caps: SizeCaps,
     audit_profile: wist_core::canary::ScoringProfile,
+    verdict_thresholds: wist_core::verdict::Thresholds,
 }
 
 impl DeltaSource {
@@ -63,6 +64,7 @@ impl DeltaSource {
                     identity_start: domain.reset().unwrap_or(domain.first()),
                     caps: block.delta_size_caps().clone(),
                     audit_profile: *block.audit_profile(),
+                    verdict_thresholds: *block.verdict_thresholds(),
                 });
             }
         }
@@ -95,6 +97,10 @@ impl DeltaSource {
 
     pub fn size_caps(&self) -> &SizeCaps {
         &self.caps
+    }
+
+    pub fn verdict_thresholds(&self) -> &wist_core::verdict::Thresholds {
+        &self.verdict_thresholds
     }
 
     pub fn audit_profile(&self) -> &wist_core::canary::ScoringProfile {

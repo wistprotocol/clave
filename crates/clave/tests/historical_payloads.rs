@@ -183,6 +183,16 @@ fn authenticated_audit_profiles_reproduce_vectors_across_amendments_and_restart(
         for _ in 0..2 {
             let source = f.delta_source(&delta).unwrap();
             let profile = source.audit_profile();
+            let thresholds = source.verdict_thresholds();
+            assert_eq!(
+                thresholds.similarity_consistent,
+                profile.similarity_consistent
+            );
+            assert_eq!(
+                thresholds.similarity_variance_floor,
+                profile.similarity_variance_floor
+            );
+            assert_eq!(thresholds.min_observed_words, profile.min_observed_words);
             assert_eq!(*profile, frozen);
             assert_eq!(
                 json!({"shingle_size":profile.shingle_size,
@@ -229,6 +239,177 @@ fn authenticated_audit_profiles_reproduce_vectors_across_amendments_and_restart(
         assert!(f.delta_source(&delta).is_err());
         std::fs::write(&path, bytes).unwrap();
         assert_eq!(*f.delta_source(&delta).unwrap().audit_profile(), frozen);
+    }
+}
+
+fn thresholds_json(thresholds: &wist_core::verdict::Thresholds) -> Value {
+    json!({"similarity_consistent": thresholds.similarity_consistent,
+        "similarity_variance_floor": thresholds.similarity_variance_floor,
+        "link_agreement_consistent": thresholds.link_agreement_consistent,
+        "link_variance_floor": thresholds.link_variance_floor,
+        "min_observed_words": thresholds.min_observed_words})
+}
+
+#[test]
+fn authenticated_verdict_thresholds_follow_the_audited_block() {
+    use wist_core::verdict::{self, ChangeType, Observation, Reference, Verdict};
+
+    let vector: Value = serde_json::from_slice(
+        &std::fs::read(spec_dir().join("vectors/wist4/link-agreement.json")).unwrap(),
+    )
+    .unwrap();
+    let cases = vector["verdict_profiles"]["cases"].as_array().unwrap();
+    assert_eq!(cases.len(), 8);
+    for case in cases {
+        let p = make_publisher_with_scope("parent.example", &["shared.example"]);
+        let (delta, _) = content(&p);
+        let audited_id = wist_core::delta::delta_id(&delta["delta"]).unwrap();
+        let mut f = Fixture::new();
+        let parameter = case["change"]["parameter"].as_str().unwrap();
+        let change = profile_change(
+            &f,
+            parameter,
+            case["change"]["value"].as_i64().unwrap(),
+            case["change"]["effective_at_s"].as_i64().unwrap(),
+        );
+        f.append_at(
+            vec![
+                entry("publisher_declaration", &current_declaration(&p)),
+                entry("registry_update", &change),
+            ],
+            0,
+        );
+        f.append_at(
+            vec![entry("publisher_delta", &delta)],
+            case["audited_delta_sealed_at_s"].as_i64().unwrap(),
+        );
+        let source = f.delta_source(&delta).unwrap();
+        let frozen = thresholds_json(source.verdict_thresholds());
+        assert_eq!(frozen, case["expected_profile"], "{}", case["label"]);
+        let reference_id = add_delta_signed(
+            &p,
+            "https://shared.example/page",
+            "later reference",
+            Some(&audited_id),
+            "2026-08-09T12:00:01Z",
+            "k1",
+            &K1_SEED,
+        );
+        let reference: Value = serde_json::from_slice(
+            &std::fs::read(p.dir.path().join(format!(
+                ".well-known/wist/deltas/{}.json",
+                &reference_id[7..]
+            )))
+            .unwrap(),
+        )
+        .unwrap();
+        let reset = profile_change(
+            &f,
+            parameter,
+            case["reset"]["value"].as_i64().unwrap(),
+            case["reset"]["effective_at_s"].as_i64().unwrap(),
+        );
+        f.append_at(
+            vec![
+                entry("publisher_delta", &reference),
+                entry("registry_update", &reset),
+            ],
+            case["reference_delta_sealed_at_s"].as_i64().unwrap(),
+        );
+        f.append_at(vec![], case["query_sealed_at_s"].as_i64().unwrap());
+        assert_eq!(thresholds_json(source.verdict_thresholds()), frozen);
+        for _ in 0..2 {
+            let chain =
+                AuditChain::reconstruct(f.data.path(), f.head.clone(), &audited_id).unwrap();
+            let thresholds = chain.audited().verdict_thresholds();
+            assert_eq!(thresholds_json(thresholds), frozen);
+            let fetched_at = jiff::Timestamp::from_second(
+                1_800_000_000 + case["fetched_at_s"].as_i64().unwrap(),
+            )
+            .unwrap()
+            .to_string();
+            let resolved = chain.resolve(&reference_id, &fetched_at).unwrap();
+            let reference_profile = thresholds_json(resolved.delta().verdict_thresholds());
+            assert_eq!(reference_profile[parameter], case["change"]["value"]);
+            if case["audited_delta_sealed_at_s"].as_i64().unwrap() < 604_800 {
+                assert_ne!(reference_profile, frozen);
+            }
+            for reading in case["readings"].as_array().unwrap() {
+                let change = match reading["reference_change"].as_str().unwrap() {
+                    "new" => ChangeType::New,
+                    "update" => ChangeType::Update,
+                    "attest" => ChangeType::Attest,
+                    "delete" => ChangeType::Delete,
+                    other => panic!("unexpected change: {other}"),
+                };
+                let expected = match reading["verdict"].as_str().unwrap() {
+                    "consistent" => Verdict::Consistent,
+                    "dynamic_variance" => Verdict::DynamicVariance,
+                    "inconsistent" => Verdict::Inconsistent,
+                    "link_variance" => Verdict::LinkVariance,
+                    "link_inconsistent" => Verdict::LinkInconsistent,
+                    other => panic!("unexpected verdict: {other}"),
+                };
+                assert_eq!(
+                    verdict::resolve(
+                        change,
+                        Reference::Available,
+                        Observation::Html {
+                            observed_words: 100,
+                            similarity: reading["similarity"].as_u64().unwrap(),
+                            link_agreement: reading["link_agreement"].as_u64(),
+                        },
+                        thresholds
+                    ),
+                    expected,
+                    "{}: {reading}",
+                    case["label"]
+                );
+            }
+        }
+        let path = f.path(3);
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::write(&path, b"broken").unwrap();
+        assert!(AuditChain::reconstruct(f.data.path(), f.head.clone(), &audited_id).is_err());
+        std::fs::write(&path, bytes).unwrap();
+        assert_eq!(
+            thresholds_json(f.delta_source(&delta).unwrap().verdict_thresholds()),
+            frozen
+        );
+    }
+}
+
+#[test]
+fn rejected_parameter_entries_cannot_supply_verdict_thresholds() {
+    for parameter in ["link_agreement_consistent", "link_variance_floor"] {
+        for fault in ["signature", "value", "grace"] {
+            let p = make_publisher_with_scope("parent.example", &["shared.example"]);
+            let (delta, _) = content(&p);
+            let mut f = Fixture::new();
+            let mut change = profile_change(
+                &f,
+                parameter,
+                if fault == "value" { 1_000_001 } else { 500_000 },
+                if fault == "grace" { 86_400 } else { 7 * 86_400 },
+            );
+            if fault == "signature" {
+                change =
+                    envelope::sign_envelope(&change["update"], "update", "log1", &p.sk).unwrap();
+            }
+            f.append_at(
+                vec![
+                    entry("publisher_declaration", &current_declaration(&p)),
+                    entry("registry_update", &change),
+                ],
+                0,
+            );
+            f.append_at(vec![entry("publisher_delta", &delta)], 7 * 86_400);
+            assert_eq!(
+                thresholds_json(f.delta_source(&delta).unwrap().verdict_thresholds()),
+                thresholds_json(&wist_core::verdict::Thresholds::default()),
+                "{parameter}: {fault}"
+            );
+        }
     }
 }
 
