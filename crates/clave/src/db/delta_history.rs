@@ -14,7 +14,7 @@ impl Db {
         )?;
         let mut rows = statement.query([domain])?;
         while let Some(row) = rows.next()? {
-            let doc: Value = serde_json::from_slice(&row.get::<_, Vec<u8>>(0)?)?;
+            let doc: Value = crate::json::parse(&row.get::<_, Vec<u8>>(0)?)?;
             if wist_core::delta::delta_id(&doc["delta"])? == id {
                 return Ok(doc);
             }

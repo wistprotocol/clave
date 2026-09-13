@@ -134,7 +134,7 @@ impl Client {
             .bytes()
             .map_err(|e| Error::Fetch(e.to_string()))?
             .to_vec();
-        let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+        let value: serde_json::Value = crate::json::parse(&bytes)?;
         Ok((bytes, value))
     }
 }

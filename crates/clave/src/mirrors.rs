@@ -15,7 +15,7 @@ pub fn list(data_dir: &Path) -> Result<Vec<String>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let doc: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
+    let doc: serde_json::Value = crate::json::parse(&std::fs::read(path)?)?;
     Ok(doc["mirrors"]["mirror_urls"]
         .as_array()
         .map(|urls| {

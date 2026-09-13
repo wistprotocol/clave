@@ -126,13 +126,28 @@ accepted queues and sealed history are not retroactively checked by this
 admission change. Field/version admission is covered below; historical
 validation remains outstanding.
 
+## JSON input eligibility
+
+Fetched protocol JSON and retained object reads reject duplicate decoded member
+names before field, identity, signature or replay checks, including escaped
+names and nested objects or arrays (WIST-1 §4, RFC 8785 §3.1). This covers
+Declaration, Delta, Feed/Page, Payload, Log Anchor, Block, governance, Mirror
+and Snapshot inputs. Fetches retain the role-specific WIST-2 rejection wrappers;
+history readers stop on failure. Queue drains parse every selected Entry before
+deleting any, preserving malformed bytes and other queued work on rejection.
+
+Parsed-Value APIs require callers to validate raw JSON before constructing the
+Value; discarded duplicate members cannot be recovered. These checks do not
+establish complete object eligibility or revalidate all existing state at open.
+`json_inputs` and `history` tests cover signed last-value duplicates, field and
+signature precedence, retry/restart, retained queues and history authority.
+
 ## Payload field and version admission
 
 Ingestion applies WIST-1 §§3.1/3.6/7 and ADR-0030/0034 before commitment,
-link or size checks. `payload::validate_json` rejects malformed JSON,
-invalid Unicode, nonfinite numbers and duplicate decoded member names,
-including nested and escaped duplicates, with E05. Raw validation must
-precede parsed-field checks, which cannot recover discarded duplicates.
+link or size checks. `payload::validate_json` exposes the raw gate described in
+[JSON input eligibility](#json-input-eligibility), rejecting malformed JSON,
+invalid Unicode, nonfinite numbers and duplicate members with E05.
 `payload::validate_fields` checks parsed JCS eligibility and complete fields;
 `payload::validate_version` adds supported-major validation after E14 field
 precedence. Callers separately check links, integrity and active caps. Pulls

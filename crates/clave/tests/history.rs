@@ -725,3 +725,58 @@ fn cli_authenticates_history_without_requiring_a_signing_key() {
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
 }
+
+#[test]
+fn duplicate_decoded_members_in_signed_headers_and_entries_reject_before_replay() {
+    for (name, escaped) in [
+        ("sealed_at", "sealed_\\u0061t"),
+        ("key_id", "key_id"),
+        ("action", "\\u0061ction"),
+    ] {
+        let f = Fixture::new();
+        let doc = f.append(
+            START,
+            vec![f.parameter("block_decompressed_cap_bytes", 4096, START + 7 * DAY)],
+        );
+        let raw = String::from_utf8(jcs::canonicalize(&doc).unwrap()).unwrap();
+        let changed = raw.replacen(
+            &format!("\"{name}\":"),
+            &format!("\"{name}\":null,\"{escaped}\":"),
+            1,
+        );
+        assert_ne!(changed, raw);
+        assert_eq!(serde_json::from_str::<Value>(&changed).unwrap(), doc);
+        std::fs::write(
+            f.path(0),
+            zstd::bulk::compress(changed.as_bytes(), 3).unwrap(),
+        )
+        .unwrap();
+        let mut history = f.history();
+        assert!(history
+            .next_block()
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate JSON member name"));
+        assert!(history.schedule().is_none());
+        assert!(history.next_block().is_err());
+    }
+}
+
+#[test]
+fn duplicate_anchor_members_cannot_supply_history_authority() {
+    let f = Fixture::new();
+    let path = f.data.path().join("anchor.json");
+    let raw = std::fs::read_to_string(&path).unwrap();
+    let doc: Value = serde_json::from_str(&raw).unwrap();
+    let compact = serde_json::to_string(&doc).unwrap();
+    let changed = compact.replacen(
+        "\"public_key\":",
+        "\"public_key\":null,\"public_\\u006bey\":",
+        1,
+    );
+    assert_ne!(changed, compact);
+    assert_eq!(serde_json::from_str::<Value>(&changed).unwrap(), doc);
+    std::fs::write(path, changed).unwrap();
+    let err = History::open(f.data.path(), None).err().unwrap();
+    assert!(err.to_string().contains("duplicate JSON member name"));
+}

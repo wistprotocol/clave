@@ -11,6 +11,7 @@ pub mod governance;
 pub mod history;
 pub mod ingest;
 pub mod init;
+mod json;
 pub mod keys;
 pub mod mirrors;
 pub mod param_change;

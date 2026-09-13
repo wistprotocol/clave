@@ -61,7 +61,7 @@ pub struct History {
 
 impl History {
     pub fn open(directory: &Path, head: Option<BlockRow>) -> Result<Self> {
-        let doc: Value = serde_json::from_slice(&std::fs::read(directory.join("anchor.json"))?)?;
+        let doc: Value = crate::json::parse(&std::fs::read(directory.join("anchor.json"))?)?;
         let anchor: LogAnchorEnvelope = serde_json::from_value(doc.clone())?;
         let genesis = &anchor.anchor.genesis_key;
         if anchor.anchor.wist_version != crate::WIST_VERSION || anchor.anchor.predecessor.is_some()
@@ -128,7 +128,7 @@ impl History {
                 .join(format!("log/blocks/{height:09}.json.zst")),
             bound,
         )?;
-        let doc: Value = serde_json::from_slice(&bytes).map_err(|e| failure(&e.to_string()))?;
+        let doc: Value = crate::json::parse(&bytes).map_err(|e| failure(&e.to_string()))?;
         let block: Block =
             serde_json::from_value(doc.clone()).map_err(|e| failure(&e.to_string()))?;
         if block.header.wist_version != crate::WIST_VERSION {

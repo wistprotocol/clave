@@ -2,8 +2,9 @@ use serde_json::Value;
 use std::collections::HashSet;
 use wist_core::objects::PayloadLinks;
 
-mod json;
-pub use json::validate as validate_json;
+pub fn validate_json(raw: &[u8]) -> Result<(), &'static str> {
+    crate::json::validate(raw).map_err(|_| "WIST1-E05")
+}
 
 fn object(value: &Value, required: &[&str], optional: &[&str]) -> Result<(), &'static str> {
     let map = value.as_object().ok_or("WIST1-E14")?;

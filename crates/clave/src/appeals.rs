@@ -29,7 +29,7 @@ fn notice_era_key_set(
     else {
         return Ok(Vec::new());
     };
-    let doc: serde_json::Value = serde_json::from_slice(&current.declaration_json)?;
+    let doc: serde_json::Value = crate::json::parse(&current.declaration_json)?;
     Ok(crate::declaration::publisher_of(&doc)
         .map(|p| p.keys)
         .unwrap_or_default())

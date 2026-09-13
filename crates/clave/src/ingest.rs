@@ -169,8 +169,8 @@ fn accepted_recovery_head(
             .envelope()
             .clone()
     } else {
-        let owner: Value = serde_json::from_slice(&window.owner_declaration_json)?;
-        let prior: Value = serde_json::from_slice(&window.prior_declaration_json)?;
+        let owner: Value = crate::json::parse(&window.owner_declaration_json)?;
+        let prior: Value = crate::json::parse(&window.prior_declaration_json)?;
         if declaration::evaluate(&prior, &owner) != Ok(Decision::Recovery) {
             return Err(crate::error::Error::History(
                 "invalid pending recovery owner".into(),
@@ -222,7 +222,7 @@ fn delta_admission_sources(db: &Db, host: &str) -> Result<(bool, Vec<Publisher>)
     let sources = raw
         .iter()
         .map(|raw| {
-            let doc: Value = serde_json::from_slice(raw)?;
+            let doc: Value = crate::json::parse(raw)?;
             declaration::publisher_of(&doc).map_err(crate::error::Error::History)
         })
         .collect::<Result<Vec<_>>>()?;
@@ -243,7 +243,7 @@ fn admit_fetched_declaration(
     let stored_raw = db.get_publisher_declaration(host)?.ok_or_else(|| {
         crate::error::Error::History("publisher row lost before Declaration admission".into())
     })?;
-    let mut current_doc: Value = serde_json::from_slice(&stored_raw)?;
+    let mut current_doc: Value = crate::json::parse(&stored_raw)?;
     let open_window = db.get_recovery_window(host)?;
     let recovery_head = open_window
         .as_ref()
@@ -297,7 +297,7 @@ fn verify_live_feed(db: &Db, host: &str, feed: &Value) -> Result<bool> {
     let raw = db
         .get_publisher_declaration(host)?
         .ok_or_else(|| crate::error::Error::History("missing Feed admission Declaration".into()))?;
-    let doc = serde_json::from_slice(&raw)?;
+    let doc = crate::json::parse(&raw)?;
     let publisher = declaration::publisher_of(&doc).map_err(crate::error::Error::History)?;
     Ok(declaration::verify_signed(
         &publisher.keys.iter().collect::<Vec<_>>(),
@@ -470,7 +470,7 @@ pub fn run_with_clock(
     let budget = crate::registry::effective(db, "ingest_budget_bytes_day", now)?;
     let stored_scope = db
         .get_publisher_declaration(host)?
-        .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
+        .and_then(|raw| crate::json::parse(&raw).ok())
         .and_then(|doc| declaration::publisher_of(&doc).ok())
         .and_then(|p| p.subdomain_scope)
         .unwrap_or_default();
@@ -491,7 +491,7 @@ pub fn run_with_clock(
     let stored_raw = db
         .get_publisher_declaration(host)?
         .ok_or_else(|| crate::error::Error::Fetch("publisher row lost mid-ingest".into()))?;
-    let mut current_doc: Value = serde_json::from_slice(&stored_raw)?;
+    let mut current_doc: Value = crate::json::parse(&stored_raw)?;
 
     if known {
         let publisher_url = format!("{base}publisher.json");
@@ -926,9 +926,7 @@ pub fn run_with_clock(
                     continue;
                 }
             };
-            if let Err(code) = crate::payload::validate_json(&payload_raw)
-                .and_then(|()| crate::payload::validate_version(&payload_value))
-            {
+            if let Err(code) = crate::payload::validate_version(&payload_value) {
                 record_rejection(db, host, "WIST2-E03", now, Some(id), code)?;
                 report.rejected.push((id.clone(), "WIST2-E03".into()));
                 continue;

@@ -151,7 +151,7 @@ impl Db {
         let mut positions = BTreeSet::new();
         while let Some(row) = rows.next()? {
             let domain: String = row.get(0)?;
-            let envelope: Value = serde_json::from_slice(&row.get::<_, Vec<u8>>(1)?)?;
+            let envelope: Value = crate::json::parse(&row.get::<_, Vec<u8>>(1)?)?;
             let position: i64 = row.get(2)?;
             let stored_id: Option<String> = row.get(3)?;
             let stored_url: Option<String> = row.get(4)?;

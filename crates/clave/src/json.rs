@@ -58,7 +58,12 @@ impl<'de> Visitor<'de> for Unique {
     }
 }
 
-pub fn validate(raw: &[u8]) -> Result<(), &'static str> {
-    serde_json::from_slice::<Unique>(raw).map_err(|_| "WIST1-E05")?;
+pub fn validate(raw: &[u8]) -> serde_json::Result<()> {
+    serde_json::from_slice::<Unique>(raw)?;
     Ok(())
+}
+
+pub fn parse(raw: &[u8]) -> serde_json::Result<serde_json::Value> {
+    validate(raw)?;
+    serde_json::from_slice(raw)
 }

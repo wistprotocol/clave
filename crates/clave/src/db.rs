@@ -425,7 +425,7 @@ impl Db {
         };
         let pending = self.peek_pending_entries()?.0;
         for (domain, raw) in rows {
-            let current: Value = serde_json::from_slice(&raw)?;
+            let current: Value = crate::json::parse(&raw)?;
             let mut seq = accepted_declaration_seq(&domain, &current)?;
             if let Some(state) = history.domains().get(&domain) {
                 seq = seq.max(state.highest_accepted_seq());
@@ -479,7 +479,7 @@ impl Db {
         let pending = self.peek_pending_entries()?.0;
         let tx = self.mutation()?;
         for (domain, prior, opened) in rows {
-            let prior: Value = serde_json::from_slice(&prior)?;
+            let prior: Value = crate::json::parse(&prior)?;
             let unavailable = || {
                 Error::History(format!(
                     "cannot restore the fixed recovery owner for {domain}"
@@ -571,7 +571,7 @@ impl Db {
         let Some(blob) = blob else {
             return Ok(None);
         };
-        let doc: Value = serde_json::from_slice(&blob)?;
+        let doc: Value = crate::json::parse(&blob)?;
         Ok(doc
             .pointer("/publisher/subdomain_scope")
             .cloned()
@@ -936,19 +936,21 @@ impl Db {
             })?;
             mapped.collect::<rusqlite::Result<Vec<_>>>()?
         };
-        tx.execute("DELETE FROM queued_deltas WHERE domain = ?1", [domain])?;
-        tx.commit()?;
-        rows.into_iter()
+        let entries = rows
+            .into_iter()
             .map(|(delta_id, blob, url, chain_pos, acceptance_order)| {
                 Ok(QueuedDeltaRow {
                     delta_id,
-                    entry_json: serde_json::from_slice(&blob)?,
+                    entry_json: crate::json::parse(&blob)?,
                     url,
                     chain_pos,
                     acceptance_order,
                 })
             })
-            .collect()
+            .collect::<Result<_>>()?;
+        tx.execute("DELETE FROM queued_deltas WHERE domain = ?1", [domain])?;
+        tx.commit()?;
+        Ok(entries)
     }
 
     pub(crate) fn reject_delta_copies(
@@ -976,7 +978,7 @@ impl Db {
             .query_map([domain], |row| row.get::<_, Vec<u8>>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?
             .into_iter()
-            .map(|raw| serde_json::from_slice::<Value>(&raw))
+            .map(|raw| crate::json::parse(&raw))
             .collect::<serde_json::Result<Vec<_>>>()?;
         drop(statement);
         loop {
@@ -1130,17 +1132,19 @@ impl Db {
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
             .collect::<rusqlite::Result<_>>()?;
         drop(stmt);
-        tx.execute("DELETE FROM pending_entries", [])?;
-        tx.commit()?;
-        rows.into_iter()
+        let entries = rows
+            .into_iter()
             .map(|(entry_type, domain, blob)| {
                 Ok(PendingEntry {
                     entry_type,
                     domain,
-                    entry_json: serde_json::from_slice(&blob)?,
+                    entry_json: crate::json::parse(&blob)?,
                 })
             })
-            .collect()
+            .collect::<Result<_>>()?;
+        tx.execute("DELETE FROM pending_entries", [])?;
+        tx.commit()?;
+        Ok(entries)
     }
 
     pub fn last_block(&self) -> Result<Option<BlockRow>> {
@@ -1184,7 +1188,7 @@ impl Db {
                     rowid,
                     entry_type,
                     domain,
-                    entry_json: serde_json::from_slice(&blob)?,
+                    entry_json: crate::json::parse(&blob)?,
                     turn_block: turn_block.map(|b| b as u64),
                 })
             })
@@ -1385,7 +1389,7 @@ impl Db {
             return Ok(());
         }
         let directory = path.parent().unwrap_or_else(|| Path::new("."));
-        let anchor: Value = serde_json::from_slice(&std::fs::read(directory.join("anchor.json"))?)?;
+        let anchor: Value = crate::json::parse(&std::fs::read(directory.join("anchor.json"))?)?;
         let public_key = anchor["anchor"]["genesis_key"]["public_key"]
             .as_str()
             .ok_or_else(|| Error::Key("stored Log Anchor has no genesis public key".into()))?;
@@ -1426,7 +1430,7 @@ impl Db {
                 Error::History(message) => Error::Seal(message),
                 error => error,
             })?;
-            let block: Value = serde_json::from_slice(&bytes)?;
+            let block: Value = crate::json::parse(&bytes)?;
             wist_core::block::verify_block(&block, &key)?;
             wist_core::block::verify_chain_link(&block["header"], &prior_hash)?;
             if height != index as u64

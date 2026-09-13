@@ -44,7 +44,7 @@ fn load_tier1_rows(data_dir: &Path, records: &[RecordRow]) -> Vec<Tier1Row> {
         let Ok(bytes) = std::fs::read(data_dir.join("payloads").join(format!("{hex}.json"))) else {
             continue;
         };
-        let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        let Ok(payload) = crate::json::parse(&bytes) else {
             continue;
         };
         let extract = payload["content"]["extract"]
@@ -230,7 +230,7 @@ fn build_state(
         }));
     }
     for p in &publishers {
-        let declaration: Value = serde_json::from_slice(&p.declaration_json)?;
+        let declaration: Value = crate::json::parse(&p.declaration_json)?;
         let seq = declaration["publisher"]["seq"].as_u64();
         let sealing_height = db
             .sealed_declarations(&p.domain)?
@@ -309,7 +309,7 @@ fn update_index(
     let index_path = data_dir.join("snapshots/index.json");
     let mut snapshots = if index_path.exists() {
         let bytes = std::fs::read(&index_path)?;
-        let doc: Value = serde_json::from_slice(&bytes)?;
+        let doc: Value = crate::json::parse(&bytes)?;
         let inner = doc
             .get("index")
             .cloned()

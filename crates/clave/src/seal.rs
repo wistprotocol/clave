@@ -237,7 +237,7 @@ fn late_inclusions(entries: &[SealEntry], block_number: u64, ceiling: i64) -> Ve
 }
 
 fn log_id(data_dir: &Path) -> Result<String> {
-    let doc: Value = serde_json::from_slice(&std::fs::read(data_dir.join("anchor.json"))?)?;
+    let doc: Value = crate::json::parse(&std::fs::read(data_dir.join("anchor.json"))?)?;
     doc["anchor"]["log_id"]
         .as_str()
         .map(str::to_string)
@@ -437,7 +437,7 @@ fn revalidate_queued_deltas(
                         let id = wist_core::delta::delta_id(&e.body["delta"])?;
                         let bytes =
                             std::fs::read(data_dir.join(format!("payloads/{}.json", &id[7..])))?;
-                        let payload: Value = serde_json::from_slice(&bytes)?;
+                        let payload: Value = crate::json::parse(&bytes)?;
                         size_caps.validate_payload_sizes(&payload)
                     }
                     result => result,
@@ -840,7 +840,7 @@ fn resolve_record_updates(
         let Ok(payload_bytes) = std::fs::read(&payload_path) else {
             continue;
         };
-        let Ok(payload_value) = serde_json::from_slice::<Value>(&payload_bytes) else {
+        let Ok(payload_value) = crate::json::parse(&payload_bytes) else {
             continue;
         };
         let Ok(payload) =
