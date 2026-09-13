@@ -24,19 +24,25 @@ impl Fixture {
             .join(format!("log/blocks/{height:09}.json.zst"))
     }
 
-    fn append(&mut self, mut entries: Vec<Value>) {
+    fn append(&mut self, entries: Vec<Value>) {
+        let height = self.head.as_ref().map_or(0, |head| head.block_number + 1);
+        self.append_at(entries, height as i64 * 3600);
+    }
+
+    fn append_at(&mut self, mut entries: Vec<Value>, offset_s: i64) {
         entries.sort_by_key(|entry| {
             (
-                if entry["type"] == "publisher_declaration" {
-                    0
-                } else {
-                    2
+                match entry["type"].as_str().unwrap() {
+                    "publisher_declaration" => 0,
+                    "registry_update" => 1,
+                    "publisher_delta" => 2,
+                    _ => 3,
                 },
                 merkle::leaf_hash(&jcs::canonicalize(entry).unwrap()),
             )
         });
         let height = self.head.as_ref().map_or(0, |head| head.block_number + 1);
-        let at = jiff::Timestamp::from_second(1_800_000_000 + height as i64 * 3600)
+        let at = jiff::Timestamp::from_second(1_800_000_000 + offset_s)
             .unwrap()
             .to_string();
         let leaves: Vec<_> = entries
@@ -95,6 +101,161 @@ fn content(p: &TestPub) -> (Value, Vec<u8>) {
     .unwrap();
     let payload = std::fs::read(base.join(format!("payloads/{}.json", &id[7..]))).unwrap();
     (delta, payload)
+}
+
+fn profile_change(f: &Fixture, parameter: &str, value: i64, effective_s: i64) -> Value {
+    let key = clave::keys::load(&f.data.path().join("keys/seed")).unwrap();
+    envelope::sign_envelope(
+        &json!({"wist_version":"1.0.0", "action":"parameter_change",
+            "subject":parameter, "details":{"parameter":parameter,"value":value},
+            "effective_at":jiff::Timestamp::from_second(1_800_000_000 + effective_s).unwrap().to_string()}),
+        "update",
+        "log1",
+        &key,
+    )
+    .unwrap()
+}
+
+#[test]
+fn authenticated_audit_profiles_reproduce_vectors_across_amendments_and_restart() {
+    let vector: Value = serde_json::from_slice(
+        &std::fs::read(spec_dir().join("vectors/wist4/canary.json")).unwrap(),
+    )
+    .unwrap();
+    let cases = vector["scoring_profile"]["cases"].as_array().unwrap();
+    assert_eq!(cases.len(), 8);
+    for case in cases {
+        let p = make_publisher_with_scope("parent.example", &["shared.example"]);
+        let (delta, _) = content(&p);
+        let mut f = Fixture::new();
+        let parameter = case["change"]["parameter"].as_str().unwrap();
+        let change = profile_change(
+            &f,
+            parameter,
+            case["change"]["value"].as_i64().unwrap(),
+            case["change"]["effective_at_s"].as_i64().unwrap(),
+        );
+        f.append_at(
+            vec![
+                entry("publisher_declaration", &current_declaration(&p)),
+                entry("registry_update", &change),
+            ],
+            0,
+        );
+        f.append_at(
+            vec![entry("publisher_delta", &delta)],
+            case["audited_delta_sealed_at_s"].as_i64().unwrap(),
+        );
+        let frozen = *f.delta_source(&delta).unwrap().audit_profile();
+        let id = wist_core::delta::delta_id(&delta["delta"]).unwrap();
+        let reference_id = add_delta_signed(
+            &p,
+            "https://shared.example/page",
+            case["reference_extract"].as_str().unwrap(),
+            Some(&id),
+            "2026-08-09T12:00:01Z",
+            "k1",
+            &K1_SEED,
+        );
+        let base = p.dir.path().join(".well-known/wist");
+        let reference: Value = serde_json::from_slice(
+            &std::fs::read(base.join(format!("deltas/{}.json", &reference_id[7..]))).unwrap(),
+        )
+        .unwrap();
+        let raw =
+            std::fs::read(base.join(format!("payloads/{}.json", &reference_id[7..]))).unwrap();
+        let reset = profile_change(
+            &f,
+            parameter,
+            vector["scoring_profile"]["defaults"][parameter]
+                .as_i64()
+                .unwrap(),
+            15 * 86_400,
+        );
+        f.append_at(
+            vec![
+                entry("publisher_delta", &reference),
+                entry("registry_update", &reset),
+            ],
+            8 * 86_400,
+        );
+        f.append_at(vec![], 15 * 86_400);
+        for _ in 0..2 {
+            let source = f.delta_source(&delta).unwrap();
+            let profile = source.audit_profile();
+            assert_eq!(*profile, frozen);
+            assert_eq!(
+                json!({"shingle_size":profile.shingle_size,
+                    "min_observed_words":profile.min_observed_words,
+                    "similarity_consistent":profile.similarity_consistent,
+                    "similarity_variance_floor":profile.similarity_variance_floor}),
+                case["expected"]["profile"],
+                "{}",
+                case["label"],
+            );
+            let reference_source = f.source(&reference).unwrap();
+            let payload = reference_source.validate(&raw).unwrap();
+            if case["audited_delta_sealed_at_s"].as_i64().unwrap() < 604800 {
+                assert_ne!(profile, reference_source.delta_source().audit_profile());
+            }
+            let served = crypto::hex_decode(case["served_bytes_hex"].as_str().unwrap()).unwrap();
+            let similarity = profile.derived_similarity(
+                &served,
+                &payload.content.extract,
+                wist_core::verdict::ChangeType::New,
+            );
+            assert_eq!(json!(similarity), case["expected"]["derived_similarity"]);
+            assert_eq!(
+                profile.hard_hit(
+                    case["credit_reproduces"].as_bool().unwrap(),
+                    match case["verdict"].as_str().unwrap() {
+                        "consistent" => wist_core::verdict::Verdict::Consistent,
+                        "inconsistent" => wist_core::verdict::Verdict::Inconsistent,
+                        other => panic!("unexpected vector verdict: {other}"),
+                    },
+                    similarity,
+                ),
+                case["expected"]["hard_hit"].as_bool().unwrap(),
+            );
+        }
+        let path = f.path(3);
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::write(&path, b"broken").unwrap();
+        assert!(f.delta_source(&delta).is_err());
+        std::fs::write(&path, bytes).unwrap();
+        assert_eq!(*f.delta_source(&delta).unwrap().audit_profile(), frozen);
+    }
+}
+
+#[test]
+fn rejected_parameter_entries_cannot_supply_audit_profiles() {
+    for fault in ["signature", "value", "grace"] {
+        let p = make_publisher_with_scope("parent.example", &["shared.example"]);
+        let (delta, _) = content(&p);
+        let mut f = Fixture::new();
+        let mut change = profile_change(
+            &f,
+            "shingle_size",
+            if fault == "value" { 0 } else { 1 },
+            if fault == "grace" { 86_400 } else { 7 * 86_400 },
+        );
+        if fault == "signature" {
+            change = envelope::sign_envelope(&change["update"], "update", "log1", &p.sk).unwrap();
+        }
+        f.append_at(
+            vec![
+                entry("publisher_declaration", &current_declaration(&p)),
+                entry("registry_update", &change),
+            ],
+            0,
+        );
+        f.append_at(vec![entry("publisher_delta", &delta)], 7 * 86_400);
+        assert_eq!(
+            f.delta_source(&delta).unwrap().audit_profile().shingle_size,
+            8,
+            "{fault}"
+        );
+    }
 }
 
 #[test]

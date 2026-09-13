@@ -15,6 +15,7 @@ pub struct DeltaSource {
     declaration: Declaration,
     identity_start: Position,
     caps: SizeCaps,
+    audit_profile: wist_core::canary::ScoringProfile,
 }
 
 impl DeltaSource {
@@ -44,6 +45,7 @@ impl DeltaSource {
                     declaration: domain.delta_sealing_source().unwrap().clone(),
                     identity_start: domain.reset().unwrap_or(domain.first()),
                     caps: block.delta_size_caps().clone(),
+                    audit_profile: *block.audit_profile(),
                 });
             }
         }
@@ -68,6 +70,10 @@ impl DeltaSource {
 
     pub fn size_caps(&self) -> &SizeCaps {
         &self.caps
+    }
+
+    pub fn audit_profile(&self) -> &wist_core::canary::ScoringProfile {
+        &self.audit_profile
     }
 }
 

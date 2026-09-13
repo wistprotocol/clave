@@ -216,8 +216,9 @@ This is a strict integrity check of the Aggregator's retained history; it does
 not implement Consumer ignored-Entry dispositions.
 
 The source retains the original Envelope, canonical Entry position, authenticating
-Declaration, identity's first-installation or latest reset position, and committing
-size profile. Later history cannot change those bindings. Contentless `attest`
+Declaration, identity's first-installation or latest reset position, committing
+size caps and [audit extraction profile](#historical-audit-extraction-profiles).
+Later history cannot change those bindings. Contentless `attest`
 and `delete` Deltas are supported. Sealed-predecessor admission uses this source;
 index reconciliation shares its sealed Delta checks. Their unsealed-state
 policies remain under [Delta predecessor admission](#delta-predecessor-admission)
@@ -233,6 +234,28 @@ Signed tests cover exact predecessor vectors in same-Block and cross-Block chain
 invalid ancestors and later unrelated Deltas, independent Publishers sharing a
 URL, identity resets, contentless successors, recreation after deletion, restart
 and repair/retry.
+
+## Historical audit extraction profiles
+
+`DeltaSource::audit_profile()` exposes core's `ScoringProfile`, derived from the
+accepted signed parameter schedule at that Delta's sealing Block under WIST-4
+§§5/9. It retains `shingle_size`, `min_observed_words`, `similarity_consistent`
+and `similarity_variance_floor`; `VerifiedBlock::audit_profile()` supplies the
+same binding for streaming callers subject to [Authenticated history](#authenticated-history).
+
+Use the audited Delta's source when producing or recomputing extract similarity
+and hard hits. A reference Payload retains its own committing size caps under
+[Historical Payload validation](#historical-payload-validation); its Delta's
+extraction profile does not replace the audited Delta's. These APIs do not
+establish reference selection, Record eligibility, link thresholds or complete
+verdicts.
+
+Eight `canary.json` scoring-profile cases run through signed Block, amendment,
+Declaration and Delta histories, reproducing extraction scores and hard-hit
+outcomes before and at amendment effectiveness. Tests cover later reference
+Payloads, subsequent parameter resets, reconstruction after restart, corrupt
+later Blocks with repair/retry, and rejected signature, value and grace-period
+amendments.
 
 ## Historical Payload validation
 

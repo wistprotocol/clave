@@ -20,6 +20,7 @@ pub struct VerifiedBlock {
     rejected_parameters: Vec<usize>,
     recovery_window_days: i64,
     delta_size_caps: crate::declaration::delta::SizeCaps,
+    audit_profile: wist_core::canary::ScoringProfile,
 }
 
 impl VerifiedBlock {
@@ -41,6 +42,10 @@ impl VerifiedBlock {
 
     pub fn delta_size_caps(&self) -> &crate::declaration::delta::SizeCaps {
         &self.delta_size_caps
+    }
+
+    pub fn audit_profile(&self) -> &wist_core::canary::ScoringProfile {
+        &self.audit_profile
     }
 
     pub fn rejected_parameters(&self) -> &[usize] {
@@ -204,6 +209,9 @@ impl History {
         self.largest = largest;
         let recovery_window_days = schedule.value_at("recovery_window_days", at).unwrap();
         let delta_size_caps = crate::declaration::delta::SizeCaps::from_schedule(&schedule, at);
+        let audit_profile = wist_core::canary::ScoringProfile::at_audited_delta(at, |name, at| {
+            schedule.value_at(name, at).unwrap() as u64
+        });
         self.schedule = Some(schedule);
         Ok(Some(VerifiedBlock {
             block,
@@ -213,6 +221,7 @@ impl History {
             rejected_parameters,
             recovery_window_days,
             delta_size_caps,
+            audit_profile,
         }))
     }
 
