@@ -127,6 +127,12 @@ fn historical_payload_sources_keep_the_committing_profile_after_restart() {
     std::fs::create_dir_all(data.path().join("payloads")).unwrap();
     let (listener, host, client) = reserve_addr();
     serve_static(listener, data.path().to_owned());
+    std::fs::write(
+        data.path().join("log/mirrors.json"),
+        serde_json::to_vec(&json!({"mirrors":{"mirror_urls":[format!("http://{host}/")]}}))
+            .unwrap(),
+    )
+    .unwrap();
     for probe in vector["reference_probes"].as_array().unwrap() {
         let object = &vector["objects"][probe["reference"].as_str().unwrap()];
         let id = wist_core::delta::delta_id(&object["envelope"]["delta"]).unwrap();
@@ -145,11 +151,26 @@ fn historical_payload_sources_keep_the_committing_profile_after_restart() {
                 &[format!("http://{host}/")],
             );
             assert!(discovered.discovery_failures().is_empty());
+            let remote = source.discover_with_remote_mirrors(
+                &client,
+                &data.path().join("missing"),
+                &[],
+                &[format!("http://{host}/")],
+            );
+            assert!(remote.discovery_failures().is_empty());
+            assert_eq!(remote.locations(), discovered.locations());
             for result in [
                 source.read(data.path()),
                 source.fetch(&client, &format!("http://{host}/{name}")),
                 source
                     .retrieve(&client, discovered.locations().iter().take(2).cloned())
+                    .map_err(|failure| {
+                        assert_eq!(failure.attempts.len(), 2);
+                        assert!(matches!(failure.attempts[0].error, clave::Error::Io(_)));
+                        failure.attempts.into_iter().last().unwrap().error
+                    }),
+                source
+                    .retrieve(&client, remote.locations().iter().take(2).cloned())
                     .map_err(|failure| {
                         assert_eq!(failure.attempts.len(), 2);
                         assert!(matches!(failure.attempts[0].error, clave::Error::Io(_)));

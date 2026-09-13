@@ -121,6 +121,10 @@ impl PayloadSource {
     }
 
     pub fn distribution_location(&self, origin: &str) -> Result<PayloadLocation> {
+        Self::origin_url(origin, &self.relative_path()).map(PayloadLocation::Url)
+    }
+
+    fn origin_url(origin: &str, path: &str) -> Result<String> {
         let parsed = url::Url::parse(origin)
             .map_err(|error| Error::Fetch(format!("invalid Payload origin: {error}")))?;
         if !matches!(parsed.scheme(), "https" | "http")
@@ -135,10 +139,7 @@ impl PayloadSource {
                 "Payload distribution requires a bare HTTP(S) origin".into(),
             ));
         }
-        Ok(PayloadLocation::Url(format!(
-            "{parsed}{}",
-            self.relative_path()
-        )))
+        Ok(format!("{parsed}{path}"))
     }
 
     pub fn publisher_location(&self, client: &crate::fetch::Client) -> PayloadLocation {
@@ -156,6 +157,16 @@ impl PayloadSource {
         directory: &Path,
         independent_origins: &[String],
     ) -> PayloadLocations {
+        self.discover_with_remote_mirrors(client, directory, independent_origins, &[])
+    }
+
+    pub fn discover_with_remote_mirrors(
+        &self,
+        client: &crate::fetch::Client,
+        directory: &Path,
+        independent_origins: &[String],
+        mirror_list_origins: &[String],
+    ) -> PayloadLocations {
         let mut discovered = PayloadLocations {
             locations: vec![self.retained_location(directory)],
             discovery_failures: Vec::new(),
@@ -164,11 +175,9 @@ impl PayloadSource {
             discovered.add_origin(self, origin);
         }
         let path = directory.join("log/mirrors.json");
-        let mirrors = std::fs::read(&path).map_err(Error::from).and_then(|raw| {
-            let doc = crate::json::parse(&raw)?;
-            serde_json::from_value::<Vec<String>>(doc["mirrors"]["mirror_urls"].clone())
-                .map_err(Error::from)
-        });
+        let mirrors = std::fs::read(&path)
+            .map_err(Error::from)
+            .and_then(|raw| mirror_hints(&raw));
         match mirrors {
             Ok(origins) => {
                 for origin in origins {
@@ -180,6 +189,33 @@ impl PayloadSource {
                 location: PayloadLocation::File(path),
                 error,
             }),
+        }
+        let mut fetched = std::collections::HashSet::new();
+        for origin in mirror_list_origins {
+            let url = match Self::origin_url(origin, "log/mirrors.json") {
+                Ok(url) => url,
+                Err(error) => {
+                    discovered.discovery_failures.push(PayloadAttemptFailure {
+                        location: PayloadLocation::Url(origin.clone()),
+                        error,
+                    });
+                    continue;
+                }
+            };
+            if !fetched.insert(url.clone()) {
+                continue;
+            }
+            match client.get_bytes(&url).and_then(|raw| mirror_hints(&raw)) {
+                Ok(origins) => {
+                    for origin in origins {
+                        discovered.add_origin(self, &origin);
+                    }
+                }
+                Err(error) => discovered.discovery_failures.push(PayloadAttemptFailure {
+                    location: PayloadLocation::Url(url),
+                    error,
+                }),
+            }
         }
         discovered.locations.push(self.publisher_location(client));
         discovered
@@ -221,6 +257,11 @@ impl PayloadSource {
             payload,
         })
     }
+}
+
+fn mirror_hints(raw: &[u8]) -> Result<Vec<String>> {
+    let doc = crate::json::parse(raw)?;
+    serde_json::from_value(doc["mirrors"]["mirror_urls"].clone()).map_err(Error::from)
 }
 
 impl RetrievedPayload<'_> {

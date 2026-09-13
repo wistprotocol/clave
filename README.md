@@ -412,12 +412,25 @@ array contributes no entries; individually invalid origins leave valid siblings
 available. Discovery errors name the list file or supplied origin and are
 separate from retrieval failures.
 
-Discovery performs no network requests or writes and retains no cache; another
-call observes repairs or configuration changes. It does not fetch remote Mirror
-lists, authenticate their signing-key time or persist selected-source provenance.
-Service and Audit Record integration remain unimplemented. Signed-history tests
-cover independent/Mirror/Publisher fallback, malformed and duplicate-member lists,
-origin deduplication, corruption, repair, restart and contentless reference anchors.
+`discover_with_remote_mirrors(client, directory, independent_origins,
+mirror_list_origins)` adds remote hints after local hints and before the Publisher.
+It fetches `/log/mirrors.json` from each distinct parsed origin in supplied order,
+using the same origin restrictions and transport client as Payload retrieval.
+Only explicitly supplied list origins are queried; independent origins and newly
+listed Mirrors trigger no list requests. Remote lists use the same untrusted-hint
+rules as local lists. HTTP failures, including absent lists, and malformed JSON
+are recorded against the requested list URL; invalid list origins retain the
+supplied origin. Each failure leaves subsequent lists and Payload candidates
+available. List retrieval does not fetch Payloads.
+
+`discover` performs no network requests. Neither method writes or caches state;
+another call observes repairs or configuration changes. Remote list reads share
+the [retrieval limits](#historical-payload-retrieval); neither signing-key time
+authentication nor durable selected-source provenance is implemented. Service
+and Audit Record integration remain unimplemented. Signed-history tests cover
+independent/Mirror/Publisher fallback, malformed and duplicate-member lists,
+origin and request deduplication, explicit-only discovery, corruption, repair,
+restart, historical caps and contentless reference anchors.
 
 ## Declaration key binding
 

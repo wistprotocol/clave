@@ -852,6 +852,267 @@ fn historical_payload_discovery_preserves_fallback_when_optional_mirror_hints_fa
 }
 
 #[test]
+fn remote_mirror_hints_preserve_payload_authentication_fallback_and_restart() {
+    let p = make_publisher_with_scope("localhost", &["shared.example"]);
+    let (delta, raw) = content(&p);
+    let mut f = Fixture::new();
+    f.append(vec![
+        entry("publisher_declaration", &current_declaration(&p)),
+        entry("publisher_delta", &delta),
+    ]);
+    let block_bytes = std::fs::read(f.path(0)).unwrap();
+    let (listener, _, client) = reserve_addr();
+    serve_static(listener, p.dir.path().to_owned());
+    let mirror = tempfile::tempdir().unwrap();
+    let (listener, _, _) = reserve_addr();
+    let origin = format!("http://{}/", listener.local_addr().unwrap());
+    serve_static(listener, mirror.path().to_owned());
+    let relative = format!(
+        "payloads/{}.json",
+        &wist_core::delta::delta_id(&delta["delta"]).unwrap()[7..],
+    );
+    let mirrored = mirror.path().join(&relative);
+    std::fs::create_dir_all(mirrored.parent().unwrap()).unwrap();
+    let independent = p.dir.path().join(&relative);
+    std::fs::create_dir_all(independent.parent().unwrap()).unwrap();
+    std::fs::write(&independent, b"bad independent copy").unwrap();
+    let list = p.dir.path().join("log/mirrors.json");
+    std::fs::create_dir_all(list.parent().unwrap()).unwrap();
+    let hints = serde_json::to_vec(&json!({"mirrors":{
+        "updated_at":"not a trusted clock",
+        "mirror_urls":["http://LOCALHOST:80/", origin, "https://bad.example/path", origin]
+    },"sig":{"value":"untrusted"}}))
+    .unwrap();
+    std::fs::write(&list, &hints).unwrap();
+    let local = f.data.path().join("log/mirrors.json");
+    std::fs::write(
+        &local,
+        r#"{"mirrors":{"mirror_urls":["http://localhost/"]}}"#,
+    )
+    .unwrap();
+    let mut wrong: Value = serde_json::from_slice(&raw).unwrap();
+    wrong["content"]["extract"] = json!("substitution");
+    for _ in 0..2 {
+        let source = f.source(&delta).unwrap();
+        let discovered = source.discover_with_remote_mirrors(
+            &client,
+            f.data.path(),
+            &["http://localhost/".into()],
+            &["http://localhost/".into(), "http://LOCALHOST:80/".into()],
+        );
+        assert_eq!(
+            discovered.locations(),
+            &[
+                source.retained_location(f.data.path()),
+                PayloadLocation::Url(format!("http://localhost/{relative}")),
+                PayloadLocation::Url(format!("{origin}{relative}")),
+                source.publisher_location(&client),
+            ]
+        );
+        assert_eq!(discovered.discovery_failures().len(), 1);
+        assert_eq!(
+            discovered.discovery_failures()[0].location,
+            PayloadLocation::Url("https://bad.example/path".into())
+        );
+        for valid in [false, true] {
+            std::fs::write(
+                &mirrored,
+                if valid {
+                    raw.clone()
+                } else {
+                    serde_json::to_vec(&wrong).unwrap()
+                },
+            )
+            .unwrap();
+            let copy = source
+                .retrieve(&client, discovered.locations().iter().cloned())
+                .unwrap();
+            let selected = if valid { 2 } else { 3 };
+            assert_eq!(copy.location(), &discovered.locations()[selected]);
+            assert_eq!(copy.failed_attempts().len(), selected);
+            if !valid {
+                assert!(matches!(
+                    copy.failed_attempts()[2].error,
+                    clave::Error::Payload("WIST1-E10")
+                ));
+            }
+            assert_eq!(copy.raw(), raw);
+            assert_eq!(copy.source().envelope(), &delta);
+        }
+        assert_eq!(std::fs::read(&list).unwrap(), hints);
+        assert_eq!(std::fs::read(f.path(0)).unwrap(), block_bytes);
+        assert!(!f.data.path().join(&relative).exists());
+    }
+    std::fs::write(&list, r#"{"mirrors":{"mirror_urls":[]}}"#).unwrap();
+    let source = f.source(&delta).unwrap();
+    let repaired = source.discover_with_remote_mirrors(
+        &client,
+        f.data.path(),
+        &[],
+        &["http://localhost/".into()],
+    );
+    assert!(repaired.discovery_failures().is_empty());
+    assert_eq!(repaired.locations().len(), 3);
+}
+
+#[test]
+fn remote_mirror_list_failures_preserve_other_lists_and_publisher_fallback() {
+    let p = make_publisher_with_scope("localhost", &["shared.example"]);
+    let (delta, raw) = content(&p);
+    let mut f = Fixture::new();
+    f.append(vec![
+        entry("publisher_declaration", &current_declaration(&p)),
+        entry("publisher_delta", &delta),
+    ]);
+    let (listener, _, client) = reserve_addr();
+    serve_static(listener, p.dir.path().to_owned());
+    let other = tempfile::tempdir().unwrap();
+    let (listener, _, _) = reserve_addr();
+    let other_origin = format!("http://{}/", listener.local_addr().unwrap());
+    serve_static(listener, other.path().to_owned());
+    std::fs::create_dir_all(other.path().join("log")).unwrap();
+    std::fs::write(
+        other.path().join("log/mirrors.json"),
+        r#"{"mirrors":{"mirror_urls":["http://localhost/"]}}"#,
+    )
+    .unwrap();
+    let path = p.dir.path().join("log/mirrors.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let source = f.source(&delta).unwrap();
+    for hints in [
+        None,
+        Some("not JSON"),
+        Some("{}"),
+        Some(r#"{"mirrors":{"mirror_urls":["https://ignored.example/",false]}}"#),
+        Some(r#"{"mirrors":{"mirror_urls":[],"mirror\u005furls":["https://ignored.example/"]}}"#),
+    ] {
+        if let Some(hints) = hints {
+            std::fs::write(&path, hints).unwrap();
+        }
+        let discovered = source.discover_with_remote_mirrors(
+            &client,
+            f.data.path(),
+            &[],
+            &[
+                "http://localhost/".into(),
+                "http://LOCALHOST:80/".into(),
+                other_origin.clone(),
+            ],
+        );
+        assert_eq!(discovered.discovery_failures().len(), 1);
+        let failure = &discovered.discovery_failures()[0];
+        assert_eq!(
+            failure.location,
+            PayloadLocation::Url("http://localhost/log/mirrors.json".into())
+        );
+        if hints.is_none() {
+            assert!(matches!(failure.error, clave::Error::Fetch(_)));
+        } else {
+            assert!(matches!(failure.error, clave::Error::Json(_)));
+        }
+        assert_eq!(discovered.locations().len(), 3);
+        assert_eq!(
+            discovered.locations()[1],
+            source.distribution_location("http://localhost/").unwrap()
+        );
+        let copy = source
+            .retrieve(&client, discovered.locations().iter().cloned())
+            .unwrap();
+        assert_eq!(copy.location(), &source.publisher_location(&client));
+        assert_eq!(copy.raw(), raw);
+    }
+    let invalid = [
+        "file:///tmp/",
+        "https://user@invalid.example/",
+        "https://invalid.example/path",
+        "http://invalid.example/",
+    ];
+    let discovered = source.discover_with_remote_mirrors(
+        &client,
+        f.data.path(),
+        &[],
+        &invalid.map(String::from),
+    );
+    assert_eq!(discovered.locations().len(), 2);
+    assert_eq!(discovered.discovery_failures().len(), invalid.len());
+    assert!(discovered
+        .discovery_failures()
+        .iter()
+        .all(|failure| matches!(failure.error, clave::Error::Fetch(_))));
+    let no_http = source.discover_with_remote_mirrors(
+        &clave::fetch::Client::new(false),
+        f.data.path(),
+        &[],
+        std::slice::from_ref(&other_origin),
+    );
+    assert_eq!(no_http.discovery_failures().len(), 1);
+    assert!(matches!(
+        no_http.discovery_failures()[0].error,
+        clave::Error::Fetch(_)
+    ));
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&json!({"mirrors":{"mirror_urls":[other_origin]}})).unwrap(),
+    )
+    .unwrap();
+    let repaired = source.discover_with_remote_mirrors(
+        &client,
+        f.data.path(),
+        &[],
+        &["http://localhost/".into()],
+    );
+    assert!(repaired.discovery_failures().is_empty());
+    assert_eq!(repaired.locations().len(), 3);
+}
+
+#[test]
+fn remote_mirror_discovery_fetches_only_distinct_explicit_list_origins() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    let p = make_publisher_with_scope("localhost", &["shared.example"]);
+    let (delta, _) = content(&p);
+    let mut f = Fixture::new();
+    f.append(vec![
+        entry("publisher_declaration", &current_declaration(&p)),
+        entry("publisher_delta", &delta),
+    ]);
+    let (listener, _, client) = reserve_addr();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let served_requests = requests.clone();
+    std::thread::spawn(move || {
+        tokio::runtime::Runtime::new().unwrap().block_on(async move {
+            let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+                let requests = served_requests.clone();
+                async move {
+                    assert_eq!(uri.path(), "/log/mirrors.json");
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(json!({"mirrors":{"mirror_urls":["http://localhost/", "https://unrequested.example/"]}}))
+                }
+            });
+            axum::serve(tokio::net::TcpListener::from_std(listener).unwrap(), app).await.unwrap();
+        });
+    });
+    let source = f.source(&delta).unwrap();
+    let independent = ["http://localhost/".into()];
+    source.discover(&client, f.data.path(), &independent);
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
+    for expected in 1..=2 {
+        let discovered = source.discover_with_remote_mirrors(
+            &client,
+            f.data.path(),
+            &independent,
+            &["http://localhost/".into(), "http://LOCALHOST:80/".into()],
+        );
+        assert!(discovered.discovery_failures().is_empty());
+        assert_eq!(discovered.locations().len(), 4);
+        assert_eq!(requests.load(Ordering::SeqCst), expected);
+    }
+}
+
+#[test]
 fn historical_payload_distribution_locations_require_origins_and_preserve_ports() {
     let p = make_publisher_with_scope("parent.example", &["shared.example"]);
     let (delta, _) = content(&p);
@@ -1387,6 +1648,12 @@ fn authenticated_reference_vectors_resolve_named_and_newest_deltas() {
     let missing = tempfile::tempdir().unwrap();
     let (listener, host, client) = reserve_addr();
     serve_static(listener, f.data.path().to_owned());
+    std::fs::write(
+        f.data.path().join("log/mirrors.json"),
+        serde_json::to_vec(&json!({"mirrors":{"mirror_urls":[format!("http://{host}/")]}}))
+            .unwrap(),
+    )
+    .unwrap();
     let (root, _) = content(&p);
     let mut other_root = root["delta"].clone();
     other_root["url"] = json!("https://shared.example/other");
@@ -1502,10 +1769,21 @@ fn authenticated_reference_vectors_resolve_named_and_newest_deltas() {
             }
             let discovered = source.discover(&client, missing.path(), &[format!("http://{host}/")]);
             assert!(discovered.discovery_failures().is_empty());
+            let remote = source.discover_with_remote_mirrors(
+                &client,
+                missing.path(),
+                &[],
+                &[format!("http://{host}/")],
+            );
+            assert!(remote.discovery_failures().is_empty());
+            assert_eq!(remote.locations(), discovered.locations());
             for copy in [
                 source.read(f.data.path()).unwrap(),
                 source
                     .retrieve(&client, discovered.locations().iter().cloned())
+                    .unwrap(),
+                source
+                    .retrieve(&client, remote.locations().iter().cloned())
                     .unwrap(),
                 source
                     .fetch(&client, &format!("http://{host}/{name}"))
