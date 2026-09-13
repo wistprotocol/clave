@@ -6,6 +6,7 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use wist_core::objects::{DeltaPayloadCommitment, Payload};
 
+#[derive(Clone)]
 pub struct PayloadSource {
     delta: DeltaSource,
     commitment: DeltaPayloadCommitment,

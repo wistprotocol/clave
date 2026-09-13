@@ -24,6 +24,12 @@ impl AuditChain {
             envelope["delta"]["publisher"] == body["publisher"]
                 && envelope["delta"]["url"] == body["url"]
         })?;
+        if selected
+            .iter()
+            .any(|delta| delta.anchor_hash() != source.anchor_hash())
+        {
+            return Err(failure("Log Anchor changed during chain reconstruction"));
+        }
         let mut successors: BTreeMap<_, _> = selected
             .into_iter()
             .map(|source| {

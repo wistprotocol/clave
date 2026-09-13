@@ -8,6 +8,7 @@ use crate::db::BlockRow;
 use crate::error::{Error, Result};
 use crate::registry;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use wist_core::crypto::PublicKey;
 use wist_core::objects::{Block, LogAnchorEnvelope, RegistryUpdateEnvelope};
@@ -71,6 +72,7 @@ impl VerifiedBlock {
 }
 
 pub struct History {
+    anchor_hash: [u8; 32],
     directory: PathBuf,
     head: Option<BlockRow>,
     key: PublicKey,
@@ -105,6 +107,7 @@ impl History {
         let key = PublicKey::from_b64u(&genesis.public_key)?;
         wist_core::envelope::verify_envelope(&doc, "anchor", &key)?;
         Ok(Self {
+            anchor_hash: Sha256::digest(wist_core::jcs::canonicalize(&doc["anchor"])?).into(),
             directory: directory.into(),
             head,
             key,

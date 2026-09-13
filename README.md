@@ -316,9 +316,9 @@ and rejected signature/value/grace amendments. Default profiles reproduce
 `history::records::IncludedRecord::reconstruct_all(directory, pinned_head)`
 returns every `audit_record` Entry in canonical Log order after the complete
 pinned Block prefix passes [Authenticated history](#authenticated-history).
-Each result preserves the original Envelope, Entry position, Block Hash and
-sealing time; reconstruction fails without returning a partial set if any Block
-is missing or invalid. A fresh attempt rereads repaired files.
+Each result preserves the original Envelope, Entry position, Block Hash, Anchor
+fingerprint and sealing time; reconstruction fails without returning a partial
+set if any Block is missing or invalid. A fresh attempt rereads repaired files.
 
 `confirmation_profile()` retains `confirm_auditors` and `confirm_window_hours`
 from the accepted schedule at that Record's sealing instant, including amendments
@@ -340,6 +340,42 @@ and restart, rejected signature/value/grace amendments, original Entries and
 positions, pinned-prefix exclusion, corrupt-history failure and repair/retry.
 The supplied candidate sets exercise profile timing without establishing Record
 eligibility or complete finding replay.
+
+## Included Record references
+
+`IncludedRecord::resolve_reference(directory)` binds the Record's signed
+`audited_delta`, `reference_delta` and `fetched_at` to
+[Historical audit references](#historical-audit-references). Reconstruction pins
+the prefix to the Record's own Block hash and sealing time and requires the
+same authenticated Anchor fingerprint (WIST-3 §3.4). Equal Block hashes under
+another Anchor cannot substitute a Log; identical authenticated files may be
+read from another directory. Later Blocks neither supply references nor prevent
+resolution of an already-included Record. Constructing that `IncludedRecord`
+still requires its complete requested prefix to pass
+[Historical Record inclusion and confirmation profiles](#historical-record-inclusion-and-confirmation-profiles).
+
+Resolution rejects `fetched_at` after the Record's sealing instant with
+WIST4-E02 and applies the named reference relation under WIST-4 §3. Fetch
+timestamps use the strict whole-second Log profile. Missing/non-string inputs,
+unavailable audited Deltas and history failures return errors without a partial
+binding or state mutation; a new attempt rereads repaired files.
+
+The returned `RecordReference` retains `record()`, `audited()`, `reference()`
+and `payload_source()`, preserving the original Envelope, identity, confirmation
+profile and each Delta's committing parameters. Retrieve or validate the Payload
+through [Historical Payload retrieval](#historical-payload-retrieval).
+
+This relation establishes no Record signature, complete field eligibility,
+Auditor standing, verdict or finding. Extension standing must additionally
+enforce the B₁ fetch lower bound; sanctions, withdrawal, availability and durable
+source retention remain separate requirements. Work and memory bounds follow
+[Historical audit references](#historical-audit-references).
+
+Signed histories exercise all ten `superseded-audit.json` reference cases and
+eight `link-agreement.json` amendment contexts. Regressions cover inclusive fetch
+endpoints, same-Block references, contentless anchors, malformed fields/times,
+forged Record signature preservation, identical hashes under different Anchors,
+alternate directories, later invalid history, restart and file repair.
 
 ## Historical audit references
 

@@ -11,6 +11,7 @@ use std::path::Path;
 
 #[derive(Clone)]
 pub struct DeltaSource {
+    anchor_hash: [u8; 32],
     id: String,
     envelope: Value,
     position: Position,
@@ -55,6 +56,7 @@ impl DeltaSource {
                 let domain =
                     &declarations.domains()[envelope["delta"]["publisher"].as_str().unwrap()];
                 found.push(Self {
+                    anchor_hash: history.anchor_hash,
                     id,
                     envelope: envelope.clone(),
                     position: Position {
@@ -77,6 +79,10 @@ impl DeltaSource {
 
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    pub(crate) fn anchor_hash(&self) -> [u8; 32] {
+        self.anchor_hash
     }
 
     pub fn sealed_at_s(&self) -> i64 {

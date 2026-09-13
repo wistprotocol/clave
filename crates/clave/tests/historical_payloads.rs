@@ -4,6 +4,7 @@ use clave::db::BlockRow;
 use clave::history::{
     deltas::DeltaSource,
     payloads::{PayloadLocation, PayloadSource},
+    records::IncludedRecord,
     references::AuditChain,
 };
 use common::*;
@@ -94,6 +95,22 @@ impl Fixture {
 
 fn entry(kind: &str, body: &Value) -> Value {
     json!({"type":kind, "body":body})
+}
+
+fn reference_record(audited: &str, reference: &str, fetched_at: &str) -> Value {
+    let commitment = format!("sha256:{}", "a".repeat(64));
+    envelope::sign_envelope(
+        &json!({"wist_version":"1.0.0", "auditor_id":"audit.independent.test",
+            "audited_delta":audited, "reference_delta":reference,
+            "fetched_at":fetched_at, "response_commitment":commitment,
+            "ref_extract_commitment":commitment, "credit_commitment":commitment,
+            "evidence_commitment":commitment, "similarity":950_000,
+            "verdict":"consistent", "vrf_proof":"A".repeat(107), "prev_record":null}),
+        "record",
+        "r1",
+        &crypto::SigningKey::from_seed(&[17; 32]),
+    )
+    .unwrap()
 }
 
 fn content(p: &TestPub) -> (Value, Vec<u8>) {
@@ -604,9 +621,32 @@ fn authenticated_verdict_thresholds_follow_the_audited_block() {
             ],
             case["reference_delta_sealed_at_s"].as_i64().unwrap(),
         );
-        f.append_at(vec![], case["query_sealed_at_s"].as_i64().unwrap());
+        let fetched_at =
+            jiff::Timestamp::from_second(1_800_000_000 + case["fetched_at_s"].as_i64().unwrap())
+                .unwrap()
+                .to_string();
+        f.append_at(
+            vec![entry(
+                "audit_record",
+                &reference_record(&audited_id, &reference_id, &fetched_at),
+            )],
+            case["query_sealed_at_s"].as_i64().unwrap(),
+        );
         assert_eq!(thresholds_json(source.verdict_thresholds()), frozen);
         for _ in 0..2 {
+            let included = IncludedRecord::reconstruct_all(f.data.path(), f.head.clone()).unwrap();
+            let bound = included[0].resolve_reference(f.data.path()).unwrap();
+            assert_eq!(
+                thresholds_json(bound.audited().verdict_thresholds()),
+                frozen
+            );
+            assert_eq!(bound.audited().identity_start(), source.identity_start());
+            assert_eq!(bound.audited().block_hash(), source.block_hash());
+            assert_eq!(bound.reference().id(), reference_id);
+            assert_eq!(
+                bound.payload_source().unwrap().delta_source().id(),
+                reference_id
+            );
             let chain =
                 AuditChain::reconstruct(f.data.path(), f.head.clone(), &audited_id).unwrap();
             let thresholds = chain.audited().verdict_thresholds();
@@ -1922,6 +1962,209 @@ fn historical_sources_resolve_contentless_deltas_and_recreation_in_chain_order()
 }
 
 #[test]
+fn included_record_references_enforce_fetch_boundaries_and_required_inputs() {
+    let p = make_publisher_with_scope("parent.example", &["shared.example"]);
+    let (delta, payload) = content(&p);
+    let id = wist_core::delta::delta_id(&delta["delta"]).unwrap();
+    let mut f = Fixture::new();
+    f.append(vec![
+        entry("publisher_declaration", &current_declaration(&p)),
+        entry("publisher_delta", &delta),
+    ]);
+    let mut probes = Vec::new();
+    for offset in [-1, 0, 1, 3599, 3600, 3601] {
+        let at = jiff::Timestamp::from_second(1_800_000_000 + offset)
+            .unwrap()
+            .to_string();
+        probes.push((
+            reference_record(&id, &id, &at),
+            (0..=3600).contains(&offset),
+        ));
+    }
+    let valid = probes[1].0.clone();
+    for timestamp in [
+        "2027-01-15T08:00:60Z",
+        "2027-01-15T08:00:00.0Z",
+        "2027-01-15T08:00:00+00:00",
+        "2027-02-29T00:00:00Z",
+        "0000-01-01T00:00:00Z",
+        "9999-12-31T23:59:59Z",
+    ] {
+        probes.push((reference_record(&id, &id, timestamp), false));
+    }
+    for field in ["audited_delta", "reference_delta", "fetched_at"] {
+        for replacement in [None, Some(Value::Null), Some(json!(42)), Some(json!(""))] {
+            let mut body = valid["record"].clone();
+            if let Some(value) = replacement {
+                body[field] = value;
+            } else {
+                body.as_object_mut().unwrap().remove(field);
+            }
+            probes.push((
+                envelope::sign_envelope(
+                    &body,
+                    "record",
+                    "r1",
+                    &crypto::SigningKey::from_seed(&[17; 32]),
+                )
+                .unwrap(),
+                false,
+            ));
+        }
+    }
+    let mut forged = valid.clone();
+    forged["sig"]["value"] = json!("A".repeat(86));
+    probes.push((forged, true));
+    f.append(
+        probes
+            .iter()
+            .map(|(doc, _)| entry("audit_record", doc))
+            .collect(),
+    );
+    for _ in 0..2 {
+        let records = IncludedRecord::reconstruct_all(f.data.path(), f.head.clone()).unwrap();
+        for (doc, expected) in &probes {
+            let included = records.iter().find(|r| r.envelope() == doc).unwrap();
+            let resolved = included.resolve_reference(f.data.path());
+            assert_eq!(
+                resolved.is_ok(),
+                *expected,
+                "{doc}: {}",
+                resolved.err().map_or(String::new(), |e| e.to_string())
+            );
+            if *expected {
+                let resolved = included.resolve_reference(f.data.path()).unwrap();
+                assert_eq!(resolved.record().envelope(), doc);
+                assert_eq!(resolved.reference().id(), id);
+                assert_eq!(resolved.audited().id(), id);
+                resolved
+                    .payload_source()
+                    .unwrap()
+                    .validate(&payload)
+                    .unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn included_record_references_pin_history_and_recover_after_file_repair() {
+    let p = make_publisher_with_scope("parent.example", &["shared.example"]);
+    let (delta, _) = content(&p);
+    let id = wist_core::delta::delta_id(&delta["delta"]).unwrap();
+    let mut f = Fixture::new();
+    let first = vec![
+        entry("publisher_declaration", &current_declaration(&p)),
+        entry("publisher_delta", &delta),
+    ];
+    f.append(first.clone());
+    let record = reference_record(&id, &id, &f.head.as_ref().unwrap().sealed_at);
+    let pinned = f.head.clone();
+    f.append(vec![entry("audit_record", &record)]);
+    let records = IncludedRecord::reconstruct_all(f.data.path(), f.head.clone()).unwrap();
+    let included = &records[0];
+    for height in 0..=1 {
+        let path = f.path(height);
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(included.resolve_reference(f.data.path()).is_err());
+        std::fs::write(&path, b"broken").unwrap();
+        assert!(included.resolve_reference(f.data.path()).is_err());
+        std::fs::write(path, bytes).unwrap();
+        included.resolve_reference(f.data.path()).unwrap();
+    }
+    let bytes = std::fs::read(f.path(1)).unwrap();
+    f.head = pinned;
+    f.append(vec![]);
+    assert!(included.resolve_reference(f.data.path()).is_err());
+    std::fs::write(f.path(1), bytes).unwrap();
+    f.head = Some(BlockRow {
+        block_number: included.position().block_number,
+        block_hash: included.block_hash().into(),
+        sealed_at: jiff::Timestamp::from_second(included.sealed_at_s())
+            .unwrap()
+            .to_string(),
+    });
+    included.resolve_reference(f.data.path()).unwrap();
+
+    let mut other = Fixture::new();
+    other.append(first);
+    other.append(vec![entry("audit_record", &record)]);
+    assert_eq!(
+        other.head.as_ref().unwrap().block_hash,
+        included.block_hash()
+    );
+    assert!(included.resolve_reference(other.data.path()).is_err());
+    for name in [
+        "anchor.json",
+        "log/blocks/000000000.json.zst",
+        "log/blocks/000000001.json.zst",
+    ] {
+        std::fs::copy(f.data.path().join(name), other.data.path().join(name)).unwrap();
+    }
+    included.resolve_reference(other.data.path()).unwrap();
+
+    let anchor_path = f.data.path().join("anchor.json");
+    let anchor: Value = serde_json::from_slice(&std::fs::read(&anchor_path).unwrap()).unwrap();
+    let mut renamed = anchor["anchor"].clone();
+    renamed["log_id"] = json!("another.example");
+    let key = clave::keys::load(&f.data.path().join("keys/seed")).unwrap();
+    let renamed = envelope::sign_envelope(&renamed, "anchor", "log1", &key).unwrap();
+    std::fs::write(&anchor_path, serde_json::to_vec(&renamed).unwrap()).unwrap();
+    assert!(included.resolve_reference(f.data.path()).is_err());
+    std::fs::write(&anchor_path, serde_json::to_vec_pretty(&anchor).unwrap()).unwrap();
+    included.resolve_reference(f.data.path()).unwrap();
+
+    let (later, _) = content(&p);
+    f.append(vec![entry("publisher_delta", &later)]);
+    assert!(AuditChain::reconstruct(f.data.path(), f.head.clone(), &id).is_err());
+    included.resolve_reference(f.data.path()).unwrap();
+    std::fs::write(f.path(2), b"broken later Block").unwrap();
+    assert!(IncludedRecord::reconstruct_all(f.data.path(), f.head.clone()).is_err());
+    included.resolve_reference(f.data.path()).unwrap();
+}
+
+#[test]
+fn included_record_references_resolve_same_block_contentless_sources() {
+    let p = make_publisher_with_scope("parent.example", &["shared.example"]);
+    let (root, payload) = content(&p);
+    for kind in ["new", "attest", "delete"] {
+        let mut body = root["delta"].clone();
+        body["change_type"] = json!(kind);
+        if kind != "new" {
+            body.as_object_mut().unwrap().remove("payload");
+            body["prev"] = json!(wist_core::delta::delta_id(&root["delta"]).unwrap());
+            body["observed_at"] = json!("2026-08-09T12:00:01Z");
+        }
+        let delta = envelope::sign_envelope(&body, "delta", "k1", &p.sk).unwrap();
+        let id = wist_core::delta::delta_id(&body).unwrap();
+        let at = jiff::Timestamp::from_second(1_800_000_000)
+            .unwrap()
+            .to_string();
+        let mut f = Fixture::new();
+        let mut entries = vec![
+            entry("publisher_declaration", &current_declaration(&p)),
+            entry("publisher_delta", &delta),
+            entry("audit_record", &reference_record(&id, &id, &at)),
+        ];
+        if kind != "new" {
+            entries.push(entry("publisher_delta", &root));
+        }
+        f.append(entries);
+        let included = IncludedRecord::reconstruct_all(f.data.path(), f.head.clone()).unwrap();
+        let bound = included[0].resolve_reference(f.data.path()).unwrap();
+        assert_eq!(bound.record().position().block_number, 0);
+        assert_eq!(bound.reference().position().block_number, 0);
+        assert_eq!(bound.reference().id(), id);
+        bound.payload_source().unwrap().validate(&payload).unwrap();
+        assert_eq!(
+            bound.payload_source().unwrap().delta_source().id(),
+            wist_core::delta::delta_id(&root["delta"]).unwrap(),
+        );
+    }
+}
+
+#[test]
 fn authenticated_reference_vectors_resolve_named_and_newest_deltas() {
     let vector: Value = serde_json::from_slice(
         &std::fs::read(spec_dir().join("vectors/wist4/superseded-audit.json")).unwrap(),
@@ -1990,8 +2233,24 @@ fn authenticated_reference_vectors_resolve_named_and_newest_deltas() {
             );
         }
     }
+    let id = |name: &str| wist_core::delta::delta_id(&named[name]["delta"]).unwrap();
+    let cases = vector["cases"].as_array().unwrap();
+    let record_envelopes: Vec<_> = cases
+        .iter()
+        .map(|case| {
+            reference_record(
+                &id(case["audited"].as_str().unwrap()),
+                &id(case["reference"].as_str().unwrap()),
+                &jiff::Timestamp::from_second(
+                    1_800_000_000 + case["fetched_at_s"].as_i64().unwrap(),
+                )
+                .unwrap()
+                .to_string(),
+            )
+        })
+        .collect();
     for height in 1..=10 {
-        let entries = vector["chain"]
+        let mut entries: Vec<_> = vector["chain"]
             .as_array()
             .unwrap()
             .iter()
@@ -2004,13 +2263,35 @@ fn authenticated_reference_vectors_resolve_named_and_newest_deltas() {
                 )
             })
             .collect();
+        entries.extend(
+            cases
+                .iter()
+                .zip(&record_envelopes)
+                .filter(|(case, _)| case["record_height"] == height)
+                .map(|(_, record)| entry("audit_record", record)),
+        );
         f.append_at(entries, (height - 1) * 3600);
     }
-    let id = |name: &str| wist_core::delta::delta_id(&named[name]["delta"]).unwrap();
-    let cases = vector["cases"].as_array().unwrap();
     assert_eq!(cases.len(), 10);
     for _ in 0..2 {
-        for case in cases {
+        let records = IncludedRecord::reconstruct_all(f.data.path(), f.head.clone()).unwrap();
+        assert_eq!(records.len(), cases.len());
+        for (case, record_envelope) in cases.iter().zip(&record_envelopes) {
+            let included = records
+                .iter()
+                .find(|record| record.envelope() == record_envelope)
+                .unwrap();
+            envelope::verify_envelope(
+                included.envelope(),
+                "record",
+                &crypto::SigningKey::from_seed(&[17; 32]).public(),
+            )
+            .unwrap();
+            assert_eq!(
+                included.sealed_at_s(),
+                1_800_000_000 + case["record_sealed_at_s"].as_i64().unwrap(),
+            );
+            let bound = included.resolve_reference(f.data.path());
             let chain = AuditChain::reconstruct(
                 f.data.path(),
                 f.head.clone(),
@@ -2030,16 +2311,36 @@ fn authenticated_reference_vectors_resolve_named_and_newest_deltas() {
             );
             let result = chain.resolve(&id(case["reference"].as_str().unwrap()), &at);
             if case["valid"] != true {
+                assert!(bound.err().unwrap().to_string().contains("WIST4-E02"));
                 assert!(result.err().unwrap().to_string().contains("WIST4-E02"));
                 continue;
             }
+            let bound = bound.unwrap();
+            assert_eq!(bound.record().envelope(), included.envelope());
+            assert_eq!(bound.record().block_hash(), included.block_hash());
+            assert_eq!(
+                bound.record().confirmation_profile(),
+                included.confirmation_profile(),
+            );
+            assert_eq!(bound.audited().id(), id(case["audited"].as_str().unwrap()));
             let reference = result.unwrap();
+            assert_eq!(bound.reference().id(), reference.delta().id());
             assert_eq!(
                 reference.delta().envelope()["delta"]["change_type"],
                 case["reading_change"],
             );
             let payload_name = case["resolved_payload"].as_str().unwrap();
             let source = reference.payload_source().unwrap();
+            let bound_source = bound.payload_source().unwrap();
+            assert_eq!(bound_source.delta_source().id(), source.delta_source().id());
+            assert_eq!(
+                bound_source
+                    .validate(&payloads[payload_name])
+                    .unwrap()
+                    .content
+                    .extract,
+                payload_name,
+            );
             let name = format!("payloads/{}.json", &source.delta_source().id()[7..]);
             std::fs::write(f.data.path().join(&name), &payloads[payload_name]).unwrap();
             if reference.delta().id() != source.delta_source().id() {
