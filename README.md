@@ -218,9 +218,10 @@ not implement Consumer ignored-Entry dispositions.
 The source retains the original Envelope, canonical Entry position, authenticating
 Declaration, identity's first-installation or latest reset position, and committing
 size profile. Later history cannot change those bindings. Contentless `attest`
-and `delete` Deltas are supported. Index reconciliation uses the same sealed
-Delta checks; its unsealed-state policy remains under
-[Delta index reconciliation](#delta-index-reconciliation).
+and `delete` Deltas are supported. Sealed-predecessor admission uses this source;
+index reconciliation shares its sealed Delta checks. Their unsealed-state
+policies remain under [Delta predecessor admission](#delta-predecessor-admission)
+and [Delta index reconciliation](#delta-index-reconciliation).
 
 Reconstruction changes no retained state and exposes no partial result. It scans
 the full prefix, retaining Declaration state, every seen ID and each Publisher/URL
@@ -600,13 +601,14 @@ suspends the pull without concluding unavailability. Fetched Envelopes are reuse
 attempt; later pulls can retrieve rejected or suspended chains again.
 
 The predecessor Envelope comes from retained pending/recovery admissions or
-the complete authenticated Block prefix pinned to the database head. Lookup
-checks its Delta ID; comparison also checks Publisher and URL ownership.
+the [historical Delta source](#historical-delta-sources) pinned to the database
+head. Lookup checks its Delta ID; comparison also checks Publisher and URL ownership.
 Materialized record timestamps supply no comparison authority. Unsealed
 Envelopes remain trusted local admission state. Missing accepted evidence or
-invalid Block history stops the pull; the sealed lookup validates the entire
-pinned prefix before returning an Envelope. See
-[Authenticated history](#authenticated-history) for its trust inputs and limits.
+invalid retained history stops the pull before accepting the dependent Delta
+or fetching its Payload. This storage failure does not reject the candidate;
+repairing the history permits a later attempt. Historical source bindings
+preserve the predecessor's authority across later Declaration changes.
 
 `declaration::verify_delta_predecessor` checks current Publisher/timestamp
 fields, predecessor ID and ownership, and strict observation ordering. Callers
@@ -617,11 +619,12 @@ Log positions or select the canonical chain tip.
 Signed `declaration-fields.json` relation cases and live tests cover exact
 fractions, offset equality, both queues, restart, sealed evidence despite altered
 materialized timestamps, fetched predecessors, missing older links, independent
-URL chains, budget suspension/resumption and corrupt history. Lookup scans
-retained domain admissions and, when needed, the full pinned Block prefix for
+URL chains, budget suspension/resumption and corrupt history. Signed-Block
+regressions cover invalid ancestor/target signatures, missing ancestors, later
+unrelated Delta failures, restart, repair/retry and retired-key authority.
+Lookup scans retained domain admissions and, when needed, the full pinned Block prefix for
 each predecessor; bounded lookup and complete authenticated Delta replay remain
-separate requirements. Existing accepted or sealed chains receive no retroactive
-timestamp revalidation from this admission check.
+separate requirements.
 
 ## Delta index reconciliation
 

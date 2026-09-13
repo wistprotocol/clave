@@ -1,6 +1,6 @@
 use super::Db;
 use crate::error::{Error, Result};
-use crate::history::History;
+use crate::history::deltas::DeltaSource;
 use serde_json::Value;
 use std::path::Path;
 
@@ -19,19 +19,7 @@ impl Db {
                 return Ok(doc);
             }
         }
-        let mut history = History::open(directory, self.last_block()?)?;
-        let mut found = None;
-        while let Some(block) = history.next_block()? {
-            for entry in &block.block().entries {
-                if entry["type"] == "publisher_delta"
-                    && wist_core::delta::delta_id(&entry["body"]["delta"])? == id
-                {
-                    found = Some(entry["body"].clone());
-                }
-            }
-        }
-        found.ok_or_else(|| {
-            Error::History("accepted predecessor Envelope is missing from retained state".into())
-        })
+        let source = DeltaSource::reconstruct(directory, self.last_block()?, id)?;
+        Ok(source.envelope().clone())
     }
 }
