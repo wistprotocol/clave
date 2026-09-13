@@ -130,4 +130,47 @@ impl RecordReference {
     pub fn payload_source(&self) -> Option<&PayloadSource> {
         self.payload.as_ref()
     }
+
+    pub fn validate_verdict_scores(&self) -> Result<()> {
+        use wist_core::verdict::{self, ChangeType, Verdict};
+
+        let failure = || Error::History("WIST4-E02: invalid Record verdict scores".into());
+        let body = &self.record.envelope["record"];
+        let score = |name: &str| {
+            body.get(name)
+                .map(|value| value.as_u64().ok_or_else(failure))
+                .transpose()
+        };
+        let verdict = match body["verdict"].as_str() {
+            Some("consistent") => Verdict::Consistent,
+            Some("dynamic_variance") => Verdict::DynamicVariance,
+            Some("inconsistent") => Verdict::Inconsistent,
+            Some("unreachable") => Verdict::Unreachable,
+            Some("not_auditable") => Verdict::NotAuditable,
+            Some("link_variance") => Verdict::LinkVariance,
+            Some("link_inconsistent") => Verdict::LinkInconsistent,
+            _ => return Err(failure()),
+        };
+        let change = match self.reference.envelope()["delta"]["change_type"]
+            .as_str()
+            .unwrap()
+        {
+            "new" => ChangeType::New,
+            "update" => ChangeType::Update,
+            "attest" => ChangeType::Attest,
+            "delete" => ChangeType::Delete,
+            _ => unreachable!(),
+        };
+        if verdict::record_scores_valid(
+            change,
+            verdict,
+            score("similarity")?,
+            score("link_agreement")?,
+            self.audited.verdict_thresholds(),
+        ) {
+            Ok(())
+        } else {
+            Err(failure())
+        }
+    }
 }

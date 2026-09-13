@@ -113,6 +113,45 @@ fn reference_record(audited: &str, reference: &str, fetched_at: &str) -> Value {
     .unwrap()
 }
 
+fn score_record(
+    audited: &str,
+    reference: &str,
+    fetched_at: &str,
+    verdict: &str,
+    similarity: Option<Value>,
+    link: Option<Value>,
+) -> Value {
+    let mut body = reference_record(audited, reference, fetched_at)["record"].clone();
+    body["verdict"] = json!(verdict);
+    for (field, value) in [("similarity", similarity), ("link_agreement", link)] {
+        if let Some(value) = value {
+            body[field] = value;
+        } else {
+            body.as_object_mut().unwrap().remove(field);
+        }
+    }
+    if matches!(verdict, "unreachable" | "not_auditable") {
+        for field in [
+            "response_commitment",
+            "ref_extract_commitment",
+            "credit_commitment",
+            "evidence_commitment",
+        ] {
+            body.as_object_mut().unwrap().remove(field);
+        }
+    }
+    if verdict == "not_auditable" {
+        body["unmeasured"] = json!("observed");
+    }
+    envelope::sign_envelope(
+        &body,
+        "record",
+        "r1",
+        &crypto::SigningKey::from_seed(&[17; 32]),
+    )
+    .unwrap()
+}
+
 fn content(p: &TestPub) -> (Value, Vec<u8>) {
     let id = add_delta(p, "https://shared.example/page", "body", None);
     let base = p.dir.path().join(".well-known/wist");
@@ -625,16 +664,57 @@ fn authenticated_verdict_thresholds_follow_the_audited_block() {
             jiff::Timestamp::from_second(1_800_000_000 + case["fetched_at_s"].as_i64().unwrap())
                 .unwrap()
                 .to_string();
+        let mut score_probes = Vec::new();
+        for reading in case["readings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|reading| reading["reference_change"] == "update")
+        {
+            for expected in [true, false] {
+                let verdict = if expected {
+                    reading["verdict"].as_str().unwrap()
+                } else if reading["verdict"] == "inconsistent" {
+                    "consistent"
+                } else {
+                    "inconsistent"
+                };
+                score_probes.push((
+                    score_record(
+                        &audited_id,
+                        &reference_id,
+                        &fetched_at,
+                        verdict,
+                        Some(reading["similarity"].clone()),
+                        Some(reading["link_agreement"].clone()),
+                    ),
+                    expected,
+                ));
+            }
+        }
         f.append_at(
-            vec![entry(
-                "audit_record",
-                &reference_record(&audited_id, &reference_id, &fetched_at),
-            )],
+            score_probes
+                .iter()
+                .map(|(record, _)| entry("audit_record", record))
+                .collect(),
             case["query_sealed_at_s"].as_i64().unwrap(),
         );
         assert_eq!(thresholds_json(source.verdict_thresholds()), frozen);
         for _ in 0..2 {
             let included = IncludedRecord::reconstruct_all(f.data.path(), f.head.clone()).unwrap();
+            for (record, expected) in &score_probes {
+                let bound = included
+                    .iter()
+                    .find(|included| included.envelope() == record)
+                    .unwrap()
+                    .resolve_reference(f.data.path())
+                    .unwrap();
+                let result = bound.validate_verdict_scores();
+                assert_eq!(result.is_ok(), *expected, "{}: {record}", case["label"]);
+                if let Err(error) = result {
+                    assert!(error.to_string().contains("WIST4-E02"));
+                }
+            }
             let bound = included[0].resolve_reference(f.data.path()).unwrap();
             assert_eq!(
                 thresholds_json(bound.audited().verdict_thresholds()),
@@ -1956,6 +2036,180 @@ fn historical_sources_resolve_contentless_deltas_and_recreation_in_chain_order()
                     .unwrap()
                     .to_string()
                     .contains("no Payload commitment"));
+            }
+        }
+    }
+}
+
+#[test]
+fn included_record_scores_use_reference_change_and_reject_malformed_readings() {
+    let p = make_publisher_with_scope("parent.example", &["shared.example"]);
+    let (root, _) = content(&p);
+    let root_id = wist_core::delta::delta_id(&root["delta"]).unwrap();
+    let at = jiff::Timestamp::from_second(1_800_003_600)
+        .unwrap()
+        .to_string();
+    for kind in ["new", "update", "attest", "delete"] {
+        let mut f = Fixture::new();
+        f.append(vec![
+            entry("publisher_declaration", &current_declaration(&p)),
+            entry("publisher_delta", &root),
+        ]);
+        let mut reference = root["delta"].clone();
+        let mut entries = Vec::new();
+        if kind != "new" {
+            reference["change_type"] = json!(kind);
+            reference["prev"] = json!(root_id);
+            reference["observed_at"] = json!("2026-08-09T12:00:01Z");
+            if kind != "update" {
+                reference.as_object_mut().unwrap().remove("payload");
+            }
+            entries.push(entry(
+                "publisher_delta",
+                &envelope::sign_envelope(&reference, "delta", "k1", &p.sk).unwrap(),
+            ));
+        }
+        let reference_id = wist_core::delta::delta_id(&reference).unwrap();
+        let mut probes = Vec::new();
+        for (similarity, verdict) in [
+            (0, "inconsistent"),
+            (299_999, "inconsistent"),
+            (300_000, "dynamic_variance"),
+            (599_999, "dynamic_variance"),
+            (600_000, "consistent"),
+            (1_000_000, "consistent"),
+        ] {
+            let raw = if kind == "delete" {
+                1_000_000 - similarity
+            } else {
+                similarity
+            };
+            for claimed in [
+                "consistent",
+                "dynamic_variance",
+                "inconsistent",
+                "link_variance",
+                "link_inconsistent",
+            ] {
+                probes.push((
+                    score_record(
+                        &root_id,
+                        &reference_id,
+                        &at,
+                        claimed,
+                        Some(json!(raw)),
+                        None,
+                    ),
+                    claimed == verdict,
+                ));
+            }
+        }
+        for verdict in ["unreachable", "not_auditable"] {
+            probes.push((
+                score_record(&root_id, &reference_id, &at, verdict, None, None),
+                true,
+            ));
+            for value in [json!(0), Value::Null] {
+                probes.push((
+                    score_record(
+                        &root_id,
+                        &reference_id,
+                        &at,
+                        verdict,
+                        Some(value.clone()),
+                        None,
+                    ),
+                    false,
+                ));
+                probes.push((
+                    score_record(&root_id, &reference_id, &at, verdict, None, Some(value)),
+                    false,
+                ));
+            }
+        }
+        let high = if kind == "delete" { 0 } else { 1_000_000 };
+        for invalid in [
+            Value::Null,
+            json!(-1),
+            json!(1_000_001),
+            json!(0.5),
+            json!("600000"),
+            json!(true),
+            json!([]),
+            json!({}),
+        ] {
+            probes.push((
+                score_record(
+                    &root_id,
+                    &reference_id,
+                    &at,
+                    "consistent",
+                    Some(invalid.clone()),
+                    None,
+                ),
+                false,
+            ));
+            probes.push((
+                score_record(
+                    &root_id,
+                    &reference_id,
+                    &at,
+                    "consistent",
+                    Some(json!(high)),
+                    Some(invalid),
+                ),
+                false,
+            ));
+        }
+        probes.push((
+            score_record(&root_id, &reference_id, &at, "consistent", None, None),
+            false,
+        ));
+        probes.push((
+            score_record(
+                &root_id,
+                &reference_id,
+                &at,
+                "unknown",
+                Some(json!(high)),
+                None,
+            ),
+            false,
+        ));
+        probes.push((
+            score_record(
+                &root_id,
+                &reference_id,
+                &at,
+                "consistent",
+                Some(json!(high)),
+                Some(json!(1_000_000)),
+            ),
+            kind != "delete",
+        ));
+        let mut forged = probes.iter().find(|(_, valid)| *valid).unwrap().0.clone();
+        forged["sig"]["value"] = json!("A".repeat(86));
+        probes.push((forged, true));
+        entries.extend(
+            probes
+                .iter()
+                .map(|(record, _)| entry("audit_record", record)),
+        );
+        f.append(entries);
+        for _ in 0..2 {
+            let included = IncludedRecord::reconstruct_all(f.data.path(), f.head.clone()).unwrap();
+            for (record, expected) in &probes {
+                let bound = included
+                    .iter()
+                    .find(|included| included.envelope() == record)
+                    .unwrap()
+                    .resolve_reference(f.data.path())
+                    .unwrap();
+                let result = bound.validate_verdict_scores();
+                assert_eq!(result.is_ok(), *expected, "{kind}: {record}");
+                if let Err(error) = result {
+                    assert!(error.to_string().contains("WIST4-E02"));
+                }
             }
         }
     }

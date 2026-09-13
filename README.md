@@ -377,6 +377,33 @@ endpoints, same-Block references, contentless anchors, malformed fields/times,
 forged Record signature preservation, identical hashes under different Anchors,
 alternate directories, later invalid history, restart and file repair.
 
+## Included Record verdict scores
+
+`RecordReference::validate_verdict_scores()` applies WIST-4 §§3/5's
+Log-decidable score/verdict checks through core's `verdict::record_scores_valid`.
+The authenticated reference Delta supplies the change type; the audited Delta
+supplies its sealing-Block thresholds. Later references, Record inclusion and
+parameter resets cannot replace that profile.
+
+Unknown verdicts, missing measured similarity, malformed or out-of-range scores,
+explicit nulls, forbidden link readings and scores outside the claimed verdict's
+bands return WIST4-E02. Deletion mirrors similarity using the reference change
+type. Optional link omission preserves the extract verdict; link verdicts require
+a score, and link scores are forbidden for deletion and unmeasured verdicts.
+
+This check reads no Payloads or network state and writes nothing. Passing it
+establishes neither measurement truth, complete field/signature eligibility,
+Auditor standing, coverage nor a finding. Unmeasured verdicts with absent scores
+pass this relation without proving their cause. The Record and its authenticated
+bindings remain available after a score rejection for separate coverage handling
+under WIST-4 §3. History prerequisites and resource limits follow
+[Included Record references](#included-record-references).
+
+Signed histories exercise link-band amendment vectors before and at activation,
+later references and resets, all reference change types, score boundaries,
+malformed JSON values, neutral dimensions and reconstruction after restart.
+Forged Record signatures remain subject to the separate authorship check.
+
 ## Historical audit references
 
 `history::references::AuditChain::reconstruct(directory, pinned_head, audited_id)`
