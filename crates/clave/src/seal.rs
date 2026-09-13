@@ -392,6 +392,8 @@ fn check_roster_acts(
 
 fn revalidate_queued_deltas(
     db: &Db,
+    data_dir: &Path,
+    size_caps: &crate::declaration::delta::SizeCaps,
     entries: Vec<SealEntry>,
     sealed_at: &str,
     projection: &Projection,
@@ -429,8 +431,24 @@ fn revalidate_queued_deltas(
             .and_then(|()| crate::declaration::verify_delta_authority(&source, &e.body));
         let code = match verified {
             Ok(()) => {
-                kept.push(e);
-                continue;
+                let sizes = size_caps.validate_delta(&e.body);
+                let sizes = match sizes {
+                    Ok(()) if e.body["delta"].get("payload").is_some() => {
+                        let id = wist_core::delta::delta_id(&e.body["delta"])?;
+                        let bytes =
+                            std::fs::read(data_dir.join(format!("payloads/{}.json", &id[7..])))?;
+                        let payload: Value = serde_json::from_slice(&bytes)?;
+                        size_caps.validate_payload_sizes(&payload)
+                    }
+                    result => result,
+                };
+                match sizes {
+                    Ok(()) => {
+                        kept.push(e);
+                        continue;
+                    }
+                    Err(code) => code,
+                }
             }
             Err(code @ ("WIST1-E14" | "WIST1-E03" | "WIST1-E15")) => code,
             Err(_) => "WIST1-E02",
@@ -981,8 +999,19 @@ pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<
             entry.entry_type != "publisher_delta" || !recovering.contains(entry.domain.as_str())
         })
         .collect();
-    let (seal_entries, retired_rowids, retired) =
-        revalidate_queued_deltas(db, seal_entries, &sealed_at, &projection)?;
+    let (seal_entries, retired_rowids, retired) = revalidate_queued_deltas(
+        db,
+        data_dir,
+        &crate::declaration::delta::SizeCaps::from_schedule(
+            history
+                .schedule()
+                .unwrap_or(&wist_core::parameters::Schedule::new(sealed_epoch)),
+            sealed_epoch,
+        ),
+        seal_entries,
+        &sealed_at,
+        &projection,
+    )?;
     let (seal_entries, roster_rowids, roster_dropped) = check_roster_acts(
         db,
         seal_entries,

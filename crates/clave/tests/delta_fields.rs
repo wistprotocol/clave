@@ -219,9 +219,18 @@ fn decimal_byte_counts_and_active_url_caps_use_canonical_values() {
     let rejected =
         clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
     assert_eq!(rejected.rejected, [(id.clone(), "WIST1-E11".into())]);
-    db.set_param("url_cap_bytes", 4096).unwrap();
+    let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
+    let now = "2026-08-09T12:00:00Z"
+        .parse::<jiff::Timestamp>()
+        .unwrap()
+        .as_second();
+    for parameter in ["url_cap_bytes", "summary_cap_bytes"] {
+        clave::param_change::run(&db, &sk, parameter, 4096, Some("2026-08-16T12:00:00Z"), now)
+            .unwrap();
+    }
+    clave::seal::run(&db, data.path(), &sk, now).unwrap();
     let accepted =
-        clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
+        clave::ingest::run(&db, &client, data.path(), &host, "2026-08-16T12:00:00Z").unwrap();
     assert_eq!(accepted.accepted, std::slice::from_ref(&id));
     assert!(accepted.rejected.is_empty());
     assert_eq!(db.url_tip(&host, &url).unwrap(), Some(id));
@@ -354,6 +363,14 @@ fn sealing_preserves_version_diagnostics_and_supported_signed_values() {
     for (id, doc, url) in [(&bad_id, &bad, bad_url), (&good_id, &good, good_url)] {
         db.record_accepted_delta(&host, id, doc, 0, url, id)
             .unwrap();
+        std::fs::create_dir_all(data.path().join("payloads")).unwrap();
+        std::fs::copy(
+            p.dir
+                .path()
+                .join(format!(".well-known/wist/payloads/{}.json", &id[7..])),
+            data.path().join(format!("payloads/{}.json", &id[7..])),
+        )
+        .unwrap();
     }
     drop(db);
     let db = clave::db::Db::open(&path).unwrap();

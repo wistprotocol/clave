@@ -123,6 +123,10 @@ impl Db {
                     .filter(|entry| entry["type"] == "publisher_delta")
                 {
                     let envelope = &entry["body"];
+                    block
+                        .delta_size_caps()
+                        .validate_delta(envelope)
+                        .map_err(failure)?;
                     let delta = Delta::read(envelope)?;
                     let source = declarations
                         .domains()

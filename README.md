@@ -56,8 +56,8 @@ WIST1-E15. It supports major `1`, preserves minor/patch components without
 numeric conversion, and is used by Delta signature verification and
 `validate_static`. The latter also checks content/predecessor presence and
 URL/commitment caps. Its caller supplies valid stage-specific caps; the helper
-does not authenticate parameter profiles. Live ingestion supplies effective
-caps at its validation clock, including the derived commitment cap.
+does not authenticate parameter profiles. Profile selection follows
+[Delta size-cap profiles](#delta-size-cap-profiles).
 
 Typed ingestion reads a canonical temporary copy so integral decimal numbers
 remain admissible; stored and verified signed objects retain their original
@@ -71,6 +71,39 @@ byte counts, fetched unsupported predecessors and signed version preservation
 across duplicate pulls, restart and sealing. These checks do not establish
 complete authenticated Delta history or other objects' version support.
 Live Declaration retries are described below.
+
+## Delta size-cap profiles
+
+WIST-1 §3.6 and ADR-0020 determine size-cap timing. Ingestion reconstructs the
+pinned authenticated schedule when each fetched Delta begins validation and
+retains its five caps through Declaration refresh, predecessor retrieval,
+Payload validation and admission rechecks. Predecessors and attempts after
+rejection or restart obtain fresh profiles; clock-skew validation keeps its
+separate clock. Local parameter overrides and amendment summaries cannot
+replace signed size-cap authority.
+
+Sealing checks each candidate Delta and its stored Payload against the
+candidate Block's authenticated profile. Pending amendments apply only from
+their effective instant. Delta URL/declared-byte failures retain WIST1-E11/E04;
+Payload cap failures use WIST2-E03 during pulls and WIST1-E04 at sealing.
+Sealing removes rejected copies and dependent successors under
+[Declaration key binding](#declaration-key-binding). Missing or
+unparseable stored Payloads abort sealing and roll back SQLite changes.
+
+`VerifiedBlock::delta_size_caps` retains the committing Block's profile for
+later Payload or reference validation. `SizeCaps::validate_payload_sizes`
+measures original JSON values in JCS octets; callers must separately validate
+Payload fields and integrity. Index restoration checks sealed Delta URL and
+declared-byte caps against each Block's profile. It does not retrieve historical
+Payloads or recalculate completed unsealed admissions' original profiles.
+
+`delta-cap-time.json` exercises authenticated histories, stage boundaries,
+reference profiles and invalid candidate Blocks. Live regressions cover
+Payload/predecessor timing, repeated rejected IDs, restart, dependent rejection,
+missing/corrupt Payload rollback and signed authority despite changed local
+summaries. Full-prefix reconstruction per attempt remains unbounded; complete
+Payload field validation, historical retrieval and Audit Record use remain
+separate obligations.
 
 ## Declaration key binding
 
@@ -447,9 +480,10 @@ Every retained Envelope passes the field and version checks in
 without a `payload` commitment stops restoration with WIST1-E09;
 an `update`, `delete` or `attest` without `prev` stops it with WIST1-E07.
 Field/version checks run first. Sealed sources come from Declaration replay
-at each Block. Restoration checks Delta signing bindings,
-key-time bounds and scope, then follows predecessor
-links within that Block. Retained unsealed copies follow persistent acceptance
+at each Block. Sealed size checks follow
+[Delta size-cap profiles](#delta-size-cap-profiles). Restoration checks Delta
+signing bindings, key-time bounds and scope, then follows predecessor links
+within that Block. Retained unsealed copies follow persistent acceptance
 positions across both queues; their Envelopes remain trusted local admission
 state, without Log authentication or renewed authority, clock or Payload
 checks. They must agree with their stored ownership, ID and URL and extend
