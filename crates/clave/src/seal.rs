@@ -576,7 +576,7 @@ fn enforce_governance(
 }
 
 fn fit_to_cap(
-    mut entries: Vec<SealEntry>,
+    entries: Vec<SealEntry>,
     cap: i64,
     empty_block_bytes: usize,
     installed: &HashSet<String>,
@@ -592,23 +592,23 @@ fn fit_to_cap(
         .filter(|entry| entry.entry_type == "publisher_declaration")
         .filter_map(|entry| crate::declaration::inner_hash(&entry.body).ok())
         .collect();
-    entries.sort_by(|a, b| {
+    let mut entries = entries
+        .into_iter()
+        .map(|entry| {
+            let declaration = if entry.entry_type == "publisher_declaration" {
+                let publisher =
+                    crate::declaration::publisher_of(&entry.body).map_err(Error::Seal)?;
+                Some((publisher.domain, publisher.seq))
+            } else {
+                None
+            };
+            Ok((declaration, entry))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    entries.sort_by(|(a_declaration, a), (b_declaration, b)| {
         entry_type_rank(&a.entry_type)
             .cmp(&entry_type_rank(&b.entry_type))
-            .then_with(|| {
-                if a.entry_type == "publisher_declaration" {
-                    a.body["publisher"]["domain"]
-                        .as_str()
-                        .cmp(&b.body["publisher"]["domain"].as_str())
-                        .then_with(|| {
-                            a.body["publisher"]["seq"]
-                                .as_u64()
-                                .cmp(&b.body["publisher"]["seq"].as_u64())
-                        })
-                } else {
-                    std::cmp::Ordering::Equal
-                }
-            })
+            .then_with(|| a_declaration.cmp(b_declaration))
             .then_with(|| a.leaf.cmp(&b.leaf))
     });
     let mut selected = installed.clone();
@@ -616,7 +616,7 @@ fn fit_to_cap(
     let mut used = empty_block_bytes;
     let mut kept = Vec::with_capacity(entries.len());
     let mut deferred = 0usize;
-    for e in entries {
+    for (_, e) in entries {
         let declaration_domain = (e.entry_type == "publisher_declaration")
             .then(|| e.body["publisher"]["domain"].as_str().unwrap_or_default());
         if declaration_domain.is_some_and(|domain| {
@@ -1168,13 +1168,15 @@ pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<
     let sealed_declarations: Vec<(String, u64, Vec<u8>)> = seal_entries
         .iter()
         .filter(|e| e.entry_type == "publisher_declaration")
-        .filter_map(|e| {
-            let publisher = e.body.get("publisher")?;
-            let domain = publisher["domain"].as_str()?.to_string();
-            let seq = publisher["seq"].as_u64()?;
-            Some((domain, seq, serde_json::to_vec(&e.body).ok()?))
+        .map(|e| {
+            let publisher = crate::declaration::publisher_of(&e.body).map_err(Error::Seal)?;
+            Ok((
+                publisher.domain,
+                publisher.seq,
+                serde_json::to_vec(&e.body)?,
+            ))
         })
-        .collect();
+        .collect::<Result<_>>()?;
     let declaration_rows: Vec<SealedDeclarationRow> = sealed_declarations
         .iter()
         .map(|(domain, seq, json)| SealedDeclarationRow {

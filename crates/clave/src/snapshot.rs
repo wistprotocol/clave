@@ -231,11 +231,13 @@ fn build_state(
     }
     for p in &publishers {
         let declaration: Value = crate::json::parse(&p.declaration_json)?;
-        let seq = declaration["publisher"]["seq"].as_u64();
+        let seq = crate::declaration::publisher_of(&declaration)
+            .map_err(Error::History)?
+            .seq;
         let sealing_height = db
             .sealed_declarations(&p.domain)?
             .into_iter()
-            .find(|d| Some(d.seq) == seq)
+            .find(|d| d.seq == seq)
             .map(|d| d.block_number)
             .unwrap_or(0);
         entries.push(StateEntry::Declaration(DeclarationEntry {

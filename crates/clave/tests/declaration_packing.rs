@@ -19,15 +19,24 @@ fn read_block(directory: &std::path::Path, height: u64) -> Value {
 
 #[test]
 fn capped_declaration_chains_progress_when_successor_hashes_first() {
-    check_capped_chain(false);
+    check_capped_chain(false, ["1", "2"]);
 }
 
 #[test]
 fn smaller_successor_waits_until_its_predecessor_fits() {
-    check_capped_chain(true);
+    check_capped_chain(true, ["1", "2"]);
 }
 
-fn check_capped_chain(oversized_predecessor: bool) {
+#[test]
+fn integral_declaration_sequences_pack_in_numeric_order() {
+    for spellings in [["1.0", "2e0"], ["1", "2.0"], ["1e0", "2"]] {
+        for oversized in [false, true] {
+            check_capped_chain(oversized, spellings);
+        }
+    }
+}
+
+fn check_capped_chain(oversized_predecessor: bool, spellings: [&str; 2]) {
     let data = tempfile::tempdir().unwrap();
     clave::init::run("log.example.com", data.path()).unwrap();
     let database = data.path().join("clave.sqlite");
@@ -64,7 +73,7 @@ fn check_capped_chain(oversized_predecessor: bool) {
     clave::seal::run(&db, data.path(), &log_key, start).unwrap();
 
     let mut predecessor_body = initial["publisher"].clone();
-    predecessor_body["seq"] = json!(1);
+    predecessor_body["seq"] = serde_json::from_str(spellings[0]).unwrap();
     predecessor_body["prev_declaration"] = clave::declaration::inner_hash(&initial).unwrap().into();
     if oversized_predecessor {
         predecessor_body["subdomain_scope"] = json!((0..32)
@@ -76,7 +85,7 @@ fn check_capped_chain(oversized_predecessor: bool) {
     let successor = (0..256)
         .find_map(|nonce| {
             let mut body = predecessor_body.clone();
-            body["seq"] = json!(2);
+            body["seq"] = serde_json::from_str(spellings[1]).unwrap();
             body["prev_declaration"] = clave::declaration::inner_hash(&predecessor).unwrap().into();
             body["subdomain_scope"] = json!([format!("s{nonce}.example.com")]);
             let candidate =
@@ -144,14 +153,16 @@ fn check_capped_chain(oversized_predecessor: bool) {
             clave::seal::run(&db, data.path(), &log_key, start + height as i64 * 3600).unwrap();
         assert_eq!(report.entry_count, 1);
         let sealed = read_block(data.path(), height);
-        assert_eq!(sealed["entries"], json!([entry(expected)]));
+        let canonical_expected: Value =
+            serde_json::from_slice(&jcs::canonicalize(expected).unwrap()).unwrap();
+        assert_eq!(sealed["entries"], json!([entry(&canonical_expected)]));
         assert!(jcs::canonicalize(&sealed).unwrap().len() <= cap);
         block::verify_block(&sealed, &log_key.public()).unwrap();
         let reconstructed =
             Declarations::reconstruct(data.path(), db.last_block().unwrap()).unwrap();
         assert_eq!(
             reconstructed.domains()["example.com"].current().envelope(),
-            expected
+            &canonical_expected
         );
         assert_eq!(
             db.peek_pending_entries().unwrap().0.len(),

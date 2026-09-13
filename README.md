@@ -192,6 +192,15 @@ authenticated pinned Block prefix and retained current/pending admission rows;
 corrupt history rejects restoration before any floor is written. Retained
 admission rows are local accepted state, not authenticated Log inclusion.
 
+Declaration sequence consumers use the validated numeric value under WIST-1
+§§4/5.1. Integral decimal/exponent spellings and negative zero preserve
+admission floors, pending recovery-head order, capped packing, sealed metadata
+and Snapshot sealing-height lookup. Retained Envelopes remain unchanged;
+Blocks and Snapshots use JCS serialization. Signed live/restart tests cover
+mixed spellings, recovery competitors/followers and idempotent re-serves.
+This does not reconstruct missing legacy metadata or establish Snapshot
+recovery conformance; see [Declaration history replay](#declaration-history-replay).
+
 Only an accepted replacement or a valid unchanged re-serve renews the cached
 Declaration's discovery timestamp. Rejected or unavailable responses preserve
 that timestamp; after attempted discovery, an expired cache stops the pull

@@ -183,9 +183,14 @@ fn accepted_recovery_head(
         .0
         .into_iter()
         .filter(|entry| entry.domain == host && entry.entry_type == "publisher_declaration")
-        .collect();
-    pending.sort_by_key(|entry| entry.entry_json["publisher"]["seq"].as_u64());
-    for entry in pending {
+        .map(|entry| {
+            let publisher = declaration::publisher_of(&entry.entry_json)
+                .map_err(crate::error::Error::History)?;
+            Ok((publisher.seq, entry))
+        })
+        .collect::<Result<_>>()?;
+    pending.sort_by_key(|(seq, _)| *seq);
+    for (_, entry) in pending {
         if declaration::follows_chain_head(&head, &entry.entry_json) {
             head = entry.entry_json;
         }

@@ -27,28 +27,38 @@ pub(crate) fn settle_due(db: &Db, history: &Declarations, now: &str) -> Result<(
         let mut head = window.head().envelope().clone();
         let mut current = state.current().envelope().clone();
         let mut floor = state.highest_accepted_seq();
-        let mut pending = db.peek_pending_entries()?.0;
-        pending.sort_by_key(|entry| entry.entry_json["publisher"]["seq"].as_u64());
-        for entry in pending.iter().filter(|entry| entry.domain == *domain) {
-            match entry.entry_type.as_str() {
-                "publisher_declaration" => {
-                    declaration::evaluate_with_heads(
-                        &current,
-                        Some(&head),
-                        floor,
-                        &entry.entry_json,
+        let mut pending = db
+            .peek_pending_entries()?
+            .0
+            .into_iter()
+            .filter(|entry| entry.domain == *domain)
+            .map(|entry| {
+                let seq = if entry.entry_type == "publisher_declaration" {
+                    Some(
+                        declaration::publisher_of(&entry.entry_json)
+                            .map_err(Error::History)?
+                            .seq,
                     )
+                } else {
+                    None
+                };
+                Ok((seq, entry))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        pending.sort_by_key(|(seq, _)| *seq);
+        for (seq, entry) in pending {
+            if let Some(seq) = seq {
+                declaration::evaluate_with_heads(&current, Some(&head), floor, &entry.entry_json)
                     .map_err(|(code, detail)| Error::History(format!("{code}: {detail}")))?;
-                    floor = floor.max(entry.entry_json["publisher"]["seq"].as_u64().unwrap());
-                    current = entry.entry_json.clone();
-                    if declaration::follows_chain_head(&head, &entry.entry_json) {
-                        head = entry.entry_json.clone();
-                    } else {
-                        db.remove_pending_declaration(entry.rowid)?;
-                    }
+                floor = floor.max(seq);
+                current = entry.entry_json.clone();
+                if declaration::follows_chain_head(&head, &entry.entry_json) {
+                    head = entry.entry_json;
+                } else {
+                    db.remove_pending_declaration(entry.rowid)?;
                 }
-                "publisher_delta" => db.requeue_pending_delta(entry)?,
-                _ => {}
+            } else if entry.entry_type == "publisher_delta" {
+                db.requeue_pending_delta(&entry)?;
             }
         }
         let sealed = declaration::publisher_of(window.head().envelope()).map_err(Error::History)?;
