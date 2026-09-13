@@ -343,7 +343,10 @@ suspension, empty Feeds and Declaration changes.
 with database reopen between observations. Additional tests cover dependent
 Page/Delta/Payload failures, budget exhaustion, storage failure, older sealed
 Pages, ordinary rotation, identity reset and concurrent per-host storage.
-Recovery-settlement integration remains unexercised for this state.
+Recovery tests cover admission-time and sealing-time settlement with pending
+or sealed competitors. A superseded identity's maximum timestamp survives
+restoration of the lower-sequence recovery Declaration and restart; the
+restored signer can publish and seal new Deltas using that same Feed timestamp.
 
 Existing databases have no retained Feed observations to reconstruct; protection
 starts at the first authenticated live Feed after upgrade. Backups must preserve

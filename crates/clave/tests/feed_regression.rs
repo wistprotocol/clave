@@ -313,3 +313,145 @@ fn declaration_rotation_and_identity_reset_preserve_the_observation() {
         assert_eq!(report.noise, Some("WIST2-E02"));
     }
 }
+
+#[test]
+fn recovery_settlement_preserves_a_superseded_identitys_feed_maximum() {
+    const MAXIMUM: &str = "9999-12-31T23:59:59Z";
+    const DEADLINE: &str = "2026-08-16T13:00:00Z";
+    for seal_settlement in [false, true] {
+        for seal_competitor in [false, true] {
+            let (listener, host, client) = reserve_addr();
+            let publisher = make_publisher_with_recovery(&host);
+            serve_static(listener, publisher.dir.path().into());
+            let data = tempfile::tempdir().unwrap();
+            clave::init::run(&host, data.path()).unwrap();
+            let path = data.path().join("clave.sqlite");
+            let mut db = Db::open(&path).unwrap();
+            let key = clave::keys::load(&data.path().join("keys/seed")).unwrap();
+            let initial = current_declaration(&publisher);
+            let mut owner = initial["publisher"].clone();
+            owner["seq"] = 1.into();
+            owner["prev_declaration"] = declaration_hash(&initial).into();
+            owner["keys"] = serde_json::json!([key_entry("k2", &K2_SEED, "2026-08-09T13:00:00Z")]);
+            for (at, body, signer, seed, feed_signer, feed_seed) in [
+                (
+                    "2026-08-09T12:00:00Z",
+                    &initial["publisher"],
+                    "k1",
+                    &K1_SEED,
+                    "k1",
+                    &K1_SEED,
+                ),
+                (
+                    "2026-08-09T13:00:00Z",
+                    &owner,
+                    "r1",
+                    &R1_SEED,
+                    "k2",
+                    &K2_SEED,
+                ),
+            ] {
+                write_declaration(&publisher, body, signer, seed);
+                write_feed_signed(&publisher, &host, &[], at, feed_signer, feed_seed);
+                let report = clave::ingest::run(&db, &client, data.path(), &host, at).unwrap();
+                assert_eq!(report.noise, Some("WIST2-E02"));
+                clave::seal::run(
+                    &db,
+                    data.path(),
+                    &key,
+                    at.parse::<jiff::Timestamp>().unwrap().as_second(),
+                )
+                .unwrap();
+            }
+            let owner_envelope = current_declaration(&publisher);
+            let mut competitor = owner.clone();
+            competitor["seq"] = 2.into();
+            competitor["prev_declaration"] = declaration_hash(&owner_envelope).into();
+            competitor["keys"] =
+                serde_json::json!([key_entry("x1", &X1_SEED, "2026-08-09T14:00:00Z")]);
+            write_declaration(&publisher, &competitor, "x1", &X1_SEED);
+            write_feed_signed(&publisher, &host, &[], MAXIMUM, "x1", &X1_SEED);
+            let report = clave::ingest::run(&db, &client, data.path(), &host, NOW).unwrap();
+            assert_eq!(report.noise, Some("WIST2-E02"));
+            let accepted: Value =
+                serde_json::from_slice(&db.get_publisher_declaration(&host).unwrap().unwrap())
+                    .unwrap();
+            assert_eq!(accepted["publisher"], competitor);
+            assert_eq!(retained(&path, &host), Some(253_402_300_799));
+            if seal_competitor {
+                clave::seal::run(
+                    &db,
+                    data.path(),
+                    &key,
+                    NOW.parse::<jiff::Timestamp>().unwrap().as_second(),
+                )
+                .unwrap();
+            }
+            db = Db::open(&path).unwrap();
+            assert!(db.get_recovery_window(&host).unwrap().is_some());
+            if seal_settlement {
+                clave::seal::run(
+                    &db,
+                    data.path(),
+                    &key,
+                    DEADLINE.parse::<jiff::Timestamp>().unwrap().as_second(),
+                )
+                .unwrap();
+                db = Db::open(&path).unwrap();
+            }
+            write_declaration(&publisher, &owner, "r1", &R1_SEED);
+            let id = add_delta_signed(
+                &publisher,
+                "https://localhost/recovered",
+                "recovered content",
+                None,
+                DEADLINE,
+                "k2",
+                &K2_SEED,
+            );
+            write_feed_signed(
+                &publisher,
+                &host,
+                std::slice::from_ref(&id),
+                DEADLINE,
+                "k2",
+                &K2_SEED,
+            );
+            let report = clave::ingest::run(&db, &client, data.path(), &host, DEADLINE).unwrap();
+            assert!(report.accepted.is_empty() && report.queued.is_empty());
+            assert_eq!(report.noise, None);
+            assert_eq!(db.list_rejections(&host).unwrap()[0].code, "WIST2-E05");
+            assert!(!db.is_delta_seen(&id).unwrap());
+            assert!(db.get_recovery_window(&host).unwrap().is_none());
+            let restored: Value =
+                serde_json::from_slice(&db.get_publisher_declaration(&host).unwrap().unwrap())
+                    .unwrap();
+            assert_eq!(restored, owner_envelope);
+            assert_eq!(db.highest_accepted_declaration_seq(&host).unwrap(), Some(2));
+            db = Db::open(&path).unwrap();
+            assert_eq!(retained(&path, &host), Some(253_402_300_799));
+            write_feed_signed(
+                &publisher,
+                &host,
+                std::slice::from_ref(&id),
+                MAXIMUM,
+                "k2",
+                &K2_SEED,
+            );
+            let report = clave::ingest::run(&db, &client, data.path(), &host, DEADLINE).unwrap();
+            assert_eq!(report.accepted, std::slice::from_ref(&id));
+            assert!(report.queued.is_empty() && report.rejected.is_empty());
+            let after_deadline = DEADLINE.parse::<jiff::Timestamp>().unwrap().as_second() + 3600;
+            clave::seal::run(&db, data.path(), &key, after_deadline).unwrap();
+            db = Db::open(&path).unwrap();
+            assert_eq!(retained(&path, &host), Some(253_402_300_799));
+            assert_eq!(
+                db.get_record("https://localhost/recovered", &host)
+                    .unwrap()
+                    .unwrap()
+                    .delta_id,
+                id
+            );
+        }
+    }
+}
