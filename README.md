@@ -197,34 +197,55 @@ checks atomic failure, preserved dependent and independent chains, and repair
 before successful sealing. Previously sealed Payloads and recovery-held copies
 that are not candidates receive no new validation from these checks.
 
+## Historical Delta sources
+
+`history::deltas::DeltaSource::reconstruct(directory, pinned_head, delta_id)`
+returns one included Delta only after authenticating the entire pinned
+Block/parameter and Declaration prefix and checking every included Delta's
+fields, version, committing size caps, historical authority and predecessor
+chain. Authority uses [Declaration history replay](#declaration-history-replay)
+and [Declaration key binding](#declaration-key-binding); trust inputs and
+unsupported transitions follow [Authenticated history](#authenticated-history).
+
+Chains retain signed Publisher/URL ownership and exact predecessor observation
+times across scope changes, rotation, recovery and identity resets. Within each
+Block, predecessor links determine chain order independently of storage order.
+Missing predecessors, forks, duplicate IDs, invalid authority or non-increasing
+observations stop reconstruction, including failures after the requested Delta.
+This is a strict integrity check of the Aggregator's retained history; it does
+not implement Consumer ignored-Entry dispositions.
+
+The source retains the original Envelope, canonical Entry position, authenticating
+Declaration, identity's first-installation or latest reset position, and committing
+size profile. Later history cannot change those bindings. Contentless `attest`
+and `delete` Deltas are supported. Index reconciliation uses the same sealed
+Delta checks; its unsealed-state policy remains under
+[Delta index reconciliation](#delta-index-reconciliation).
+
+Reconstruction changes no retained state and exposes no partial result. It scans
+the full prefix, retaining Declaration state, every seen ID and each Publisher/URL
+tip; bounded lookup remains required. It does not check validator-clock skew,
+Payload bodies, sanctions, materialization or Audit Record eligibility, and does
+not replace live admission or `verify-history`.
+
+Signed tests cover exact predecessor vectors in same-Block and cross-Block chains,
+invalid ancestors and later unrelated Deltas, independent Publishers sharing a
+URL, identity resets, contentless successors, recreation after deletion, restart
+and repair/retry.
+
 ## Historical Payload validation
 
 `history::payloads::PayloadSource::reconstruct(directory, pinned_head, delta_id)`
-authenticates the complete pinned Block/parameter and Declaration history before
-returning a source for one included Delta. Trust inputs and unsupported Log
-transitions follow [Authenticated history](#authenticated-history). The source
-retains the original Delta Envelope, its Block height, commitment and
-[committing size profile](#delta-size-cap-profiles).
-
-The selected Delta passes fields, version, declared-size and historical
-Declaration authority checks, including signed Publisher scope, key-time bounds,
-recovery-window exclusion and deadline-Block replacements. Later scope/key changes
-do not revise that source. Missing or repeated target IDs, contentless targets,
-invalid authority or any failure in the pinned prefix return no source.
+requires a [historical Delta source](#historical-delta-sources) with a Payload
+commitment. `delta_source()` exposes its authenticated bindings.
 
 `PayloadSource::validate(raw)` applies the complete
 [Payload validator](#retained-payload-validation) to supplied bytes with the retained
 commitment, signed Publisher and caps. Reconstructing after restart selects the
 same profile; an Audit Record's or another Delta's profile cannot replace it.
 Invalid bytes return a Payload error without mutating the source or stored state,
-allowing another copy to be checked. Both methods leave retained files unchanged.
-
-This API neither fetches Payloads nor establishes Delta chain/clock eligibility,
-Audit Record reference eligibility or availability/withdrawal obligations. It
-validates no other Delta's body and does not update indexes, sanctions or service
-admission. Each reconstruction scans the full prefix and retains Declaration
-replay state; bounded lookup and integration into complete Delta/Audit Record
-replay remain required. `verify-history` keeps its existing scope.
+allowing another copy to be checked. Neither method fetches Payloads or establishes
+availability, withdrawal or Audit Record reference eligibility.
 
 Signed tests cover 103 default-profile Payload field cases, original-byte and
 numeric-value preservation, historical cap references and invalid cap Blocks,

@@ -1,4 +1,5 @@
 pub mod declarations;
+pub mod deltas;
 pub mod payloads;
 
 use crate::db::BlockRow;

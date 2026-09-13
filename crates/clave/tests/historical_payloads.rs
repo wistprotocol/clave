@@ -1,7 +1,7 @@
 mod common;
 
 use clave::db::BlockRow;
-use clave::history::payloads::PayloadSource;
+use clave::history::{deltas::DeltaSource, payloads::PayloadSource};
 use common::*;
 use serde_json::{json, Value};
 use wist_core::{block, crypto, envelope, jcs, merkle};
@@ -63,6 +63,14 @@ impl Fixture {
             block_hash: block::block_hash(&header).unwrap(),
             sealed_at: at,
         });
+    }
+
+    fn delta_source(&self, delta: &Value) -> Result<DeltaSource, clave::Error> {
+        DeltaSource::reconstruct(
+            self.data.path(),
+            self.head.clone(),
+            &wist_core::delta::delta_id(&delta["delta"]).unwrap(),
+        )
     }
 
     fn source(&self, delta: &Value) -> Result<PayloadSource, clave::Error> {
@@ -257,6 +265,7 @@ fn historical_sources_require_the_entire_pinned_prefix_before_returning() {
         .contains("absent"));
     let mut attest = delta["delta"].clone();
     attest["change_type"] = json!("attest");
+    attest["observed_at"] = json!("2026-08-09T12:00:01Z");
     attest["prev"] = json!(wist_core::delta::delta_id(&delta["delta"]).unwrap());
     attest.as_object_mut().unwrap().remove("payload");
     let attest = envelope::sign_envelope(&attest, "delta", "k1", &p.sk).unwrap();
@@ -339,6 +348,239 @@ fn historical_sources_apply_recovery_windows_and_deadline_scope() {
                     .unwrap()
                     .to_string()
                     .contains("WIST1-E03")),
+            }
+        }
+    }
+}
+
+#[test]
+fn historical_delta_sources_check_exact_predecessor_vectors_in_chain_order() {
+    let vector: Value = serde_json::from_slice(
+        &std::fs::read(spec_dir().join("vectors/wist1/declaration-fields.json")).unwrap(),
+    )
+    .unwrap();
+    let mut count = 0;
+    for case in vector["relation_cases"].as_array().unwrap() {
+        if case["kind"] != "predecessor" {
+            continue;
+        }
+        count += 1;
+        for same_block in [false, true] {
+            let mut f = Fixture::new();
+            let mut entries = vec![
+                entry("publisher_declaration", &vector["stored"]),
+                entry("publisher_delta", &case["predecessor"]),
+            ];
+            if !same_block {
+                f.append(entries);
+                entries = vec![];
+            }
+            entries.push(entry("publisher_delta", &case["envelope"]));
+            f.append(entries);
+            for _ in 0..2 {
+                match f.delta_source(&case["envelope"]) {
+                    Ok(source) => {
+                        assert_eq!(case["expected"], "relation_satisfied", "{}", case["name"]);
+                        assert_eq!(source.envelope(), &case["envelope"]);
+                        assert_eq!(source.declaration().envelope(), &vector["stored"]);
+                        assert_eq!(source.position().block_number, u64::from(!same_block));
+                    }
+                    Err(error) => assert!(
+                        error
+                            .to_string()
+                            .contains(case["expected"].as_str().unwrap()),
+                        "{}: {error}",
+                        case["name"]
+                    ),
+                }
+            }
+        }
+    }
+    assert_eq!(count, 3);
+}
+
+#[test]
+fn historical_payloads_require_authenticated_ancestors_and_all_later_delta_chains() {
+    let p = make_publisher_with_scope("parent.example", &["shared.example"]);
+    let (root, _) = content(&p);
+    let root_id = wist_core::delta::delta_id(&root["delta"]).unwrap();
+    let next_id = add_delta(&p, "https://shared.example/page", "next", Some(&root_id));
+    let next: Value = serde_json::from_slice(
+        &std::fs::read(
+            p.dir
+                .path()
+                .join(format!(".well-known/wist/deltas/{}.json", &next_id[7..])),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    for fault in [
+        "none",
+        "missing",
+        "signature",
+        "scope",
+        "publisher",
+        "url",
+        "late_fork",
+        "late_signature",
+        "late_fields",
+        "late_missing",
+    ] {
+        let mut f = Fixture::new();
+        let mut predecessor = root.clone();
+        match fault {
+            "signature" => predecessor["sig"]["value"] = json!(crypto::b64u_encode(&[0; 64])),
+            "scope" => predecessor["delta"]["url"] = json!("https://outside.example/page"),
+            "publisher" => predecessor["delta"]["publisher"] = json!("other.example"),
+            "url" => predecessor["delta"]["url"] = json!("https://shared.example/other"),
+            _ => (),
+        }
+        if matches!(fault, "scope" | "publisher" | "url") {
+            predecessor =
+                envelope::sign_envelope(&predecessor["delta"], "delta", "k1", &p.sk).unwrap();
+        }
+        let mut target = next.clone();
+        target["delta"]["prev"] = json!(wist_core::delta::delta_id(&predecessor["delta"]).unwrap());
+        target = envelope::sign_envelope(&target["delta"], "delta", "k1", &p.sk).unwrap();
+        let mut entries = vec![entry("publisher_declaration", &current_declaration(&p))];
+        if fault != "missing" {
+            entries.push(entry("publisher_delta", &predecessor));
+        }
+        f.append(entries);
+        f.append(vec![entry("publisher_delta", &target)]);
+        let good_prefix = f.head.clone();
+        if fault.starts_with("late_") {
+            let mut later = next["delta"].clone();
+            later["observed_at"] = json!("2026-08-09T12:00:02Z");
+            if fault != "late_fork" {
+                later["url"] = json!("https://shared.example/other");
+                later["change_type"] = json!("new");
+                if fault != "late_missing" {
+                    later.as_object_mut().unwrap().remove("prev");
+                }
+            }
+            if fault == "late_fields" {
+                later["meta"]["unknown"] = json!(true);
+            }
+            let mut later = envelope::sign_envelope(&later, "delta", "k1", &p.sk).unwrap();
+            if fault == "late_signature" {
+                later["sig"]["value"] = json!(crypto::b64u_encode(&[0; 64]));
+            }
+            f.append(vec![entry("publisher_delta", &later)]);
+        }
+        for _ in 0..2 {
+            assert_eq!(f.source(&target).is_ok(), fault == "none", "{fault}");
+        }
+        if fault.starts_with("late_") {
+            f.head = good_prefix;
+            f.source(&target).unwrap();
+        }
+    }
+}
+
+#[test]
+fn historical_sources_preserve_chain_ownership_across_identity_resets() {
+    let a = make_publisher_with_scope("a.example", &["shared.example"]);
+    let b = make_publisher_with_scope("b.example", &["shared.example"]);
+    let (root_a, _) = content(&a);
+    let (root_b, _) = content(&b);
+    let reset_key = crypto::SigningKey::from_seed(&[9; 32]);
+    let mut replacement = current_declaration(&a)["publisher"].clone();
+    replacement["seq"] = json!(1);
+    replacement["prev_declaration"] = json!(declaration_hash(&current_declaration(&a)));
+    replacement["keys"][0]["public_key"] = json!(reset_key.public().to_b64u());
+    let replacement = envelope::sign_envelope(&replacement, "publisher", "k1", &reset_key).unwrap();
+    for fault in ["none", "restart", "foreign", "equal", "decreasing"] {
+        let mut f = Fixture::new();
+        f.append(vec![
+            entry("publisher_declaration", &current_declaration(&a)),
+            entry("publisher_declaration", &current_declaration(&b)),
+            entry("publisher_delta", &root_a),
+            entry("publisher_delta", &root_b),
+        ]);
+        let mut next = root_a["delta"].clone();
+        next["observed_at"] = json!(match fault {
+            "equal" => "2026-08-09T09:00:00.000-03:00",
+            "decreasing" => "2026-08-09T11:59:59.99999999999999999999Z",
+            _ => "2026-08-09T12:00:00.00000000000000000001Z",
+        });
+        if fault != "restart" {
+            let predecessor = if fault == "foreign" { &root_b } else { &root_a };
+            next["prev"] = json!(wist_core::delta::delta_id(&predecessor["delta"]).unwrap());
+        }
+        let next = envelope::sign_envelope(&next, "delta", "k1", &reset_key).unwrap();
+        f.append(vec![
+            entry("publisher_declaration", &replacement),
+            entry("publisher_delta", &next),
+        ]);
+        for _ in 0..2 {
+            if fault == "none" {
+                let source = f.source(&next).unwrap();
+                let delta = source.delta_source();
+                assert_eq!(delta.envelope(), &next);
+                assert_eq!(delta.declaration().envelope(), &replacement);
+                assert_eq!(delta.identity_start(), delta.declaration().position());
+                assert_eq!(delta.identity_start().block_number, 1);
+                for (root, publisher) in [(&root_a, &a), (&root_b, &b)] {
+                    let earlier = f.delta_source(root).unwrap();
+                    assert_eq!(earlier.identity_start(), earlier.declaration().position());
+                    assert_eq!(earlier.identity_start().block_number, 0);
+                    assert_eq!(
+                        earlier.declaration().envelope(),
+                        &current_declaration(publisher)
+                    );
+                }
+            } else {
+                assert!(f.source(&next).is_err(), "{fault}");
+            }
+        }
+    }
+}
+
+#[test]
+fn historical_sources_resolve_contentless_deltas_and_recreation_in_chain_order() {
+    let p = make_publisher_with_scope("parent.example", &["shared.example"]);
+    let (root, payload) = content(&p);
+    let mut chain = vec![root];
+    for (i, kind) in ["attest", "delete", "new"].into_iter().enumerate() {
+        let mut next = chain[0]["delta"].clone();
+        next["change_type"] = json!(kind);
+        next["observed_at"] = json!(format!("2026-08-09T12:00:0{}Z", i + 1));
+        next["prev"] = json!(wist_core::delta::delta_id(&chain.last().unwrap()["delta"]).unwrap());
+        if kind != "new" {
+            next.as_object_mut().unwrap().remove("payload");
+        }
+        chain.push(envelope::sign_envelope(&next, "delta", "k1", &p.sk).unwrap());
+    }
+    for same_block in [false, true] {
+        let mut f = Fixture::new();
+        let mut entries = vec![entry("publisher_declaration", &current_declaration(&p))];
+        for delta in &chain {
+            entries.push(entry("publisher_delta", delta));
+            if !same_block {
+                f.append(entries);
+                entries = vec![];
+            }
+        }
+        if same_block {
+            f.append(entries);
+        }
+        for (i, delta) in chain.iter().enumerate() {
+            let source = f.delta_source(delta).unwrap();
+            assert_eq!(source.envelope(), delta);
+            assert_eq!(
+                source.position().block_number,
+                if same_block { 0 } else { i as u64 }
+            );
+            if i == 0 || i == 3 {
+                f.source(delta).unwrap().validate(&payload).unwrap();
+            } else {
+                assert!(f
+                    .source(delta)
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("no Payload commitment"));
             }
         }
     }
