@@ -446,6 +446,10 @@ fn rejected_parameter_entries_cannot_supply_audit_profiles() {
 
 #[test]
 fn historical_payloads_apply_raw_fields_integrity_and_numeric_value_rules() {
+    let copies = tempfile::tempdir().unwrap();
+    std::fs::create_dir(copies.path().join("payloads")).unwrap();
+    let (listener, host, client) = reserve_addr();
+    serve_static(listener, copies.path().to_owned());
     let vector: Value = serde_json::from_slice(
         &std::fs::read(spec_dir().join("vectors/wist1/payload-fields.json")).unwrap(),
     )
@@ -472,6 +476,30 @@ fn historical_payloads_apply_raw_fields_integrity_and_numeric_value_rules() {
         let original = raw.clone();
         let result = source.validate(&raw);
         let allowed = case["allowed"].as_array().unwrap();
+        let name = format!("payloads/{}.json", &source.delta_source().id()[7..]);
+        std::fs::write(copies.path().join(&name), &raw).unwrap();
+        for retrieved in [
+            source.read(copies.path()),
+            source.fetch(&client, &format!("http://{host}/{name}")),
+        ] {
+            match retrieved {
+                Ok(copy) => {
+                    assert!(allowed.is_empty(), "{}", case["name"]);
+                    assert_eq!(copy.raw(), raw);
+                    assert!(std::ptr::eq(copy.source(), &source));
+                    assert_eq!(
+                        jcs::canonicalize(&json!(copy.payload())).unwrap(),
+                        jcs::canonicalize(&case["payload"]).unwrap(),
+                    );
+                }
+                Err(clave::Error::Payload(code)) => assert!(
+                    allowed.iter().any(|value| value == code),
+                    "{}: {code}",
+                    case["name"],
+                ),
+                Err(error) => panic!("{}: {error}", case["name"]),
+            }
+        }
         match result {
             Ok(payload) => {
                 assert!(allowed.is_empty(), "{}", case["name"]);
@@ -487,10 +515,77 @@ fn historical_payloads_apply_raw_fields_integrity_and_numeric_value_rules() {
             ),
         }
         assert_eq!(raw, original);
+        assert_eq!(std::fs::read(copies.path().join(name)).unwrap(), raw);
         assert_eq!(source.envelope(), &case["envelope"]);
         cases += 1;
     }
     assert_eq!(cases, 103);
+}
+
+#[test]
+fn historical_payload_retrieval_retries_independent_copies_without_rewriting_state() {
+    let p = make_publisher_with_scope("parent.example", &["shared.example"]);
+    let (delta, raw) = content(&p);
+    let mut f = Fixture::new();
+    f.append(vec![
+        entry("publisher_declaration", &current_declaration(&p)),
+        entry("publisher_delta", &delta),
+    ]);
+    let block_bytes = std::fs::read(f.path(0)).unwrap();
+    let copies = tempfile::tempdir().unwrap();
+    let (listener, host, client) = reserve_addr();
+    serve_static(listener, copies.path().to_owned());
+    let url = format!("http://{host}/copy.json");
+    let mut wrong: Value = serde_json::from_slice(&raw).unwrap();
+    wrong["content"]["extract"] = json!("substitution");
+    let wrong = serde_json::to_vec(&wrong).unwrap();
+    let mut original = b" \n".to_vec();
+    original.extend_from_slice(&raw);
+    original.extend_from_slice(b"\n ");
+    for _ in 0..2 {
+        let source = f.source(&delta).unwrap();
+        assert!(matches!(
+            source.read(f.data.path()),
+            Err(clave::Error::Io(_))
+        ));
+        assert!(matches!(
+            source.fetch(&client, &url),
+            Err(clave::Error::Fetch(_))
+        ));
+        assert!(matches!(
+            source.fetch(&client, "http://parent.example/copy.json"),
+            Err(clave::Error::Fetch(_)),
+        ));
+        for rejected in [b"not JSON".as_slice(), wrong.as_slice()] {
+            std::fs::write(copies.path().join("copy.json"), rejected).unwrap();
+            let code = if rejected == wrong {
+                "WIST1-E10"
+            } else {
+                "WIST1-E05"
+            };
+            assert!(
+                matches!(source.fetch(&client, &url), Err(clave::Error::Payload(actual)) if actual == code)
+            );
+            assert_eq!(
+                std::fs::read(copies.path().join("copy.json")).unwrap(),
+                rejected
+            );
+        }
+        std::fs::write(copies.path().join("copy.json"), &original).unwrap();
+        let copy = source.fetch(&client, &url).unwrap();
+        assert_eq!(copy.raw(), original);
+        assert_eq!(copy.payload().content.extract, "body");
+        assert_eq!(copy.source().envelope(), &delta);
+        assert_eq!(
+            std::fs::read_dir(f.data.path().join("payloads"))
+                .unwrap()
+                .count(),
+            0
+        );
+        std::fs::remove_file(copies.path().join("copy.json")).unwrap();
+        assert_eq!(copy.raw(), original);
+        assert_eq!(std::fs::read(f.path(0)).unwrap(), block_bytes);
+    }
 }
 
 #[test]
@@ -991,6 +1086,8 @@ fn authenticated_reference_vectors_resolve_named_and_newest_deltas() {
     .unwrap();
     let p = make_publisher_with_scope("parent.example", &["shared.example"]);
     let mut f = Fixture::new();
+    let (listener, host, client) = reserve_addr();
+    serve_static(listener, f.data.path().to_owned());
     let (root, _) = content(&p);
     let mut other_root = root["delta"].clone();
     other_root["url"] = json!("https://shared.example/other");
@@ -1093,6 +1190,30 @@ fn authenticated_reference_vectors_resolve_named_and_newest_deltas() {
             );
             let payload_name = case["resolved_payload"].as_str().unwrap();
             let source = reference.payload_source().unwrap();
+            let name = format!("payloads/{}.json", &source.delta_source().id()[7..]);
+            std::fs::write(f.data.path().join(&name), &payloads[payload_name]).unwrap();
+            if reference.delta().id() != source.delta_source().id() {
+                std::fs::write(
+                    f.data
+                        .path()
+                        .join(format!("payloads/{}.json", &reference.delta().id()[7..])),
+                    b"contentless reference has no Payload of its own",
+                )
+                .unwrap();
+            }
+            for copy in [
+                source.read(f.data.path()).unwrap(),
+                source
+                    .fetch(&client, &format!("http://{host}/{name}"))
+                    .unwrap(),
+            ] {
+                assert_eq!(copy.payload().content.extract, payload_name);
+                assert_eq!(copy.raw(), payloads[payload_name]);
+                assert_eq!(
+                    copy.source().delta_source().id(),
+                    source.delta_source().id()
+                );
+            }
             assert_eq!(
                 source
                     .validate(&payloads[payload_name])

@@ -102,8 +102,9 @@ Payloads or recalculate completed unsealed admissions' original profiles.
 reference profiles and invalid candidate Blocks. Live regressions cover
 Payload/predecessor timing, repeated rejected IDs, restart, dependent rejection,
 missing/corrupt Payload rollback and signed authority despite changed local
-summaries. Full-prefix reconstruction per attempt remains unbounded; historical
-retrieval and Audit Record use remain separate obligations.
+summaries. Full-prefix reconstruction per attempt remains unbounded.
+[Historical Payload retrieval](#historical-payload-retrieval) preserves these
+profiles; Audit Record integration remains required.
 
 ## Payload link admission
 
@@ -164,8 +165,9 @@ of the Python reference. Live tests exercise 103 default-profile candidates,
 restart, fetched predecessors, same-ID retry after version rejection,
 record materialization and original-byte preservation through sealing.
 Field vectors supply cap contexts; [Delta size-cap profiles](#delta-size-cap-profiles)
-covers authenticated profile timing. Historical retrieval and Audit Record
-reference eligibility remain incomplete.
+covers authenticated profile timing. Historical copies use
+[Historical Payload retrieval](#historical-payload-retrieval); full Audit Record
+eligibility remains incomplete.
 
 ## Retained Payload validation
 
@@ -280,7 +282,8 @@ change types and extract-band precedence. Later references, parameter resets,
 reconstruction after restart and corrupt-prefix repair preserve the audited
 profile. Rejected signatures, values and grace periods supply no thresholds;
 `canary.json` histories also check shared extraction bindings. Full Record
-replay, live retrieval and availability/withdrawal enforcement remain required.
+replay, automatic source selection and availability/withdrawal enforcement
+remain required.
 
 ## Historical audit references
 
@@ -307,8 +310,9 @@ predecessor's. The Payload source validates supplied bytes with its original
 commitment, Publisher and committing caps under
 [Historical Payload validation](#historical-payload-validation). Extraction keeps
 the audited Delta's [profile](#historical-audit-extraction-profiles), available
-through `audited()`. Retrieval, availability, withdrawal, sanctions and verdict
-derivation remain separate requirements.
+through `audited()`. [Historical Payload retrieval](#historical-payload-retrieval)
+checks copies from disk or an explicitly selected URL. Availability, withdrawal,
+sanctions and verdict derivation remain separate requirements.
 
 Reconstruction scans the pinned prefix twice and retains the selected chain's
 Envelopes and bindings, in addition to the underlying replay state; bounded work
@@ -328,13 +332,44 @@ commitment. `delta_source()` exposes its authenticated bindings.
 commitment, signed Publisher and caps. Reconstructing after restart selects the
 same profile; an Audit Record's or another Delta's profile cannot replace it.
 Invalid bytes return a Payload error without mutating the source or stored state,
-allowing another copy to be checked. Neither method fetches Payloads or establishes
-availability, withdrawal or Audit Record reference eligibility.
+allowing another copy to be checked. Retrieval follows the contract below;
+availability, withdrawal and Audit Record eligibility remain separate requirements.
 
 Signed tests cover 103 default-profile Payload field cases, original-byte and
 numeric-value preservation, historical cap references and invalid cap Blocks,
 scope/key changes, recovery deadlines, missing/duplicate targets, full-prefix
 failures, restart and repair/retry.
+
+## Historical Payload retrieval
+
+`PayloadSource::read(directory)` reads `payloads/<delta-id-hex>.json` beneath
+the supplied directory. `fetch(client, url)` retrieves one explicitly selected
+URL; WIST-3 §6.1 permits copies from any source because the commitment
+authenticates the content. Both methods apply
+[Historical Payload validation](#historical-payload-validation) before returning
+a `RetrievedPayload`. Its `source()` retains the authenticated Delta bindings,
+`raw()` exposes the original file bytes, and `payload()` exposes the checked
+typed content. Preserve `raw()` when storing a copy; serializing `payload()`
+does not preserve the original representation.
+
+Invalid bytes return `Error::Payload` with the WIST-1 diagnostic. Disk and
+transport failures retain their respective errors; no failure establishes a
+withdrawal, a serving fault or a `not_auditable` verdict. Reads and fetches
+write no files or history state and retain no failure cache, so callers can
+retry another copy. A resolved audit reference uses its `payload_source()`;
+an `attest` or `delete` reference has no own Payload to retrieve.
+
+HTTP retrieval uses the client's HTTPS guard, explicit loopback HTTP opt-in,
+30-second request timeout and five-hop redirect limit within the same Canonical
+Host. Response and file reads remain unbounded. Callers select sources and enforce withdrawal,
+availability and Record eligibility before using or retaining content; automatic
+discovery, fallback, durable replication and those policy integrations remain
+unimplemented.
+
+Tests exercise 103 signed Payload field cases through disk and HTTP, historical
+cap amendments after reconstruction, named references including contentless
+successors, malformed and substituted copies, missing files/HTTP responses,
+retry, exact-byte preservation and unchanged authenticated history.
 
 ## Declaration key binding
 

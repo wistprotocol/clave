@@ -87,6 +87,16 @@ impl Client {
         url: &str,
         subdomain_scope: &[String],
     ) -> Result<(Vec<u8>, serde_json::Value)> {
+        let bytes = self.get_bytes_in_scope(url, subdomain_scope)?;
+        let value = crate::json::parse(&bytes)?;
+        Ok((bytes, value))
+    }
+
+    pub fn get_bytes(&self, url: &str) -> Result<Vec<u8>> {
+        self.get_bytes_in_scope(url, &[])
+    }
+
+    fn get_bytes_in_scope(&self, url: &str, subdomain_scope: &[String]) -> Result<Vec<u8>> {
         let mut parsed =
             url::Url::parse(url).map_err(|e| Error::Fetch(format!("invalid URL {url}: {e}")))?;
         guard_scheme(&parsed, self.allow_http)?;
@@ -130,12 +140,10 @@ impl Client {
         if !resp.status().is_success() {
             return Err(Error::Fetch(format!("HTTP {} for {url}", resp.status())));
         }
-        let bytes = resp
+        Ok(resp
             .bytes()
             .map_err(|e| Error::Fetch(e.to_string()))?
-            .to_vec();
-        let value: serde_json::Value = crate::json::parse(&bytes)?;
-        Ok((bytes, value))
+            .to_vec())
     }
 }
 

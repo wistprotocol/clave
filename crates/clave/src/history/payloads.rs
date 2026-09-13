@@ -11,6 +11,12 @@ pub struct PayloadSource {
     commitment: DeltaPayloadCommitment,
 }
 
+pub struct RetrievedPayload<'a> {
+    source: &'a PayloadSource,
+    raw: Vec<u8>,
+    payload: Payload,
+}
+
 impl PayloadSource {
     pub fn reconstruct(directory: &Path, head: Option<BlockRow>, delta_id: &str) -> Result<Self> {
         let delta = DeltaSource::reconstruct(directory, head, delta_id)?;
@@ -49,6 +55,40 @@ impl PayloadSource {
             self.envelope()["delta"]["publisher"].as_str().unwrap(),
             self.size_caps(),
         )
+    }
+
+    pub fn read(&self, directory: &Path) -> Result<RetrievedPayload<'_>> {
+        let path = directory
+            .join("payloads")
+            .join(format!("{}.json", &self.delta.id()[7..]));
+        self.checked(std::fs::read(path)?)
+    }
+
+    pub fn fetch(&self, client: &crate::fetch::Client, url: &str) -> Result<RetrievedPayload<'_>> {
+        self.checked(client.get_bytes(url)?)
+    }
+
+    fn checked(&self, raw: Vec<u8>) -> Result<RetrievedPayload<'_>> {
+        let payload = self.validate(&raw).map_err(Error::Payload)?;
+        Ok(RetrievedPayload {
+            source: self,
+            raw,
+            payload,
+        })
+    }
+}
+
+impl RetrievedPayload<'_> {
+    pub fn source(&self) -> &PayloadSource {
+        self.source
+    }
+
+    pub fn raw(&self) -> &[u8] {
+        &self.raw
+    }
+
+    pub fn payload(&self) -> &Payload {
+        &self.payload
     }
 }
 

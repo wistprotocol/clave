@@ -24,6 +24,8 @@ pub enum Error {
     History(String),
     #[error("fetch: {0}")]
     Fetch(String),
+    #[error("Payload: {0}")]
+    Payload(&'static str),
     #[error("clock: {0}")]
     Clock(String),
     #[error("seal: {0}")]

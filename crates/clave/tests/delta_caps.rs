@@ -124,16 +124,36 @@ fn historical_payload_sources_keep_the_committing_profile_after_restart() {
     let data = tempfile::tempdir().unwrap();
     anchor(data.path());
     let head = write_blocks(data.path(), vector["blocks"].as_array().unwrap());
+    std::fs::create_dir_all(data.path().join("payloads")).unwrap();
+    let (listener, host, client) = reserve_addr();
+    serve_static(listener, data.path().to_owned());
     for probe in vector["reference_probes"].as_array().unwrap() {
         let object = &vector["objects"][probe["reference"].as_str().unwrap()];
         let id = wist_core::delta::delta_id(&object["envelope"]["delta"]).unwrap();
         let raw = serde_json::to_vec(&object["payload"]).unwrap();
+        let name = format!("payloads/{}.json", &id[7..]);
+        std::fs::write(data.path().join(&name), &raw).unwrap();
         for _ in 0..2 {
             let source = PayloadSource::reconstruct(data.path(), Some(head.clone()), &id).unwrap();
             assert_eq!(source.envelope(), &object["envelope"]);
             assert_eq!(json!(source.block_number()), object["sealed_height"]);
             assert_eq!(json!(source.size_caps()), probe["expected_profile"]);
             assert_eq!(json!(source.validate(&raw).err()), probe["expected"]);
+            for result in [
+                source.read(data.path()),
+                source.fetch(&client, &format!("http://{host}/{name}")),
+            ] {
+                let code = match result {
+                    Ok(copy) => {
+                        assert_eq!(copy.raw(), raw);
+                        assert_eq!(json!(copy.source().size_caps()), probe["expected_profile"]);
+                        None
+                    }
+                    Err(clave::Error::Payload(code)) => Some(code),
+                    Err(error) => panic!("{error}"),
+                };
+                assert_eq!(json!(code), probe["expected"]);
+            }
             let chain = clave::history::references::AuditChain::reconstruct(
                 data.path(),
                 Some(head.clone()),
