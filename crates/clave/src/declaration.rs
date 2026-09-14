@@ -301,11 +301,16 @@ pub(crate) fn url_in_scope(url: &str, domain: &str, scope: &[String]) -> bool {
     if wist_core::extract::normalize_url(url, url).as_deref() != Some(url) {
         return false;
     }
-    let host = url["https://".len()..]
+    let host = url_host(url);
+    host == domain || scope.iter().any(|declared| declared == host)
+}
+
+pub(crate) fn url_host(url: &str) -> &str {
+    url.strip_prefix("https://")
+        .unwrap_or(url)
         .split(['/', ':'])
         .next()
-        .unwrap_or_default();
-    host == domain || scope.iter().any(|declared| declared == host)
+        .unwrap_or_default()
 }
 
 /// WIST-1 §5.1/§5.2 Key Set checks for a signed object. `observed_at`

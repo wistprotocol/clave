@@ -148,7 +148,7 @@ pub struct PublisherStatusRow {
     pub state: PublisherState,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct BlockRow {
     pub block_number: u64,
     pub block_hash: String,

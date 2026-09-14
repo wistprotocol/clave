@@ -101,6 +101,13 @@ impl IncludedRecord {
         crate::record::evidence_fields_valid(&self.envelope)
     }
 
+    pub fn vrf_proof(&self) -> Option<[u8; wist_core::vrf::PROOF_LEN]> {
+        self.envelope["record"]["vrf_proof"]
+            .as_str()
+            .and_then(|hex| wist_core::crypto::hex_decode(hex).ok())
+            .and_then(|bytes| bytes.try_into().ok())
+    }
+
     pub fn field_validation(&self) -> crate::record::FieldValidation {
         crate::record::RecordEnvelope::from_included(&self.envelope).fields()
     }

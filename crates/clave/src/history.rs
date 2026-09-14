@@ -5,6 +5,7 @@ pub mod payloads;
 pub mod records;
 pub mod references;
 pub mod roster;
+pub mod selection;
 
 use crate::db::BlockRow;
 use crate::error::{Error, Result};

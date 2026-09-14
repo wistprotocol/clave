@@ -329,18 +329,68 @@ Pass it to core's `sampling::alpha_from_block_hash` for the VRF input, then use
 the full `DeltaSource::id()` for the draw. Reconstruction validates the complete
 pinned prefix before returning either binding, including for Block 0.
 
-These inputs do not establish Auditor standing or selection. Callers must
-derive Publisher reputation and sanction/escalation state at the preceding
-height, using the audited Block's applicable parameters, and enforce
-self-audit, selection-domain and extension rules before accepting a Record.
-The roster follows [Historical roster and Record signing bindings](#historical-roster-and-record-signing-bindings);
-the selection integrations remain unimplemented.
+These inputs do not establish Auditor standing or selection. VRF draws,
+selection domains and self-audit bars follow
+[Historical selection sets](#historical-selection-sets); reputation and
+sanction/escalation state at the preceding height and the extension path
+remain caller obligations.
 
 Signed-history tests cover increases and decreases of each constant before,
 at and after effectiveness, negative slopes and zero, later references and resets,
 reconstruction, VRF proof binding to the original Block, corrupt-prefix repair
 and rejected signature/value/grace amendments. Default profiles reproduce
 `sampling.json`'s rate cases, including sanction and escalation overrides.
+
+## Historical selection sets
+
+`history::selection::SelectionDomain::reconstruct(directory, pinned_head, block_hash)`
+authenticates the complete pinned prefix, replays Declarations and sealed
+Delta chains, and lists the named Block's `publisher_delta` Entries in
+canonical order with each Delta's ID, signed Publisher, URL host and the
+height of that host's own `seq`-0 Declaration Entry when one is sealed at or
+below the Block. Under WIST-4 §4 and WIST-3 §7 a Delta is outside the Block's
+selection domain when its signed Publisher differs from its URL host and that
+host's own `seq`-0 Declaration is sealed at or below the Block, whatever the
+label relationship between the two Publishers; a host's own Deltas are never
+excluded. The domain retains the Block's accepted `sampling_floor`,
+`sampling_ceiling` and `sampling_slope`, its Log Anchor fingerprint and its
+canonical `BlockRow`.
+
+`selection_set(&roster, auditor_id, vrf_proof, state)` derives one Auditor's
+draw for that Block. The proof must verify under the key the Auditor held at
+the Block's `sealed_at` per
+[Historical roster and Record signing bindings](#historical-roster-and-record-signing-bindings),
+using RFC 9381 verification with key validation over the Block Hash octets;
+an Auditor holding no key at that instant reports `NoKeyAtBlock`, and a proof
+under another key, another Block, an unusable admitted point or tampered
+bytes reports `ProofDoesNotVerify`. For each Delta the result records the
+disposition: outside the domain, barred by §3's self-audit test against the
+signed Publisher, not drawn, or selected. Outside-domain precedes self-audit;
+neither consults the draw. Drawn candidates carry `D` and `p_1e7`, computed
+with core's integer test from the caller-supplied `SamplingState` for the
+Delta's Publisher (`reputation_u`, level-1 sanction and escalated sampling as
+of the preceding height) and the Block's own constants. The roster must
+share the domain's Log Anchor and carry the Block's hash; otherwise
+reconstruction fails rather than binding across sources.
+`IncludedRecord::vrf_proof()` decodes a sealed Record's proof for this check.
+
+The result establishes the VRF path only. It supplies no reputation,
+sanction or escalation state, no extension-rule membership, no coverage
+duty, discharge or attestation, and no Record disposition; those remain
+separate obligations. Reconstruction validates every sealed Delta of the
+prefix, retains the domain in memory without a work bound, exposes nothing
+after a prefix failure and rereads repaired files on retry.
+
+Signed histories replay every `selection-domain.json` domain case, including
+own-host, pre-Declaration, same-height, later, subdomain-own and mixed
+Blocks, and every self-audit case through admitted Auditors and declared
+Publishers. Draw tests compare derived sets with independent proofs over
+the same Blocks at Provisional, established, sanctioned and escalated rates,
+show an accepted `sampling_slope` amendment changing later Blocks only,
+follow same-Block key rotation, removal for cause, foreign and cross-Block
+proofs, small-order and non-canonical admitted keys, pinned-prefix
+exclusion, corrupt-file repair, roster mismatches and sealed Records whose
+proofs select, miss, fall outside the domain or fail verification.
 
 ## Historical coverage clocks
 
