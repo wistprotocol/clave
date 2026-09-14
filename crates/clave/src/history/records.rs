@@ -112,6 +112,32 @@ impl IncludedRecord {
         crate::record::RecordEnvelope::from_included(&self.envelope).disposition(context)
     }
 
+    pub fn signing_binding<'a>(
+        &'a self,
+        roster: &'a super::roster::RosterHistory,
+    ) -> Result<Option<crate::record::SigningBinding<'a>>> {
+        if roster.anchor_hash() != &self.anchor_hash {
+            return Err(Error::History(
+                "Record signing binding: Log Anchor differs from the inclusion source".into(),
+            ));
+        }
+        let expected = self
+            .block_hash
+            .strip_prefix("sha256:")
+            .and_then(|hex| wist_core::crypto::hex_decode(hex).ok());
+        if roster
+            .block_hash_at(self.position.block_number)
+            .is_none_or(|hash| expected.as_deref() != Some(hash.as_slice()))
+        {
+            return Err(Error::History(
+                "Record signing binding: roster history does not carry the Record's Block".into(),
+            ));
+        }
+        Ok(self.envelope["record"]["auditor_id"]
+            .as_str()
+            .and_then(|auditor_id| roster.signing_binding(auditor_id, self.sealed_at_s)))
+    }
+
     pub fn resolve_reference(&self, directory: &Path) -> Result<RecordReference> {
         let body = &self.envelope["record"];
         let field = |name: &str| {

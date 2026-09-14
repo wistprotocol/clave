@@ -332,17 +332,15 @@ fn a_delta_held_past_the_inclusion_ceiling_is_reported() {
     assert!(!late.is_empty(), "no late inclusion reported");
 }
 
-fn roster_update(
-    action: &str,
-    auditor_id: &str,
-    key_id: &str,
-    public_key: &str,
-) -> serde_json::Value {
+fn roster_update(action: &str, auditor_id: &str, key_id: &str, seed: u8) -> serde_json::Value {
+    let public_key = wist_core::crypto::SigningKey::from_seed(&[seed; 32])
+        .public()
+        .to_b64u();
     serde_json::json!({
         "wist_version": "1.0.0",
         "action": action,
         "subject": auditor_id,
-        "details": {"key_id": key_id, "public_key": public_key},
+        "details": {"key_id": key_id, "alg": "Ed25519", "public_key": public_key},
         "effective_at": "2026-08-09T12:00:00Z",
     })
 }
@@ -355,14 +353,14 @@ fn a_roster_act_the_e07_rules_reject_is_not_sealed() {
     db.set_param("block_cadence_seconds", 1).unwrap();
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
 
-    let admit = roster_update("auditor_admit", "audit.example.net", "a1", "pk-a1");
+    let admit = roster_update("auditor_admit", "audit.example.net", "a1", 21);
     let envelope = wist_core::envelope::sign_envelope(&admit, "update", "log1", &sk).unwrap();
     db.insert_pending_entry("registry_update", "", &envelope, 0)
         .unwrap();
     let first = clave::seal::run(&db, data.path(), &sk, SEAL_START).unwrap();
     assert_eq!(first.entry_count, 1, "dropped {:?}", first.dropped);
 
-    let again = roster_update("auditor_admit", "audit.example.net", "a2", "pk-a2");
+    let again = roster_update("auditor_admit", "audit.example.net", "a2", 22);
     let envelope = wist_core::envelope::sign_envelope(&again, "update", "log1", &sk).unwrap();
     db.insert_pending_entry("registry_update", "", &envelope, 0)
         .unwrap();
@@ -372,5 +370,108 @@ fn a_roster_act_the_e07_rules_reject_is_not_sealed() {
         second.dropped.iter().any(|d| d.contains("WIST4-E07")),
         "dropped {:?}",
         second.dropped
+    );
+}
+
+#[test]
+fn live_roster_acts_follow_authenticated_history_and_batch_rules() {
+    let data = tempfile::tempdir().unwrap();
+    clave::init::run("log.example.org", data.path()).unwrap();
+    let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
+    let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
+    let observer = wist_core::crypto::SigningKey::from_seed(&[41; 32]);
+    let queue = |envelope: &serde_json::Value| {
+        db.insert_pending_entry("registry_update", "", envelope, 0)
+            .unwrap();
+    };
+
+    let register = serde_json::json!({
+        "wist_version": "1.0.0", "action": "observer_register", "subject": "watch.sample.net",
+        "details": {"key_id": "w1", "alg": "Ed25519", "public_key": observer.public().to_b64u()},
+        "effective_at": "2026-08-09T12:00:00Z",
+    });
+    queue(&wist_core::envelope::sign_envelope(&register, "update", "w1", &observer).unwrap());
+    let mut malformed = roster_update("auditor_admit", "audit.example.net", "a1", 21);
+    malformed["details"]["public_key"] = serde_json::json!("not-a-key");
+    queue(&wist_core::envelope::sign_envelope(&malformed, "update", "log1", &sk).unwrap());
+    let forged = roster_update("auditor_admit", "checker.example.info", "c1", 23);
+    queue(
+        &wist_core::envelope::sign_envelope(
+            &forged,
+            "update",
+            "log1",
+            &wist_core::crypto::SigningKey::from_seed(&[42; 32]),
+        )
+        .unwrap(),
+    );
+    let first = clave::seal::run(&db, data.path(), &sk, SEAL_START).unwrap();
+    assert_eq!(first.entry_count, 1, "dropped {:?}", first.dropped);
+    assert!(
+        first.dropped.iter().any(|d| d.contains("WIST4-E04"))
+            && first.dropped.iter().any(|d| d.contains("Log key")),
+        "dropped {:?}",
+        first.dropped
+    );
+
+    let checkpoint = serde_json::json!({
+        "wist_version": "1.0.0", "action": "observer_checkpoint", "subject": "watch.sample.net",
+        "details": {"head": format!("sha256:{}", "7".repeat(64))},
+        "effective_at": "2026-08-09T12:00:01Z",
+    });
+    let checkpoint_envelope =
+        wist_core::envelope::sign_envelope(&checkpoint, "update", "w1", &observer).unwrap();
+    queue(&checkpoint_envelope);
+    let stranger = serde_json::json!({
+        "wist_version": "1.0.0", "action": "observer_checkpoint", "subject": "watch.sample.org",
+        "details": {"head": format!("sha256:{}", "8".repeat(64))},
+        "effective_at": "2026-08-09T12:00:01Z",
+    });
+    queue(&wist_core::envelope::sign_envelope(&stranger, "update", "w1", &observer).unwrap());
+    let second = clave::seal::run(&db, data.path(), &sk, SEAL_START + 3600).unwrap();
+    assert_eq!(second.entry_count, 1, "dropped {:?}", second.dropped);
+    assert!(
+        second.dropped.iter().any(|d| d.contains("WIST4-E07")),
+        "dropped {:?}",
+        second.dropped
+    );
+
+    let mut promote = roster_update("auditor_admit", "watch.sample.net", "w1", 41);
+    queue(&wist_core::envelope::sign_envelope(&promote, "update", "log1", &sk).unwrap());
+    let third = clave::seal::run(&db, data.path(), &sk, SEAL_START + 2 * 3600).unwrap();
+    assert_eq!(third.entry_count, 0, "dropped {:?}", third.dropped);
+    assert!(
+        third.dropped.iter().any(|d| d.contains("WIST4-E04")),
+        "dropped {:?}",
+        third.dropped
+    );
+    promote["details"]["track_record"] = serde_json::json!({
+        "checkpoint": wist_core::delta::delta_id(&checkpoint_envelope["update"]).unwrap(),
+        "scoreboard": {"provisional": [0, 0, 0], "standing": [0, 0, 0], "mature": [0, 0, 0]},
+    });
+    queue(&wist_core::envelope::sign_envelope(&promote, "update", "log1", &sk).unwrap());
+    let fourth = clave::seal::run(&db, data.path(), &sk, SEAL_START + 3 * 3600).unwrap();
+    assert_eq!(fourth.entry_count, 1, "dropped {:?}", fourth.dropped);
+
+    let roster =
+        clave::history::roster::RosterHistory::reconstruct(data.path(), db.last_block().unwrap())
+            .unwrap();
+    assert!(roster.rejected().is_empty(), "{:?}", roster.rejected());
+    assert_eq!(
+        roster
+            .admitted_key_at("watch.sample.net", SEAL_START + 3 * 3600)
+            .map(|b| b.key_id),
+        Some("w1")
+    );
+    assert!(roster
+        .registered_key_at("watch.sample.net", SEAL_START + 3 * 3600)
+        .is_none());
+    assert_eq!(roster.checkpoints().len(), 1);
+    assert_eq!(
+        db.roster_state()
+            .unwrap()
+            .iter()
+            .map(|(auditor, key, ..)| (auditor.as_str(), key.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("watch.sample.net", "w1")]
     );
 }

@@ -331,9 +331,10 @@ pinned prefix before returning either binding, including for Block 0.
 
 These inputs do not establish Auditor standing or selection. Callers must
 derive Publisher reputation and sanction/escalation state at the preceding
-height, using the audited Block's applicable parameters, and enforce roster,
+height, using the audited Block's applicable parameters, and enforce
 self-audit, selection-domain and extension rules before accepting a Record.
-Those replay integrations remain unimplemented.
+The roster follows [Historical roster and Record signing bindings](#historical-roster-and-record-signing-bindings);
+the selection integrations remain unimplemented.
 
 Signed-history tests cover increases and decreases of each constant before,
 at and after effectiveness, negative slopes and zero, later references and resets,
@@ -491,9 +492,10 @@ before standing/authenticity and semantic evidence errors; §10.1 permits any
 applicable semantic diagnostic.
 
 `ReplayContext` supplies predicates that callers must establish from the same
-authenticated Log prefix: the admitted signing binding, ordinary or extension
-duty, removal relative to its anchor, coverage failure at sealing and semantic
-evidence failures. `Duty::Active` requires every duty premise, including valid
+authenticated Log prefix: the admitted signing binding
+([Historical roster and Record signing bindings](#historical-roster-and-record-signing-bindings)),
+ordinary or extension duty, removal relative to its anchor, coverage failure
+at sealing and semantic evidence failures. `Duty::Active` requires every duty premise, including valid
 selection/extension proof, selection-domain membership and absence of self-audit;
 `RemovedAfterAnchor` requires those premises and removal only after that duty's
 anchor. A missing duty premise requires `Absent`. The field validator
@@ -510,6 +512,57 @@ for raw parsing, signatures, complete fields, versions and conditional discharge
 Signed Block tests exercise its object Envelopes through history reconstruction,
 preserve retained bytes and repeat after reopening, using supplied contexts
 within the limits above.
+
+## Historical roster and Record signing bindings
+
+`history::roster::RosterHistory::reconstruct(directory, pinned_head)` replays
+every roster act in the authenticated pinned prefix under WIST-4 §§3, 3.1, 4
+and 9.1. `auditor_admit` and `auditor_remove` must verify under the Log key,
+an `observer_register` under the key it registers with `sig.key_id` naming it,
+and an `observer_checkpoint` under the key registered for its subject at its
+Block. Malformed details, evidence, a subject with fewer than two labels and a
+missing, forbidden or stale `track_record` reject the act as WIST4-E04; core's
+batch rules reject roster conflicts as WIST4-E07; Envelope field, version,
+timestamp and signature failures ignore the act without a registry code.
+Rejection leaves the roster unchanged and the Block valid. Removals apply
+before the Block's admissions and registrations; checkpoints read the roster
+after the Block's roster acts; a same-Block registration is not Observer
+history for that Block's admission.
+
+`admitted_key_at`, `registered_key_at`, `admitted_at`, `registered_at` and
+`tenure` read key custody from Block `sealed_at` instants: a key is held from
+the admitting Block's instant to the removing Block's instant, the latter
+excluded. `signing_binding(auditor_id, sealed_at_s)` supplies the
+`record::SigningBinding` for the key held at that instant.
+`IncludedRecord::signing_binding(&roster)` binds an included Record to the key
+its `auditor_id` held at the Record's own Block after checking that the roster
+carries the same Log Anchor and the Record's Block hash. A Record under an
+Observer key, an unknown Auditor, another Auditor's key or a removed key binds
+to nothing or to another key ID, and `disposition()` reports WIST4-E01. The
+carve-out for a Record signed under a duty Block's key after that key's
+removal takes the anchor instant's binding with `Duty::RemovedAfterAnchor`;
+deriving the duty anchor remains the caller's.
+
+A lexically valid admitted `public_key` that is not a canonical Ed25519 point
+or is of small order is admitted as a roster string; no Record or proof
+verifies under it. A checkpoint `head` is checked for ID shape, not for a
+sealed Record or attestation. Live sealing evaluates queued roster acts
+against this authenticated roster before recording them, so admission, restart
+and replay derive one roster. The Auditor Declaration check WIST-4 §3 requires
+before sealing an `auditor_admit`, Observer discovery and checkpoint pulling
+are not implemented. Reconstruction retains every Block hash and the roster in
+memory without a work/cache bound, exposes no state until the complete pinned
+prefix passes, and rereads repaired files on retry.
+
+Signed histories embed every `roster.json` roster, batch and admission case,
+substituting real keys for vector labels and cited checkpoints for seeded
+Observers, plus regressions for foreign signatures, non-canonical keys,
+missing algorithms, one-label subjects, unsupported versions, unknown members,
+leap-second instants, mis-signed registrations, unregistered checkpoints,
+empty removal evidence, same-Block rotation, Record bindings across rotation,
+pinned-prefix exclusion and corrupt-file repair. Live tests seal Observer
+registration, a checkpoint and a promotion citing it, and drop malformed and
+foreign-signed admissions.
 
 ## Included Record evidence fields
 

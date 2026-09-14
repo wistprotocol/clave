@@ -375,7 +375,11 @@ fn the_state_artifact_carries_every_kind_with_live_instances() {
         "wist_version": "1.0.0",
         "action": "auditor_admit",
         "subject": "audit.example.org",
-        "details": {"key_id": "a1", "public_key": "pk-a1"},
+        "details": {
+            "key_id": "a1",
+            "alg": "Ed25519",
+            "public_key": wist_core::crypto::SigningKey::from_seed(&[21; 32]).public().to_b64u(),
+        },
         "effective_at": "2026-08-09T12:00:00Z",
     });
     let envelope = wist_core::envelope::sign_envelope(&admit, "update", "log1", &sk).unwrap();

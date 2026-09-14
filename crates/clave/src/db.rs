@@ -1720,7 +1720,7 @@ impl Db {
                     act.block_number,
                     None,
                 )),
-                _ => {
+                "auditor_remove" => {
                     if let Some(row) = admitted
                         .iter_mut()
                         .find(|(a, k, ..)| *a == act.auditor_id && *k == act.key_id)
@@ -1728,6 +1728,7 @@ impl Db {
                         row.4 = Some(act.block_number);
                     }
                 }
+                _ => {}
             }
         }
         Ok(admitted)

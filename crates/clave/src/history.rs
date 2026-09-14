@@ -4,6 +4,7 @@ pub mod deltas;
 pub mod payloads;
 pub mod records;
 pub mod references;
+pub mod roster;
 
 use crate::db::BlockRow;
 use crate::error::{Error, Result};
@@ -86,6 +87,7 @@ pub struct History {
     anchor_hash: [u8; 32],
     directory: PathBuf,
     head: Option<BlockRow>,
+    log_id: String,
     key: PublicKey,
     key_id: String,
     next_height: u64,
@@ -121,6 +123,7 @@ impl History {
             anchor_hash: Sha256::digest(wist_core::jcs::canonicalize(&doc["anchor"])?).into(),
             directory: directory.into(),
             head,
+            log_id: anchor.anchor.log_id.clone(),
             key,
             key_id: genesis.key_id.clone(),
             next_height: 0,
@@ -134,6 +137,18 @@ impl History {
 
     pub fn schedule(&self) -> Option<&Schedule> {
         self.schedule.as_ref()
+    }
+
+    pub fn log_id(&self) -> &str {
+        &self.log_id
+    }
+
+    pub fn log_key(&self) -> &PublicKey {
+        &self.key
+    }
+
+    pub fn log_key_id(&self) -> &str {
+        &self.key_id
     }
 
     pub fn next_block(&mut self) -> Result<Option<VerifiedBlock>> {

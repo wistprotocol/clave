@@ -123,7 +123,7 @@ fn object(value: &Value, required: &[&str], optional: &[&str]) -> bool {
     })
 }
 
-fn release(version: &str) -> bool {
+pub(crate) fn release(version: &str) -> bool {
     version.split('.').count() == 3
         && version.split('.').all(|part| {
             !part.is_empty()
@@ -146,7 +146,7 @@ fn hash(value: &Value, prefix: &str) -> bool {
         .is_some_and(|value| hex(value, 64))
 }
 
-fn auditor_id(value: &str) -> bool {
+pub(crate) fn hostname_subject(value: &str) -> bool {
     value.len() <= 253
         && value.contains('.')
         && value.split('.').all(|label| {
@@ -190,7 +190,7 @@ fn non_evidence_fields_valid(envelope: &Value) -> bool {
         ],
     ) && body["wist_version"].as_str().is_some_and(release)
         && hash(&body["audited_delta"], "sha256:")
-        && body["auditor_id"].as_str().is_some_and(auditor_id)
+        && body["auditor_id"].as_str().is_some_and(hostname_subject)
         && body["vrf_proof"]
             .as_str()
             .is_some_and(|value| hex(value, 160))
