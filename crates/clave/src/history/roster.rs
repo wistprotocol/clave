@@ -19,7 +19,7 @@ pub struct RejectedAct {
     pub position: Position,
     pub action: String,
     pub subject: String,
-    pub code: Option<&'static str>,
+    pub code: &'static str,
     pub reason: String,
 }
 
@@ -46,7 +46,7 @@ pub struct SealedCheckpoint {
 pub(crate) struct Rejection {
     pub action: String,
     pub subject: String,
-    pub code: Option<&'static str>,
+    pub code: &'static str,
     pub reason: String,
 }
 
@@ -257,7 +257,7 @@ impl RosterHistory {
                     Outcome::Rejected(Rejection {
                         action,
                         subject: candidate.subject.clone(),
-                        code: Some(code),
+                        code,
                         reason,
                     })
                 }
@@ -309,7 +309,7 @@ impl RosterHistory {
                 Outcome::Rejected(Rejection {
                     action: "observer_checkpoint".into(),
                     subject: candidate.subject,
-                    code: Some("WIST4-E07"),
+                    code: "WIST4-E07",
                     reason: "WIST4-E07: checkpoint is not signed by the key registered for its subject at its Block".into(),
                 })
             };
@@ -414,20 +414,17 @@ pub(crate) fn classify(
         .as_str()
         .unwrap_or_default()
         .to_owned();
-    let reject = |code: Option<&'static str>, reason: &str| Rejection {
+    let reject = |code: &'static str, reason: &str| Rejection {
         action: action.to_owned(),
         subject: subject.clone(),
         code,
-        reason: match code {
-            Some(code) => format!("{code}: {reason}"),
-            None => reason.to_owned(),
-        },
+        reason: format!("{code}: {reason}"),
     };
     let envelope: RegistryUpdateEnvelope = match serde_json::from_value(body.clone()) {
         Ok(envelope) => envelope,
         Err(e) => {
             return Some(Err(reject(
-                None,
+                "WIST4-E11",
                 &format!("malformed Registry Update envelope: {e}"),
             )))
         }
@@ -436,11 +433,14 @@ pub(crate) fn classify(
     if !crate::record::release(&update.wist_version)
         || update.wist_version.split('.').next() != Some("1")
     {
-        return Some(Err(reject(None, "unsupported Registry Update version")));
+        return Some(Err(reject(
+            "WIST4-E11",
+            "unsupported Registry Update version",
+        )));
     }
     if crate::registry::epoch(&update.effective_at).is_err() {
         return Some(Err(reject(
-            None,
+            "WIST4-E11",
             "effective_at is not a whole-second UTC instant",
         )));
     }
@@ -448,11 +448,11 @@ pub(crate) fn classify(
         || envelope.sig.key_id.chars().count() > 64
         || !canonical_b64u(&envelope.sig.value, 64)
     {
-        return Some(Err(reject(None, "malformed signature fields")));
+        return Some(Err(reject("WIST4-E11", "malformed signature fields")));
     }
     if !crate::record::hostname_subject(&update.subject) {
         return Some(Err(reject(
-            Some("WIST4-E04"),
+            "WIST4-E04",
             "subject is not a hostname of at least two labels",
         )));
     }
@@ -463,19 +463,19 @@ pub(crate) fn classify(
         "auditor_admit" => {
             let Ok(RegistryDetails::Admission(details)) = update.typed_details() else {
                 return Some(Err(reject(
-                    Some("WIST4-E04"),
+                    "WIST4-E04",
                     "auditor_admit details are malformed",
                 )));
             };
             if details.key_id.chars().count() > 64 || !canonical_b64u(&details.public_key, 32) {
                 return Some(Err(reject(
-                    Some("WIST4-E04"),
+                    "WIST4-E04",
                     "auditor_admit key fields are malformed",
                 )));
             }
             if !log_signed(body) {
                 return Some(Err(reject(
-                    None,
+                    "WIST4-E11",
                     "signature does not verify under the Log key",
                 )));
             }
@@ -490,20 +490,20 @@ pub(crate) fn classify(
         "auditor_remove" => {
             let Ok(RegistryDetails::Removal(details)) = update.typed_details() else {
                 return Some(Err(reject(
-                    Some("WIST4-E04"),
+                    "WIST4-E04",
                     "auditor_remove details are malformed",
                 )));
             };
             if details.key_id.chars().count() > 64 {
                 return Some(Err(reject(
-                    Some("WIST4-E04"),
+                    "WIST4-E04",
                     "auditor_remove key_id is malformed",
                 )));
             }
             let evidence = update.evidence.as_deref();
             if evidence.is_some_and(|ids| ids.iter().any(|id| id.chars().count() > 256)) {
                 return Some(Err(reject(
-                    Some("WIST4-E04"),
+                    "WIST4-E04",
                     "removal evidence IDs are malformed",
                 )));
             }
@@ -511,14 +511,14 @@ pub(crate) fn classify(
                 Ok(action) => action,
                 Err(_) => {
                     return Some(Err(reject(
-                        Some("WIST4-E04"),
+                        "WIST4-E04",
                         "removal evidence must be absent or nonempty",
                     )))
                 }
             };
             if !log_signed(body) {
                 return Some(Err(reject(
-                    None,
+                    "WIST4-E11",
                     "signature does not verify under the Log key",
                 )));
             }
@@ -533,19 +533,19 @@ pub(crate) fn classify(
         "observer_register" => {
             let Ok(RegistryDetails::Registration(details)) = update.typed_details() else {
                 return Some(Err(reject(
-                    Some("WIST4-E04"),
+                    "WIST4-E04",
                     "observer_register details are malformed",
                 )));
             };
             if details.key_id.chars().count() > 64 || !canonical_b64u(&details.public_key, 32) {
                 return Some(Err(reject(
-                    Some("WIST4-E04"),
+                    "WIST4-E04",
                     "observer_register key fields are malformed",
                 )));
             }
             if envelope.sig.key_id != details.key_id {
                 return Some(Err(reject(
-                    None,
+                    "WIST4-E11",
                     "observer_register is not signed by the key it registers",
                 )));
             }
@@ -553,7 +553,7 @@ pub(crate) fn classify(
                 .is_ok_and(|key| verify_envelope(body, "update", &key).is_ok());
             if !verifies {
                 return Some(Err(reject(
-                    None,
+                    "WIST4-E11",
                     "signature does not verify under the registered key",
                 )));
             }
@@ -568,7 +568,7 @@ pub(crate) fn classify(
         _ => {
             let Ok(RegistryDetails::ObserverCheckpoint(_)) = update.typed_details() else {
                 return Some(Err(reject(
-                    Some("WIST4-E04"),
+                    "WIST4-E04",
                     "observer_checkpoint details are malformed",
                 )));
             };
@@ -576,7 +576,7 @@ pub(crate) fn classify(
                 Ok(id) => id,
                 Err(e) => {
                     return Some(Err(reject(
-                        None,
+                        "WIST4-E11",
                         &format!("checkpoint cannot be identified: {e}"),
                     )))
                 }

@@ -522,12 +522,14 @@ an `observer_register` under the key it registers with `sig.key_id` naming it,
 and an `observer_checkpoint` under the key registered for its subject at its
 Block. Malformed details, evidence, a subject with fewer than two labels and a
 missing, forbidden or stale `track_record` reject the act as WIST4-E04; core's
-batch rules reject roster conflicts as WIST4-E07; Envelope field, version,
-timestamp and signature failures ignore the act without a registry code.
-Rejection leaves the roster unchanged and the Block valid. Removals apply
-before the Block's admissions and registrations; checkpoints read the roster
-after the Block's roster acts; a same-Block registration is not Observer
-history for that Block's admission.
+batch rules reject roster conflicts as WIST4-E07; unknown members, malformed
+`wist_version`, `effective_at` or signature fields, an unsupported major and a
+signature failing under the key WIST-4 §9.1 names reject the act as WIST4-E11,
+with E11 before E04 and both before authenticity and roster rules. Rejection
+leaves the roster unchanged and the Block valid, and a rejected act is no
+batch candidate. Removals apply before the Block's admissions and
+registrations; checkpoints read the roster after the Block's roster acts; an
+admission reads Observer history and citable checkpoints below its Block.
 
 `admitted_key_at`, `registered_key_at`, `admitted_at`, `registered_at` and
 `tenure` read key custody from Block `sealed_at` instants: a key is held from
@@ -545,8 +547,8 @@ deriving the duty anchor remains the caller's.
 
 A lexically valid admitted `public_key` that is not a canonical Ed25519 point
 or is of small order is admitted as a roster string; no Record or proof
-verifies under it. A checkpoint `head` is checked for ID shape, not for a
-sealed Record or attestation. Live sealing evaluates queued roster acts
+verifies under it (WIST4-E01). A checkpoint `head` is checked for ID shape,
+not for a sealed Record or attestation. Live sealing evaluates queued roster acts
 against this authenticated roster before recording them, so admission, restart
 and replay derive one roster. The Auditor Declaration check WIST-4 §3 requires
 before sealing an `auditor_admit`, Observer discovery and checkpoint pulling
@@ -560,7 +562,11 @@ Observers, plus regressions for foreign signatures, non-canonical keys,
 missing algorithms, one-label subjects, unsupported versions, unknown members,
 leap-second instants, mis-signed registrations, unregistered checkpoints,
 empty removal evidence, same-Block rotation, Record bindings across rotation,
-pinned-prefix exclusion and corrupt-file repair. Live tests seal Observer
+pinned-prefix exclusion and corrupt-file repair. Every `roster-acts.json`
+history replays with its Aggregator acts re-signed under the fixture Log key,
+reproducing each Entry's diagnostic, the roster and checkpoint set after the
+last Block and the small-order Record probe; its duplicate-member Envelopes
+invalidate the containing Block file under WIST-3 §3. Live tests seal Observer
 registration, a checkpoint and a promotion citing it, and drop malformed and
 foreign-signed admissions.
 

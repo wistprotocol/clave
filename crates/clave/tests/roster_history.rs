@@ -6,7 +6,7 @@ use clave::record::{Duty, ReplayContext};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use wist_core::crypto::{hex_encode, SigningKey};
+use wist_core::crypto::{hex_encode, PublicKey, SigningKey};
 use wist_core::{block, envelope, jcs, merkle};
 
 mod common;
@@ -322,7 +322,7 @@ fn roster_vectors_replay_in_signed_histories() {
                 roster
                     .rejected()
                     .iter()
-                    .all(|r| r.code == Some("WIST4-E07") && r.reason.contains("WIST4-E07")),
+                    .all(|r| r.code == "WIST4-E07" && r.reason.contains("WIST4-E07")),
                 "{label}: {:?}",
                 roster.rejected()
             );
@@ -532,7 +532,7 @@ fn admission_evidence_vectors_replay_in_signed_histories() {
                     roster.rejected()
                 );
                 let rejected = &roster.rejected()[0];
-                assert_eq!(rejected.code, Some(code), "{label}");
+                assert_eq!(rejected.code, code, "{label}");
                 assert!(
                     rejected.reason.contains(code),
                     "{label}: {}",
@@ -638,23 +638,23 @@ fn malformed_and_misattributed_roster_acts_are_rejected_without_changing_the_ros
     ];
     let block = fx.append(START, entries.clone());
     let roster = fx.roster();
-    let codes: BTreeMap<String, Option<&'static str>> = roster
+    let codes: BTreeMap<String, &'static str> = roster
         .rejected()
         .iter()
         .map(|r| (r.subject.clone(), r.code))
         .collect();
-    let expected: BTreeMap<String, Option<&'static str>> = [
-        ("forged.example.org", None),
-        ("padded.example.org", Some("WIST4-E04")),
-        ("noalg.example.org", Some("WIST4-E04")),
-        ("single", Some("WIST4-E04")),
-        ("major.example.org", None),
-        ("extra.example.org", None),
-        ("leap.example.org", None),
-        ("watch.sample.net", None),
-        ("watch.sample.org", None),
-        ("watch.example.info", Some("WIST4-E04")),
-        ("watch.example.biz", Some("WIST4-E07")),
+    let expected: BTreeMap<String, &'static str> = [
+        ("forged.example.org", "WIST4-E11"),
+        ("padded.example.org", "WIST4-E04"),
+        ("noalg.example.org", "WIST4-E04"),
+        ("single", "WIST4-E04"),
+        ("major.example.org", "WIST4-E11"),
+        ("extra.example.org", "WIST4-E11"),
+        ("leap.example.org", "WIST4-E11"),
+        ("watch.sample.net", "WIST4-E11"),
+        ("watch.sample.org", "WIST4-E11"),
+        ("watch.example.info", "WIST4-E04"),
+        ("watch.example.biz", "WIST4-E07"),
     ]
     .into_iter()
     .map(|(subject, code)| (subject.to_string(), code))
@@ -702,7 +702,7 @@ fn removal_evidence_and_checkpoint_keys_follow_the_batch_rules() {
         ],
     );
     let roster = fx.roster();
-    let rejected: BTreeSet<(&str, Option<&str>)> = roster
+    let rejected: BTreeSet<(&str, &str)> = roster
         .rejected()
         .iter()
         .map(|r| (r.action.as_str(), r.code))
@@ -710,8 +710,8 @@ fn removal_evidence_and_checkpoint_keys_follow_the_batch_rules() {
     assert_eq!(
         rejected,
         BTreeSet::from([
-            ("auditor_remove", Some("WIST4-E04")),
-            ("observer_checkpoint", Some("WIST4-E07")),
+            ("auditor_remove", "WIST4-E04"),
+            ("observer_checkpoint", "WIST4-E07"),
         ]),
         "{:?}",
         roster.rejected()
@@ -953,4 +953,240 @@ fn roster_reconstruction_requires_the_complete_pinned_prefix_and_can_retry() {
         .unwrap()
         .admitted_at(START)
         .is_empty());
+}
+
+fn resign_log_act(
+    fx: &Fixture,
+    mut envelope: Value,
+    log_key_id: &str,
+    log_key: &PublicKey,
+) -> Value {
+    let verifies = envelope["sig"]["key_id"] == log_key_id
+        && envelope["sig"]["value"].as_str().is_some_and(|value| {
+            wist_core::crypto::verify(
+                log_key,
+                &jcs::canonicalize(&envelope["update"]).unwrap(),
+                value,
+            )
+            .is_ok()
+        });
+    if verifies {
+        let fresh = envelope::sign_envelope(&envelope["update"], "update", "log1", &fx.sk).unwrap();
+        envelope["sig"]["key_id"] = json!("log1");
+        envelope["sig"]["value"] = fresh["sig"]["value"].clone();
+    }
+    envelope
+}
+
+fn raw_block_file(fx: &Fixture, at: i64, raw_entries: &[String]) {
+    let head = fx.db.last_block().unwrap();
+    let height = head.as_ref().map_or(0, |b| b.block_number + 1);
+    let header = json!({
+        "wist_version": "1.0.0", "block_number": height,
+        "prev_block_hash": head.map_or("sha256:genesis".into(), |b| b.block_hash),
+        "sealed_at": ts(at), "entry_count": raw_entries.len(),
+        "merkle_root": format!("sha256:{}", hex_encode(&merkle::leaf_hash(&[]))),
+    });
+    let signature = fx.sk.sign(&jcs::canonicalize(&header).unwrap());
+    let entries = raw_entries
+        .iter()
+        .map(|raw| format!("{{\"body\":{raw},\"type\":\"registry_update\"}}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let header_text = String::from_utf8(jcs::canonicalize(&header).unwrap()).unwrap();
+    let text = format!(
+        "{{\"entries\":[{entries}],\"header\":{header_text},\"sig\":{{\"alg\":\"Ed25519\",\"key_id\":\"log1\",\"value\":\"{signature}\"}}}}"
+    );
+    std::fs::write(
+        fx.path(height),
+        zstd::bulk::compress(text.as_bytes(), 3).unwrap(),
+    )
+    .unwrap();
+    fx.db
+        .commit_seal(
+            &[],
+            height,
+            &block::block_hash(&header).unwrap(),
+            &ts(at),
+            &[],
+            &[],
+            &[],
+            &[],
+            text.len() as u64,
+        )
+        .unwrap();
+}
+
+#[test]
+fn roster_act_vectors_replay_in_signed_histories() {
+    let vectors: Value = serde_json::from_slice(
+        &std::fs::read(common::spec_dir().join("vectors/wist4/roster-acts.json")).unwrap(),
+    )
+    .unwrap();
+    let log_id = vectors["log_id"].as_str().unwrap();
+    let log_key_id = vectors["log_key"]["key_id"].as_str().unwrap();
+    let log_key = PublicKey::from_b64u(vectors["log_key"]["public_key"].as_str().unwrap()).unwrap();
+    let codes = |value: &Value| -> BTreeMap<String, String> {
+        value
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.as_str().unwrap().to_string()))
+            .collect()
+    };
+    let mut seen = BTreeSet::new();
+    for case in vectors["cases"].as_array().unwrap() {
+        let label = case["label"].as_str().unwrap();
+        let fx = Fixture::new(log_id);
+        fx.append(START, vec![]);
+        let raw_invalid = case["blocks"].as_array().unwrap().iter().any(|block| {
+            block["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["expect"] == "WIST1-E05")
+        });
+        if raw_invalid {
+            for block in case["blocks"].as_array().unwrap() {
+                let height = block["height"].as_u64().unwrap();
+                let raw: Vec<String> = block["entries"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|entry| entry["envelope_json"].as_str().unwrap().to_string())
+                    .collect();
+                raw_block_file(&fx, START + height as i64 * HOUR, &raw);
+            }
+            let error = match RosterHistory::reconstruct(fx.data.path(), fx.head()) {
+                Ok(_) => panic!("{label}: a Block with a duplicate member was accepted"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains("duplicate"), "{label}: {error}");
+            seen.insert("WIST1-E05".to_string());
+            continue;
+        }
+        let mut blocks = Vec::new();
+        let mut expectations: Vec<(Value, String)> = Vec::new();
+        let mut last_at = START;
+        for block in case["blocks"].as_array().unwrap() {
+            let height = block["height"].as_u64().unwrap();
+            last_at = START + height as i64 * HOUR;
+            let entries: Vec<Value> = block["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| {
+                    let envelope: Value =
+                        serde_json::from_str(entry["envelope_json"].as_str().unwrap()).unwrap();
+                    let wrapped = wrap(resign_log_act(&fx, envelope, log_key_id, &log_key));
+                    expectations.push((
+                        wrapped.clone(),
+                        entry["expect"].as_str().unwrap().to_string(),
+                    ));
+                    wrapped
+                })
+                .collect();
+            blocks.push(fx.append(last_at, entries));
+        }
+        let roster = fx.roster();
+        let rejected: BTreeMap<Position, &str> = roster
+            .rejected()
+            .iter()
+            .map(|r| (r.position, r.code))
+            .collect();
+        for (wrapped, expect) in &expectations {
+            let position = positions_of(&blocks, std::slice::from_ref(wrapped))
+                .into_iter()
+                .next()
+                .unwrap();
+            let got = rejected.get(&position).copied().unwrap_or("accepted");
+            assert_eq!(got, expect, "{label}: {:?}", roster.rejected());
+            if let Some(rejection) = roster.rejected().iter().find(|r| r.position == position) {
+                assert!(
+                    rejection.reason.contains(expect),
+                    "{label}: {}",
+                    rejection.reason
+                );
+            }
+            seen.insert(expect.clone());
+        }
+        let auditors: BTreeMap<String, String> = roster
+            .admitted_at(last_at)
+            .into_iter()
+            .map(|(s, k)| (s.to_string(), k.to_string()))
+            .collect();
+        assert_eq!(auditors, codes(&case["auditors_after"]), "{label}");
+        let observers: BTreeMap<String, String> = roster
+            .registered_at(last_at)
+            .into_iter()
+            .map(|(s, k)| (s.to_string(), k.to_string()))
+            .collect();
+        assert_eq!(observers, codes(&case["observers_after"]), "{label}");
+        let mut sealed: Vec<&clave::history::roster::SealedCheckpoint> =
+            roster.checkpoints().iter().collect();
+        sealed.sort_by(|a, b| (a.height, a.id.as_bytes()).cmp(&(b.height, b.id.as_bytes())));
+        let checkpoints: Vec<&str> = sealed.iter().map(|c| c.id.as_str()).collect();
+        let expected: Vec<&str> = case["checkpoints_after"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|id| id.as_str().unwrap())
+            .collect();
+        assert_eq!(checkpoints, expected, "{label}");
+        if label == "small order key is admitted as a string" {
+            let probe = vectors["record_probe"]["envelope"].clone();
+            let subject = probe["record"]["auditor_id"].as_str().unwrap();
+            let at = START + HOUR + 1;
+            let held = roster.admitted_key_at(subject, at).unwrap();
+            assert_eq!(held.key_id, probe["sig"]["key_id"]);
+            assert!(roster.signing_binding(subject, at).is_none(), "{label}");
+            let fx = Fixture::new(log_id);
+            fx.append(START, vec![]);
+            let first = case["blocks"][0]["entries"][0]["envelope_json"]
+                .as_str()
+                .unwrap();
+            let admit: Value = serde_json::from_str(first).unwrap();
+            fx.append(
+                START + HOUR,
+                vec![wrap(resign_log_act(&fx, admit, log_key_id, &log_key))],
+            );
+            fx.append(
+                START + 2 * HOUR,
+                vec![json!({"type": "audit_record", "body": probe})],
+            );
+            let roster = fx.roster();
+            assert!(
+                roster.rejected().is_empty(),
+                "{label}: {:?}",
+                roster.rejected()
+            );
+            let records = IncludedRecord::reconstruct_all(fx.data.path(), fx.head()).unwrap();
+            assert_eq!(records.len(), 1);
+            assert!(records[0].signing_binding(&roster).unwrap().is_none());
+            let disposition = records[0].disposition(&ReplayContext {
+                signing: None,
+                duty: Duty::Active,
+                coverage_failure: false,
+                semantic_evidence_error: false,
+            });
+            assert_eq!(
+                Some(disposition.diagnostic.unwrap()),
+                vectors["record_probe"]["expect"].as_str()
+            );
+            assert!(!disposition.discharges_coverage);
+        }
+    }
+    assert_eq!(
+        seen,
+        [
+            "accepted",
+            "WIST1-E05",
+            "WIST4-E04",
+            "WIST4-E07",
+            "WIST4-E11"
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect()
+    );
 }
