@@ -331,9 +331,10 @@ pinned prefix before returning either binding, including for Block 0.
 
 These inputs do not establish Auditor standing or selection. VRF draws,
 selection domains and self-audit bars follow
-[Historical selection sets](#historical-selection-sets); reputation and
-sanction/escalation state at the preceding height and the extension path
-remain caller obligations.
+[Historical selection sets](#historical-selection-sets); the extension path
+and escalation state follow
+[Historical extension path](#historical-extension-path); reputation and
+sanction state at the preceding height remain caller obligations.
 
 Signed-history tests cover increases and decreases of each constant before,
 at and after effectiveness, negative slopes and zero, later references and resets,
@@ -375,9 +376,10 @@ reconstruction fails rather than binding across sources.
 `IncludedRecord::vrf_proof()` decodes a sealed Record's proof for this check.
 
 The result establishes the VRF path only. It supplies no reputation,
-sanction or escalation state, no extension-rule membership, no coverage
-duty, discharge or attestation, and no Record disposition; those remain
-separate obligations. Reconstruction validates every sealed Delta of the
+sanction or escalation state, no coverage duty, discharge or attestation,
+and no Record disposition; extension-rule membership, contradiction and
+escalation derivation follow
+[Historical extension path](#historical-extension-path). Reconstruction validates every sealed Delta of the
 prefix, retains the domain in memory without a work bound, exposes nothing
 after a prefix failure and rereads repaired files on retry.
 
@@ -391,6 +393,80 @@ follow same-Block key rotation, removal for cause, foreign and cross-Block
 proofs, small-order and non-canonical admitted keys, pinned-prefix
 exclusion, corrupt-file repair, roster mismatches and sealed Records whose
 proofs select, miss, fall outside the domain or fail verification.
+
+## Historical extension path
+
+`history::extension::ExtensionHistory::reconstruct(directory, pinned_head, prior)`
+authenticates the complete pinned prefix and replays every `audit_record`
+Entry in Log order under WIST-4 §§3/4 and §10.1. `prior(publisher, height)`
+supplies the Publisher's `reputation_u` and level-1 sanction state at the
+height preceding a draw's Block; escalated sampling is derived by the replay.
+
+Each result's `standing` is the proof path alone. `Selected`: the proof
+verifies over the audited Delta's Block under the key held at that Block's
+`sealed_at` and the draw selects the Delta with that Block's constants and the
+derived escalation state. `Extension { trigger_height }`: the proof instead
+verifies over a Block B₁ at which the extension rule named the Delta for that
+Auditor, under the key held at B₁. Otherwise `Void` with its reason: malformed
+non-evidence fields, an audited Delta the prefix does not seal, outside the
+selection domain, self-audit, no key at any candidate Block, or a proof that
+verifies nowhere; outside-domain and self-audit precede both paths. `duty` is
+`Active` when the Record is signed under the key its Auditor holds at its own
+Block, `RemovedAfterAnchor` when it is signed under the duty anchor Block's key
+after that key's removal (WIST-4 §3's carve-out), and `Absent` without
+standing. `diagnostic` and `discharges_coverage` apply
+[Audit Record fields and dispositions](#audit-record-fields-and-dispositions)
+with those predicates plus a `fetched_at` inside the closed interval from the
+proof's Block to the Record's Block, a `reference_delta` in the audited Delta's
+authenticated Publisher/URL chain, not preceding it and sealed at or before the
+fetch, and verdict scores under the audited Block's thresholds. A Record with
+no diagnostic is evidence; only evidence enters triggers, filer sets and
+contradiction quorums.
+
+An evidence `inconsistent` or `link_inconsistent` Record triggers when no
+earlier such evidence Record for the Delta is sealed inside the confirmation
+window in force at its Block, read over the strict prefix including earlier
+Entries of the same Block. A trigger summons while its Auditor has fewer than
+`extension_triggers_max` (in force at B₁) summoning triggers in the 30 whole
+days ending at B₁'s `sealed_at`; a rationed trigger stays evidence and summons
+nobody. The summoned set is every Auditor admitted at B₁'s `sealed_at` that is
+independent of the signed Publisher and of every Auditor whose such evidence
+Record for the Delta is already sealed, the trigger included. `triggers()`
+lists each trigger with its summons, summoned Auditors, deadline
+(`confirm_window_hours / 2` after B₁) and profile; `duties()` and
+`named(auditor_id, trigger_height)` list the resulting extension duties.
+
+At the first Block sealed more than the fixed window after B₁, the trigger's
+`outcome` records core's contradiction test over the Delta's evidence Records:
+whether a quorum of the trigger's verdict including the trigger formed,
+whether `confirm_auditors` pairwise independent `consistent` Records sealed
+inside the window, and the establishing Block when a summoning trigger is
+contradicted. `escalations()` lists contradictions by Publisher and
+establishing height; `escalated_sampling(publisher, height)` reads the state
+at that height, in force from the establishing height for 30 whole days. A
+draw reads the preceding height, so an escalation established at height N
+displaces the formula from Block N + 1 on.
+
+Reputation and level-1 sanction state remain caller obligations. Coverage
+failure at a Record's sealing Block is not derived, so a Record from an
+Auditor in coverage failure is not excluded from evidence, triggers or
+quorums. `prev_record` chains, coverage and pull attestations, duty discharge
+accounting and failure counts are not replayed. Reconstruction retains every
+Block profile, Delta binding and Record in memory without a work bound,
+exposes nothing after a prefix failure and rereads repaired files on retry.
+
+Signed histories cover extension-proof semantics across a key rotation between
+B₁ and the Record (proof under the key held at B₁, signature under the key
+held at the Record's Block) against proofs over the audited Block, an
+unrelated Block and the rotated key; `extension.json` order, ration and
+independence semantics with same-Block triggers, a same-Delta
+`link_inconsistent` inside the window, ration exhaustion and reset,
+per-Auditor rations and multi-filer exclusion; every `extension.json`
+contradiction case with VRF or extension standing per Record, closing and
+establishing heights and escalation probes; the escalation displacing the
+floor for later Blocks of the escalated domain only; void, unauthentic,
+malformed, mis-scored, early-fetch, unknown-Delta, outside-domain, self-audit
+and removed-key Records; corrupt-file repair and pinned-prefix exclusion.
 
 ## Historical coverage clocks
 

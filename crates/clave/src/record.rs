@@ -26,6 +26,14 @@ impl FieldValidation {
     pub fn supported_major(self) -> bool {
         self.supported_major
     }
+
+    pub fn non_evidence_valid(self) -> bool {
+        self.non_evidence_valid
+    }
+
+    pub fn evidence_valid(self) -> bool {
+        self.evidence_valid
+    }
 }
 
 pub struct SigningBinding<'a> {
