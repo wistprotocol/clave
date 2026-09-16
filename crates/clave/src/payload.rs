@@ -2,6 +2,12 @@ use serde_json::Value;
 use std::collections::HashSet;
 use wist_core::objects::{DeltaPayloadCommitment, Payload, PayloadLinks};
 
+/// The bound on a fetched Payload: WIST-1 §3.6's content caps in force
+/// plus room for the salt, the version and the object framing.
+pub fn cap_bytes(caps: &crate::declaration::delta::SizeCaps) -> u64 {
+    (caps.extract_cap_bytes + caps.links_cap_bytes + caps.summary_cap_bytes) as u64 + 4096
+}
+
 pub fn validate(
     payload: &Value,
     commitment: &DeltaPayloadCommitment,

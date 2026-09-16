@@ -24,6 +24,8 @@ pub enum Error {
     History(String),
     #[error("fetch: {0}")]
     Fetch(String),
+    #[error("fetch: {0}")]
+    Oversized(String),
     #[error("Payload: {0}")]
     Payload(&'static str),
     #[error("clock: {0}")]

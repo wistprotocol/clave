@@ -371,23 +371,99 @@ fn onboard_publisher(
     Ok(Some(()))
 }
 
+/// The work one pull may do before it suspends the walk for a later pull
+/// to resume, below the per-domain daily budget of WIST-2 §5.
+#[derive(Debug, Clone, Copy)]
+pub struct PullLimits {
+    pub work_bytes: u64,
+    pub work_objects: u32,
+}
+
+impl Default for PullLimits {
+    fn default() -> Self {
+        PullLimits {
+            work_bytes: 64 << 20,
+            work_objects: 4096,
+        }
+    }
+}
+
+/// The kinds of content object a pull fetches under the byte budget, each
+/// bounded while it streams.
+#[derive(Debug, Clone, Copy)]
+enum Object {
+    Page,
+    Registry,
+    Delta,
+    Payload,
+}
+
+/// Per-object bounds: Feed pages and Registry files by the shared object
+/// cap, a Delta file by its URL cap and fixed fields, a Payload by the
+/// content caps in force plus its salt and framing.
+struct ObjectCaps {
+    delta: u64,
+    payload: u64,
+}
+
+impl ObjectCaps {
+    fn from_schedule(schedule: &wist_core::parameters::Schedule, at: i64) -> Self {
+        let caps = crate::declaration::delta::SizeCaps::from_schedule(schedule, at);
+        ObjectCaps {
+            delta: 16_384 + 2 * caps.url_cap_bytes as u64,
+            payload: crate::payload::cap_bytes(&caps),
+        }
+    }
+
+    fn of(&self, object: Object) -> u64 {
+        match object {
+            Object::Page | Object::Registry => crate::fetch::OBJECT_CAP_BYTES,
+            Object::Delta => self.delta,
+            Object::Payload => self.payload,
+        }
+    }
+}
+
 struct Meter<'a> {
     db: &'a Db,
     domain: &'a str,
     day: &'a str,
     budget: i64,
     subdomain_scope: Vec<String>,
+    caps: ObjectCaps,
+    work: std::cell::Cell<(u64, u32)>,
 }
 
 impl Meter<'_> {
-    fn get(&self, client: &Client, url: &str) -> Result<Option<(Vec<u8>, Value)>> {
-        if self.db.ingest_bytes(self.domain, self.day)? >= self.budget {
+    /// Fetches one content object under the remaining daily budget, the
+    /// pull's work limits and the object's own cap. `None` suspends the
+    /// walk: the budget or the work is spent, or the object would cross
+    /// the budget, in which case the bytes read up to the bound are
+    /// debited. An object above its own cap is a failed fetch.
+    fn get(&self, client: &Client, url: &str, object: Object) -> Result<Option<(Vec<u8>, Value)>> {
+        let spent = self.db.ingest_bytes(self.domain, self.day)?;
+        let (work_bytes, work_objects) = self.work.get();
+        if spent >= self.budget || work_bytes == 0 || work_objects == 0 {
             return Ok(None);
         }
-        let (raw, value) = client.get_json_in_scope(url, &self.subdomain_scope)?;
-        self.db
-            .add_ingest_bytes(self.domain, self.day, raw.len() as i64)?;
-        Ok(Some((raw, value)))
+        let cap = self.caps.of(object);
+        let limit = cap.min((self.budget - spent) as u64).min(work_bytes);
+        match client.get_json_bounded(url, &self.subdomain_scope, limit) {
+            Ok((raw, value)) => {
+                self.db
+                    .add_ingest_bytes(self.domain, self.day, raw.len() as i64)?;
+                self.work
+                    .set((work_bytes - raw.len() as u64, work_objects - 1));
+                Ok(Some((raw, value)))
+            }
+            Err(crate::error::Error::Oversized(_)) if limit < cap => {
+                self.db
+                    .add_ingest_bytes(self.domain, self.day, limit as i64)?;
+                self.work.set((work_bytes - limit, work_objects));
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -463,6 +539,26 @@ pub fn run_with_clock(
     now: &str,
     clock: impl Fn() -> jiff::Timestamp,
 ) -> Result<IngestReport> {
+    run_bounded(
+        db,
+        client,
+        data_dir,
+        host,
+        now,
+        clock,
+        PullLimits::default(),
+    )
+}
+
+pub fn run_bounded(
+    db: &Db,
+    client: &Client,
+    data_dir: &Path,
+    host: &str,
+    now: &str,
+    clock: impl Fn() -> jiff::Timestamp,
+    limits: PullLimits,
+) -> Result<IngestReport> {
     let mut report = IngestReport::default();
     let Some(host) = canonical_authority(host) else {
         return Ok(report);
@@ -483,12 +579,15 @@ pub fn run_with_clock(
         .and_then(|doc| declaration::publisher_of(&doc).ok())
         .and_then(|p| p.subdomain_scope)
         .unwrap_or_default();
+    let now_epoch = crate::registry::epoch(now)?;
     let meter = Meter {
         db,
         domain: host,
         day,
         budget,
         subdomain_scope: stored_scope,
+        caps: ObjectCaps::from_schedule(&db.parameter_schedule(now_epoch)?, now_epoch),
+        work: std::cell::Cell::new((limits.work_bytes, limits.work_objects)),
     };
 
     let known = db.get_publisher(host)?.is_some();
@@ -553,7 +652,7 @@ pub fn run_with_clock(
     let mut unseen_any = false;
     let mut suspended = false;
     loop {
-        let fetched = match meter.get(client, &page_url) {
+        let fetched = match meter.get(client, &page_url, Object::Page) {
             Ok(Some(v)) => v,
             Ok(None) => {
                 suspended = true;
@@ -674,7 +773,9 @@ pub fn run_with_clock(
     }
 
     if !suspended {
-        if let Ok(Some((_, served))) = meter.get(client, &format!("{base}registry.json")) {
+        if let Ok(Some((_, served))) =
+            meter.get(client, &format!("{base}registry.json"), Object::Registry)
+        {
             report.submissions = crate::submissions::queue_served(db, host, Some(&served))?.queued;
         }
     }
@@ -720,7 +821,7 @@ pub fn run_with_clock(
         let delta_url = format!("{base}deltas/{hex}.json");
         let delta_value = match prefetched.remove(id) {
             Some(v) => v,
-            None => match meter.get(client, &delta_url) {
+            None => match meter.get(client, &delta_url, Object::Delta) {
                 Ok(Some((_, v))) => v,
                 Ok(None) => {
                     suspended = true;
@@ -863,7 +964,7 @@ pub fn run_with_clock(
                 if let Some(prev) = delta_env.delta.prev.as_deref() {
                     if !db.is_delta_seen_for(prev, host)? {
                         let prev_url = format!("{base}deltas/{}.json", &prev[7..]);
-                        match meter.get(client, &prev_url) {
+                        match meter.get(client, &prev_url, Object::Delta) {
                             Ok(Some((_, predecessor))) => {
                                 let at = position - 1;
                                 attempt_profiles.insert(id.clone(), attempt);
@@ -912,25 +1013,26 @@ pub fn run_with_clock(
 
         let payload_raw = if let Some(commitment) = &delta_env.delta.payload {
             let payload_url = format!("{base}payloads/{hex}.json");
-            let (payload_raw, payload_value) = match meter.get(client, &payload_url) {
-                Ok(Some(v)) => v,
-                Ok(None) => {
-                    suspended = true;
-                    break 'process;
-                }
-                Err(e) => {
-                    record_rejection(
-                        db,
-                        host,
-                        "WIST2-E03",
-                        now,
-                        Some(id.as_str()),
-                        &e.to_string(),
-                    )?;
-                    report.rejected.push((id.clone(), "WIST2-E03".to_string()));
-                    continue;
-                }
-            };
+            let (payload_raw, payload_value) =
+                match meter.get(client, &payload_url, Object::Payload) {
+                    Ok(Some(v)) => v,
+                    Ok(None) => {
+                        suspended = true;
+                        break 'process;
+                    }
+                    Err(e) => {
+                        record_rejection(
+                            db,
+                            host,
+                            "WIST2-E03",
+                            now,
+                            Some(id.as_str()),
+                            &e.to_string(),
+                        )?;
+                        report.rejected.push((id.clone(), "WIST2-E03".to_string()));
+                        continue;
+                    }
+                };
             if let Err(code) = crate::payload::validate(
                 &payload_value,
                 commitment,

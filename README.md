@@ -32,7 +32,9 @@ Retry-After; only WIST2-E02/E04 pings count as noise), rejects quarantined
 and delisted domains with 403, and runs a baseline pass every minute that
 re-pulls stale or budget-suspended publishers without a Ping. Ingest
 follows feed pages (WIST-2 §3.2) under the per-domain daily byte budget,
-suspending and resuming across days.
+suspending and resuming across days. Ping admission and every fetch are
+bounded as [Fetch bounds and destination policy](#fetch-bounds-and-destination-policy)
+describes.
 
 Ingest re-fetches each known publisher's Declaration and validates the
 chain (WIST-1 §5.2: `seq`/`prev_declaration` monotonicity, recovery-keys
@@ -128,6 +130,44 @@ cover their pull dispositions, restart, accepted-byte preservation through
 sealing, scoped subjects and rejection of a retrieved predecessor.
 Field/version admission and retained validation are described below;
 historical validation remains outstanding.
+
+## Fetch bounds and destination policy
+
+Every fetch reads its response while it streams and refuses it at a bound
+before buffering or parsing: a declared length above the bound is refused
+before the body is read, and a body that crosses it is refused where it
+crosses. A Declaration, Feed page, Registry file, appeal or Mirror list is
+bounded at 1 MiB; a Delta file at 16 KiB plus twice `url_cap_bytes`; a
+Payload at `extract_cap_bytes + links_cap_bytes + summary_cap_bytes` plus
+4 KiB, each read from the schedule in force at the pull. Content fetches
+under WIST-2 §5's daily budget are further bounded by the budget's
+remainder and by the pull's work limits (64 MiB and 4096 objects per
+pull): an object that would cross the budget or the work limit is not
+read past it, the bytes read are debited, and the walk suspends for a
+later pull to resume from where it stopped, exactly as budget exhaustion
+does; an object above its own cap is a failed fetch. Declaration requests
+stay outside the budget and carry only their own cap.
+
+A fetch connects only to a public unicast address. Loopback addresses are
+allowed under `--allow-http`, the local-test exception; private,
+link-local, shared (100.64/10), multicast, broadcast, documentation,
+benchmarking, reserved and unspecified addresses, and IPv6 addresses that
+map or embed them, are never fetch destinations. The policy applies to a
+literal host, to every redirect hop and to what a name resolves to at
+the moment the connection is made: name resolution runs through a
+resolver that refuses the whole answer when any address fails the policy,
+so a name that rebinds between two fetches is refused on the second. A
+refused destination is a failed fetch with the address class named.
+
+`serve` bounds the work a Ping can start: at most 4 pulls run at once and
+at most 64 accepted Pings wait for a slot. A Ping for a host with a pull
+running or waiting is accepted (202) without new work; a Ping beyond the
+waiting bound is refused with 503 and `Retry-After: 30`, is not queued,
+and counts as neither noise nor a pull, so the Publisher retries later
+under its own backoff. Quota (429) and quarantine (403) are answered
+before admission. `serve` still runs each pull under the shared store
+lock, so a Ping's quota check waits for the pull in progress; taking
+fetches and verification outside that lock is a separate requirement.
 
 ## JSON input eligibility
 
@@ -1038,8 +1078,10 @@ or the final redirect destination. Every copy retains the same authenticated
 commitment and historical caps regardless of location.
 
 HTTP retrieval uses the client's HTTPS guard, explicit loopback HTTP opt-in,
-30-second request timeout and five-hop redirect limit within the same Canonical
-Host. Response and file reads remain unbounded. Callers enforce withdrawal,
+destination policy, 30-second request timeout and five-hop redirect limit
+within the same Canonical Host, and reads a Payload only up to the cap its
+content caps imply ([Fetch bounds and destination policy](#fetch-bounds-and-destination-policy));
+file reads remain unbounded. Callers enforce withdrawal,
 availability and Record eligibility before using or retaining content;
 durable replication and those policy integrations remain unimplemented.
 

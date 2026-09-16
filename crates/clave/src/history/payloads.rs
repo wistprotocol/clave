@@ -114,7 +114,9 @@ impl PayloadSource {
     }
 
     pub fn fetch(&self, client: &crate::fetch::Client, url: &str) -> Result<RetrievedPayload<'_>> {
-        self.checked(client.get_bytes(url)?, PayloadLocation::Url(url.into()))
+        let raw =
+            client.get_bytes_bounded(url, &[], crate::payload::cap_bytes(self.size_caps()))?;
+        self.checked(raw, PayloadLocation::Url(url.into()))
     }
 
     pub fn retained_location(&self, directory: &Path) -> PayloadLocation {
@@ -231,7 +233,9 @@ impl PayloadSource {
         for location in candidates {
             let raw = match &location {
                 PayloadLocation::File(path) => std::fs::read(path).map_err(Error::from),
-                PayloadLocation::Url(url) => client.get_bytes(url),
+                PayloadLocation::Url(url) => {
+                    client.get_bytes_bounded(url, &[], crate::payload::cap_bytes(self.size_caps()))
+                }
             };
             match raw.and_then(|raw| self.checked(raw, location.clone())) {
                 Ok(mut retrieved) => {

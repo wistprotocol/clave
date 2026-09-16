@@ -312,6 +312,60 @@ fn ingest_budget_suspends_walk_and_resumes_when_budget_allows() {
     assert!(!db.walk_suspended(&host).unwrap());
 }
 
+#[test]
+fn a_pull_suspends_at_its_work_limit_and_a_later_pull_resumes() {
+    let (listener, host, client) = reserve_addr();
+    let p = make_publisher_with_scope(&host, &["example.com"]);
+    let id1 = add_delta(&p, "https://example.com/a", "first content", None);
+    let id2 = add_delta(&p, "https://example.com/a", "second content", Some(&id1));
+    common::write_feed_page(
+        &p,
+        &host,
+        0,
+        std::slice::from_ref(&id1),
+        "2026-08-09T10:00:00Z",
+        None,
+    );
+    common::write_feed_with_next(
+        &p,
+        &host,
+        std::slice::from_ref(&id2),
+        "2026-08-09T12:00:00Z",
+        Some(&common::page_url(&host, 0)),
+    );
+    serve_static(listener, p.dir.path().to_path_buf());
+
+    let tmp = tempfile::tempdir().unwrap();
+    clave::init::run(&host, tmp.path()).unwrap();
+    let db = clave::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+    seal_page_authority(&db, &client, tmp.path(), &p);
+
+    let clock = || "2026-08-09T12:00:05Z".parse::<jiff::Timestamp>().unwrap();
+    let report = clave::ingest::run_bounded(
+        &db,
+        &client,
+        tmp.path(),
+        &host,
+        "2026-08-09T12:00:05Z",
+        clock,
+        clave::ingest::PullLimits {
+            work_bytes: u64::MAX,
+            work_objects: 1,
+        },
+    )
+    .unwrap();
+    assert!(report.suspended);
+    assert!(report.accepted.is_empty());
+    assert!(db.walk_suspended(&host).unwrap());
+    assert!(db.ingest_bytes(&host, "2026-08-09").unwrap() > 0);
+
+    let resumed =
+        clave::ingest::run(&db, &client, tmp.path(), &host, "2026-08-09T12:10:05Z").unwrap();
+    assert_eq!(resumed.accepted, vec![id1.clone(), id2.clone()]);
+    assert!(!resumed.suspended);
+    assert!(!db.walk_suspended(&host).unwrap());
+}
+
 fn seal_page_authority(
     db: &clave::db::Db,
     client: &clave::fetch::Client,

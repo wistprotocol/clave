@@ -286,7 +286,7 @@ fn unsuccessful_refresh_counts_one_feed_failure_without_installing_invalid_autho
 }
 
 #[test]
-fn exhausted_content_budget_allows_feed_refresh_and_resumes_after_restart() {
+fn an_exhausted_content_budget_refuses_the_feed_at_its_bound_and_resumes_after_restart() {
     let (listener, host, client) = reserve_addr();
     let p = make_publisher_with_recovery(&host);
     let previous = current_declaration(&p);
@@ -316,13 +316,17 @@ fn exhausted_content_budget_allows_feed_refresh_and_resumes_after_restart() {
     assert_eq!(report.noise, None);
     assert!(report.accepted.is_empty());
     assert!(db.list_rejections(&host).unwrap().is_empty());
-    assert_eq!(stored(&db), next);
+    assert_eq!(
+        stored(&db),
+        previous,
+        "a Feed refused at the budget bound is never verified, so it triggers no refresh"
+    );
+    assert_eq!(db.ingest_bytes(&host, &NOW[..10]).unwrap(), 1);
     assert_eq!(
         *requests.lock().unwrap(),
         [
             format!("{PREFIX}publisher.json"),
             format!("{PREFIX}feed.json"),
-            format!("{PREFIX}publisher.json")
         ]
     );
     drop(db);
@@ -335,6 +339,7 @@ fn exhausted_content_budget_allows_feed_refresh_and_resumes_after_restart() {
     assert_eq!(report.accepted, [id]);
     assert!(!report.suspended);
     assert_eq!(report.noise, None);
+    assert_eq!(stored(&db), next);
     assert!(!db.walk_suspended(&host).unwrap());
 }
 

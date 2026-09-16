@@ -17,11 +17,19 @@ fn spawn_server(data_dir: &Path) -> String {
 }
 
 fn spawn_server_with_client(data_dir: &Path, transport: clave::fetch::Client) -> String {
+    spawn_server_with_options(data_dir, transport, clave::serve::ServeOptions::default())
+}
+
+fn spawn_server_with_options(
+    data_dir: &Path,
+    transport: clave::fetch::Client,
+    options: clave::serve::ServeOptions,
+) -> String {
     let bind = free_addr();
     let data_dir = data_dir.to_path_buf();
     let db_path = data_dir.join("clave.sqlite");
     std::thread::spawn(move || {
-        clave::serve::run_with_client(data_dir, db_path, bind, transport).unwrap();
+        clave::serve::run_with_options(data_dir, db_path, bind, transport, options).unwrap();
     });
     let addr = format!("http://{bind}");
     let client = reqwest::blocking::Client::new();
@@ -331,4 +339,47 @@ fn sanctioned_domain_ping_gets_403_and_status_shows_state() {
         .json()
         .unwrap();
     assert_eq!(body["state"], "sanctioned_quarantine");
+}
+
+#[test]
+fn pings_beyond_the_pending_bound_are_refused_with_retry_after() {
+    let tmp = tempfile::tempdir().unwrap();
+    clave::init::run("127.0.0.1:0", tmp.path()).unwrap();
+    let addr = spawn_server_with_options(
+        tmp.path(),
+        clave::fetch::Client::new(true),
+        clave::serve::ServeOptions {
+            max_concurrent_ingests: 0,
+            max_pending_ingests: 2,
+        },
+    );
+    let c = reqwest::blocking::Client::new();
+    let ping = |n: u8| {
+        c.post(format!("{addr}/ingest"))
+            .json(&serde_json::json!({"host": format!("127.0.0.{n}:9")}))
+            .send()
+            .unwrap()
+    };
+    let statuses: Vec<u16> = (2..=5).map(|n| ping(n).status().as_u16()).collect();
+    assert_eq!(statuses, vec![202, 202, 503, 503]);
+    let refused = ping(6);
+    assert_eq!(refused.status(), 503);
+    assert_eq!(
+        refused.headers().get("Retry-After").unwrap(),
+        &clave::serve::OVERLOAD_RETRY_AFTER_SECS.to_string()
+    );
+    assert_eq!(
+        ping(2).status(),
+        202,
+        "a host already waiting is not new work"
+    );
+    let r = c
+        .get(format!("{addr}/status/unknown.example"))
+        .send()
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        404,
+        "status answers while the gate is saturated"
+    );
 }
