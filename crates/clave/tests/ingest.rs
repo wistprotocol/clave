@@ -1,5 +1,6 @@
 mod common;
 
+use clave::history::declarations::DeclarationsReplay;
 use common::{
     add_delta, make_publisher, make_publisher_with_scope, reserve_addr, serve_static, write_feed,
 };

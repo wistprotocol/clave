@@ -1,5 +1,6 @@
 use super::{Db, Result};
 use crate::error::Error;
+use crate::history::declarations::DeclarationsReplay;
 use crate::history::{
     declarations::Declarations,
     deltas::{Chains, Delta},

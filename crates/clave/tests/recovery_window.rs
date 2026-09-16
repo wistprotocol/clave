@@ -1,5 +1,6 @@
 mod common;
 
+use clave::history::declarations::DeclarationsReplay;
 use common::*;
 
 const T0: i64 = 1_786_276_800;

@@ -1,4 +1,5 @@
 use clave::history::declarations::Declarations;
+use clave::history::declarations::DeclarationsReplay;
 use serde_json::{json, Value};
 use wist_core::crypto::SigningKey;
 use wist_core::{block, envelope, jcs, merkle};

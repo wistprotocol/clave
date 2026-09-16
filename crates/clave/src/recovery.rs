@@ -2,6 +2,7 @@ use crate::db::Db;
 use crate::declaration;
 use crate::error::{Error, Result};
 use crate::history::declarations::Declarations;
+use crate::history::declarations::DeclarationsReplay;
 use std::path::Path;
 
 pub fn settle(db: &Db, data_dir: &Path, now: &str) -> Result<()> {

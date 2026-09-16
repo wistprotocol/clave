@@ -1,6 +1,7 @@
 use crate::db::Db;
 use crate::error::Result;
 use crate::fetch::Client;
+use crate::history::declarations::DeclarationsReplay;
 use serde_json::Value;
 use std::path::Path;
 use wist_core::delta::delta_id;

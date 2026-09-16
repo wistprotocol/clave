@@ -6,6 +6,7 @@ use super::{
 };
 use crate::db::BlockRow;
 use crate::error::{Error, Result};
+use crate::history::declarations::DeclarationsReplay;
 use std::path::Path;
 use wist_core::sampling::{self, SamplingConstants};
 use wist_core::vrf;

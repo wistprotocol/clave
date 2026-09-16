@@ -1,4 +1,5 @@
 use crate::error::{Error, Result};
+use crate::history::declarations::DeclarationsReplay;
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::Value;
 use std::path::Path;

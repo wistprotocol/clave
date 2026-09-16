@@ -6,6 +6,7 @@ use super::{
 };
 use crate::db::BlockRow;
 use crate::error::{Error, Result};
+use crate::history::declarations::DeclarationsReplay;
 use crate::record::{Duty, RecordEnvelope, ReplayContext};
 use serde_json::Value;
 use std::collections::BTreeMap;

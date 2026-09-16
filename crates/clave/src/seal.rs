@@ -2,6 +2,7 @@ use crate::db::{
     Db, GovernanceRow, ParamChangeRow, PendingEntryRow, RecordUpsert, SealedDeclarationRow,
 };
 use crate::error::{Error, Result};
+use crate::history::declarations::DeclarationsReplay;
 use crate::history::declarations::{Declarations, Projection};
 use crate::history::roster::{Outcome, RosterHistory};
 use crate::history::History;

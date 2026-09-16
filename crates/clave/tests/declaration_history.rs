@@ -1,5 +1,6 @@
 use clave::db::BlockRow;
 use clave::declaration::Decision;
+use clave::history::declarations::DeclarationsReplay;
 use clave::history::declarations::{Declarations, Domain, Effects};
 use clave::history::History;
 use serde_json::{json, Value};

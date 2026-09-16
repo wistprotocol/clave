@@ -3,6 +3,7 @@ mod common;
 use clave::db::Db;
 use clave::declaration::{evaluate_with_heads, Decision};
 use clave::history::declarations::Declarations;
+use clave::history::declarations::DeclarationsReplay;
 use serde_json::{json, Value};
 use wist_core::{block, envelope, jcs};
 

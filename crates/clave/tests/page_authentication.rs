@@ -1,5 +1,6 @@
 mod common;
 
+use clave::history::declarations::DeclarationsReplay;
 use common::*;
 use serde_json::{json, Value};
 
