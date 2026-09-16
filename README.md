@@ -534,9 +534,10 @@ for rungs 3 and 4, an accepted unvoided notice of that level for the active
 activation at or below the height, which is the Aggregator's own
 notice-before-enforcement bound. Live ingestion, serving, quota and
 Snapshot state read this derived state through
-[Derived state](#derived-state); Mirror evidence retention through
-`retention_end_at_s`, the `auditor_remove` a coverage failure requires,
-live pulls and attestation sealing are not implemented.
+[Derived state](#derived-state), which also queues the `auditor_remove` a
+coverage failure requires; Mirror evidence retention through
+`retention_end_at_s`, live pulls and attestation sealing are not
+implemented.
 Observers hold no coverage duty. Reconstruction retains every Block
 profile, Delta binding, Record, duty, publication, audit, finding, notice
 and act in memory without a work bound, exposes nothing after a prefix
@@ -609,16 +610,24 @@ shows: the named `finding` must be a first confirming Record of the domain
 with the severity its closed confirming set fixes, `evidence` must include
 it, the requested level must not exceed the derived ladder, and a level-3 or
 level-4 action seals a `notice` whose `activation` is the active rung's
-confirming Record. Sanction acts, not findings, remain operator-issued; the
-`auditor_remove` a coverage failure requires is not issued.
+confirming Record. Sanction acts, not findings, remain operator-issued.
+
+The refresh also queues the `auditor_remove` WIST-4 §4 requires for every
+Auditor in coverage failure at the head that still holds a key: a Log-signed
+removal of that key whose `evidence` lists the Block Hashes of the failed
+duty Blocks counting at the head, queued once and sealed by the next Block.
+The removal carries evidence, so it is for cause and bars readmission of
+the `auditor_id`; the derived state, not the act, is what excludes the
+Auditor's Records.
 
 Each refresh replays the complete history without a work bound, so sealing
 cost grows with the Log; incremental derivation is deferred to the durable
 ingestion work. Database rows written by local parameter overrides do not
 change the authenticated schedule the replay reads. Tests drive the whole
 path through sealed Records: findings that reach levels 1 to 4, the notice
-before enforcement, lapsed and discharged sealing deadlines, a lift, and
-the quota read from a Block sealed before the day.
+before enforcement, lapsed and discharged sealing deadlines, a lift, the
+quota read from a Block sealed before the day, and a silent Auditor removed
+for cause at the twenty-fifth established failure.
 
 ## Historical coverage clocks
 

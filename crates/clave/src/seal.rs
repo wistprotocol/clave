@@ -1167,7 +1167,7 @@ pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<
     }
 
     mutation.commit()?;
-    crate::derived::refresh(db, data_dir)?;
+    crate::derived::refresh(db, data_dir, sk)?;
 
     if !withdrawals.is_empty() {
         for delta_id in &withdrawals {

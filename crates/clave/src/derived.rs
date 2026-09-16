@@ -2,6 +2,7 @@ use crate::db::{Db, DerivedAuditorRow, DerivedPublisherRow, DerivedPublisherStat
 use crate::error::{Error, Result};
 use crate::history::extension::ExtensionHistory;
 use std::path::Path;
+use wist_core::crypto::SigningKey;
 use wist_core::objects::SanctionDeadlineLabel;
 use wist_core::reputation::PROVISIONAL_CAP_U;
 
@@ -23,7 +24,7 @@ fn instant(epoch: i128) -> Result<String> {
         .to_string())
 }
 
-pub fn refresh(db: &Db, data_dir: &Path) -> Result<()> {
+pub fn refresh(db: &Db, data_dir: &Path, sk: &SigningKey) -> Result<()> {
     let Some(head) = db.last_block()? else {
         return Ok(());
     };
@@ -146,7 +147,59 @@ pub fn refresh(db: &Db, data_dir: &Path) -> Result<()> {
             coverage_failure: *coverage_failure,
         })
         .collect();
-    db.record_derived_state(height, &head.sealed_at, &rows, &auditor_rows)
+    db.record_derived_state(height, &head.sealed_at, &rows, &auditor_rows)?;
+    remove_failed_auditors(db, sk, &history, &head, &auditors)
+}
+
+/// WIST-4 §4: an Auditor in coverage failure MUST be removed by an
+/// `auditor_remove` whose `evidence` names the failed Blocks. The removal
+/// records a consequence the Log already derives; it is queued once, for
+/// the key the Auditor holds at the head, and the next seal records it.
+fn remove_failed_auditors(
+    db: &Db,
+    sk: &SigningKey,
+    history: &ExtensionHistory,
+    head: &crate::db::BlockRow,
+    auditors: &[(String, bool)],
+) -> Result<()> {
+    let (pending, _) = db.peek_pending_entries()?;
+    let sealed_at_s = crate::registry::epoch(&head.sealed_at)?;
+    for (auditor_id, failing) in auditors {
+        if !failing {
+            continue;
+        }
+        let already_queued = pending.iter().any(|entry| {
+            entry.entry_type == "registry_update"
+                && entry.entry_json["update"]["action"] == "auditor_remove"
+                && entry.entry_json["update"]["subject"] == auditor_id.as_str()
+        });
+        if already_queued {
+            continue;
+        }
+        let Some(key) = history.roster().admitted_key_at(auditor_id, sealed_at_s) else {
+            continue;
+        };
+        let mut evidence: Vec<String> = history
+            .counting_failures(auditor_id, head.block_number)
+            .into_iter()
+            .filter_map(|duty| history.block_hash(duty).map(str::to_owned))
+            .collect();
+        evidence.sort();
+        if evidence.is_empty() {
+            continue;
+        }
+        let update = serde_json::json!({
+            "wist_version": crate::WIST_VERSION,
+            "action": "auditor_remove",
+            "subject": auditor_id,
+            "details": {"key_id": key.key_id},
+            "evidence": evidence,
+            "effective_at": head.sealed_at,
+        });
+        let envelope = wist_core::envelope::sign_envelope(&update, "update", "log1", sk)?;
+        db.insert_pending_entry("registry_update", "", &envelope, 0)?;
+    }
+    Ok(())
 }
 
 pub fn publisher_state(db: &Db, domain: &str, at: &str) -> Result<Option<DerivedPublisherState>> {

@@ -320,6 +320,7 @@ pub struct ExtensionHistory {
     anchor_hash: [u8; 32],
     through: Option<BlockRow>,
     blocks: Vec<BlockFact>,
+    hashes: Vec<String>,
     heights: BTreeMap<String, u64>,
     deltas: BTreeMap<String, DeltaFact>,
     deltas_by_height: BTreeMap<u64, Vec<String>>,
@@ -363,6 +364,7 @@ impl ExtensionHistory {
             anchor_hash: history.anchor_hash,
             through: head,
             blocks: Vec::new(),
+            hashes: Vec::new(),
             heights: BTreeMap::new(),
             deltas: BTreeMap::new(),
             deltas_by_height: BTreeMap::new(),
@@ -458,6 +460,7 @@ impl ExtensionHistory {
         }
         let confirmation = block.confirmation_profile();
         self.heights.insert(block.hash().to_owned(), height);
+        self.hashes.push(block.hash().to_owned());
         self.blocks.push(BlockFact {
             block: Block {
                 height,
@@ -1357,6 +1360,10 @@ impl ExtensionHistory {
         self.blocks
             .get(height as usize)
             .map(|b| b.block.sealed_at_s)
+    }
+
+    pub fn block_hash(&self, height: u64) -> Option<&str> {
+        self.hashes.get(height as usize).map(String::as_str)
     }
 
     fn process_act(
