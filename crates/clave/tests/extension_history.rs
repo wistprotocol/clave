@@ -3282,3 +3282,349 @@ fn same_block_discharges_settle_before_the_blocks_records_are_weighed() {
     assert!(!history.in_coverage_failure(filer, 121));
     assert!(history.in_coverage_failure(filer, 122));
 }
+
+fn record_id_of(entry: &Value) -> String {
+    wist_core::delta::delta_id(&entry["body"]["record"]).unwrap()
+}
+
+fn audit_with_similarity(audit: &Audit<'_>, similarity: u64) -> Value {
+    let mut entry = record(audit);
+    let mut body = entry["body"]["record"].clone();
+    body["similarity"] = json!(similarity);
+    entry["body"] =
+        envelope::sign_envelope(&body, "record", &key_id(audit.auditor), &key(audit.auditor))
+            .unwrap();
+    entry
+}
+
+fn notice(
+    fx: &Fixture,
+    subject: &str,
+    level: u64,
+    activation: &str,
+    evidence: &[String],
+    deadline: i64,
+) -> Value {
+    fx.log_signed(json!({
+        "wist_version": "1.0.0", "action": "notice", "subject": subject,
+        "details": {"kind": "sanction", "level": level, "activation": activation,
+                    "reason": "confirmed finding", "appeal_deadline": ts(deadline)},
+        "evidence": evidence, "effective_at": ts(START),
+    }))
+}
+
+fn appeal(subject: &str, notice_id: &str, key_label: &str, key_id: &str) -> Value {
+    let update = json!({
+        "wist_version": "1.0.0", "action": "appeal", "subject": subject,
+        "details": {"notice": notice_id, "statement": "the reference was stale"},
+        "effective_at": ts(START),
+    });
+    json!({
+        "type": "registry_update",
+        "body": envelope::sign_envelope(&update, "update", key_id, &key(key_label)).unwrap(),
+    })
+}
+
+fn ruling(fx: &Fixture, subject: &str, notice_id: &str, outcome: &str) -> Value {
+    fx.log_signed(json!({
+        "wist_version": "1.0.0", "action": "appeal_ruling", "subject": subject,
+        "details": {"notice": notice_id, "outcome": outcome, "reasoning": "decided"},
+        "effective_at": ts(START),
+    }))
+}
+
+fn sanction_act(
+    fx: &Fixture,
+    subject: &str,
+    level: u64,
+    severity: u64,
+    finding: &str,
+    evidence: &[String],
+) -> Value {
+    fx.log_signed(json!({
+        "wist_version": "1.0.0", "action": "sanction", "subject": subject,
+        "details": {"level": level, "severity": severity, "finding": finding},
+        "evidence": evidence, "effective_at": ts(START),
+    }))
+}
+
+#[test]
+fn notice_processes_replay_with_voids_and_enforceable_levels() {
+    use clave::history::extension::ProcessSummary;
+    use wist_core::sanctions::Outcome;
+    let (filer, checker) = ("audit.example.net", "checker.example.org");
+    let mut fx = Fixture::new();
+    fx.attest_empty = true;
+    fx.hourly(
+        0,
+        vec![
+            fx.admit_own(filer),
+            fx.admit_own(checker),
+            declaration(PUBLISHER, &[], "site"),
+        ],
+    );
+    let deltas = pages(PUBLISHER, "site", "n", 48);
+    let audited = fx.hourly(1, deltas.clone());
+    let (fb, cb) = (beta(filer, &audited), beta(checker, &audited));
+    let d = first(&deltas, &|id| {
+        drawn(&fb, id, PROVISIONAL) && drawn(&cb, id, PROVISIONAL)
+    });
+    let first_record = audit_with_similarity(
+        &Audit {
+            auditor: filer,
+            audited: &d,
+            proof_over: &audited,
+            fetched_at: START + HOUR,
+            verdict: "inconsistent",
+        },
+        10_000,
+    );
+    let confirming_record = audit_with_similarity(
+        &Audit {
+            auditor: checker,
+            audited: &d,
+            proof_over: &audited,
+            fetched_at: START + HOUR + 1,
+            verdict: "inconsistent",
+        },
+        10_000,
+    );
+    let (first_id, confirming_id) = (
+        record_id_of(&first_record),
+        record_id_of(&confirming_record),
+    );
+    fx.hourly(2, vec![first_record]);
+    fx.hourly(3, vec![confirming_record]);
+    let evidence = vec![first_id.clone(), confirming_id.clone()];
+    let notice_entry = notice(
+        &fx,
+        PUBLISHER,
+        3,
+        &confirming_id,
+        &evidence,
+        START + 4 * HOUR + 14 * 86_400,
+    );
+    let notice_id = update_id(&notice_entry);
+    let wrong_level = notice(
+        &fx,
+        PUBLISHER,
+        4,
+        &confirming_id,
+        &evidence,
+        START + 4 * HOUR + 14 * 86_400,
+    );
+    fx.hourly(
+        4,
+        vec![
+            notice_entry,
+            wrong_level.clone(),
+            sanction_act(&fx, PUBLISHER, 3, 3, &confirming_id, &evidence),
+            sanction_act(&fx, PUBLISHER, 3, 2, &confirming_id, &evidence),
+            sanction_act(
+                &fx,
+                PUBLISHER,
+                1,
+                3,
+                &confirming_id,
+                &[first_id.clone(), format!("sha256:{}", "7".repeat(64))],
+            ),
+        ],
+    );
+    let unknown_notice = format!("sha256:{}", "5".repeat(64));
+    fx.hourly(
+        5,
+        vec![
+            appeal(PUBLISHER, &notice_id, "site", "k1"),
+            appeal(PUBLISHER, &notice_id, "stranger", "k1"),
+            appeal(PUBLISHER, &notice_id, "site", "kx"),
+            ruling(&fx, PUBLISHER, &unknown_notice, "upheld"),
+        ],
+    );
+    fx.hourly(6, vec![ruling(&fx, PUBLISHER, &notice_id, "overturned")]);
+    for height in 7..=10 {
+        fx.hourly(height, vec![]);
+    }
+    let history = fx.reconstruct().unwrap();
+    assert_eq!(history.findings().len(), 1);
+    assert_eq!(history.findings()[0].severity, 3);
+    assert_eq!(history.findings()[0].confirming_record_id, confirming_id);
+    assert_eq!(history.sanction_level(PUBLISHER, 2), 0);
+    assert_eq!(history.sanction_level(PUBLISHER, 3), 3);
+    assert_eq!(history.sanction_level(PUBLISHER, 5), 3);
+    assert_eq!(
+        history.sanction_level(PUBLISHER, 6),
+        1,
+        "an overturned ruling voids the level-3 activation"
+    );
+    assert_eq!(history.sanction_level(PUBLISHER, 10), 1);
+    assert_eq!(
+        history.enforceable_level(PUBLISHER, 3),
+        1,
+        "no notice yet: only rungs 1-2 are enforceable"
+    );
+    assert_eq!(history.enforceable_level(PUBLISHER, 4), 3);
+    assert_eq!(history.enforceable_level(PUBLISHER, 5), 3);
+    assert_eq!(history.enforceable_level(PUBLISHER, 6), 1);
+    let processes = history.processes(PUBLISHER).unwrap();
+    assert_eq!(processes.accepted.len(), 1);
+    let process: &ProcessSummary = &processes.accepted[0];
+    assert_eq!(process.notice.block_number, 4);
+    assert_eq!(process.id, notice_id);
+    assert_eq!(
+        (process.level, process.activation.as_str()),
+        (3, confirming_id.as_str())
+    );
+    assert_eq!(process.appeal.map(|p| p.block_number), Some(5));
+    assert_eq!(
+        process.merits.map(|(p, outcome)| (p.block_number, outcome)),
+        Some((6, Outcome::Overturned))
+    );
+    assert_eq!(process.unappealed, None);
+    assert_eq!(process.void_at_s, Some(i128::from(START + 6 * HOUR)));
+    assert_eq!(
+        process.retention_end_at_s,
+        Some(i128::from(START + 6 * HOUR))
+    );
+    let rejected: Vec<(u64, &str)> = processes
+        .rejected
+        .iter()
+        .map(|(p, code)| (p.block_number, *code))
+        .collect();
+    assert_eq!(
+        rejected,
+        vec![(4, "WIST4-E05"), (5, "WIST4-E05")],
+        "the level-4 notice and the ruling for an unknown notice"
+    );
+    let mut acts: Vec<(u64, &str, &str)> = history
+        .rejected_acts()
+        .iter()
+        .map(|r| (r.position.block_number, r.action.as_str(), r.code))
+        .collect();
+    acts.sort();
+    assert_eq!(
+        acts,
+        vec![(5, "appeal", "WIST1-E01"), (5, "appeal", "WIST4-E05")]
+    );
+    let mut sanctions: Vec<(u8, u8, Option<&str>, bool)> = processes
+        .sanctions
+        .iter()
+        .map(|s| (s.level, s.severity, s.diagnostic, s.noticed))
+        .collect();
+    sanctions.sort();
+    assert_eq!(
+        sanctions,
+        vec![
+            (1, 3, Some("WIST4-E05"), false),
+            (3, 2, Some("WIST4-E05"), true),
+            (3, 3, None, true),
+        ]
+    );
+    assert_eq!(processes.levels, vec![(0, 0), (3, 3), (6, 1)]);
+    assert_eq!(
+        processes.activations.last().unwrap().1,
+        [Some(confirming_id.clone()), None, None, None]
+    );
+}
+
+#[test]
+fn lapsed_appeal_sealing_deadline_voids_state_unless_an_unappealed_ruling_discharges_it() {
+    let (filer, checker) = ("audit.example.net", "checker.example.org");
+    for discharged in [false, true] {
+        let mut fx = Fixture::new();
+        fx.hourly(
+            0,
+            vec![
+                fx.admit_own(filer),
+                fx.admit_own(checker),
+                declaration(PUBLISHER, &[], "site"),
+            ],
+        );
+        let deltas = pages(PUBLISHER, "site", "v", 48);
+        let audited = fx.hourly(1, deltas.clone());
+        let (fb, cb) = (beta(filer, &audited), beta(checker, &audited));
+        let d = first(&deltas, &|id| {
+            drawn(&fb, id, PROVISIONAL) && drawn(&cb, id, PROVISIONAL)
+        });
+        let first_record = audit_with_similarity(
+            &Audit {
+                auditor: filer,
+                audited: &d,
+                proof_over: &audited,
+                fetched_at: START + HOUR,
+                verdict: "inconsistent",
+            },
+            10_000,
+        );
+        let confirming_record = audit_with_similarity(
+            &Audit {
+                auditor: checker,
+                audited: &d,
+                proof_over: &audited,
+                fetched_at: START + HOUR + 1,
+                verdict: "inconsistent",
+            },
+            10_000,
+        );
+        let evidence = vec![
+            record_id_of(&first_record),
+            record_id_of(&confirming_record),
+        ];
+        let activation = evidence[1].clone();
+        fx.hourly(2, vec![first_record]);
+        fx.hourly(3, vec![confirming_record]);
+        let notice_entry = notice(
+            &fx,
+            PUBLISHER,
+            3,
+            &activation,
+            &evidence,
+            START + 4 * HOUR + 14 * 86_400,
+        );
+        let notice_id = update_id(&notice_entry);
+        fx.hourly(4, vec![notice_entry]);
+        let window_close = 4 + 14 * 24;
+        let seal_deadline = window_close + 7 * 24;
+        for height in 5..=seal_deadline + 2 {
+            let entries = if discharged && height == window_close {
+                vec![ruling(&fx, PUBLISHER, &notice_id, "unappealed")]
+            } else {
+                Vec::new()
+            };
+            fx.hourly(height, entries);
+        }
+        let history = fx.reconstruct().unwrap();
+        assert!(history.rejected_acts().is_empty(), "{discharged}");
+        let processes = history.processes(PUBLISHER).unwrap();
+        assert!(processes.rejected.is_empty(), "{discharged}");
+        let process = &processes.accepted[0];
+        assert_eq!(
+            history.sanction_level(PUBLISHER, seal_deadline - 1),
+            3,
+            "{discharged}"
+        );
+        if discharged {
+            assert_eq!(
+                process.unappealed.map(|p| p.block_number),
+                Some(window_close)
+            );
+            assert_eq!(process.void_at_s, None);
+            assert_eq!(history.sanction_level(PUBLISHER, seal_deadline + 2), 3);
+            assert_eq!(history.enforceable_level(PUBLISHER, seal_deadline + 2), 3);
+        } else {
+            assert_eq!(
+                process.void_at_s,
+                Some(i128::from(START + seal_deadline as i64 * HOUR))
+            );
+            assert_eq!(
+                history.sanction_level(PUBLISHER, seal_deadline),
+                1,
+                "silence voids the state at T"
+            );
+            assert_eq!(history.enforceable_level(PUBLISHER, seal_deadline), 1);
+        }
+        assert_eq!(
+            process.retention_end_at_s,
+            Some(i128::from(START + seal_deadline as i64 * HOUR))
+        );
+    }
+}

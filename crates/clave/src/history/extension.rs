@@ -9,6 +9,7 @@ use crate::error::{Error, Result};
 use crate::record::{Duty, RecordEnvelope, ReplayContext};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::path::Path;
 use wist_core::confirmation::{
     ci_severity, confirming_index_including, independent, CandidateRecord,
@@ -21,6 +22,7 @@ use wist_core::derivation::{
 use wist_core::envelope::verify_envelope;
 pub use wist_core::extension::ExtensionOutcome;
 use wist_core::extension::{self, Escalation, ExtensionClaim, ExtensionRecord, RATION_WINDOW_DAYS};
+use wist_core::objects::audit::RegistryUpdate;
 use wist_core::objects::audit::Verdict as SealedVerdict;
 use wist_core::objects::audit::{RegistryAction, RegistryUpdateEnvelope};
 use wist_core::reputation::{
@@ -28,7 +30,10 @@ use wist_core::reputation::{
     DecayTable, PROVISIONAL_CAP_U,
 };
 use wist_core::sampling::{self, SamplingConstants};
-use wist_core::sanctions::{Ladder, OrderedFinding, SanctionBlock};
+use wist_core::sanctions::{
+    ConfirmedFinding as CoreFinding, EvidenceRecord, Ladder, NoticeCandidate, OrderedFinding,
+    Outcome, ProcessAct, ProcessKind, Replay, ReplayBlock, SanctionBlock,
+};
 use wist_core::verdict::{self, ChangeType, Thresholds, Verdict};
 use wist_core::vrf;
 
@@ -57,9 +62,70 @@ pub struct Finding {
     pub confirming_sealed_at_s: i64,
     pub confirming_record_id: String,
     pub severity: u8,
+    pub records_len: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessSummary {
+    pub notice: Position,
+    pub id: String,
+    pub level: u8,
+    pub activation: String,
+    pub appeal: Option<Position>,
+    pub merits: Option<(Position, Outcome)>,
+    pub unappealed: Option<Position>,
+    pub void_at_s: Option<i128>,
+    pub retention_end_at_s: Option<i128>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SanctionSummary {
+    pub position: Position,
+    pub level: u8,
+    pub severity: u8,
+    pub finding: String,
+    pub diagnostic: Option<&'static str>,
+    pub noticed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PublisherProcesses {
+    pub levels: Vec<(u64, u8)>,
+    pub activations: Vec<(u64, [Option<String>; 4])>,
+    pub accepted: Vec<ProcessSummary>,
+    pub rejected: Vec<(Position, &'static str)>,
+    pub sanctions: Vec<SanctionSummary>,
+}
+
+struct NoticeRecord {
+    position: Position,
+    id: String,
+    subject: String,
+    update: RegistryUpdate,
+    keys: Vec<(String, String)>,
+}
+
+struct ActRecord {
+    position: Position,
+    sealed_at_s: i64,
+    id: String,
+    subject: String,
+    notice: String,
+    kind: ProcessKind,
+    ruling_deadline_days: u64,
+}
+
+struct SanctionRecord {
+    position: Position,
+    subject: String,
+    level: u8,
+    severity: u8,
+    finding: String,
+    evidence: Vec<String>,
 }
 
 struct FindingRecord {
+    id: [u8; 32],
     position: Position,
     sealed_at_s: i64,
     auditor_id: String,
@@ -227,6 +293,7 @@ struct BlockFact {
     extension_triggers_max: u64,
     coverage: super::coverage::CoverageProfile,
     decay_horizon_days: u64,
+    process: super::ProcessProfile,
 }
 
 struct DeltaFact {
@@ -275,6 +342,13 @@ pub struct ExtensionHistory {
     rungs: BTreeMap<String, Vec<(u64, u8)>>,
     block_resets: Vec<String>,
     block_lifts: Vec<String>,
+    lifts: BTreeSet<(String, u64)>,
+    record_ids_by_height: BTreeMap<u64, Vec<[u8; 32]>>,
+    record_id_heights: BTreeMap<String, u64>,
+    notices: Vec<NoticeRecord>,
+    acts: Vec<ActRecord>,
+    sanction_acts: Vec<SanctionRecord>,
+    processes: BTreeMap<String, PublisherProcesses>,
 }
 
 impl ExtensionHistory {
@@ -311,6 +385,13 @@ impl ExtensionHistory {
             rungs: BTreeMap::new(),
             block_resets: Vec::new(),
             block_lifts: Vec::new(),
+            lifts: BTreeSet::new(),
+            record_ids_by_height: BTreeMap::new(),
+            record_id_heights: BTreeMap::new(),
+            notices: Vec::new(),
+            acts: Vec::new(),
+            sanction_acts: Vec::new(),
+            processes: BTreeMap::new(),
         };
         while let Some(block) = history.next_block()? {
             let effects = declarations.apply(&block)?;
@@ -337,13 +418,23 @@ impl ExtensionHistory {
             replay.open_duties(&block);
             for (entry_index, entry) in block.block().entries.iter().enumerate() {
                 match entry["type"].as_str() {
-                    Some("registry_update") => replay.registry_update(
-                        &block,
-                        entry_index,
-                        &entry["body"],
-                        history.log_key_id(),
-                        history.log_key(),
-                    )?,
+                    Some("registry_update") => {
+                        replay.registry_update(
+                            &block,
+                            entry_index,
+                            &entry["body"],
+                            history.log_key_id(),
+                            history.log_key(),
+                        )?;
+                        replay.process_act(
+                            &block,
+                            entry_index,
+                            &entry["body"],
+                            history.log_key_id(),
+                            history.log_key(),
+                            &declarations,
+                        )?;
+                    }
                     Some("audit_record") => replay.classify(&block, entry_index, &entry["body"])?,
                     _ => {}
                 }
@@ -351,6 +442,7 @@ impl ExtensionHistory {
             replay.settle(&block)?;
             replay.close_extensions()?;
         }
+        replay.settle_processes()?;
         Ok(replay)
     }
 
@@ -376,6 +468,7 @@ impl ExtensionHistory {
             extension_triggers_max: block.extension_triggers_max(),
             coverage: *block.coverage_profile(),
             decay_horizon_days: block.decay_horizon_days(),
+            process: *block.process_profile(),
         });
         Ok(())
     }
@@ -592,6 +685,13 @@ impl ExtensionHistory {
         let record_id = wist_core::delta::delta_id(record).ok();
         if let Some(id) = &record_id {
             self.sealed_ids.entry(id.clone()).or_insert(height);
+            self.record_id_heights.entry(id.clone()).or_insert(height);
+            if let Some(raw) = parse_digest(id) {
+                self.record_ids_by_height
+                    .entry(height)
+                    .or_default()
+                    .push(raw);
+            }
         }
         self.publications.push(Publication {
             auditor_id: auditor_id.clone(),
@@ -1008,6 +1108,9 @@ impl ExtensionHistory {
         }
         let resets = std::mem::take(&mut self.block_resets);
         let lifts = std::mem::take(&mut self.block_lifts);
+        for lift in &lifts {
+            self.lifts.insert((lift.clone(), height));
+        }
         let mut publishers: Vec<String> = resets.iter().chain(&lifts).cloned().collect();
         publishers.extend(new_findings.keys().cloned());
         publishers.sort();
@@ -1059,6 +1162,7 @@ impl ExtensionHistory {
             .and_then(|bytes| bytes.try_into().ok())?;
         let block = &self.blocks[record.position.block_number as usize];
         let entry = FindingRecord {
+            id,
             position: record.position,
             sealed_at_s: record.sealed_at_s,
             auditor_id: record.auditor_id.clone(),
@@ -1113,6 +1217,7 @@ impl ExtensionHistory {
             confirming_sealed_at_s: sealed_at_s,
             confirming_record_id,
             severity,
+            records_len: last + 1,
         });
         let reset = most_recent_reset(
             self.resets
@@ -1187,14 +1292,567 @@ impl ExtensionHistory {
     }
 
     pub fn sanction_level(&self, publisher: &str, height: u64) -> u8 {
-        self.rungs
+        self.processes
             .get(publisher)
-            .and_then(|rungs| rungs.iter().rev().find(|(at, _)| *at <= height))
+            .and_then(|state| state.levels.iter().rev().find(|(at, _)| *at <= height))
             .map_or(0, |(_, level)| *level)
     }
 
     pub fn level1_sanction(&self, publisher: &str, height: u64) -> bool {
-        self.sanction_level(publisher, height) >= 1
+        self.rungs
+            .get(publisher)
+            .and_then(|rungs| rungs.iter().rev().find(|(at, _)| *at <= height))
+            .is_some_and(|(_, level)| *level >= 1)
+    }
+
+    pub fn enforceable_level(&self, publisher: &str, height: u64) -> u8 {
+        let Some(state) = self.processes.get(publisher) else {
+            return 0;
+        };
+        let Some((_, activations)) = state.activations.iter().rev().find(|(at, _)| *at <= height)
+        else {
+            return 0;
+        };
+        let Some(sealed_at_s) = self
+            .blocks
+            .get(height as usize)
+            .map(|b| b.block.sealed_at_s)
+        else {
+            return 0;
+        };
+        (1..=4u8)
+            .rev()
+            .find(|level| {
+                let Some(activation) = &activations[usize::from(level - 1)] else {
+                    return false;
+                };
+                *level <= 2
+                    || state.accepted.iter().any(|process| {
+                        process.level == *level
+                            && process.activation == *activation
+                            && process.notice.block_number <= height
+                            && process
+                                .void_at_s
+                                .is_none_or(|void| void > i128::from(sealed_at_s))
+                    })
+            })
+            .unwrap_or(0)
+    }
+
+    pub fn processes(&self, publisher: &str) -> Option<&PublisherProcesses> {
+        self.processes.get(publisher)
+    }
+
+    fn process_act(
+        &mut self,
+        block: &VerifiedBlock,
+        entry_index: usize,
+        body: &Value,
+        log_key_id: &str,
+        log_key: &PublicKey,
+        declarations: &Declarations,
+    ) -> Result<()> {
+        let action = body["update"]["action"].as_str().unwrap_or("");
+        if !matches!(action, "notice" | "appeal" | "appeal_ruling" | "sanction") {
+            return Ok(());
+        }
+        let position = Position {
+            block_number: block.block().header.block_number,
+            entry_index,
+        };
+        if let Err((code, reason)) =
+            self.process_act_inner(block, position, body, log_key_id, log_key, declarations)
+        {
+            self.rejected_acts.push(RejectedAct {
+                position,
+                action: action.to_owned(),
+                subject: body["update"]["subject"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+                code,
+                reason: format!("{code}: {reason}"),
+            });
+        }
+        Ok(())
+    }
+
+    fn process_act_inner(
+        &mut self,
+        block: &VerifiedBlock,
+        position: Position,
+        body: &Value,
+        log_key_id: &str,
+        log_key: &PublicKey,
+        declarations: &Declarations,
+    ) -> std::result::Result<(), (&'static str, String)> {
+        let sealed_at_s = block.sealed_at_s();
+        let id = crate::governance::update_id(&body["update"])
+            .map_err(|e| ("WIST4-E11", format!("act cannot be identified: {e}")))?;
+        let envelope: RegistryUpdateEnvelope =
+            serde_json::from_value(body.clone()).map_err(|e| {
+                (
+                    "WIST4-E11",
+                    format!("malformed Registry Update envelope: {e}"),
+                )
+            })?;
+        let update = envelope.update.clone();
+        if !crate::record::release(&update.wist_version)
+            || update.wist_version.split('.').next() != Some("1")
+        {
+            return Err(("WIST4-E11", "unsupported Registry Update version".into()));
+        }
+        if crate::registry::epoch(&update.effective_at).is_err() {
+            return Err((
+                "WIST4-E11",
+                "effective_at is not a whole-second UTC instant".into(),
+            ));
+        }
+        if envelope.sig.alg != "Ed25519"
+            || envelope.sig.key_id.chars().count() > 64
+            || !canonical_b64u(&envelope.sig.value, 64)
+        {
+            return Err(("WIST4-E11", "malformed signature fields".into()));
+        }
+        if !canonical_host_shape(&update.subject) {
+            return Err(("WIST4-E04", "subject is not a Canonical Host".into()));
+        }
+        let details = update
+            .details
+            .as_ref()
+            .filter(|details| details.is_object())
+            .ok_or(("WIST4-E04", "details are missing".to_owned()))?;
+        let log_signed =
+            envelope.sig.key_id == log_key_id && verify_envelope(body, "update", log_key).is_ok();
+        let subject = update.subject.clone();
+        match update.action {
+            RegistryAction::Notice => {
+                match details["kind"].as_str() {
+                    Some("recovery") => return Ok(()),
+                    Some("sanction") => {}
+                    _ => {
+                        return Err((
+                            "WIST4-E04",
+                            "notice kind is neither sanction nor recovery".into(),
+                        ))
+                    }
+                }
+                let level_ok = matches!(details["level"].as_u64(), Some(3 | 4));
+                let activation_ok = details["activation"].as_str().is_some_and(digest);
+                let reason_ok = details["reason"]
+                    .as_str()
+                    .is_some_and(|reason| (1..=1024).contains(&reason.chars().count()));
+                let deadline_ok = details["appeal_deadline"]
+                    .as_str()
+                    .is_some_and(|at| crate::registry::epoch(at).is_ok());
+                let evidence_ok = update
+                    .evidence
+                    .as_ref()
+                    .is_some_and(|ids| !ids.is_empty() && ids.iter().all(|id| digest(id)));
+                if !(level_ok && activation_ok && reason_ok && deadline_ok && evidence_ok) {
+                    return Err((
+                        "WIST4-E04",
+                        "sanction notice details or evidence are malformed".into(),
+                    ));
+                }
+                if !log_signed {
+                    return Err((
+                        "WIST4-E11",
+                        "signature does not verify under the Log key".into(),
+                    ));
+                }
+                let keys = declarations
+                    .domains()
+                    .get(&subject)
+                    .map(|domain| {
+                        domain.appeal_declaration().envelope()["publisher"]["keys"].clone()
+                    })
+                    .and_then(|keys| keys.as_array().cloned())
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|key| {
+                        Some((
+                            key["key_id"].as_str()?.to_owned(),
+                            key["public_key"].as_str()?.to_owned(),
+                        ))
+                    })
+                    .collect();
+                self.notices.push(NoticeRecord {
+                    position,
+                    id,
+                    subject,
+                    update,
+                    keys,
+                });
+            }
+            RegistryAction::Appeal => {
+                let notice = details["notice"]
+                    .as_str()
+                    .filter(|id| digest(id))
+                    .ok_or(("WIST4-E04", "appeal names no notice ID".to_owned()))?
+                    .to_owned();
+                let Some(target) = self
+                    .notices
+                    .iter()
+                    .find(|record| record.id == notice && record.subject == subject)
+                else {
+                    return Err((
+                        "WIST4-E05",
+                        "appeal names no accepted sanction notice of its subject".into(),
+                    ));
+                };
+                let Some((_, public_key)) = target
+                    .keys
+                    .iter()
+                    .find(|(key_id, _)| *key_id == envelope.sig.key_id)
+                else {
+                    return Err((
+                        "WIST4-E05",
+                        "appeal signer is absent from the notice-era Key Set".into(),
+                    ));
+                };
+                let verifies = PublicKey::from_b64u(public_key)
+                    .is_ok_and(|key| verify_envelope(body, "update", &key).is_ok());
+                if !verifies {
+                    return Err((
+                        "WIST1-E01",
+                        "appeal signature fails under the frozen entry".into(),
+                    ));
+                }
+                let ruling_deadline_days = block.process_profile().ruling_deadline_days;
+                self.acts.push(ActRecord {
+                    position,
+                    sealed_at_s,
+                    id,
+                    subject,
+                    notice,
+                    kind: ProcessKind::Appeal,
+                    ruling_deadline_days,
+                });
+            }
+            RegistryAction::AppealRuling => {
+                let notice = details["notice"]
+                    .as_str()
+                    .filter(|id| digest(id))
+                    .ok_or(("WIST4-E04", "ruling names no notice ID".to_owned()))?
+                    .to_owned();
+                let outcome = match details["outcome"].as_str() {
+                    Some("upheld") => Outcome::Upheld,
+                    Some("overturned") => Outcome::Overturned,
+                    Some("unappealed") => Outcome::Unappealed,
+                    _ => return Err(("WIST4-E04", "ruling outcome is malformed".into())),
+                };
+                if !details["reasoning"]
+                    .as_str()
+                    .is_some_and(|reasoning| (1..=1024).contains(&reasoning.chars().count()))
+                {
+                    return Err(("WIST4-E04", "ruling reasoning is malformed".into()));
+                }
+                if !log_signed {
+                    return Err((
+                        "WIST4-E11",
+                        "signature does not verify under the Log key".into(),
+                    ));
+                }
+                self.acts.push(ActRecord {
+                    position,
+                    sealed_at_s,
+                    id,
+                    subject,
+                    notice,
+                    kind: ProcessKind::Ruling(outcome),
+                    ruling_deadline_days: block.process_profile().ruling_deadline_days,
+                });
+            }
+            RegistryAction::Sanction => {
+                let level = details["level"]
+                    .as_u64()
+                    .filter(|level| (1..=4).contains(level));
+                let severity = details["severity"]
+                    .as_u64()
+                    .filter(|severity| (1..=3).contains(severity));
+                let finding = details["finding"].as_str().filter(|id| digest(id));
+                let evidence = update
+                    .evidence
+                    .clone()
+                    .filter(|ids| ids.len() >= 2 && ids.iter().all(|id| digest(id)));
+                let (Some(level), Some(severity), Some(finding), Some(evidence)) =
+                    (level, severity, finding, evidence)
+                else {
+                    return Err((
+                        "WIST4-E04",
+                        "sanction details or evidence are malformed".into(),
+                    ));
+                };
+                if !log_signed {
+                    return Err((
+                        "WIST4-E11",
+                        "signature does not verify under the Log key".into(),
+                    ));
+                }
+                self.sanction_acts.push(SanctionRecord {
+                    position,
+                    subject,
+                    level: level as u8,
+                    severity: severity as u8,
+                    finding: finding.to_owned(),
+                    evidence,
+                });
+            }
+            _ => unreachable!("only process acts reach process_act_inner"),
+        }
+        Ok(())
+    }
+
+    fn settle_processes(&mut self) -> Result<()> {
+        let mut publishers: BTreeSet<String> = BTreeSet::new();
+        publishers.extend(self.findings.iter().map(|f| f.publisher.clone()));
+        publishers.extend(self.notices.iter().map(|n| n.subject.clone()));
+        publishers.extend(self.acts.iter().map(|a| a.subject.clone()));
+        publishers.extend(self.sanction_acts.iter().map(|s| s.subject.clone()));
+        publishers.extend(self.lifts.iter().map(|(p, _)| p.clone()));
+        publishers.extend(self.resets.keys().cloned());
+        let mut processes = BTreeMap::new();
+        for publisher in publishers {
+            let state = self.replay_processes(&publisher)?;
+            processes.insert(publisher, state);
+        }
+        self.processes = processes;
+        Ok(())
+    }
+
+    fn replay_processes(&self, publisher: &str) -> Result<PublisherProcesses> {
+        let resets = self
+            .resets
+            .get(publisher)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let findings: Vec<&Finding> = self
+            .findings
+            .iter()
+            .filter(|f| f.publisher == publisher)
+            .collect();
+        let evidence: Vec<Vec<EvidenceRecord<'_>>> = findings
+            .iter()
+            .map(|f| {
+                self.finding_records[&(f.delta_id.clone(), f.link)][..f.records_len]
+                    .iter()
+                    .map(|r| EvidenceRecord {
+                        id: r.id,
+                        record: CandidateRecord {
+                            block_height: r.position.block_number,
+                            entry_index: r.position.entry_index as u64,
+                            block_sealed_at_s: r.sealed_at_s,
+                            auditor_id: &r.auditor_id,
+                            effective_similarity: r.effective_similarity,
+                        },
+                        confirm_window_hours: r.confirm_window_hours,
+                        confirm_auditors: r.confirm_auditors,
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut confirmed: BTreeMap<u64, Vec<CoreFinding<'_>>> = BTreeMap::new();
+        for (finding, records) in findings.iter().zip(&evidence) {
+            let reset = most_recent_reset(resets, finding.confirming.block_number);
+            if reset.is_some_and(|r| finding.audited_height < r) {
+                continue;
+            }
+            let core = CoreFinding::new(records, finding.link)
+                .map_err(|e| Error::History(format!("finding replay failed: {e}")))?;
+            confirmed
+                .entry(finding.confirming.block_number)
+                .or_default()
+                .push(core);
+        }
+        let notices: Vec<&NoticeRecord> = self
+            .notices
+            .iter()
+            .filter(|n| n.subject == publisher)
+            .collect();
+        let acts: Vec<&ActRecord> = self
+            .acts
+            .iter()
+            .filter(|a| a.subject == publisher)
+            .collect();
+        let mut replay = Replay::new(publisher);
+        let mut state = PublisherProcesses::default();
+        for fact in &self.blocks {
+            let height = fact.block.height;
+            let block_notices: Vec<&NoticeRecord> = notices
+                .iter()
+                .copied()
+                .filter(|n| n.position.block_number == height)
+                .collect();
+            let candidates: Vec<NoticeCandidate<'_>> = block_notices
+                .iter()
+                .map(|n| NoticeCandidate {
+                    id: &n.id,
+                    update: &n.update,
+                })
+                .collect();
+            let block_acts: Vec<&ActRecord> = acts
+                .iter()
+                .copied()
+                .filter(|a| a.position.block_number == height)
+                .collect();
+            let process_acts: Vec<ProcessAct<'_>> = block_acts
+                .iter()
+                .map(|a| ProcessAct {
+                    id: &a.id,
+                    notice: &a.notice,
+                    subject: &a.subject,
+                    height,
+                    sealed_at_s: a.sealed_at_s,
+                    kind: a.kind,
+                    ruling_deadline_days: a.ruling_deadline_days,
+                })
+                .collect();
+            let admission = replay
+                .apply_block(ReplayBlock {
+                    height,
+                    sealed_at_s: fact.block.sealed_at_s,
+                    reset: resets.contains(&height),
+                    lift: self.lifts.contains(&(publisher.to_owned(), height)),
+                    findings: confirmed
+                        .get(&height)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default(),
+                    available_records: self
+                        .record_ids_by_height
+                        .get(&height)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default(),
+                    notices: &candidates,
+                    acts: &process_acts,
+                    appeal_window_days: fact.process.appeal_window_days,
+                    appeal_seal_days: fact.process.appeal_seal_days,
+                })
+                .map_err(|e| Error::History(format!("process replay failed: {e}")))?;
+            for (index, code) in admission.rejected_notices {
+                state.rejected.push((block_notices[index].position, code));
+            }
+            for index in admission.rejected_acts {
+                state
+                    .rejected
+                    .push((block_acts[index].position, "WIST4-E05"));
+            }
+            let level = replay.ladder().level();
+            if state.levels.last().is_none_or(|(_, l)| *l != level) {
+                state.levels.push((height, level));
+            }
+            let activations: [Option<String>; 4] = std::array::from_fn(|i| {
+                replay.ladder().active()[i].map(|a| digest_string(&a.record_id))
+            });
+            if state
+                .activations
+                .last()
+                .is_none_or(|(_, current)| *current != activations)
+            {
+                state.activations.push((height, activations));
+            }
+        }
+        for accepted in replay.notices() {
+            let mut seen = BTreeSet::new();
+            let routed: Vec<&ActRecord> = acts
+                .iter()
+                .copied()
+                .filter(|a| seen.insert(a.id.clone()) && a.notice == accepted.notice.id)
+                .collect();
+            let notice = notices
+                .iter()
+                .find(|n| n.id == accepted.notice.id)
+                .ok_or_else(|| Error::History("accepted notice left its candidates".into()))?;
+            let at = |index: Option<usize>| index.map(|i| routed[i].position);
+            state.accepted.push(ProcessSummary {
+                notice: notice.position,
+                id: accepted.notice.id.to_owned(),
+                level: accepted.level,
+                activation: digest_string(&accepted.activation),
+                appeal: at(accepted.state.appeal_index),
+                merits: accepted
+                    .state
+                    .merits_index
+                    .and_then(|i| match routed[i].kind {
+                        ProcessKind::Ruling(outcome) => Some((routed[i].position, outcome)),
+                        ProcessKind::Appeal => None,
+                    }),
+                unappealed: at(accepted.state.unappealed_index),
+                void_at_s: accepted.state.void_at_s,
+                retention_end_at_s: accepted.state.retention_end_at_s,
+            });
+        }
+        state.rejected.sort_by_key(|(position, _)| *position);
+        for sanction in self.sanction_acts.iter().filter(|s| s.subject == publisher) {
+            let diagnostic = self.sanction_diagnostic(sanction, &findings);
+            let noticed = state.accepted.iter().any(|process| {
+                process.level == sanction.level
+                    && process.notice.block_number <= sanction.position.block_number
+            });
+            state.sanctions.push(SanctionSummary {
+                position: sanction.position,
+                level: sanction.level,
+                severity: sanction.severity,
+                finding: sanction.finding.clone(),
+                diagnostic,
+                noticed,
+            });
+        }
+        Ok(state)
+    }
+
+    fn sanction_diagnostic(
+        &self,
+        sanction: &SanctionRecord,
+        findings: &[&Finding],
+    ) -> Option<&'static str> {
+        let height = sanction.position.block_number;
+        let Some(finding) = findings.iter().find(|f| {
+            f.confirming_record_id == sanction.finding && f.confirming.block_number <= height
+        }) else {
+            return Some("WIST4-E05");
+        };
+        if finding.severity != sanction.severity || !sanction.evidence.contains(&sanction.finding) {
+            return Some("WIST4-E05");
+        }
+        if sanction.evidence.iter().any(|id| {
+            !self
+                .record_id_heights
+                .get(id)
+                .is_some_and(|sealed| *sealed <= height)
+        }) {
+            return Some("WIST4-E05");
+        }
+        let records =
+            &self.finding_records[&(finding.delta_id.clone(), finding.link)][..finding.records_len];
+        let cited: Vec<&FindingRecord> = records
+            .iter()
+            .filter(|r| sanction.evidence.contains(&digest_string(&r.id)))
+            .collect();
+        let candidates: Vec<CandidateRecord<'_>> = cited
+            .iter()
+            .map(|r| CandidateRecord {
+                block_height: r.position.block_number,
+                entry_index: r.position.entry_index as u64,
+                block_sealed_at_s: r.sealed_at_s,
+                auditor_id: &r.auditor_id,
+                effective_similarity: r.effective_similarity,
+            })
+            .collect();
+        let Some(required) = cited.iter().position(|r| r.position == finding.confirming) else {
+            return Some("WIST4-E05");
+        };
+        let last = &records[records.len() - 1];
+        let established = confirming_index_including(
+            &candidates,
+            last.confirm_window_hours,
+            last.confirm_auditors,
+            required,
+        )
+        .ok()
+        .flatten()
+        .is_some_and(|i| i == required);
+        (!established).then_some("WIST4-E05")
     }
 
     pub fn prior_state(&self, publisher: &str, height: Option<u64>) -> PriorState {
@@ -1599,6 +2257,28 @@ impl ExtensionHistory {
             .collect();
         extension::escalated_sampling(&escalations, publisher, at.block)
     }
+}
+
+fn canonical_host_shape(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 253
+        && value.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'-'))
+        })
+}
+
+fn parse_digest(id: &str) -> Option<[u8; 32]> {
+    id.strip_prefix("sha256:")
+        .and_then(|hex| wist_core::crypto::hex_decode(hex).ok())
+        .and_then(|bytes| bytes.try_into().ok())
+}
+
+fn digest_string(raw: &[u8; 32]) -> String {
+    format!("sha256:{}", wist_core::crypto::hex_encode(raw))
 }
 
 fn canonical_b64u(value: &str, octets: usize) -> bool {

@@ -504,14 +504,42 @@ the quorum and window in force at that Record's Block are met, with the
 height)` and `level1_sanction` read core's derived ladder, fed per Block with identity resets,
 Log-signed `sanction_lift` acts (rejected as WIST4-E11/E04 like other acts)
 and the Block's new findings in confirming-Record order; a finding whose
-Delta is sealed below the identity's reset arms nothing. Notice-scoped
-voids, `sanction` act validation and the level-3/4 processes are not
-replayed, so higher rungs never void here. Observers hold no coverage duty.
-The `auditor_remove` a coverage failure requires, live pulls and attestation
-sealing are not implemented. Reconstruction retains every Block profile,
-Delta binding, Record, duty, publication, audit and finding in memory
-without a work bound, exposes nothing after a prefix failure and rereads
-repaired files on retry.
+Delta is sealed below the identity's reset arms nothing.
+
+The same replay feeds core's WIST-4 §7 process replay per Publisher once the
+prefix is complete. A `notice`, `appeal`, `appeal_ruling` or `sanction`
+passes §9.1's Envelope gate (WIST4-E11 for Envelope, version and
+signature-field failures, WIST4-E04 for details, evidence or subject shape),
+then its signing rule: notices, rulings and sanctions under the Log key
+(WIST4-E11); an appeal under the notice-era Key Set frozen from the
+Declarations replay at the notice's Block (the current or recovery-head
+Declaration's `keys`), where a notice the appeal cannot name, a mismatched
+subject or an absent identifier is WIST4-E05 and a failing signature
+WIST1-E01. Recovery notices open no process. Core then applies, per Block,
+identity resets, accepted lifts, the Block's findings with their closed
+confirming sets, the Record IDs sealed in the Block as available evidence,
+notice candidates and process acts under the appeal window and sealing
+allowance in force at the notice's Block and the ruling deadline in force
+at the appeal's Block. `processes(publisher)` returns the accepted notices
+with their appeal, merits and unappealed positions, void and retention
+instants, the notices and acts core rejected (WIST4-E04/E05), the derived
+level and rung activations per height, and each `sanction` act's evidence
+verdict: its `finding` must be a first confirming Record of the subject
+sealed at or below the act, `severity` the finding's, and `evidence` must
+resolve to sealed Records and establish the finding's quorum at that Record
+(WIST4-E05 otherwise); `noticed` records whether an accepted notice of the
+act's level precedes it. `sanction_level(publisher, height)` reads the full
+ladder with notice-scoped voids; `enforceable_level` additionally requires,
+for rungs 3 and 4, an accepted unvoided notice of that level for the active
+activation at or below the height, which is the Aggregator's own
+notice-before-enforcement bound. Live ingestion and serving still read the
+database summaries; adopting the derived state there, Mirror evidence
+retention through `retention_end_at_s`, the `auditor_remove` a coverage
+failure requires, live pulls and attestation sealing are not implemented.
+Observers hold no coverage duty. Reconstruction retains every Block
+profile, Delta binding, Record, duty, publication, audit, finding, notice
+and act in memory without a work bound, exposes nothing after a prefix
+failure and rereads repaired files on retry.
 
 Signed histories cover extension-proof semantics across a key rotation between
 B₁ and the Record (proof under the key held at B₁, signature under the key
@@ -542,7 +570,15 @@ clearing rungs and penalties, including a pre-reset Delta confirmed after
 the reset. `coverage.json` attestation cases and `sanctions.json` lift cases
 are transplanted onto fixture keys and Blocks and replayed as signed
 histories; the exemption-after-fallback, forged-successor and same-Block
-discharge readings have dedicated histories.
+discharge readings have dedicated histories. Process tests cover a
+severity-3 finding arming level 3, its notice, a Publisher-signed appeal
+and an overturning ruling voiding the rung, rejected appeals (stranger key,
+absent identifier), a ruling for an unknown notice, a level-4 notice with
+no activation, valid and invalid sanction acts, the enforceable level before
+and after the notice, and the sealing deadline voiding state unless an
+unappealed ruling sealed after the window closed discharges it. The
+`sanctions.json` process, notice-target and notice-evidence cases are
+consumed by core.
 
 ## Historical coverage clocks
 

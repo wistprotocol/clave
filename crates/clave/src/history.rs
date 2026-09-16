@@ -35,11 +35,23 @@ pub struct VerifiedBlock {
     extension_triggers_max: u64,
     clock_skew_seconds: i64,
     decay_horizon_days: u64,
+    process_profile: ProcessProfile,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessProfile {
+    pub appeal_window_days: u64,
+    pub appeal_seal_days: u64,
+    pub ruling_deadline_days: u64,
 }
 
 impl VerifiedBlock {
     pub fn decay_horizon_days(&self) -> u64 {
         self.decay_horizon_days
+    }
+
+    pub fn process_profile(&self) -> &ProcessProfile {
+        &self.process_profile
     }
 
     pub fn block(&self) -> &Block {
@@ -320,6 +332,15 @@ impl History {
                 .unwrap()
                 .value_at("decay_horizon_days", at)
                 .unwrap() as u64,
+            process_profile: {
+                let schedule = self.schedule.as_ref().unwrap();
+                ProcessProfile {
+                    appeal_window_days: schedule.value_at("appeal_window_days", at).unwrap() as u64,
+                    appeal_seal_days: schedule.value_at("appeal_seal_days", at).unwrap() as u64,
+                    ruling_deadline_days: schedule.value_at("ruling_deadline_days", at).unwrap()
+                        as u64,
+                }
+            },
         }))
     }
 
