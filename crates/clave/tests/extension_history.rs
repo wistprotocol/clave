@@ -3205,6 +3205,172 @@ fn two_independent_blocking_records_exclude_the_url_until_a_third_auditor_measur
     assert!(standing(2).blocking && standing(3).blocking && !standing(5).blocking);
 }
 
+fn canary_tree(tag: usize) -> Vec<[u8; 32]> {
+    (0..4)
+        .map(|i| {
+            wist_core::merkle::leaf_hash(
+                format!("served bytes {tag}/{i} nonce {tag:016}{i:016}").as_bytes(),
+            )
+        })
+        .collect()
+}
+
+fn canary_root(tree: &[[u8; 32]]) -> String {
+    format!(
+        "sha256:{}",
+        hex_encode(&wist_core::merkle::merkle_root(tree).unwrap())
+    )
+}
+
+fn publisher_act(subject: &str, key_label: &str, action: &str, details: Value) -> Value {
+    let update = json!({
+        "wist_version": "1.0.0", "action": action, "subject": subject,
+        "details": details, "effective_at": ts(START),
+    });
+    json!({
+        "type": "registry_update",
+        "body": envelope::sign_envelope(&update, "update", "k1", &key(key_label)).unwrap(),
+    })
+}
+
+fn reveal_leaves(tree: &[[u8; 32]], bindings: &[(usize, &str)]) -> Value {
+    json!(bindings
+        .iter()
+        .map(|(index, delta_id)| {
+            json!({
+                "index": index,
+                "delta_id": delta_id,
+                "leaf_hash": format!("sha256:{}", hex_encode(&tree[*index])),
+                "path": wist_core::merkle::audit_path(*index, tree)
+                    .unwrap()
+                    .iter()
+                    .map(|node| format!("sha256:{}", hex_encode(node)))
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect::<Vec<_>>())
+}
+
+#[test]
+fn canary_commitments_ration_per_suffix_epoch_and_reveals_settle_as_a_batch() {
+    const PLANTER: &str = "planter.example.org";
+    let mut fx = Fixture::new();
+    fx.hourly(
+        0,
+        vec![
+            declaration(PLANTER, &[], "planter"),
+            declaration(PUBLISHER, &[], "site"),
+        ],
+    );
+    let trees: Vec<Vec<[u8; 32]>> = (0..9).map(canary_tree).collect();
+    let commit = |tree: &[[u8; 32]]| {
+        publisher_act(
+            PLANTER,
+            "planter",
+            "canary_commitment",
+            json!({"root": canary_root(tree), "leaves": 4}),
+        )
+    };
+    let commitment = commit(&trees[0]);
+    let commitment_id = update_id(&commitment);
+    fx.hourly(1, vec![commitment.clone()]);
+    let extras: Vec<Value> = trees[1..].iter().map(|tree| commit(tree)).collect();
+    fx.hourly(2, extras.clone());
+    for height in 3..30 {
+        fx.hourly(height, Vec::new());
+    }
+    let deltas = pages(PUBLISHER, "site", "c", 2);
+    fx.hourly(30, deltas.clone());
+    let (a, b) = (delta_id(&deltas[0]), delta_id(&deltas[1]));
+    for height in 31..197 {
+        fx.hourly(height, Vec::new());
+    }
+    let reveal = |tree: &[[u8; 32]], commitment_id: &str, bindings: &[(usize, &str)]| {
+        publisher_act(
+            PUBLISHER,
+            "site",
+            "canary_reveal",
+            json!({"commitment": commitment_id, "leaves": reveal_leaves(tree, bindings)}),
+        )
+    };
+    let early = reveal(&trees[0], &commitment_id, &[(0, &a)]);
+    fx.hourly(197, vec![early]);
+    let valid = reveal(&trees[0], &commitment_id, &[(0, &a), (1, &b)]);
+    let mut broken_leaves = reveal_leaves(&trees[0], &[(2, &a)]);
+    broken_leaves[0]["path"] = json!([]);
+    let invalid = publisher_act(
+        PUBLISHER,
+        "site",
+        "canary_reveal",
+        json!({"commitment": commitment_id, "leaves": broken_leaves}),
+    );
+    fx.hourly(198, vec![valid, invalid]);
+    let accepted_ids: Vec<String> = fx
+        .reconstruct()
+        .unwrap()
+        .commitments()
+        .map(|c| c.id.clone())
+        .collect();
+    let (extra_id, extra_tree) = extras
+        .iter()
+        .zip(&trees[1..])
+        .map(|(entry, tree)| (update_id(entry), tree.clone()))
+        .find(|(id, _)| accepted_ids.contains(id))
+        .unwrap();
+    let again = reveal(&trees[0], &commitment_id, &[(3, &b)]);
+    let reserved = reveal(&extra_tree, &extra_id, &[(0, &a)]);
+    fx.hourly(199, vec![again, reserved]);
+    let history = fx.reconstruct().unwrap();
+
+    let rejected: Vec<(u64, &str)> = history
+        .rejected_acts()
+        .iter()
+        .filter(|act| act.action.starts_with("canary"))
+        .map(|act| (act.position.block_number, act.reason.as_str()))
+        .collect();
+    assert_eq!(
+        rejected.iter().filter(|(h, _)| *h == 2).count(),
+        1,
+        "the ninth commitment of the suffix's epoch is rejected: {rejected:?}"
+    );
+    assert!(rejected
+        .iter()
+        .all(|(_, reason)| reason.starts_with("WIST4-E08")));
+    for (height, needle) in [
+        (2, "ration"),
+        (197, "reveal minimum"),
+        (198, "inclusion proof"),
+        (199, "already revealed"),
+        (199, "reserved"),
+    ] {
+        assert!(
+            rejected
+                .iter()
+                .any(|(h, reason)| *h == height && reason.contains(needle)),
+            "{height}/{needle}: {rejected:?}"
+        );
+    }
+    assert_eq!(rejected.len(), 5);
+    assert_eq!(history.reveals().len(), 1);
+    assert_eq!(history.reveals()[0].deltas, [a.clone(), b.clone()]);
+    assert_eq!(history.reveals()[0].position.block_number, 198);
+    assert_eq!(
+        history.reserved_delta(&a),
+        Some(history.reveals()[0].id.as_str())
+    );
+    assert_eq!(history.commitments().count(), 8);
+    assert!(history
+        .live_commitments(100)
+        .iter()
+        .any(|c| c.id == commitment_id));
+    assert_eq!(history.live_commitments(197).len(), 8);
+    assert_eq!(history.live_commitments(198).len(), 7);
+    assert!(!history
+        .live_commitments(198)
+        .iter()
+        .any(|c| c.id == commitment_id));
+}
+
 fn withdrawal_update(subject: &str, delta_id: &str, basis: &str) -> Value {
     json!({
         "wist_version": "1.0.0", "action": "payload_withdrawal", "subject": subject,

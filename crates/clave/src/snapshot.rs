@@ -11,10 +11,10 @@ use std::path::Path;
 use wist_core::crypto::{hex_encode, SigningKey};
 use wist_core::envelope::sign_envelope;
 use wist_core::objects::{
-    AggregatorKeyEntry, AuditorEntry, CoverageFailureEntry, DeclarationEntry, EscalationEntry,
-    ExclusionEntry, ParameterEntry, RecordEntry, RecoveryWindowEntry, ReputationInputsEntry,
-    SanctionStateEntry, SnapshotFile, SnapshotIndex, SnapshotIndexEntry, SnapshotManifest,
-    SnapshotState, SnapshotStateFile, StateEntry,
+    AggregatorKeyEntry, AuditorEntry, CanaryCommitmentEntry, CoverageFailureEntry,
+    DeclarationEntry, EscalationEntry, ExclusionEntry, ParameterEntry, RecordEntry,
+    RecoveryWindowEntry, ReputationInputsEntry, SanctionStateEntry, SnapshotFile, SnapshotIndex,
+    SnapshotIndexEntry, SnapshotManifest, SnapshotState, SnapshotStateFile, StateEntry,
 };
 use wist_core::snapshot::{content_digest, state_digest};
 
@@ -292,6 +292,17 @@ fn build_state(
         entries.push(StateEntry::Escalation(EscalationEntry {
             domain,
             establishing_sealed_at,
+        }));
+    }
+    for (update_id, planter, root, leaves, sealing_height) in
+        db.derived_canary_commitments_at(log_position)?
+    {
+        entries.push(StateEntry::CanaryCommitment(CanaryCommitmentEntry {
+            update_id,
+            planter,
+            root,
+            leaves,
+            sealing_height,
         }));
     }
     for (publisher, url, excluded_since_height) in db.derived_exclusions_at(log_position)? {

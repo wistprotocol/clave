@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS derived_reputation_inputs(domain TEXT NOT NULL, block
 CREATE TABLE IF NOT EXISTS derived_escalations(domain TEXT NOT NULL, block_number INTEGER NOT NULL, establishing_at TEXT NOT NULL, PRIMARY KEY(domain, block_number));
 CREATE TABLE IF NOT EXISTS derived_coverage_failures(auditor_id TEXT NOT NULL, block_number INTEGER NOT NULL, duty_block INTEGER NOT NULL, PRIMARY KEY(auditor_id, block_number, duty_block));
 CREATE TABLE IF NOT EXISTS sealed_updates(update_id TEXT PRIMARY KEY, block_number INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS derived_canary_commitments(update_id TEXT NOT NULL, block_number INTEGER NOT NULL, planter TEXT NOT NULL, root TEXT NOT NULL, leaves INTEGER NOT NULL, sealing_height INTEGER NOT NULL, PRIMARY KEY(update_id, block_number));
 CREATE TABLE IF NOT EXISTS derived_exclusions(publisher TEXT NOT NULL, url TEXT NOT NULL, block_number INTEGER NOT NULL, since_height INTEGER NOT NULL, PRIMARY KEY(publisher, url, block_number));
 CREATE TABLE IF NOT EXISTS derived_auditor_state(auditor_id TEXT NOT NULL, block_number INTEGER NOT NULL, sealed_at TEXT NOT NULL, coverage_failure INTEGER NOT NULL, PRIMARY KEY(auditor_id, block_number));
 ";
@@ -223,6 +224,10 @@ pub struct DerivedAuditorRow<'a> {
     pub auditor_id: &'a str,
     pub coverage_failure: bool,
 }
+
+/// A live canary commitment at a derived height: Registry Update ID,
+/// planter, root, leaf count and sealing height.
+pub type DerivedCanaryCommitment = (String, String, String, u64, u64);
 
 pub struct DerivedReputationInputsRow<'a> {
     pub domain: &'a str,
@@ -1436,6 +1441,49 @@ impl Db {
             [update_id],
             |row| row.get(0),
         )?)
+    }
+
+    pub fn record_derived_canary_commitments(
+        &self,
+        block_number: u64,
+        commitments: &[DerivedCanaryCommitment],
+    ) -> Result<()> {
+        let tx = self.mutation()?;
+        for (update_id, planter, root, leaves, sealing_height) in commitments {
+            tx.execute(
+                "INSERT OR REPLACE INTO derived_canary_commitments(update_id, block_number, planter, root, leaves, sealing_height) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                (
+                    update_id,
+                    block_number as i64,
+                    planter,
+                    root,
+                    *leaves as i64,
+                    *sealing_height as i64,
+                ),
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn derived_canary_commitments_at(
+        &self,
+        block_number: u64,
+    ) -> Result<Vec<DerivedCanaryCommitment>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT update_id, planter, root, leaves, sealing_height FROM derived_canary_commitments WHERE block_number = ?1 ORDER BY update_id",
+        )?;
+        let rows = stmt.query_map([block_number as i64], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)? as u64,
+                r.get::<_, i64>(4)? as u64,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Error::Db)
     }
 
     pub fn record_derived_exclusions(

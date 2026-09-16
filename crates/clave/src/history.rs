@@ -37,6 +37,18 @@ pub struct VerifiedBlock {
     decay_horizon_days: u64,
     unauditable_horizon_days: u64,
     process_profile: ProcessProfile,
+    canary_profile: CanaryProfile,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CanaryProfile {
+    pub lead_blocks: u64,
+    pub leaves_max: u64,
+    pub commitments_max: u64,
+    pub reveal_min_blocks: u64,
+    pub lifetime_blocks: u64,
+    pub epoch_blocks: u64,
+    pub checkpoint_budget: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +69,10 @@ impl VerifiedBlock {
 
     pub fn process_profile(&self) -> &ProcessProfile {
         &self.process_profile
+    }
+
+    pub fn canary_profile(&self) -> &CanaryProfile {
+        &self.canary_profile
     }
 
     pub fn block(&self) -> &Block {
@@ -350,6 +366,19 @@ impl History {
                     appeal_seal_days: schedule.value_at("appeal_seal_days", at).unwrap() as u64,
                     ruling_deadline_days: schedule.value_at("ruling_deadline_days", at).unwrap()
                         as u64,
+                }
+            },
+            canary_profile: {
+                let schedule = self.schedule.as_ref().unwrap();
+                let read = |name: &str| schedule.value_at(name, at).unwrap() as u64;
+                CanaryProfile {
+                    lead_blocks: read("canary_lead_blocks"),
+                    leaves_max: read("canary_leaves_max"),
+                    commitments_max: read("canary_commitments_max"),
+                    reveal_min_blocks: read("canary_reveal_min_blocks"),
+                    lifetime_blocks: read("canary_lifetime_blocks"),
+                    epoch_blocks: read("epoch_blocks"),
+                    checkpoint_budget: read("observer_checkpoint_budget"),
                 }
             },
         }))

@@ -44,6 +44,40 @@ pub struct PriorState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanaryCommitment {
+    pub id: String,
+    pub planter: String,
+    pub root: String,
+    pub leaves: u64,
+    pub height: u64,
+    pub revealed_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanaryReveal {
+    pub position: Position,
+    pub id: String,
+    pub subject: String,
+    pub commitment: String,
+    pub deltas: Vec<String>,
+}
+
+struct RevealLeaf {
+    index: u64,
+    delta_id: String,
+    leaf_hash: [u8; 32],
+    path: Vec<[u8; 32]>,
+}
+
+struct RevealCandidate {
+    position: Position,
+    id: String,
+    subject: String,
+    commitment: String,
+    leaves: Vec<RevealLeaf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReputationInputs {
     pub first_accepted_sealed_at_s: i64,
     pub reset_height: Option<u64>,
@@ -306,6 +340,7 @@ struct BlockFact {
     extension_triggers_max: u64,
     coverage: super::coverage::CoverageProfile,
     unauditable_horizon_days: u64,
+    canary: crate::history::CanaryProfile,
     decay_horizon_days: u64,
     process: super::ProcessProfile,
 }
@@ -375,6 +410,11 @@ pub struct ExtensionHistory {
     withdrawn: BTreeMap<String, u64>,
     url_records: BTreeMap<(String, String), Vec<UrlRecord>>,
     applied_acts: BTreeSet<String>,
+    commitments: BTreeMap<String, CanaryCommitment>,
+    suffix_epoch_commitments: BTreeMap<(String, u64), u64>,
+    reserved_deltas: BTreeMap<String, String>,
+    block_reveals: Vec<RevealCandidate>,
+    reveals: Vec<CanaryReveal>,
 }
 
 impl ExtensionHistory {
@@ -422,6 +462,11 @@ impl ExtensionHistory {
             withdrawn: BTreeMap::new(),
             url_records: BTreeMap::new(),
             applied_acts: BTreeSet::new(),
+            commitments: BTreeMap::new(),
+            suffix_epoch_commitments: BTreeMap::new(),
+            reserved_deltas: BTreeMap::new(),
+            block_reveals: Vec::new(),
+            reveals: Vec::new(),
         };
         while let Some(block) = history.next_block()? {
             let effects = declarations.apply(&block)?;
@@ -464,6 +509,7 @@ impl ExtensionHistory {
                             history.log_key(),
                             &declarations,
                         )?;
+                        replay.canary_act(&block, entry_index, &entry["body"], &declarations);
                     }
                     Some("audit_record") => replay.classify(&block, entry_index, &entry["body"])?,
                     _ => {}
@@ -500,6 +546,7 @@ impl ExtensionHistory {
             coverage: *block.coverage_profile(),
             decay_horizon_days: block.decay_horizon_days(),
             unauditable_horizon_days: block.unauditable_horizon_days(),
+            canary: *block.canary_profile(),
             process: *block.process_profile(),
         });
         Ok(())
@@ -1060,6 +1107,7 @@ impl ExtensionHistory {
     fn settle(&mut self, block: &VerifiedBlock) -> Result<()> {
         let height = block.block().header.block_number;
         let sealed_at_s = block.sealed_at_s();
+        self.settle_reveals(height);
         for pair in self.coverage.values_mut() {
             if pair.height < height
                 && pair.unattested_height.is_none()
@@ -1453,6 +1501,469 @@ impl ExtensionHistory {
                 .map(|(_, sealed_at_s, severity)| (sealed_at_s, severity))
                 .collect(),
         })
+    }
+
+    fn canary_act(
+        &mut self,
+        block: &VerifiedBlock,
+        entry_index: usize,
+        body: &Value,
+        declarations: &Declarations,
+    ) {
+        let action = body["update"]["action"].as_str().unwrap_or("");
+        if !matches!(action, "canary_commitment" | "canary_reveal") {
+            return;
+        }
+        let position = Position {
+            block_number: block.block().header.block_number,
+            entry_index,
+        };
+        if let Err((code, reason)) = self.canary_inner(position, body, declarations) {
+            self.rejected_acts.push(RejectedAct {
+                position,
+                action: action.to_owned(),
+                subject: body["update"]["subject"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+                code,
+                reason: format!("{code}: {reason}"),
+            });
+        }
+    }
+
+    fn canary_inner(
+        &mut self,
+        position: Position,
+        body: &Value,
+        declarations: &Declarations,
+    ) -> std::result::Result<(), (&'static str, String)> {
+        let height = position.block_number;
+        let id = crate::governance::update_id(&body["update"])
+            .map_err(|e| ("WIST4-E11", format!("act cannot be identified: {e}")))?;
+        if self.applied_acts.contains(&id) {
+            return Ok(());
+        }
+        let envelope: RegistryUpdateEnvelope =
+            serde_json::from_value(body.clone()).map_err(|e| {
+                (
+                    "WIST4-E11",
+                    format!("malformed Registry Update envelope: {e}"),
+                )
+            })?;
+        let update = &envelope.update;
+        if !crate::record::release(&update.wist_version)
+            || update.wist_version.split('.').next() != Some("1")
+        {
+            return Err(("WIST4-E11", "unsupported Registry Update version".into()));
+        }
+        if crate::registry::epoch(&update.effective_at).is_err() {
+            return Err((
+                "WIST4-E11",
+                "effective_at is not a whole-second UTC instant".into(),
+            ));
+        }
+        if envelope.sig.alg != "Ed25519"
+            || envelope.sig.key_id.chars().count() > 64
+            || !canonical_b64u(&envelope.sig.value, 64)
+        {
+            return Err(("WIST4-E11", "malformed signature fields".into()));
+        }
+        if !crate::record::hostname_subject(&update.subject) {
+            return Err((
+                "WIST4-E04",
+                "subject is not a hostname of at least two labels".into(),
+            ));
+        }
+        let details = update
+            .details
+            .as_ref()
+            .filter(|details| details.is_object())
+            .ok_or(("WIST4-E04", "details are missing".to_owned()))?;
+        let keys = declarations
+            .domains()
+            .get(&update.subject)
+            .map(|domain| crate::declaration::publisher_of(domain.current().envelope()))
+            .and_then(|publisher| publisher.ok())
+            .map(|publisher| publisher.keys)
+            .unwrap_or_default();
+        keys.iter()
+            .find(|key| key.key_id == envelope.sig.key_id)
+            .and_then(|key| PublicKey::from_b64u(&key.public_key).ok())
+            .filter(|key| verify_envelope(body, "update", key).is_ok())
+            .ok_or((
+                "WIST4-E11",
+                "act is not authenticated under its subject's Key Set at the Block".to_owned(),
+            ))?;
+        let profile = &self.blocks[height as usize].canary;
+        match update.action {
+            RegistryAction::CanaryCommitment => {
+                let root = details["root"]
+                    .as_str()
+                    .filter(|root| digest(root))
+                    .ok_or(("WIST4-E04", "details.root is not a digest".to_owned()))?
+                    .to_owned();
+                let leaves = details["leaves"]
+                    .as_u64()
+                    .filter(|leaves| *leaves >= 1)
+                    .ok_or((
+                        "WIST4-E04",
+                        "details.leaves is not a count from 1".to_owned(),
+                    ))?;
+                if leaves > profile.leaves_max {
+                    return Err(("WIST4-E08", "leaves exceed canary_leaves_max".into()));
+                }
+                let epoch = self.epoch_of(height).ok_or((
+                    "WIST4-E08",
+                    "no budgeting epoch covers the Block".to_owned(),
+                ))?;
+                let suffix = wist_core::observer::suffix(&update.subject).to_owned();
+                let sealed = self
+                    .suffix_epoch_commitments
+                    .entry((suffix, epoch.number))
+                    .or_insert(0);
+                if *sealed >= profile.commitments_max {
+                    return Err((
+                        "WIST4-E08",
+                        "the planter suffix's epoch ration is exhausted".into(),
+                    ));
+                }
+                *sealed += 1;
+                self.commitments.insert(
+                    id.clone(),
+                    CanaryCommitment {
+                        id: id.clone(),
+                        planter: update.subject.clone(),
+                        root,
+                        leaves,
+                        height,
+                        revealed_at: None,
+                    },
+                );
+                self.applied_acts.insert(id);
+                Ok(())
+            }
+            RegistryAction::CanaryReveal => {
+                let commitment = details["commitment"]
+                    .as_str()
+                    .filter(|id| digest(id))
+                    .ok_or(("WIST4-E04", "details.commitment is not an ID".to_owned()))?
+                    .to_owned();
+                let leaves = details["leaves"]
+                    .as_array()
+                    .filter(|leaves| !leaves.is_empty())
+                    .ok_or((
+                        "WIST4-E04",
+                        "details.leaves is not a non-empty array".to_owned(),
+                    ))?
+                    .iter()
+                    .map(|leaf| {
+                        let index = leaf["index"]
+                            .as_u64()
+                            .ok_or(("WIST4-E04", "leaf index is not an integer".to_owned()))?;
+                        let delta_id = leaf["delta_id"]
+                            .as_str()
+                            .filter(|id| digest(id))
+                            .ok_or(("WIST4-E04", "leaf delta_id is not a Delta ID".to_owned()))?
+                            .to_owned();
+                        let leaf_hash = leaf["leaf_hash"]
+                            .as_str()
+                            .and_then(parse_digest)
+                            .ok_or(("WIST4-E04", "leaf_hash is not a digest".to_owned()))?;
+                        let path = leaf["path"]
+                            .as_array()
+                            .ok_or(("WIST4-E04", "leaf path is not an array".to_owned()))?
+                            .iter()
+                            .map(|node| {
+                                node.as_str()
+                                    .and_then(parse_digest)
+                                    .ok_or(("WIST4-E04", "path node is not a digest".to_owned()))
+                            })
+                            .collect::<std::result::Result<Vec<_>, _>>()?;
+                        Ok(RevealLeaf {
+                            index,
+                            delta_id,
+                            leaf_hash,
+                            path,
+                        })
+                    })
+                    .collect::<std::result::Result<Vec<_>, (&'static str, String)>>()?;
+                self.block_reveals.push(RevealCandidate {
+                    position,
+                    id,
+                    subject: update.subject.clone(),
+                    commitment,
+                    leaves,
+                });
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn epoch_of(&self, height: u64) -> Option<wist_core::observer::Epoch> {
+        wist_core::observer::epoch_of_block(height, |first| {
+            self.blocks
+                .get(first as usize)
+                .and_then(|block| std::num::NonZeroU64::new(block.canary.epoch_blocks))
+        })
+    }
+
+    fn validate_reveal(
+        &self,
+        candidate: &RevealCandidate,
+        height: u64,
+    ) -> std::result::Result<Vec<u64>, String> {
+        let commitment = self
+            .commitments
+            .get(&candidate.commitment)
+            .filter(|commitment| commitment.height < height)
+            .ok_or_else(|| "reveal names no sealed commitment".to_owned())?;
+        if commitment.revealed_at.is_some() {
+            return Err("commitment is already revealed".into());
+        }
+        let root = parse_digest(&commitment.root)
+            .ok_or_else(|| "commitment root is unusable".to_owned())?;
+        let profile_at_commitment = &self.blocks[commitment.height as usize].canary;
+        let mut indexes = BTreeSet::new();
+        let mut deltas = BTreeSet::new();
+        let mut delta_heights = Vec::new();
+        for leaf in &candidate.leaves {
+            if leaf.index >= commitment.leaves || !indexes.insert(leaf.index) {
+                return Err("leaf index is out of range or repeated".into());
+            }
+            let fact = self
+                .deltas
+                .get(&leaf.delta_id)
+                .filter(|fact| fact.height < height)
+                .ok_or_else(|| "leaf names no Delta sealed below the reveal".to_owned())?;
+            if fact.publisher != candidate.subject {
+                return Err("leaf names another domain's Delta".into());
+            }
+            if fact.height < commitment.height + profile_at_commitment.lead_blocks {
+                return Err("leaf names a Delta sealed inside the lead".into());
+            }
+            if !deltas.insert(leaf.delta_id.clone()) {
+                return Err("a Delta is bound to two leaves".into());
+            }
+            if self.reserved_deltas.contains_key(&leaf.delta_id) {
+                return Err("a Delta is reserved by an earlier reveal".into());
+            }
+            wist_core::merkle::verify_inclusion(
+                &leaf.leaf_hash,
+                leaf.index as usize,
+                commitment.leaves as usize,
+                &leaf.path,
+                &root,
+            )
+            .map_err(|_| "inclusion proof fails".to_owned())?;
+            delta_heights.push(fact.height);
+        }
+        let newest = *delta_heights
+            .iter()
+            .max()
+            .ok_or_else(|| "no leaves".to_owned())?;
+        let newest_block = &self.blocks[newest as usize];
+        let registered_at_newest: Vec<&str> = self
+            .roster
+            .registered_at(newest_block.block.sealed_at_s)
+            .into_iter()
+            .map(|(observer_id, _)| observer_id)
+            .collect();
+        let suffixes: BTreeSet<&str> = registered_at_newest
+            .iter()
+            .map(|id| wist_core::observer::suffix(id))
+            .collect();
+        let delay = wist_core::canary::RevealDelay {
+            minimum_blocks: newest_block.canary.reveal_min_blocks,
+            suffixes_registered: suffixes.len() as u64,
+            checkpoint_budget: std::num::NonZeroU64::new(newest_block.canary.checkpoint_budget)
+                .ok_or_else(|| "checkpoint budget is zero".to_owned())?,
+            epoch_blocks: std::num::NonZeroU64::new(newest_block.canary.epoch_blocks)
+                .ok_or_else(|| "epoch length is zero".to_owned())?,
+        };
+        let timing = wist_core::canary::numeric_timing(
+            wist_core::canary::CommitmentTiming {
+                height: commitment.height,
+                lead_blocks: profile_at_commitment.lead_blocks,
+                lifetime_blocks: profile_at_commitment.lifetime_blocks,
+            },
+            &delta_heights,
+            delay,
+        )
+        .ok_or_else(|| "no leaves".to_owned())?;
+        if !timing.allows(height) {
+            return Err("reveal is sealed before the reveal minimum or after the lifetime".into());
+        }
+        let block_times: Vec<i64> = self.blocks.iter().map(|b| b.block.sealed_at_s).collect();
+        let deadlines: Vec<wist_core::canary::CoverageDeadline> = delta_heights
+            .iter()
+            .map(|&h| {
+                let block = &self.blocks[h as usize];
+                Ok(wist_core::canary::CoverageDeadline {
+                    deadline_s: i128::from(block.block.sealed_at_s)
+                        + i128::from(block.coverage.deadline_hours) * 3_600,
+                    record_seal_blocks: std::num::NonZeroU64::new(block.coverage.seal_blocks)
+                        .ok_or_else(|| "record_seal_blocks is zero".to_owned())?,
+                })
+            })
+            .collect::<std::result::Result<_, String>>()?;
+        let registered_at_reveal: Vec<&str> = self
+            .roster
+            .registered_at(self.blocks[height as usize].block.sealed_at_s)
+            .into_iter()
+            .map(|(observer_id, _)| observer_id)
+            .collect();
+        let mut epochs = Vec::new();
+        let mut first = 0u64;
+        while (first as usize) < self.blocks.len() {
+            let Some(epoch) = self.epoch_of(first) else {
+                break;
+            };
+            let first_block = &self.blocks[epoch.first as usize];
+            let registered: Vec<&str> = self
+                .roster
+                .registered_at(first_block.block.sealed_at_s)
+                .into_iter()
+                .map(|(observer_id, _)| observer_id)
+                .collect();
+            let budgeted = match std::num::NonZeroU64::new(first_block.canary.checkpoint_budget) {
+                Some(budget) => {
+                    wist_core::observer::epoch_budget(&registered, epoch.number, budget)
+                        .budgeted
+                        .into_iter()
+                        .map(wist_core::observer::suffix)
+                        .collect()
+                }
+                None => Vec::new(),
+            };
+            epochs.push(wist_core::canary::BudgetingEpoch {
+                epoch,
+                budgeted_suffixes: budgeted,
+                record_seal_blocks: std::num::NonZeroU64::new(first_block.coverage.seal_blocks)
+                    .ok_or_else(|| "record_seal_blocks is zero".to_owned())?,
+            });
+            first = u64::try_from(epoch.last() + 1).map_err(|_| "epoch overflow".to_owned())?;
+        }
+        if !wist_core::canary::sealing_opportunities(
+            height,
+            &block_times,
+            &deadlines,
+            &registered_at_newest,
+            &registered_at_reveal,
+            &epochs,
+        ) {
+            return Err("reveal leaves no actual sealing opportunity".into());
+        }
+        Ok(delta_heights)
+    }
+
+    fn settle_reveals(&mut self, height: u64) {
+        let candidates = std::mem::take(&mut self.block_reveals);
+        let mut seen_ids = BTreeSet::new();
+        let mut valid: Vec<(usize, &RevealCandidate)> = Vec::new();
+        let mut rejected: Vec<(Position, String, String)> = Vec::new();
+        for (index, candidate) in candidates.iter().enumerate() {
+            if !seen_ids.insert(candidate.id.clone()) {
+                continue;
+            }
+            match self.validate_reveal(candidate, height) {
+                Ok(_) => valid.push((index, candidate)),
+                Err(reason) => {
+                    rejected.push((candidate.position, candidate.subject.clone(), reason))
+                }
+            }
+        }
+        let mut survivors = Vec::new();
+        for (index, candidate) in &valid {
+            let conflicting = valid.iter().any(|(other, competitor)| {
+                other != index
+                    && (competitor.commitment == candidate.commitment
+                        || competitor.leaves.iter().any(|leaf| {
+                            candidate
+                                .leaves
+                                .iter()
+                                .any(|mine| mine.delta_id == leaf.delta_id)
+                        }))
+            });
+            if conflicting {
+                rejected.push((
+                    candidate.position,
+                    candidate.subject.clone(),
+                    "reveal shares a commitment or Delta with another reveal in the Block".into(),
+                ));
+            } else {
+                survivors.push(*candidate);
+            }
+        }
+        let survivors: Vec<(Position, String, String, String, Vec<String>)> = survivors
+            .iter()
+            .map(|candidate| {
+                (
+                    candidate.position,
+                    candidate.id.clone(),
+                    candidate.subject.clone(),
+                    candidate.commitment.clone(),
+                    candidate
+                        .leaves
+                        .iter()
+                        .map(|leaf| leaf.delta_id.clone())
+                        .collect(),
+                )
+            })
+            .collect();
+        for (position, subject, reason) in rejected {
+            self.rejected_acts.push(RejectedAct {
+                position,
+                action: "canary_reveal".into(),
+                subject,
+                code: "WIST4-E08",
+                reason: format!("WIST4-E08: {reason}"),
+            });
+        }
+        for (position, id, subject, commitment, deltas) in survivors {
+            if let Some(record) = self.commitments.get_mut(&commitment) {
+                record.revealed_at = Some(height);
+            }
+            for delta in &deltas {
+                self.reserved_deltas.insert(delta.clone(), id.clone());
+            }
+            self.applied_acts.insert(id.clone());
+            self.reveals.push(CanaryReveal {
+                position,
+                id,
+                subject,
+                commitment,
+                deltas,
+            });
+        }
+    }
+
+    pub fn commitments(&self) -> impl Iterator<Item = &CanaryCommitment> {
+        self.commitments.values()
+    }
+
+    pub fn live_commitments(&self, height: u64) -> Vec<&CanaryCommitment> {
+        self.commitments
+            .values()
+            .filter(|commitment| {
+                commitment.height <= height
+                    && commitment.revealed_at.is_none_or(|at| at > height)
+                    && height
+                        <= commitment.height
+                            + self.blocks[commitment.height as usize]
+                                .canary
+                                .lifetime_blocks
+            })
+            .collect()
+    }
+
+    pub fn reveals(&self) -> &[CanaryReveal] {
+        &self.reveals
+    }
+
+    pub fn reserved_delta(&self, delta_id: &str) -> Option<&str> {
+        self.reserved_deltas.get(delta_id).map(String::as_str)
     }
 
     pub fn unauditable(&self, publisher: &str, url: &str, height: u64) -> bool {

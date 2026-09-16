@@ -198,6 +198,20 @@ pub fn refresh(db: &Db, data_dir: &Path, sk: &SigningKey) -> Result<()> {
         .collect();
     db.record_derived_snapshot_inputs(height, &reputation_rows, &escalations, &failures)?;
     db.record_derived_exclusions(height, &history.exclusions(height))?;
+    let commitments: Vec<crate::db::DerivedCanaryCommitment> = history
+        .live_commitments(height)
+        .into_iter()
+        .map(|c| {
+            (
+                c.id.clone(),
+                c.planter.clone(),
+                c.root.clone(),
+                c.leaves,
+                c.height,
+            )
+        })
+        .collect();
+    db.record_derived_canary_commitments(height, &commitments)?;
     remove_failed_auditors(db, sk, &history, &head, &auditors)
 }
 

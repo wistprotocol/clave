@@ -1360,6 +1360,33 @@ The schema gate does not establish exact Page cardinality, publication/history
 partitioning, supported-major policy or durable selected-source provenance;
 target validation is described under [Feed next targets](#feed-next-targets).
 
+## Canary act replay
+
+Extension history replays `canary_commitment` and `canary_reveal` acts under
+WIST-4 §§5.1/9.1: field failures are WIST4-E11 or WIST4-E04 (two-label
+subject, digest root, leaf count from 1, reveal leaf shapes), authentication
+reads the subject's Key Set at the sealing Block from the Declaration replay
+(WIST4-E11), and §5.1's rules are WIST4-E08: a leaf count above
+`canary_leaves_max`, a planter suffix past `canary_commitments_max` in its
+budgeting epoch (`epoch_blocks` walked from genesis), a reveal naming an
+unsealed or revealed commitment, an index out of range or repeated, a Delta of
+another domain, sealed at or above the reveal, inside `canary_lead_blocks` of
+the commitment, bound twice or reserved by an earlier reveal, an inclusion
+proof that fails under the commitment's root and leaf count, a reveal before
+the numeric minimum (reveal minimum plus the checkpoint-budget rotation for
+the suffixes registered at the newest bound Delta's Block) or after the
+lifetime, or one leaving no actual sealing opportunity under §5.1's
+coverage-deadline and budgeting-epoch test. Reveals settle per Block as a
+batch: identical IDs count once, invalid candidates block nobody, and
+candidates sharing a commitment or Delta reject each other. An accepted
+reveal reserves its Deltas Log-wide. Derived-state refresh records the
+commitments live at the head, unrevealed and inside their lifetime, and
+Snapshot state emits them as `canary_commitment` tuples; scoreboards,
+`track_record` derivation from reveals and Observer tuples are not
+implemented. A signed history exercises the epoch ration, an early reveal,
+a failing proof beside a valid reveal in one Block, a second reveal of a
+revealed commitment and a reserved Delta.
+
 ## Submissions path pulls
 
 Every Feed pull also fetches the domain's
