@@ -79,6 +79,33 @@ impl Fixture {
         }
     }
 
+    fn fork(&self) -> Self {
+        fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+            std::fs::create_dir_all(to).unwrap();
+            for entry in std::fs::read_dir(from).unwrap() {
+                let entry = entry.unwrap();
+                let target = to.join(entry.file_name());
+                if entry.file_type().unwrap().is_dir() {
+                    copy_dir(&entry.path(), &target);
+                } else {
+                    std::fs::copy(entry.path(), target).unwrap();
+                }
+            }
+        }
+        let data = tempfile::tempdir().unwrap();
+        copy_dir(self.data.path(), data.path());
+        let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
+        Self {
+            data,
+            head: self.head.clone(),
+            rows: self.rows.clone(),
+            sk,
+            attest_empty: self.attest_empty,
+            labels: std::cell::RefCell::new(self.labels.borrow().clone()),
+            roster: self.roster.clone(),
+        }
+    }
+
     fn attestations_for_previous_block(&self) -> Vec<Value> {
         let Some(previous) = self.head.as_ref() else {
             return Vec::new();
@@ -279,6 +306,10 @@ fn declaration_after(
 }
 
 fn delta(publisher: &str, url: &str, key_label: &str) -> Value {
+    delta_keyed(publisher, url, key_label, "k1")
+}
+
+fn delta_keyed(publisher: &str, url: &str, key_label: &str, key_id: &str) -> Value {
     let salt = wist_core::crypto::b64u_encode(&[5u8; 16]);
     let content = json!({"extract": format!("body of {url}"), "links": {"total": 0, "urls": []}, "summary": {"title": url}});
     let body = json!({
@@ -293,7 +324,7 @@ fn delta(publisher: &str, url: &str, key_label: &str) -> Value {
     });
     json!({
         "type": "publisher_delta",
-        "body": envelope::sign_envelope(&body, "delta", "k1", &key(key_label)).unwrap(),
+        "body": envelope::sign_envelope(&body, "delta", key_id, &key(key_label)).unwrap(),
     })
 }
 
@@ -3369,6 +3400,293 @@ fn canary_commitments_ration_per_suffix_epoch_and_reveals_settle_as_a_batch() {
         .live_commitments(198)
         .iter()
         .any(|c| c.id == commitment_id));
+}
+
+fn declaration_keyed(domain: &str, key_label: &str, key_id: &str) -> Value {
+    let publisher = json!({
+        "wist_version": "1.0.0", "domain": domain,
+        "keys": [{"key_id": key_id, "alg": "Ed25519", "public_key": public(key_label), "valid_from": "2026-08-01T00:00:00Z"}],
+        "seq": 0,
+    });
+    json!({
+        "type": "publisher_declaration",
+        "body": envelope::sign_envelope(&publisher, "publisher", key_id, &key(key_label)).unwrap(),
+    })
+}
+
+#[test]
+fn canary_act_vectors_replay_as_signed_histories() {
+    let vectors: Value = serde_json::from_slice(
+        &std::fs::read(common::spec_dir().join("vectors/wist4/canary-acts.json")).unwrap(),
+    )
+    .unwrap();
+    let params = &vectors["parameters"];
+    assert_eq!(params["canary_lead_blocks"], 24);
+    assert_eq!(params["canary_reveal_min_blocks"], 168);
+    assert_eq!(params["canary_lifetime_blocks"], 1440);
+    assert_eq!(params["canary_commitments_max"], 8);
+    let commitment_height = vectors["commitment"]["height"].as_u64().unwrap();
+    let key_sets = vectors["key_sets"].as_object().unwrap();
+    let (planter, canary) = ("planter.example.io", "example.com");
+    let planter_key_id = key_sets[planter][0]["key_id"].as_str().unwrap();
+    let canary_key_id = key_sets[canary][0]["key_id"].as_str().unwrap();
+    let label_for = |key_id: &str| -> &'static str {
+        if key_id == planter_key_id {
+            "planter"
+        } else if key_id == canary_key_id {
+            "canary"
+        } else {
+            "intruder"
+        }
+    };
+    let resign_case = |doc: &Value, update: &Value| -> Value {
+        let key_id = doc["sig"]["key_id"].as_str().unwrap();
+        let subject = doc["update"]["subject"].as_str().unwrap_or_default();
+        let vector_signer = key_sets
+            .get(subject)
+            .and_then(|keys| keys.as_array())
+            .and_then(|keys| keys.iter().find(|k| k["key_id"] == key_id))
+            .and_then(|k| {
+                wist_core::crypto::PublicKey::from_b64u(k["public_key"].as_str().unwrap()).ok()
+            })
+            .is_some_and(|pk| envelope::verify_envelope(doc, "update", &pk).is_ok());
+        let label = if vector_signer {
+            label_for(key_id)
+        } else {
+            "intruder"
+        };
+        json!({
+            "type": "registry_update",
+            "body": envelope::sign_envelope(update, "update", key_id, &key(label)).unwrap(),
+        })
+    };
+    let outcome = |history: &ExtensionHistory, height: u64| -> Option<&'static str> {
+        history
+            .rejected_acts()
+            .iter()
+            .find(|act| act.position.block_number == height && act.action.starts_with("canary"))
+            .map(|act| act.code)
+    };
+
+    let mut base = Fixture::new();
+    base.hourly(
+        0,
+        vec![
+            declaration_keyed(planter, "planter", planter_key_id),
+            declaration_keyed(canary, "canary", canary_key_id),
+            declaration("other.example", &[], "other"),
+        ],
+    );
+    for height in 1..commitment_height {
+        base.hourly(height, Vec::new());
+    }
+    let commitment_doc: Value = serde_json::from_str(
+        vectors["commitment_cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["code"].is_null())
+            .unwrap()["envelope_json"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    let commitment_entry = resign_case(&commitment_doc, &commitment_doc["update"]);
+    assert_eq!(update_id(&commitment_entry), vectors["commitment"]["id"]);
+    let mut second_update = commitment_doc["update"].clone();
+    second_update["effective_at"] = json!("2026-08-02T13:00:00Z");
+    let second_commitment = resign_case(&commitment_doc, &second_update);
+    let second_id = update_id(&second_commitment);
+
+    let mut with_commitment = base.fork();
+    with_commitment.hourly(
+        commitment_height,
+        vec![commitment_entry.clone(), second_commitment],
+    );
+    let mut without_commitment = base.fork();
+    without_commitment.hourly(commitment_height, Vec::new());
+    let mut sealed: BTreeMap<(String, u64), String> = BTreeMap::new();
+    let extend = |fx: &mut Fixture, sealed: &mut BTreeMap<(String, u64), String>| {
+        let mut heights: Vec<(String, u64)> = vectors["reveal_cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|c| c["sealed_deltas"].as_array().unwrap())
+            .map(|d| {
+                (
+                    d["publisher"].as_str().unwrap().to_owned(),
+                    d["height"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        heights.sort();
+        heights.dedup();
+        let last = heights.iter().map(|(_, h)| *h).max().unwrap();
+        for height in (commitment_height + 1)..=last {
+            let entries: Vec<Value> = heights
+                .iter()
+                .filter(|(_, h)| *h == height)
+                .map(|(publisher, h)| {
+                    let (label, key_id) = if publisher == canary {
+                        ("canary", canary_key_id)
+                    } else {
+                        ("other", "k1")
+                    };
+                    let entry = delta_keyed(
+                        publisher,
+                        &format!("https://{publisher}/canary/{h}"),
+                        label,
+                        key_id,
+                    );
+                    sealed.insert((publisher.clone(), *h), delta_id(&entry));
+                    entry
+                })
+                .collect();
+            fx.hourly(height, entries);
+        }
+    };
+    extend(&mut with_commitment, &mut sealed);
+    let mut sealed_without = BTreeMap::new();
+    extend(&mut without_commitment, &mut sealed_without);
+    let mapped = |case: &Value, doc: &Value| -> Value {
+        let mut update = doc["update"].clone();
+        let context: BTreeMap<String, (String, u64)> = case["sealed_deltas"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| {
+                (
+                    d["delta_id"].as_str().unwrap().to_owned(),
+                    (
+                        d["publisher"].as_str().unwrap().to_owned(),
+                        d["height"].as_u64().unwrap(),
+                    ),
+                )
+            })
+            .collect();
+        if let Some(leaves) = update["details"]["leaves"].as_array_mut() {
+            for leaf in leaves {
+                if let Some(id) = leaf["delta_id"].as_str() {
+                    if let Some(key) = context.get(id) {
+                        leaf["delta_id"] = json!(sealed[key]);
+                    }
+                }
+            }
+        }
+        update
+    };
+    let valid_case = vectors["reveal_cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["label"] == "valid reveal")
+        .unwrap();
+    let valid_doc: Value =
+        serde_json::from_str(valid_case["envelope_json"].as_str().unwrap()).unwrap();
+    let valid_entry = resign_case(&valid_doc, &mapped(valid_case, &valid_doc));
+
+    let mut seen = BTreeSet::new();
+    for case in vectors["reveal_cases"].as_array().unwrap() {
+        let label = case["label"].as_str().unwrap();
+        let doc: Value = serde_json::from_str(case["envelope_json"].as_str().unwrap()).unwrap();
+        let mut fx = if case["commitment_sealed"] == false {
+            without_commitment.fork()
+        } else {
+            with_commitment.fork()
+        };
+        let mut height = fx.rows.len() as u64;
+        let target = case["reveal_height"].as_u64().unwrap();
+        let mut pre: Option<Value> = None;
+        if case["commitment_revealed"] == true {
+            pre = Some(valid_entry.clone());
+        } else if let Some(reserved) = case["reserved_deltas"].as_array().filter(|r| !r.is_empty())
+        {
+            let context = case["sealed_deltas"].as_array().unwrap();
+            let bindings: Vec<Value> = reserved
+                .iter()
+                .map(|id| {
+                    let d = context.iter().find(|d| d["delta_id"] == *id).unwrap();
+                    let fixture_id = &sealed[&(
+                        d["publisher"].as_str().unwrap().to_owned(),
+                        d["height"].as_u64().unwrap(),
+                    )];
+                    let leaf = valid_doc["update"]["details"]["leaves"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|l| l["delta_id"] == *id)
+                        .unwrap();
+                    let mut leaf = leaf.clone();
+                    leaf["delta_id"] = json!(fixture_id);
+                    leaf
+                })
+                .collect();
+            let mut update = valid_doc["update"].clone();
+            update["details"]["commitment"] = json!(second_id);
+            update["details"]["leaves"] = json!(bindings);
+            pre = Some(resign_case(&valid_doc, &update));
+        }
+        let case_height = if pre.is_some() { target + 1 } else { target };
+        while height < case_height {
+            let entries = if pre.is_some() && height == target {
+                vec![pre.take().unwrap()]
+            } else {
+                Vec::new()
+            };
+            fx.hourly(height, entries);
+            height += 1;
+        }
+        fx.hourly(case_height, vec![resign_case(&doc, &mapped(case, &doc))]);
+        let history = fx.reconstruct().unwrap();
+        let expected = case["code"].as_str();
+        let got = outcome(&history, case_height);
+        assert_eq!(got, expected, "{label}: {:?}", history.rejected_acts());
+        if expected.is_none() {
+            assert!(
+                history
+                    .reveals()
+                    .iter()
+                    .any(|r| r.position.block_number == case_height),
+                "{label}: accepted reveal is recorded"
+            );
+        }
+        seen.insert(expected);
+    }
+    assert_eq!(
+        seen,
+        BTreeSet::from([
+            None,
+            Some("WIST4-E04"),
+            Some("WIST4-E08"),
+            Some("WIST4-E11")
+        ])
+    );
+
+    for case in vectors["commitment_cases"].as_array().unwrap() {
+        let label = case["label"].as_str().unwrap();
+        let doc: Value = serde_json::from_str(case["envelope_json"].as_str().unwrap()).unwrap();
+        let mut fx = base.fork();
+        let ration = case["suffix_commitments_this_epoch"].as_u64().unwrap();
+        let fillers: Vec<Value> = (0..ration)
+            .map(|i| {
+                let mut update = commitment_doc["update"].clone();
+                update["details"]["root"] = json!(format!("sha256:{:064x}", i + 1));
+                resign_case(&commitment_doc, &update)
+            })
+            .collect();
+        fx.hourly(commitment_height, fillers);
+        fx.hourly(
+            commitment_height + 1,
+            vec![resign_case(&doc, &doc["update"])],
+        );
+        let history = fx.reconstruct().unwrap();
+        assert_eq!(
+            outcome(&history, commitment_height + 1),
+            case["code"].as_str(),
+            "{label}: {:?}",
+            history.rejected_acts()
+        );
+    }
 }
 
 fn withdrawal_update(subject: &str, delta_id: &str, basis: &str) -> Value {

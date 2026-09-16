@@ -1385,7 +1385,11 @@ Snapshot state emits them as `canary_commitment` tuples; scoreboards,
 `track_record` derivation from reveals and Observer tuples are not
 implemented. A signed history exercises the epoch ration, an early reveal,
 a failing proof beside a valid reveal in one Block, a second reveal of a
-revealed commitment and a reserved Delta.
+revealed commitment and a reserved Delta, and every `canary-acts.json` case
+replays as a signed history: the vector's acts are re-signed under fixture
+Declarations carrying the vector's key identifiers, its Deltas are sealed at
+the vector's heights, and a revealed or reserved context is sealed one Block
+before the case.
 
 ## Submissions path pulls
 
