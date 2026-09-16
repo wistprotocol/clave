@@ -448,13 +448,50 @@ at that height, in force from the establishing height for 30 whole days. A
 draw reads the preceding height, so an escalation established at height N
 displaces the formula from Block N + 1 on.
 
-Reputation and level-1 sanction state remain caller obligations. Coverage
-failure at a Record's sealing Block is not derived, so a Record from an
-Auditor in coverage failure is not excluded from evidence, triggers or
-quorums. `prev_record` chains, coverage and pull attestations, duty discharge
-accounting and failure counts are not replayed. Reconstruction retains every
-Block profile, Delta binding and Record in memory without a work bound,
-exposes nothing after a prefix failure and rereads repaired files on retry.
+The same replay accounts for WIST-4 §4 coverage duties. Every Auditor admitted
+at a Block's `sealed_at` holds a `CoverageDuty` for that Block, read through
+`coverage_duty(auditor_id, height)` and `coverage_duties()`, with the deadline
+and `record_seal_blocks` in force at that Block. Its `beta` is the first VRF
+output that verifies over the Block under the key admitted there, taken from
+any of the Auditor's sealed Records or coverage attestations; `selection` is
+then the draw over the Block's in-domain, non-self-audit Deltas with the
+caller-supplied prior state, and `named` lists the Deltas the extension rule
+added at that Block. A Record whose `discharges_coverage` holds and whose
+standing is anchored at the Block discharges its Delta at its own height. A
+`coverage_attestation` is accepted when its fields, version and signature
+under the key the subject holds at its Block (or the duty Block's key after
+removal) verify and its proof verifies over the named Block; it completes an
+empty duty set and otherwise only reveals the draw. A `pull_attestation` must
+be signed by the Log key, name an earlier sealed Block and a subject with a
+duty there; the earliest sealed one fixes the pair's attested height.
+Field, version and signature failures are reported as `WIST4-E11`, malformed
+details, unknown Blocks and pairs without a duty as `WIST4-E04`, and a
+coverage attestation whose proof does not verify as `WIST4-E01`
+(`rejected_attestations()`).
+
+`complete_at` is the height at which the whole duty set is discharged, or the
+attestation height for an empty set; `unattested_height` is the
+`record_seal_blocks`-th Block sealed strictly after the deadline; the
+establishing height is the earlier of the pull attestation and that fallback.
+`counting_failures(auditor_id, height)` lists the duty Blocks that count at a
+height: established at or below it, inside the 30 whole days ending at its
+`sealed_at`, not complete at or below it, and not exempt — an attested pair
+is exempt while an authentic later publication of the same Auditor, sealed
+between the attestation and the height read, names a `prev_record` the
+attestation lists in `found` that the prefix through that height lacks.
+`in_coverage_failure(auditor_id, height)` applies `coverage_failures_max` to
+that list. Records of a Block are classified in two passes: discharges and
+attestations of the Block settle its coverage state, then each Record's
+`coverage_failure` at its own Block rejects it as WIST4-E01 (after field and
+version diagnostics, still discharging) before evidence, triggers and quorums
+are read in Entry order.
+
+Reputation and level-1 sanction state remain caller obligations. Observers
+hold no coverage duty. The `auditor_remove` a coverage failure requires, live
+pulls and attestation sealing are not implemented. Reconstruction retains
+every Block profile, Delta binding, Record, duty and publication in memory
+without a work bound, exposes nothing after a prefix failure and rereads
+repaired files on retry.
 
 Signed histories cover extension-proof semantics across a key rotation between
 B₁ and the Record (proof under the key held at B₁, signature under the key
@@ -472,7 +509,12 @@ and removed-key Records; corrupt-file repair and pinned-prefix exclusion.
 parsed and dispositioned directly under their supplied contexts, and each
 case is rebuilt as an authenticated history whose replay must derive the
 same rejections, triggers, summoned sets and outcomes; the coverage-failure
-case is skipped there because that state is not derived.
+case is exercised through the derived state below instead of a supplied
+flag. Coverage tests replay `coverage.json` late-discharge and attribution
+cases as signed histories, and cover silent Auditors failing at the fallback
+and crossing `coverage_failures_max`, attestation discharge of empty and
+extension-named duty sets, partial completion, attested-versus-fallback
+establishing heights, and rejected attestations.
 
 ## Historical coverage clocks
 

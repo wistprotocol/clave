@@ -11,9 +11,12 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::Path;
 use wist_core::confirmation::{independent, CandidateRecord};
-use wist_core::coverage::{within_days_ending_at, Block};
+use wist_core::coverage::{self, within_days_ending_at, Block, COVERAGE_FAILURES_MAX};
+use wist_core::crypto::PublicKey;
+use wist_core::envelope::verify_envelope;
 pub use wist_core::extension::ExtensionOutcome;
 use wist_core::extension::{self, Escalation, ExtensionClaim, ExtensionRecord, RATION_WINDOW_DAYS};
+use wist_core::objects::audit::RegistryUpdateEnvelope;
 use wist_core::objects::audit::Verdict as SealedVerdict;
 use wist_core::sampling::{self, SamplingConstants};
 use wist_core::verdict::{self, ChangeType, Thresholds, Verdict};
@@ -54,6 +57,7 @@ pub struct RecordStanding {
     pub standing: Standing,
     pub duty: Duty,
     pub authentic: bool,
+    pub coverage_failure: bool,
     pub diagnostic: Option<&'static str>,
     pub discharges_coverage: bool,
 }
@@ -62,6 +66,71 @@ impl RecordStanding {
     pub fn evidence(&self) -> bool {
         self.diagnostic.is_none()
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullAttestation {
+    pub position: Position,
+    pub found: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoverageDuty {
+    pub auditor_id: String,
+    pub height: u64,
+    pub sealed_at_s: i64,
+    pub deadline_s: i128,
+    pub seal_blocks: u64,
+    pub beta: Option<[u8; vrf::OUTPUT_LEN]>,
+    pub selection: Option<Vec<String>>,
+    pub named: Vec<String>,
+    pub discharged: BTreeMap<String, u64>,
+    pub attested_empty_at: Option<u64>,
+    pub pull: Option<PullAttestation>,
+    pub successors_after_deadline: u64,
+    pub unattested_height: Option<u64>,
+    pub complete_at: Option<u64>,
+}
+
+impl CoverageDuty {
+    pub fn establishing_height(&self) -> Option<u64> {
+        let attested = self.pull.as_ref().map(|pull| pull.position.block_number);
+        match (attested, self.unattested_height) {
+            (Some(a), Some(u)) => Some(a.min(u)),
+            (a, u) => a.or(u),
+        }
+    }
+
+    pub fn duty_set(&self) -> Option<Vec<String>> {
+        let mut set = self.selection.clone()?;
+        for delta in &self.named {
+            if !set.contains(delta) {
+                set.push(delta.clone());
+            }
+        }
+        Some(set)
+    }
+
+    pub fn published(&self) -> bool {
+        self.beta.is_some()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RejectedAttestation {
+    pub position: Position,
+    pub action: String,
+    pub subject: String,
+    pub code: &'static str,
+    pub reason: String,
+}
+
+#[derive(Clone)]
+struct Publication {
+    auditor_id: String,
+    height: u64,
+    prev_record: Option<String>,
+    authentic: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,6 +175,7 @@ struct BlockFact {
     confirm_window_hours: u64,
     confirm_auditors: u64,
     extension_triggers_max: u64,
+    coverage: super::coverage::CoverageProfile,
 }
 
 struct DeltaFact {
@@ -129,15 +199,22 @@ pub struct ExtensionHistory {
     anchor_hash: [u8; 32],
     through: Option<BlockRow>,
     blocks: Vec<BlockFact>,
+    heights: BTreeMap<String, u64>,
     deltas: BTreeMap<String, DeltaFact>,
+    deltas_by_height: BTreeMap<u64, Vec<String>>,
     roster: RosterHistory,
     records: Vec<RecordStanding>,
+    pending: Vec<(usize, Option<&'static str>, bool)>,
     evidence: BTreeMap<String, Vec<Evidence>>,
     summoning: Vec<(String, i64)>,
     named: BTreeMap<(String, String), Vec<u64>>,
     triggers: Vec<Trigger>,
     duties: Vec<ExtensionDuty>,
     escalations: Vec<EscalationRecord>,
+    coverage: BTreeMap<(String, u64), CoverageDuty>,
+    publications: Vec<Publication>,
+    sealed_ids: BTreeMap<String, u64>,
+    rejected_attestations: Vec<RejectedAttestation>,
 }
 
 impl ExtensionHistory {
@@ -153,15 +230,22 @@ impl ExtensionHistory {
             anchor_hash: history.anchor_hash,
             through: head,
             blocks: Vec::new(),
+            heights: BTreeMap::new(),
             deltas: BTreeMap::new(),
+            deltas_by_height: BTreeMap::new(),
             roster: RosterHistory::start(&history),
             records: Vec::new(),
+            pending: Vec::new(),
             evidence: BTreeMap::new(),
             summoning: Vec::new(),
             named: BTreeMap::new(),
             triggers: Vec::new(),
             duties: Vec::new(),
             escalations: Vec::new(),
+            coverage: BTreeMap::new(),
+            publications: Vec::new(),
+            sealed_ids: BTreeMap::new(),
+            rejected_attestations: Vec::new(),
         };
         while let Some(block) = history.next_block()? {
             declarations.apply(&block)?;
@@ -171,11 +255,23 @@ impl ExtensionHistory {
                 .apply(&block, history.log_key_id(), history.log_key())?;
             replay.register_block(&block)?;
             replay.register_deltas(&block, &declarations)?;
+            replay.open_duties(&block);
             for (entry_index, entry) in block.block().entries.iter().enumerate() {
-                if entry["type"] == "audit_record" {
-                    replay.classify(&block, entry_index, &entry["body"], prior)?;
+                match entry["type"].as_str() {
+                    Some("registry_update") => replay.attest(
+                        &block,
+                        entry_index,
+                        &entry["body"],
+                        history.log_key_id(),
+                        history.log_key(),
+                    )?,
+                    Some("audit_record") => {
+                        replay.classify(&block, entry_index, &entry["body"], prior)?
+                    }
+                    _ => {}
                 }
             }
+            replay.settle(&block, prior)?;
             replay.close_extensions()?;
         }
         Ok(replay)
@@ -189,6 +285,7 @@ impl ExtensionHistory {
             ));
         }
         let confirmation = block.confirmation_profile();
+        self.heights.insert(block.hash().to_owned(), height);
         self.blocks.push(BlockFact {
             block: Block {
                 height,
@@ -200,6 +297,7 @@ impl ExtensionHistory {
             confirm_window_hours: confirmation.window_hours,
             confirm_auditors: confirmation.auditors,
             extension_triggers_max: block.extension_triggers_max(),
+            coverage: *block.coverage_profile(),
         });
         Ok(())
     }
@@ -261,6 +359,10 @@ impl ExtensionHistory {
                         change: *change,
                     },
                 );
+                self.deltas_by_height
+                    .entry(height)
+                    .or_default()
+                    .push(delta.id.clone());
                 false
             });
             if pending.len() == before {
@@ -305,6 +407,7 @@ impl ExtensionHistory {
             .as_str()
             .and_then(|hex| wist_core::crypto::hex_decode(hex).ok())
             .and_then(|bytes| <[u8; vrf::PROOF_LEN]>::try_from(bytes).ok());
+        let mut betas: Vec<(u64, [u8; vrf::OUTPUT_LEN])> = Vec::new();
 
         let (standing, anchor_s) = match (fact, proof) {
             _ if !fields.non_evidence_valid() => (Standing::Void(VoidReason::Malformed), None),
@@ -319,6 +422,7 @@ impl ExtensionHistory {
                 let mut key_seen = false;
                 let mut result = None;
                 if let Some(beta) = self.beta_at(&auditor_id, audited, &proof, &mut key_seen) {
+                    betas.push((fact.height, beta));
                     let state = prior(&fact.publisher, fact.height);
                     let p_1e7 = sampling::p_1e7(
                         state.reputation_u,
@@ -338,10 +442,10 @@ impl ExtensionHistory {
                         .unwrap_or_default();
                     for trigger_height in named {
                         let trigger = &self.blocks[trigger_height as usize];
-                        if self
-                            .beta_at(&auditor_id, trigger, &proof, &mut key_seen)
-                            .is_some()
+                        if let Some(beta) =
+                            self.beta_at(&auditor_id, trigger, &proof, &mut key_seen)
                         {
+                            betas.push((trigger_height, beta));
                             result = Some((
                                 Standing::Extension { trigger_height },
                                 trigger.block.sealed_at_s,
@@ -387,48 +491,476 @@ impl ExtensionHistory {
             coverage_failure: false,
             semantic_evidence_error,
         });
-        let standing_record = RecordStanding {
+        for (duty_height, beta) in betas {
+            if let Some(pair) = self.coverage.get_mut(&(auditor_id.clone(), duty_height)) {
+                pair.beta.get_or_insert(beta);
+            }
+        }
+        let anchor_height = match standing {
+            Standing::Selected => audited_height,
+            Standing::Extension { trigger_height } => Some(trigger_height),
+            Standing::Void(_) => None,
+        };
+        if disposition.discharges_coverage {
+            if let Some(pair) = anchor_height
+                .and_then(|anchor| self.coverage.get_mut(&(auditor_id.clone(), anchor)))
+            {
+                pair.discharged
+                    .entry(audited_delta.clone())
+                    .or_insert(height);
+            }
+        }
+        if let Ok(id) = wist_core::delta::delta_id(record) {
+            self.sealed_ids.entry(id).or_insert(height);
+        }
+        self.publications.push(Publication {
+            auditor_id: auditor_id.clone(),
+            height,
+            prev_record: record["prev_record"].as_str().map(str::to_owned),
+            authentic,
+        });
+        self.pending.push((
+            self.records.len(),
+            fields.diagnostic(),
+            fields.supported_major(),
+        ));
+        self.records.push(RecordStanding {
             position,
             sealed_at_s,
-            auditor_id: auditor_id.clone(),
-            audited_delta: audited_delta.clone(),
-            publisher: publisher.clone(),
+            auditor_id,
+            audited_delta,
+            publisher,
             audited_height,
             verdict,
             standing,
             duty,
             authentic,
+            coverage_failure: false,
             diagnostic: disposition.diagnostic,
             discharges_coverage: disposition.discharges_coverage,
-        };
-        let evidence = standing_record.evidence();
-        self.records.push(standing_record);
-        if !evidence {
-            return Ok(());
-        }
-        let (Some(verdict), Some(publisher)) = (verdict, publisher) else {
-            return Ok(());
-        };
-        if matches!(verdict, Verdict::Inconsistent | Verdict::LinkInconsistent) {
-            self.trigger(
-                position,
-                sealed_at_s,
-                &auditor_id,
-                &audited_delta,
-                &publisher,
-                verdict,
+        });
+        Ok(())
+    }
+
+    fn open_duties(&mut self, block: &VerifiedBlock) {
+        let height = block.block().header.block_number;
+        let sealed_at_s = block.sealed_at_s();
+        let profile = self.blocks[height as usize].coverage;
+        for (auditor_id, _) in self.roster.admitted_at(sealed_at_s) {
+            self.coverage.insert(
+                (auditor_id.to_owned(), height),
+                CoverageDuty {
+                    auditor_id: auditor_id.to_owned(),
+                    height,
+                    sealed_at_s,
+                    deadline_s: i128::from(sealed_at_s)
+                        + i128::from(profile.deadline_hours) * 3_600,
+                    seal_blocks: profile.seal_blocks,
+                    beta: None,
+                    selection: None,
+                    named: Vec::new(),
+                    discharged: BTreeMap::new(),
+                    attested_empty_at: None,
+                    pull: None,
+                    successors_after_deadline: 0,
+                    unattested_height: None,
+                    complete_at: None,
+                },
             );
         }
-        self.evidence
-            .entry(audited_delta)
-            .or_default()
-            .push(Evidence {
+    }
+
+    fn attest(
+        &mut self,
+        block: &VerifiedBlock,
+        entry_index: usize,
+        body: &Value,
+        log_key_id: &str,
+        log_key: &PublicKey,
+    ) -> Result<()> {
+        let action = body["update"]["action"].as_str().unwrap_or("");
+        if action != "pull_attestation" && action != "coverage_attestation" {
+            return Ok(());
+        }
+        let position = Position {
+            block_number: block.block().header.block_number,
+            entry_index,
+        };
+        if let Err((code, reason)) = self.attest_inner(block, position, body, log_key_id, log_key) {
+            self.rejected_attestations.push(RejectedAttestation {
                 position,
-                sealed_at_s,
-                auditor_id,
-                verdict,
+                action: action.to_owned(),
+                subject: body["update"]["subject"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+                code,
+                reason: format!("{code}: {reason}"),
             });
+        }
         Ok(())
+    }
+
+    fn attest_inner(
+        &mut self,
+        block: &VerifiedBlock,
+        position: Position,
+        body: &Value,
+        log_key_id: &str,
+        log_key: &PublicKey,
+    ) -> std::result::Result<(), (&'static str, String)> {
+        let height = position.block_number;
+        let sealed_at_s = block.sealed_at_s();
+        let envelope: RegistryUpdateEnvelope =
+            serde_json::from_value(body.clone()).map_err(|e| {
+                (
+                    "WIST4-E11",
+                    format!("malformed Registry Update envelope: {e}"),
+                )
+            })?;
+        let update = &envelope.update;
+        if !crate::record::release(&update.wist_version)
+            || update.wist_version.split('.').next() != Some("1")
+        {
+            return Err(("WIST4-E11", "unsupported Registry Update version".into()));
+        }
+        if crate::registry::epoch(&update.effective_at).is_err() {
+            return Err((
+                "WIST4-E11",
+                "effective_at is not a whole-second UTC instant".into(),
+            ));
+        }
+        if envelope.sig.alg != "Ed25519"
+            || envelope.sig.key_id.chars().count() > 64
+            || !canonical_b64u(&envelope.sig.value, 64)
+        {
+            return Err(("WIST4-E11", "malformed signature fields".into()));
+        }
+        if !crate::record::hostname_subject(&update.subject) {
+            return Err((
+                "WIST4-E04",
+                "subject is not a hostname of at least two labels".into(),
+            ));
+        }
+        let details = update
+            .details
+            .as_ref()
+            .filter(|details| details.is_object())
+            .ok_or(("WIST4-E04", "details are missing".to_owned()))?;
+        let block_hash = details["block"]
+            .as_str()
+            .filter(|hash| digest(hash))
+            .ok_or(("WIST4-E04", "details.block is not a Block Hash".to_owned()))?;
+        let subject = update.subject.clone();
+        if let Ok(id) = crate::governance::update_id(&body["update"]) {
+            self.sealed_ids.entry(id).or_insert(height);
+        }
+        let duty_height = *self
+            .heights
+            .get(block_hash)
+            .filter(|duty| **duty < height)
+            .ok_or((
+                "WIST4-E04",
+                "details.block names no earlier sealed Block".to_owned(),
+            ))?;
+        if !self.coverage.contains_key(&(subject.clone(), duty_height)) {
+            return Err((
+                "WIST4-E04",
+                "the subject held no coverage duty for the named Block".into(),
+            ));
+        }
+        match update.action {
+            wist_core::objects::audit::RegistryAction::PullAttestation => {
+                let found: Vec<String> = details["found"]
+                    .as_array()
+                    .ok_or(("WIST4-E04", "details.found is not an array".to_owned()))?
+                    .iter()
+                    .map(|id| {
+                        id.as_str()
+                            .filter(|id| digest(id))
+                            .map(str::to_owned)
+                            .ok_or((
+                                "WIST4-E04",
+                                "details.found carries a malformed ID".to_owned(),
+                            ))
+                    })
+                    .collect::<std::result::Result<_, _>>()?;
+                if envelope.sig.key_id != log_key_id
+                    || verify_envelope(body, "update", log_key).is_err()
+                {
+                    return Err((
+                        "WIST4-E11",
+                        "signature does not verify under the Log key".into(),
+                    ));
+                }
+                let pair = self.coverage.get_mut(&(subject, duty_height)).unwrap();
+                if pair.pull.is_none() {
+                    pair.pull = Some(PullAttestation { position, found });
+                }
+            }
+            wist_core::objects::audit::RegistryAction::CoverageAttestation => {
+                let proof = details["vrf_proof"]
+                    .as_str()
+                    .filter(|hex| {
+                        hex.len() == 2 * vrf::PROOF_LEN
+                            && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+                    })
+                    .and_then(|hex| wist_core::crypto::hex_decode(hex).ok())
+                    .and_then(|bytes| <[u8; vrf::PROOF_LEN]>::try_from(bytes).ok())
+                    .ok_or(("WIST4-E04", "details.vrf_proof is malformed".to_owned()))?;
+                let prev_record = match &details["prev_record"] {
+                    Value::Null => None,
+                    Value::String(id) if digest(id) => Some(id.clone()),
+                    _ => {
+                        return Err((
+                            "WIST4-E04",
+                            "details.prev_record is neither null nor an ID".into(),
+                        ))
+                    }
+                };
+                let duty_sealed_at_s = self.blocks[duty_height as usize].block.sealed_at_s;
+                let signer = [
+                    self.roster.admitted_key_at(&subject, sealed_at_s),
+                    self.roster.admitted_key_at(&subject, duty_sealed_at_s),
+                ]
+                .into_iter()
+                .flatten()
+                .find(|key| key.key_id == envelope.sig.key_id);
+                let authentic = signer.is_some_and(|key| {
+                    PublicKey::from_b64u(key.public_key)
+                        .is_ok_and(|key| verify_envelope(body, "update", &key).is_ok())
+                });
+                if !authentic {
+                    return Err((
+                        "WIST4-E11",
+                        "signature does not verify under a key the subject held".into(),
+                    ));
+                }
+                let mut key_seen = false;
+                let beta = self
+                    .beta_at(
+                        &subject,
+                        &self.blocks[duty_height as usize],
+                        &proof,
+                        &mut key_seen,
+                    )
+                    .ok_or((
+                        "WIST4-E01",
+                        "vrf_proof does not verify over the named Block".to_owned(),
+                    ))?;
+                self.publications.push(Publication {
+                    auditor_id: subject.clone(),
+                    height,
+                    prev_record,
+                    authentic: true,
+                });
+                let pair = self.coverage.get_mut(&(subject, duty_height)).unwrap();
+                pair.beta.get_or_insert(beta);
+                pair.attested_empty_at.get_or_insert(height);
+            }
+            _ => unreachable!("only attestation actions reach attest_inner"),
+        }
+        Ok(())
+    }
+
+    fn settle(
+        &mut self,
+        block: &VerifiedBlock,
+        prior: &dyn Fn(&str, u64) -> PriorState,
+    ) -> Result<()> {
+        let height = block.block().header.block_number;
+        let sealed_at_s = block.sealed_at_s();
+        for pair in self.coverage.values_mut() {
+            if pair.height < height
+                && pair.unattested_height.is_none()
+                && i128::from(sealed_at_s) > pair.deadline_s
+            {
+                pair.successors_after_deadline += 1;
+                if pair.successors_after_deadline == pair.seal_blocks {
+                    pair.unattested_height = Some(height);
+                }
+            }
+        }
+        let underived: Vec<(String, u64)> = self
+            .coverage
+            .iter()
+            .filter(|(_, pair)| pair.beta.is_some() && pair.selection.is_none())
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in underived {
+            let selection = self.derive_selection(&key.0, key.1, prior);
+            self.coverage.get_mut(&key).unwrap().selection = Some(selection);
+        }
+        for pair in self.coverage.values_mut() {
+            if pair.complete_at.is_some() {
+                continue;
+            }
+            let Some(set) = pair.duty_set() else {
+                continue;
+            };
+            pair.complete_at = if set.is_empty() {
+                pair.attested_empty_at
+            } else {
+                set.iter()
+                    .map(|delta| pair.discharged.get(delta).copied())
+                    .collect::<Option<Vec<u64>>>()
+                    .and_then(|heights| heights.into_iter().max())
+            };
+        }
+        let pending = std::mem::take(&mut self.pending);
+        let mut failing: BTreeMap<String, bool> = BTreeMap::new();
+        for (index, field_diagnostic, supported_major) in pending {
+            let auditor_id = self.records[index].auditor_id.clone();
+            let in_failure = match failing.get(&auditor_id) {
+                Some(state) => *state,
+                None => {
+                    let state = self.in_coverage_failure(&auditor_id, height);
+                    failing.insert(auditor_id.clone(), state);
+                    state
+                }
+            };
+            if in_failure {
+                let record = &mut self.records[index];
+                record.coverage_failure = true;
+                if field_diagnostic.is_none() && supported_major {
+                    record.diagnostic = Some("WIST4-E01");
+                }
+            }
+            let record = &self.records[index];
+            if !record.evidence() {
+                continue;
+            }
+            let (Some(verdict), Some(publisher)) = (record.verdict, record.publisher.clone())
+            else {
+                continue;
+            };
+            let (position, sealed_at_s, audited_delta) = (
+                record.position,
+                record.sealed_at_s,
+                record.audited_delta.clone(),
+            );
+            if matches!(verdict, Verdict::Inconsistent | Verdict::LinkInconsistent) {
+                self.trigger(
+                    position,
+                    sealed_at_s,
+                    &auditor_id,
+                    &audited_delta,
+                    &publisher,
+                    verdict,
+                );
+            }
+            self.evidence
+                .entry(audited_delta)
+                .or_default()
+                .push(Evidence {
+                    position,
+                    sealed_at_s,
+                    auditor_id,
+                    verdict,
+                });
+        }
+        Ok(())
+    }
+
+    fn derive_selection(
+        &self,
+        auditor_id: &str,
+        height: u64,
+        prior: &dyn Fn(&str, u64) -> PriorState,
+    ) -> Vec<String> {
+        let block = &self.blocks[height as usize];
+        let beta = self.coverage[&(auditor_id.to_owned(), height)]
+            .beta
+            .expect("selection is derived from a sealed proof");
+        let mut selection: Vec<String> = self
+            .deltas_by_height
+            .get(&height)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .filter(|id| {
+                let fact = &self.deltas[*id];
+                if fact.excluded || sampling::self_audit_barred(auditor_id, &fact.publisher) {
+                    return false;
+                }
+                let state = prior(&fact.publisher, height);
+                let p_1e7 = sampling::p_1e7(
+                    state.reputation_u,
+                    state.level1_sanction,
+                    self.escalated_before(&fact.publisher, height),
+                    &block.sampling,
+                );
+                sampling::selected(sampling::draw(&beta, id), p_1e7)
+            })
+            .cloned()
+            .collect();
+        selection.sort();
+        selection
+    }
+
+    fn exempt(&self, pair: &CoverageDuty, height: u64) -> bool {
+        let Some(pull) = &pair.pull else {
+            return false;
+        };
+        let from = pull.position.block_number;
+        from <= height
+            && self.publications.iter().any(|publication| {
+                publication.auditor_id == pair.auditor_id
+                    && publication.authentic
+                    && (from..=height).contains(&publication.height)
+                    && publication.prev_record.as_deref().is_some_and(|prev| {
+                        pull.found.iter().any(|found| found == prev)
+                            && !self
+                                .sealed_ids
+                                .get(prev)
+                                .is_some_and(|sealed| *sealed <= height)
+                    })
+            })
+    }
+
+    fn counts_at(&self, pair: &CoverageDuty, height: u64, sealed_at_s: i64) -> bool {
+        coverage::failure_counts_at(
+            pair.establishing_height(),
+            pair.sealed_at_s,
+            height,
+            sealed_at_s,
+        ) && !pair.complete_at.is_some_and(|complete| complete <= height)
+            && !self.exempt(pair, height)
+    }
+
+    pub fn counting_failures(&self, auditor_id: &str, height: u64) -> Vec<u64> {
+        let Some(at) = self.blocks.get(height as usize) else {
+            return Vec::new();
+        };
+        self.coverage
+            .range((auditor_id.to_owned(), 0)..=(auditor_id.to_owned(), height))
+            .filter(|(_, pair)| self.counts_at(pair, height, at.block.sealed_at_s))
+            .map(|(key, _)| key.1)
+            .collect()
+    }
+
+    pub fn in_coverage_failure(&self, auditor_id: &str, height: u64) -> bool {
+        let Some(at) = self.blocks.get(height as usize) else {
+            return false;
+        };
+        let times: Vec<i64> = self
+            .counting_failures(auditor_id, height)
+            .into_iter()
+            .map(|duty| self.blocks[duty as usize].block.sealed_at_s)
+            .collect();
+        coverage::in_coverage_failure(&times, at.block.sealed_at_s, COVERAGE_FAILURES_MAX)
+    }
+
+    pub fn coverage_duties(&self) -> impl Iterator<Item = &CoverageDuty> {
+        self.coverage.values()
+    }
+
+    pub fn coverage_duty(&self, auditor_id: &str, height: u64) -> Option<&CoverageDuty> {
+        self.coverage.get(&(auditor_id.to_owned(), height))
+    }
+
+    pub fn rejected_attestations(&self) -> &[RejectedAttestation] {
+        &self.rejected_attestations
     }
 
     fn beta_at(
@@ -562,6 +1094,12 @@ impl ExtensionHistory {
             self.summoning.push((auditor_id.to_owned(), sealed_at_s));
         }
         for candidate in &summoned {
+            if let Some(pair) = self
+                .coverage
+                .get_mut(&(candidate.clone(), position.block_number))
+            {
+                pair.named.push(delta_id.to_owned());
+            }
             self.named
                 .entry((delta_id.to_owned(), candidate.clone()))
                 .or_default()
@@ -712,6 +1250,17 @@ impl ExtensionHistory {
             .collect();
         extension::escalated_sampling(&escalations, publisher, at.block)
     }
+}
+
+fn canonical_b64u(value: &str, octets: usize) -> bool {
+    wist_core::crypto::b64u_decode(value)
+        .is_ok_and(|bytes| bytes.len() == octets && wist_core::crypto::b64u_encode(&bytes) == value)
+}
+
+fn digest(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    })
 }
 
 fn parse_verdict(name: &str) -> Option<Verdict> {

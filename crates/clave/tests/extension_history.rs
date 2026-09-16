@@ -60,6 +60,9 @@ struct Fixture {
     head: Option<BlockRow>,
     rows: Vec<BlockRow>,
     sk: SigningKey,
+    attest_empty: bool,
+    labels: std::cell::RefCell<BTreeMap<String, String>>,
+    roster: BTreeMap<String, (String, String)>,
 }
 
 impl Fixture {
@@ -72,6 +75,43 @@ impl Fixture {
             head: None,
             rows: Vec::new(),
             sk,
+            attest_empty: false,
+            labels: std::cell::RefCell::new(BTreeMap::new()),
+            roster: BTreeMap::new(),
+        }
+    }
+
+    fn attestations_for_previous_block(&self) -> Vec<Value> {
+        let Some(previous) = self.head.as_ref() else {
+            return Vec::new();
+        };
+        self.roster
+            .iter()
+            .map(|(subject, (key_id, label))| {
+                coverage_attestation(subject, label, key_id, previous, None)
+            })
+            .collect()
+    }
+
+    fn track_roster(&mut self, entries: &[Value]) {
+        for entry in entries {
+            if entry["type"] != "registry_update" {
+                continue;
+            }
+            let update = &entry["body"]["update"];
+            let subject = update["subject"].as_str().unwrap_or("").to_owned();
+            match update["action"].as_str() {
+                Some("auditor_remove") => {
+                    self.roster.remove(&subject);
+                }
+                Some("auditor_admit") => {
+                    let public_key = update["details"]["public_key"].as_str().unwrap();
+                    let label = self.labels.borrow()[public_key].clone();
+                    let key_id = update["details"]["key_id"].as_str().unwrap().to_owned();
+                    self.roster.insert(subject, (key_id, label));
+                }
+                _ => {}
+            }
         }
     }
 
@@ -81,7 +121,11 @@ impl Fixture {
             .join(format!("log/blocks/{height:09}.json.zst"))
     }
 
-    fn append(&mut self, at: i64, entries: Vec<Value>) -> BlockRow {
+    fn append(&mut self, at: i64, mut entries: Vec<Value>) -> BlockRow {
+        if self.attest_empty {
+            entries.extend(self.attestations_for_previous_block());
+        }
+        self.track_roster(&entries);
         let entries = sorted(entries);
         let height = self.head.as_ref().map_or(0, |head| head.block_number + 1);
         let leaves: Vec<_> = entries
@@ -151,6 +195,9 @@ impl Fixture {
     }
 
     fn admit(&self, subject: &str, key_label: &str, key_id: &str) -> Value {
+        self.labels
+            .borrow_mut()
+            .insert(public(key_label), key_label.to_owned());
         self.log_signed(json!({
             "wist_version": "1.0.0", "action": "auditor_admit", "subject": subject,
             "details": {"key_id": key_id, "alg": "Ed25519", "public_key": public(key_label)},
@@ -168,6 +215,35 @@ impl Fixture {
             "details": {"key_id": key_id}, "effective_at": ts(START),
         }))
     }
+
+    fn pull(&self, subject: &str, block: &BlockRow, found: &[String]) -> Value {
+        self.log_signed(json!({
+            "wist_version": "1.0.0", "action": "pull_attestation", "subject": subject,
+            "details": {"block": block.block_hash, "found": found}, "effective_at": ts(START),
+        }))
+    }
+}
+
+fn coverage_attestation(
+    subject: &str,
+    key_label: &str,
+    key_id: &str,
+    block: &BlockRow,
+    prev_record: Option<&str>,
+) -> Value {
+    let update = json!({
+        "wist_version": "1.0.0", "action": "coverage_attestation", "subject": subject,
+        "details": {
+            "block": block.block_hash,
+            "vrf_proof": hex_encode(&proof(key_label, block)),
+            "prev_record": prev_record,
+        },
+        "effective_at": ts(START),
+    });
+    json!({
+        "type": "registry_update",
+        "body": envelope::sign_envelope(&update, "update", key_id, &key(key_label)).unwrap(),
+    })
 }
 
 fn declaration(domain: &str, scope: &[&str], key_label: &str) -> Value {
@@ -528,6 +604,7 @@ fn triggers_follow_log_order_ration_and_independence() {
         "eye.sample.net",
     ];
     let mut fx = Fixture::new();
+    fx.attest_empty = true;
     let mut genesis: Vec<Value> = roster.iter().map(|auditor| fx.admit_own(auditor)).collect();
     genesis.push(declaration(publisher, &[], "site"));
     fx.hourly(0, genesis);
@@ -1886,4 +1963,545 @@ fn evidence_vectors_replay_as_signed_histories() {
             .map(str::to_owned)
         )
     );
+}
+
+fn coverage_vectors() -> Value {
+    serde_json::from_slice(
+        &std::fs::read(common::spec_dir().join("vectors/wist4/coverage.json")).unwrap(),
+    )
+    .unwrap()
+}
+
+fn update_id(entry: &Value) -> String {
+    wist_core::delta::delta_id(&entry["body"]["update"]).unwrap()
+}
+
+#[test]
+fn unpublished_duties_fail_at_the_fallback_and_exclude_records_past_the_maximum() {
+    let mut fx = Fixture::new();
+    fx.hourly(
+        0,
+        vec![
+            fx.admit_own("audit.example.net"),
+            fx.admit_own("checker.example.org"),
+            declaration(PUBLISHER, &[], "site"),
+        ],
+    );
+    for height in 1..100 {
+        fx.hourly(height, vec![]);
+    }
+    let deltas = pages(PUBLISHER, "site", "c", 64);
+    let audited = fx.hourly(100, deltas.clone());
+    let filer_beta = beta("audit.example.net", &audited);
+    let d = first(&deltas, &|id| drawn(&filer_beta, id, CEILING));
+    for height in 101..=130 {
+        let entries = if height == 119 || height == 120 {
+            vec![record(&Audit {
+                auditor: "audit.example.net",
+                audited: &d,
+                proof_over: &audited,
+                fetched_at: START + 100 * HOUR + (height - 118) as i64,
+                verdict: "consistent",
+            })]
+        } else {
+            Vec::new()
+        };
+        fx.hourly(height, entries);
+    }
+    let history = fx.reconstruct(&ceiling).unwrap();
+    assert!(history.rejected_attestations().is_empty());
+    let silent = history.coverage_duty("audit.example.net", 5).unwrap();
+    assert!(!silent.published());
+    assert_eq!(silent.selection, None);
+    assert_eq!(silent.deadline_s, i128::from(START + 5 * HOUR + 72 * HOUR));
+    assert_eq!(silent.unattested_height, Some(101));
+    assert_eq!(silent.establishing_height(), Some(101));
+    assert_eq!(silent.complete_at, None);
+    assert_eq!(
+        history.counting_failures("audit.example.net", 95),
+        Vec::<u64>::new()
+    );
+    assert_eq!(history.counting_failures("audit.example.net", 96), vec![0]);
+    assert_eq!(
+        history.counting_failures("audit.example.net", 120),
+        (0..=24).collect::<Vec<u64>>()
+    );
+    assert!(!history.in_coverage_failure("audit.example.net", 119));
+    assert!(history.in_coverage_failure("audit.example.net", 120));
+    assert!(history.in_coverage_failure("checker.example.org", 130));
+    let audited_pair = history.coverage_duty("audit.example.net", 100).unwrap();
+    assert!(audited_pair.published());
+    assert!(audited_pair.selection.as_ref().unwrap().contains(&d));
+    assert_eq!(audited_pair.discharged.get(&d), Some(&119));
+    let timely = standing_of(&history, 119, "audit.example.net");
+    assert!(timely.evidence() && timely.discharges_coverage && !timely.coverage_failure);
+    let late = standing_of(&history, 120, "audit.example.net");
+    assert!(late.coverage_failure && !late.evidence() && late.discharges_coverage);
+    assert_eq!(late.diagnostic, Some("WIST4-E01"));
+    assert_eq!(late.standing, Standing::Selected);
+}
+
+#[test]
+fn coverage_attestations_discharge_empty_selections_and_pulls_establish_at_their_block() {
+    let mut fx = Fixture::new();
+    fx.hourly(
+        0,
+        vec![
+            fx.admit_own("audit.example.net"),
+            fx.admit_own("checker.example.org"),
+            declaration(PUBLISHER, &[], "site"),
+        ],
+    );
+    let filer = "audit.example.net";
+    let checker = "checker.example.org";
+    let mut rows: BTreeMap<u64, BlockRow> = BTreeMap::new();
+    for height in 1..=100 {
+        let previous = |h: u64| rows[&h].clone();
+        let entries = match height {
+            10 => vec![coverage_attestation(
+                filer,
+                filer,
+                &key_id(filer),
+                &previous(5),
+                None,
+            )],
+            12 => {
+                let mut tampered =
+                    coverage_attestation(filer, filer, &key_id(filer), &previous(7), None);
+                let mut update = tampered["body"]["update"].clone();
+                let mut hex = update["details"]["vrf_proof"].as_str().unwrap().to_owned();
+                hex.replace_range(0..2, if hex.starts_with("00") { "01" } else { "00" });
+                update["details"]["vrf_proof"] = json!(hex);
+                tampered["body"] =
+                    envelope::sign_envelope(&update, "update", &key_id(filer), &key(filer))
+                        .unwrap();
+                let unknown = BlockRow {
+                    block_number: 8,
+                    block_hash: format!("sha256:{}", "1".repeat(64)),
+                    sealed_at: ts(START + 8 * HOUR),
+                };
+                let mut stale =
+                    coverage_attestation(filer, filer, &key_id(filer), &previous(9), None);
+                let mut update = stale["body"]["update"].clone();
+                update["wist_version"] = json!("2.0.0");
+                stale["body"] =
+                    envelope::sign_envelope(&update, "update", &key_id(filer), &key(filer))
+                        .unwrap();
+                vec![
+                    coverage_attestation(filer, checker, &key_id(checker), &previous(6), None),
+                    tampered,
+                    coverage_attestation(filer, filer, &key_id(filer), &unknown, None),
+                    stale,
+                    fx.pull("nobody.example.net", &previous(5), &[]),
+                    {
+                        let update = json!({
+                            "wist_version": "1.0.0", "action": "pull_attestation", "subject": checker,
+                            "details": {"block": previous(6).block_hash, "found": []}, "effective_at": ts(START),
+                        });
+                        json!({"type": "registry_update", "body": envelope::sign_envelope(&update, "update", &key_id(filer), &key(filer)).unwrap()})
+                    },
+                    {
+                        let mut malformed = fx.pull(checker, &previous(7), &[]);
+                        malformed["body"]["update"]["details"]["found"] = json!(["not an id"]);
+                        malformed
+                    },
+                ]
+            }
+            80 => vec![fx.pull(checker, &previous(5), &[])],
+            90 => vec![coverage_attestation(
+                checker,
+                checker,
+                &key_id(checker),
+                &previous(5),
+                None,
+            )],
+            _ => Vec::new(),
+        };
+        let row = fx.hourly(height, entries);
+        rows.insert(height, row);
+    }
+    let history = fx.reconstruct(&ceiling).unwrap();
+    let attested = history.coverage_duty(filer, 5).unwrap();
+    assert_eq!(attested.selection.as_deref(), Some(&[][..]));
+    assert_eq!(attested.attested_empty_at, Some(10));
+    assert_eq!(attested.complete_at, Some(10));
+    assert_eq!(
+        history.counting_failures(filer, 100),
+        vec![0, 1, 2, 3, 4],
+        "pairs establish at the fallback 96 Blocks after their Block; the attested pair is complete"
+    );
+    let mut codes: Vec<(u64, String, &str, String)> = history
+        .rejected_attestations()
+        .iter()
+        .map(|r| {
+            (
+                r.position.block_number,
+                r.action.clone(),
+                r.code,
+                r.subject.clone(),
+            )
+        })
+        .collect();
+    codes.sort();
+    assert_eq!(
+        codes,
+        vec![
+            (
+                12,
+                "coverage_attestation".to_owned(),
+                "WIST4-E01",
+                filer.to_owned()
+            ),
+            (
+                12,
+                "coverage_attestation".to_owned(),
+                "WIST4-E04",
+                filer.to_owned()
+            ),
+            (
+                12,
+                "coverage_attestation".to_owned(),
+                "WIST4-E11",
+                filer.to_owned()
+            ),
+            (
+                12,
+                "coverage_attestation".to_owned(),
+                "WIST4-E11",
+                filer.to_owned()
+            ),
+            (
+                12,
+                "pull_attestation".to_owned(),
+                "WIST4-E04",
+                checker.to_owned()
+            ),
+            (
+                12,
+                "pull_attestation".to_owned(),
+                "WIST4-E04",
+                "nobody.example.net".to_owned()
+            ),
+            (
+                12,
+                "pull_attestation".to_owned(),
+                "WIST4-E11",
+                checker.to_owned()
+            ),
+        ]
+    );
+    for height in [6, 7, 9] {
+        assert_eq!(
+            history.coverage_duty(filer, height).unwrap().complete_at,
+            None,
+            "{height}"
+        );
+    }
+    let pulled = history.coverage_duty(checker, 5).unwrap();
+    assert_eq!(pulled.pull.as_ref().unwrap().position.block_number, 80);
+    assert_eq!(pulled.unattested_height, None);
+    assert_eq!(pulled.establishing_height(), Some(80));
+    assert_eq!(pulled.complete_at, Some(90));
+    assert!(!history.counting_failures(checker, 79).contains(&5));
+    assert!(history.counting_failures(checker, 80).contains(&5));
+    assert!(history.counting_failures(checker, 89).contains(&5));
+    assert!(!history.counting_failures(checker, 90).contains(&5));
+    assert_eq!(history.coverage_duty(checker, 6).unwrap().pull, None);
+    assert_eq!(history.coverage_duty(checker, 7).unwrap().pull, None);
+}
+
+#[test]
+fn records_discharge_selected_and_named_deltas_and_partial_completion_fails() {
+    let mut fx = Fixture::new();
+    fx.attest_empty = true;
+    let (filer, checker, watcher) = (
+        "audit.example.net",
+        "checker.example.org",
+        "watch.sample.net",
+    );
+    fx.hourly(
+        0,
+        vec![
+            fx.admit_own(filer),
+            fx.admit_own(checker),
+            fx.admit_own(watcher),
+            declaration(PUBLISHER, &[], "site"),
+        ],
+    );
+    let deltas = pages(PUBLISHER, "site", "s", 48);
+    let audited = fx.hourly(1, deltas.clone());
+    let filer_beta = beta(filer, &audited);
+    let selected: Vec<String> = pick(&deltas, &|id| drawn(&filer_beta, id, CEILING));
+    assert!(selected.len() >= 3);
+    let (last, rest) = selected.split_last().unwrap();
+    let filed = |id: &str, fetched_at: i64| {
+        record(&Audit {
+            auditor: filer,
+            audited: id,
+            proof_over: &audited,
+            fetched_at,
+            verdict: "consistent",
+        })
+    };
+    fx.hourly(2, rest.iter().map(|id| filed(id, START + HOUR)).collect());
+    let checked = fx.hourly(3, vec![filed(last, START + HOUR + 1)]);
+    let checker_beta = beta(checker, &audited);
+    let e = first(&deltas, &|id| drawn(&checker_beta, id, CEILING));
+    let trigger = fx.hourly(
+        4,
+        vec![record(&Audit {
+            auditor: checker,
+            audited: &e,
+            proof_over: &audited,
+            fetched_at: START + HOUR + 2,
+            verdict: "inconsistent",
+        })],
+    );
+    fx.hourly(5, vec![]);
+    fx.hourly(
+        6,
+        vec![record(&Audit {
+            auditor: filer,
+            audited: &e,
+            proof_over: &trigger,
+            fetched_at: START + 4 * HOUR,
+            verdict: "consistent",
+        })],
+    );
+    for height in 7..=100 {
+        fx.hourly(height, vec![]);
+    }
+    let history = fx.reconstruct(&ceiling).unwrap();
+    assert!(history.rejected_attestations().is_empty());
+    let pair = history.coverage_duty(filer, 1).unwrap();
+    let mut expected = selected.clone();
+    expected.sort();
+    assert_eq!(pair.selection.as_ref(), Some(&expected));
+    assert_eq!(pair.attested_empty_at, Some(2));
+    assert_eq!(pair.discharged.len(), selected.len());
+    assert_eq!(pair.discharged[last], 3);
+    assert_eq!(pair.complete_at, Some(checked.block_number));
+    let partial =
+        ExtensionHistory::reconstruct(fx.data.path(), Some(fx.rows[2].clone()), &ceiling).unwrap();
+    let open = partial.coverage_duty(filer, 1).unwrap();
+    assert_eq!(open.discharged.len(), selected.len() - 1);
+    assert_eq!(
+        open.complete_at, None,
+        "an attested nonempty selection is not complete"
+    );
+    let summoned = history.coverage_duty(filer, 4).unwrap();
+    assert_eq!(summoned.selection.as_deref(), Some(&[][..]));
+    assert_eq!(summoned.named, vec![e.clone()]);
+    assert_eq!(summoned.duty_set(), Some(vec![e.clone()]));
+    assert_eq!(summoned.attested_empty_at, Some(5));
+    assert_eq!(summoned.discharged.get(&e), Some(&6));
+    assert_eq!(summoned.complete_at, Some(6));
+    let extension = standing_of(&history, 6, filer);
+    assert_eq!(
+        extension.standing,
+        Standing::Extension { trigger_height: 4 }
+    );
+    let idle = history.coverage_duty(watcher, 4).unwrap();
+    assert_eq!(idle.named, vec![e.clone()]);
+    assert_eq!(idle.complete_at, None);
+    assert_eq!(idle.establishing_height(), Some(100));
+    assert!(!history.counting_failures(watcher, 99).contains(&4));
+    assert!(history.counting_failures(watcher, 100).contains(&4));
+    assert_eq!(history.counting_failures(filer, 100), Vec::<u64>::new());
+    assert_eq!(history.counting_failures(checker, 100), vec![1]);
+}
+
+#[test]
+fn pair_specific_exemption_reads_the_aggregators_receipt() {
+    let vectors = coverage_vectors();
+    let (filer, checker) = ("audit.example.net", "checker.example.org");
+    let mut exercised = 0;
+    for case in vectors["attribution_cases"].as_array().unwrap() {
+        let label = case["label"].as_str().unwrap();
+        if case["successor"]["log"] != case["log"] {
+            continue;
+        }
+        exercised += 1;
+        let mut fx = Fixture::new();
+        fx.hourly(
+            0,
+            vec![
+                fx.admit_own(filer),
+                fx.admit_own(checker),
+                declaration(PUBLISHER, &[], "site"),
+            ],
+        );
+        let mut rows: BTreeMap<u64, BlockRow> = BTreeMap::new();
+        for height in 1..=9 {
+            rows.insert(height, fx.hourly(height, vec![]));
+        }
+        let missing_a = coverage_attestation(filer, filer, &key_id(filer), &rows[&6], None);
+        let missing_b = coverage_attestation(filer, filer, &key_id(filer), &rows[&7], None);
+        let id_of = |name: &str| match name {
+            "missing a" => update_id(&missing_a),
+            "missing b" => update_id(&missing_b),
+            other => panic!("{label}: unknown ID {other}"),
+        };
+        let found: Vec<String> = case["pull"]["found"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|name| id_of(name.as_str().unwrap()))
+            .collect();
+        let pull_height = case["pull"]["height"].as_u64().unwrap();
+        let successor = &case["successor"];
+        let successor_height = successor["height"].as_u64().unwrap();
+        let successor_auditor = successor["auditor"].as_str().unwrap();
+        let prev = id_of(successor["prev_record"].as_str().unwrap());
+        let predecessor_height = case["predecessor_sealed_height"].as_u64();
+        let n_height = case["n_height"].as_u64().unwrap();
+        let last = n_height.max(successor_height) + 1;
+        for height in 10..=last {
+            let mut entries = Vec::new();
+            if height == pull_height {
+                entries.push(fx.pull(filer, &rows[&5], &found));
+            }
+            if height == successor_height {
+                entries.push(coverage_attestation(
+                    successor_auditor,
+                    successor_auditor,
+                    &key_id(successor_auditor),
+                    &rows[&8],
+                    Some(&prev),
+                ));
+            }
+            if predecessor_height == Some(height) {
+                entries.push(missing_a.clone());
+            }
+            rows.insert(height, fx.hourly(height, entries));
+        }
+        let history = fx.reconstruct(&ceiling).unwrap();
+        assert!(history.rejected_attestations().is_empty(), "{label}");
+        let pair = history.coverage_duty(filer, 5).unwrap();
+        assert_eq!(
+            pair.pull.as_ref().unwrap().position.block_number,
+            pull_height,
+            "{label}"
+        );
+        assert_eq!(pair.complete_at, None, "{label}");
+        let counts = history.counting_failures(filer, n_height).contains(&5);
+        assert_eq!(
+            counts,
+            !case["chain_contradicts"].as_bool().unwrap(),
+            "{label}"
+        );
+    }
+    assert_eq!(exercised, 8);
+}
+
+#[test]
+fn late_discharge_vectors_replay_as_signed_histories() {
+    let vectors = coverage_vectors();
+    let filer = "audit.example.net";
+    let offset = 1u64;
+    let mut exercised = 0;
+    for case in vectors["late_discharge_cases"].as_array().unwrap() {
+        let label = case["label"].as_str().unwrap();
+        assert_eq!(case["audited_height"].as_u64().unwrap(), 0, "{label}");
+        assert_eq!(case["record_seal_blocks"].as_u64().unwrap(), 24, "{label}");
+        assert_eq!(case["deadline_height"].as_u64().unwrap(), 72, "{label}");
+        let selected: Vec<&str> = case["selected"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|name| name.as_str().unwrap())
+            .collect();
+        let mut fx = Fixture::new();
+        fx.hourly(
+            0,
+            vec![fx.admit_own(filer), declaration(PUBLISHER, &[], "site")],
+        );
+        let deltas = if selected.is_empty() {
+            Vec::new()
+        } else {
+            pages(PUBLISHER, "site", "l", 64)
+        };
+        let audited = fx.hourly(offset, deltas.clone());
+        let filer_beta = beta(filer, &audited);
+        let drawn_ids = pick(&deltas, &|id| drawn(&filer_beta, id, CEILING));
+        assert!(
+            selected.is_empty() || drawn_ids.len() > selected.len(),
+            "{label}"
+        );
+        let mapped: BTreeMap<&str, &String> = selected.iter().copied().zip(&drawn_ids).collect();
+        let filed = |id: &str, fetched_at: i64, tampered: bool| {
+            let audit = Audit {
+                auditor: filer,
+                audited: id,
+                proof_over: &audited,
+                fetched_at,
+                verdict: "consistent",
+            };
+            if tampered {
+                let mut pi = proof(filer, &audited);
+                pi[7] ^= 1;
+                record_signed(&audit, filer, &key_id(filer), &hex_encode(&pi))
+            } else {
+                record(&audit)
+            }
+        };
+        let last = case["probes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|probe| probe["height"].as_u64().unwrap())
+            .max()
+            .unwrap()
+            + offset;
+        for height in offset + 1..=last {
+            let mut entries = Vec::new();
+            if height == offset + 1 {
+                for id in drawn_ids.iter().skip(selected.len()) {
+                    entries.push(filed(id, START + offset as i64 * HOUR, false));
+                }
+            }
+            if case["pull_height"].as_u64() == Some(height - offset) {
+                entries.push(fx.pull(filer, &audited, &[]));
+            }
+            for sealed in case["records"].as_array().unwrap() {
+                if sealed["sealed_height"].as_u64().unwrap() + offset == height {
+                    let tampered = sealed["void"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|reason| reason == "bad_vrf_proof");
+                    entries.push(filed(
+                        mapped[sealed["delta"].as_str().unwrap()],
+                        START + offset as i64 * HOUR + height as i64,
+                        tampered,
+                    ));
+                }
+            }
+            if case["coverage_attestation_height"].as_u64() == Some(height - offset) {
+                entries.push(coverage_attestation(
+                    filer,
+                    filer,
+                    &key_id(filer),
+                    &audited,
+                    None,
+                ));
+            }
+            fx.hourly(height, entries);
+        }
+        let history = fx.reconstruct(&ceiling).unwrap();
+        assert!(history.rejected_attestations().is_empty(), "{label}");
+        let pair = history.coverage_duty(filer, offset).unwrap();
+        let mut expected: Vec<String> = drawn_ids.clone();
+        expected.sort();
+        assert_eq!(pair.selection.as_ref(), Some(&expected), "{label}");
+        for probe in case["probes"].as_array().unwrap() {
+            let height = probe["height"].as_u64().unwrap() + offset;
+            let complete = pair.complete_at.is_some_and(|at| at <= height);
+            assert_eq!(complete, probe["complete"], "{label} at {height}");
+            let counts = history.counting_failures(filer, height).contains(&offset);
+            assert_eq!(counts, probe["counts"], "{label} at {height}");
+        }
+        exercised += 1;
+    }
+    assert_eq!(exercised, 5);
 }
