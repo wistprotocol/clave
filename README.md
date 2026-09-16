@@ -333,8 +333,8 @@ These inputs do not establish Auditor standing or selection. VRF draws,
 selection domains and self-audit bars follow
 [Historical selection sets](#historical-selection-sets); the extension path
 and escalation state follow
-[Historical extension path](#historical-extension-path); reputation and
-sanction state at the preceding height remain caller obligations.
+[Historical extension path](#historical-extension-path), which also derives
+the reputation and sanction state a draw reads at the preceding height.
 
 Signed-history tests cover increases and decreases of each constant before,
 at and after effectiveness, negative slopes and zero, later references and resets,
@@ -396,11 +396,12 @@ proofs select, miss, fall outside the domain or fail verification.
 
 ## Historical extension path
 
-`history::extension::ExtensionHistory::reconstruct(directory, pinned_head, prior)`
+`history::extension::ExtensionHistory::reconstruct(directory, pinned_head)`
 authenticates the complete pinned prefix and replays every `audit_record`
-Entry in Log order under WIST-4 §§3/4 and §10.1. `prior(publisher, height)`
-supplies the Publisher's `reputation_u` and level-1 sanction state at the
-height preceding a draw's Block; escalated sampling is derived by the replay.
+Entry in Log order under WIST-4 §§3/4, §6, §7 and §10.1. A draw over Block B
+reads `prior_state(publisher, B − 1)`: the Publisher's derived `reputation_u`
+and first-rung sanction state at the preceding height, with escalated
+sampling derived by the same replay; Block 0 reads the empty Log.
 
 Each result's `standing` is the proof path alone. `Selected`: the proof
 verifies over the audited Delta's Block under the key held at that Block's
@@ -455,7 +456,7 @@ and `record_seal_blocks` in force at that Block. Its `beta` is the first VRF
 output that verifies over the Block under the key admitted there, taken from
 any of the Auditor's sealed Records or coverage attestations; `selection` is
 then the draw over the Block's in-domain, non-self-audit Deltas with the
-caller-supplied prior state, and `named` lists the Deltas the extension rule
+derived prior state, and `named` lists the Deltas the extension rule
 added at that Block. A Record whose `discharges_coverage` holds and whose
 standing is anchored at the Block discharges its Delta at its own height. A
 `coverage_attestation` is accepted when its fields, version and signature
@@ -467,7 +468,10 @@ duty there; the earliest sealed one fixes the pair's attested height.
 Field, version and signature failures are reported as `WIST4-E11`, malformed
 details, unknown Blocks and pairs without a duty as `WIST4-E04`, and a
 coverage attestation whose proof does not verify as `WIST4-E01`
-(`rejected_attestations()`).
+(`rejected_acts()`). Every sealed Record and Registry Update ID counts as
+sealed for the exemption test below, whatever its validity; only a Record
+with valid non-evidence fields and an authentic signature is the Auditor's
+publication for that test.
 
 `complete_at` is the height at which the whole duty set is discharged, or the
 attestation height for an empty set; `unattested_height` is the
@@ -486,10 +490,25 @@ attestations of the Block settle its coverage state, then each Record's
 version diagnostics, still discharging) before evidence, triggers and quorums
 are read in Entry order.
 
-Reputation and level-1 sanction state remain caller obligations. Observers
-hold no coverage duty. The `auditor_remove` a coverage failure requires, live
-pulls and attestation sealing are not implemented. Reconstruction retains
-every Block profile, Delta binding, Record, duty and publication in memory
+`reputation(publisher, height)` derives WIST-4 §6 at a height from the same
+evidence: `A` from the Publisher's first accepted Delta at or above its most
+recent identity reset (Declarations replay supplies resets), `C` from
+distinct URLs with an evidence `consistent` Record whose reference is a
+`new` or `update` Delta, and `penalty_n` from `findings()`: a Confirmed
+Inconsistency or Confirmed Link Inconsistency is established at the first
+evidence `inconsistent` or `link_inconsistent` Record for a Delta at which
+the quorum and window in force at that Record's Block are met, with the
+§7 severity of the closed confirming set (fixed at 1 for a link finding);
+`decay_horizon_days` is read at the height. `level1_sanction(publisher,
+height)` reads core's derived ladder, fed per Block with identity resets,
+Log-signed `sanction_lift` acts (rejected as WIST4-E11/E04 like other acts)
+and the Block's new findings in confirming-Record order; a finding whose
+Delta is sealed below the identity's reset arms nothing. Notice-scoped
+voids, `sanction` act validation and the level-3/4 processes are not
+replayed, so higher rungs never void here. Observers hold no coverage duty.
+The `auditor_remove` a coverage failure requires, live pulls and attestation
+sealing are not implemented. Reconstruction retains every Block profile,
+Delta binding, Record, duty, publication, audit and finding in memory
 without a work bound, exposes nothing after a prefix failure and rereads
 repaired files on retry.
 
@@ -514,7 +533,11 @@ flag. Coverage tests replay `coverage.json` late-discharge and attribution
 cases as signed histories, and cover silent Auditors failing at the fallback
 and crossing `coverage_failures_max`, attestation discharge of empty and
 extension-named duty sets, partial completion, attested-versus-fallback
-establishing heights, and rejected attestations.
+establishing heights, and rejected attestations. Reputation tests derive
+`A`, `C`, penalties with decay, the Provisional cap, extract and link
+findings, the first rung raising later draws to the ceiling, a Log-signed
+lift restoring the formula rate, a rejected lift, and a fresh identity
+clearing rungs and penalties.
 
 ## Historical coverage clocks
 

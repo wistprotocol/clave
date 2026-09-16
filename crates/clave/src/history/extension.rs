@@ -10,15 +10,25 @@ use crate::record::{Duty, RecordEnvelope, ReplayContext};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::Path;
-use wist_core::confirmation::{independent, CandidateRecord};
+use wist_core::confirmation::{
+    ci_severity, confirming_index_including, independent, CandidateRecord,
+};
 use wist_core::coverage::{self, within_days_ending_at, Block, COVERAGE_FAILURES_MAX};
 use wist_core::crypto::PublicKey;
+use wist_core::derivation::{
+    age_days, c_count, most_recent_reset, penalty_inputs, ConsistentAudit, DeltaEvent,
+};
 use wist_core::envelope::verify_envelope;
 pub use wist_core::extension::ExtensionOutcome;
 use wist_core::extension::{self, Escalation, ExtensionClaim, ExtensionRecord, RATION_WINDOW_DAYS};
-use wist_core::objects::audit::RegistryUpdateEnvelope;
 use wist_core::objects::audit::Verdict as SealedVerdict;
+use wist_core::objects::audit::{RegistryAction, RegistryUpdateEnvelope};
+use wist_core::reputation::{
+    apply_provisional_cap, base_u, is_provisional, penalty_n_within, reputation_formula_u,
+    DecayTable, PROVISIONAL_CAP_U,
+};
 use wist_core::sampling::{self, SamplingConstants};
+use wist_core::sanctions::{Ladder, OrderedFinding, SanctionBlock};
 use wist_core::verdict::{self, ChangeType, Thresholds, Verdict};
 use wist_core::vrf;
 
@@ -26,6 +36,43 @@ use wist_core::vrf;
 pub struct PriorState {
     pub reputation_u: u64,
     pub level1_sanction: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReputationState {
+    pub age_days: u64,
+    pub c: u64,
+    pub penalty_n: u128,
+    pub provisional: bool,
+    pub reputation_u: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Finding {
+    pub publisher: String,
+    pub delta_id: String,
+    pub link: bool,
+    pub audited_height: u64,
+    pub confirming: Position,
+    pub confirming_sealed_at_s: i64,
+    pub confirming_record_id: String,
+    pub severity: u8,
+}
+
+struct FindingRecord {
+    position: Position,
+    sealed_at_s: i64,
+    auditor_id: String,
+    effective_similarity: u64,
+    confirm_window_hours: u64,
+    confirm_auditors: u64,
+}
+
+struct AcceptedAudit {
+    height: u64,
+    audited_height: u64,
+    url: String,
+    change: ChangeType,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +101,9 @@ pub struct RecordStanding {
     pub publisher: Option<String>,
     pub audited_height: Option<u64>,
     pub verdict: Option<Verdict>,
+    pub reference_delta: Option<String>,
+    pub similarity: Option<u64>,
+    pub record_id: Option<String>,
     pub standing: Standing,
     pub duty: Duty,
     pub authentic: bool,
@@ -117,7 +167,7 @@ impl CoverageDuty {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RejectedAttestation {
+pub struct RejectedAct {
     pub position: Position,
     pub action: String,
     pub subject: String,
@@ -176,6 +226,7 @@ struct BlockFact {
     confirm_auditors: u64,
     extension_triggers_max: u64,
     coverage: super::coverage::CoverageProfile,
+    decay_horizon_days: u64,
 }
 
 struct DeltaFact {
@@ -214,15 +265,20 @@ pub struct ExtensionHistory {
     coverage: BTreeMap<(String, u64), CoverageDuty>,
     publications: Vec<Publication>,
     sealed_ids: BTreeMap<String, u64>,
-    rejected_attestations: Vec<RejectedAttestation>,
+    rejected_acts: Vec<RejectedAct>,
+    resets: BTreeMap<String, Vec<u64>>,
+    accepted: BTreeMap<String, Vec<DeltaEvent>>,
+    audits: BTreeMap<String, Vec<AcceptedAudit>>,
+    finding_records: BTreeMap<(String, bool), Vec<FindingRecord>>,
+    findings: Vec<Finding>,
+    ladders: BTreeMap<String, Ladder>,
+    rungs: BTreeMap<String, Vec<(u64, bool)>>,
+    block_resets: Vec<String>,
+    block_lifts: Vec<String>,
 }
 
 impl ExtensionHistory {
-    pub fn reconstruct(
-        directory: &Path,
-        head: Option<BlockRow>,
-        prior: &dyn Fn(&str, u64) -> PriorState,
-    ) -> Result<Self> {
+    pub fn reconstruct(directory: &Path, head: Option<BlockRow>) -> Result<Self> {
         let mut history = History::open(directory, head.clone())?;
         let mut declarations = Declarations::default();
         let mut chains = Chains::default();
@@ -245,10 +301,33 @@ impl ExtensionHistory {
             coverage: BTreeMap::new(),
             publications: Vec::new(),
             sealed_ids: BTreeMap::new(),
-            rejected_attestations: Vec::new(),
+            rejected_acts: Vec::new(),
+            resets: BTreeMap::new(),
+            accepted: BTreeMap::new(),
+            audits: BTreeMap::new(),
+            finding_records: BTreeMap::new(),
+            findings: Vec::new(),
+            ladders: BTreeMap::new(),
+            rungs: BTreeMap::new(),
+            block_resets: Vec::new(),
+            block_lifts: Vec::new(),
         };
         while let Some(block) = history.next_block()? {
-            declarations.apply(&block)?;
+            let effects = declarations.apply(&block)?;
+            for installation in &effects.installations {
+                if installation.resets_identity {
+                    let domain = installation.declaration.envelope()["publisher"]["domain"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_owned();
+                    replay
+                        .resets
+                        .entry(domain.clone())
+                        .or_default()
+                        .push(block.block().header.block_number);
+                    replay.block_resets.push(domain);
+                }
+            }
             chains.apply(&block, &declarations)?;
             replay
                 .roster
@@ -258,20 +337,18 @@ impl ExtensionHistory {
             replay.open_duties(&block);
             for (entry_index, entry) in block.block().entries.iter().enumerate() {
                 match entry["type"].as_str() {
-                    Some("registry_update") => replay.attest(
+                    Some("registry_update") => replay.registry_update(
                         &block,
                         entry_index,
                         &entry["body"],
                         history.log_key_id(),
                         history.log_key(),
                     )?,
-                    Some("audit_record") => {
-                        replay.classify(&block, entry_index, &entry["body"], prior)?
-                    }
+                    Some("audit_record") => replay.classify(&block, entry_index, &entry["body"])?,
                     _ => {}
                 }
             }
-            replay.settle(&block, prior)?;
+            replay.settle(&block)?;
             replay.close_extensions()?;
         }
         Ok(replay)
@@ -298,6 +375,7 @@ impl ExtensionHistory {
             confirm_auditors: confirmation.auditors,
             extension_triggers_max: block.extension_triggers_max(),
             coverage: *block.coverage_profile(),
+            decay_horizon_days: block.decay_horizon_days(),
         });
         Ok(())
     }
@@ -363,6 +441,13 @@ impl ExtensionHistory {
                     .entry(height)
                     .or_default()
                     .push(delta.id.clone());
+                self.accepted
+                    .entry(delta.domain.clone())
+                    .or_default()
+                    .push(DeltaEvent {
+                        height,
+                        sealed_at_s: self.blocks[height as usize].block.sealed_at_s,
+                    });
                 false
             });
             if pending.len() == before {
@@ -380,13 +465,7 @@ impl ExtensionHistory {
             .is_some_and(|height| self.escalated_sampling(publisher, height))
     }
 
-    fn classify(
-        &mut self,
-        block: &VerifiedBlock,
-        entry_index: usize,
-        body: &Value,
-        prior: &dyn Fn(&str, u64) -> PriorState,
-    ) -> Result<()> {
+    fn classify(&mut self, block: &VerifiedBlock, entry_index: usize, body: &Value) -> Result<()> {
         let height = block.block().header.block_number;
         let sealed_at_s = block.sealed_at_s();
         let position = Position {
@@ -423,7 +502,7 @@ impl ExtensionHistory {
                 let mut result = None;
                 if let Some(beta) = self.beta_at(&auditor_id, audited, &proof, &mut key_seen) {
                     betas.push((fact.height, beta));
-                    let state = prior(&fact.publisher, fact.height);
+                    let state = self.prior_state(&fact.publisher, fact.height.checked_sub(1));
                     let p_1e7 = sampling::p_1e7(
                         state.reputation_u,
                         state.level1_sanction,
@@ -510,14 +589,15 @@ impl ExtensionHistory {
                     .or_insert(height);
             }
         }
-        if let Ok(id) = wist_core::delta::delta_id(record) {
-            self.sealed_ids.entry(id).or_insert(height);
+        let record_id = wist_core::delta::delta_id(record).ok();
+        if let Some(id) = &record_id {
+            self.sealed_ids.entry(id.clone()).or_insert(height);
         }
         self.publications.push(Publication {
             auditor_id: auditor_id.clone(),
             height,
             prev_record: record["prev_record"].as_str().map(str::to_owned),
-            authentic,
+            authentic: authentic && fields.non_evidence_valid(),
         });
         self.pending.push((
             self.records.len(),
@@ -532,6 +612,9 @@ impl ExtensionHistory {
             publisher,
             audited_height,
             verdict,
+            reference_delta: record["reference_delta"].as_str().map(str::to_owned),
+            similarity: record["similarity"].as_u64(),
+            record_id,
             standing,
             duty,
             authentic,
@@ -570,7 +653,7 @@ impl ExtensionHistory {
         }
     }
 
-    fn attest(
+    fn registry_update(
         &mut self,
         block: &VerifiedBlock,
         entry_index: usize,
@@ -579,7 +662,10 @@ impl ExtensionHistory {
         log_key: &PublicKey,
     ) -> Result<()> {
         let action = body["update"]["action"].as_str().unwrap_or("");
-        if action != "pull_attestation" && action != "coverage_attestation" {
+        if !matches!(
+            action,
+            "pull_attestation" | "coverage_attestation" | "sanction_lift"
+        ) {
             return Ok(());
         }
         let position = Position {
@@ -587,7 +673,7 @@ impl ExtensionHistory {
             entry_index,
         };
         if let Err((code, reason)) = self.attest_inner(block, position, body, log_key_id, log_key) {
-            self.rejected_attestations.push(RejectedAttestation {
+            self.rejected_acts.push(RejectedAct {
                 position,
                 action: action.to_owned(),
                 subject: body["update"]["subject"]
@@ -611,6 +697,9 @@ impl ExtensionHistory {
     ) -> std::result::Result<(), (&'static str, String)> {
         let height = position.block_number;
         let sealed_at_s = block.sealed_at_s();
+        if let Ok(id) = crate::governance::update_id(&body["update"]) {
+            self.sealed_ids.entry(id).or_insert(height);
+        }
         let envelope: RegistryUpdateEnvelope =
             serde_json::from_value(body.clone()).map_err(|e| {
                 (
@@ -642,6 +731,18 @@ impl ExtensionHistory {
                 "subject is not a hostname of at least two labels".into(),
             ));
         }
+        if matches!(update.action, RegistryAction::SanctionLift) {
+            if envelope.sig.key_id != log_key_id
+                || verify_envelope(body, "update", log_key).is_err()
+            {
+                return Err((
+                    "WIST4-E11",
+                    "signature does not verify under the Log key".into(),
+                ));
+            }
+            self.block_lifts.push(update.subject.clone());
+            return Ok(());
+        }
         let details = update
             .details
             .as_ref()
@@ -652,9 +753,6 @@ impl ExtensionHistory {
             .filter(|hash| digest(hash))
             .ok_or(("WIST4-E04", "details.block is not a Block Hash".to_owned()))?;
         let subject = update.subject.clone();
-        if let Ok(id) = crate::governance::update_id(&body["update"]) {
-            self.sealed_ids.entry(id).or_insert(height);
-        }
         let duty_height = *self
             .heights
             .get(block_hash)
@@ -708,9 +806,9 @@ impl ExtensionHistory {
                     .and_then(|hex| wist_core::crypto::hex_decode(hex).ok())
                     .and_then(|bytes| <[u8; vrf::PROOF_LEN]>::try_from(bytes).ok())
                     .ok_or(("WIST4-E04", "details.vrf_proof is malformed".to_owned()))?;
-                let prev_record = match &details["prev_record"] {
-                    Value::Null => None,
-                    Value::String(id) if digest(id) => Some(id.clone()),
+                let prev_record = match details.get("prev_record") {
+                    Some(Value::Null) => None,
+                    Some(Value::String(id)) if digest(id) => Some(id.clone()),
                     _ => {
                         return Err((
                             "WIST4-E04",
@@ -763,11 +861,7 @@ impl ExtensionHistory {
         Ok(())
     }
 
-    fn settle(
-        &mut self,
-        block: &VerifiedBlock,
-        prior: &dyn Fn(&str, u64) -> PriorState,
-    ) -> Result<()> {
+    fn settle(&mut self, block: &VerifiedBlock) -> Result<()> {
         let height = block.block().header.block_number;
         let sealed_at_s = block.sealed_at_s();
         for pair in self.coverage.values_mut() {
@@ -788,7 +882,7 @@ impl ExtensionHistory {
             .map(|(key, _)| key.clone())
             .collect();
         for key in underived {
-            let selection = self.derive_selection(&key.0, key.1, prior);
+            let selection = self.derive_selection(&key.0, key.1);
             self.coverage.get_mut(&key).unwrap().selection = Some(selection);
         }
         for pair in self.coverage.values_mut() {
@@ -809,6 +903,7 @@ impl ExtensionHistory {
         }
         let pending = std::mem::take(&mut self.pending);
         let mut failing: BTreeMap<String, bool> = BTreeMap::new();
+        let mut new_findings: BTreeMap<String, Vec<OrderedFinding>> = BTreeMap::new();
         for (index, field_diagnostic, supported_major) in pending {
             let auditor_id = self.records[index].auditor_id.clone();
             let in_failure = match failing.get(&auditor_id) {
@@ -839,6 +934,48 @@ impl ExtensionHistory {
                 record.sealed_at_s,
                 record.audited_delta.clone(),
             );
+            let bindings = record
+                .reference_delta
+                .as_deref()
+                .and_then(|id| self.deltas.get(id))
+                .zip(self.deltas.get(&audited_delta))
+                .map(|(reference, audited)| {
+                    (audited.height, audited.chain.1.clone(), reference.change)
+                });
+            let Some((audited_height, url, change)) = bindings else {
+                return Err(Error::History(
+                    "evidence Record lost its authenticated Delta bindings".into(),
+                ));
+            };
+            match verdict {
+                Verdict::Consistent => {
+                    self.audits
+                        .entry(publisher.clone())
+                        .or_default()
+                        .push(AcceptedAudit {
+                            height,
+                            audited_height,
+                            url,
+                            change,
+                        });
+                }
+                Verdict::Inconsistent | Verdict::LinkInconsistent => {
+                    if let Some(finding) = self.confirm(
+                        index,
+                        &publisher,
+                        &audited_delta,
+                        audited_height,
+                        change,
+                        verdict == Verdict::LinkInconsistent,
+                    ) {
+                        new_findings
+                            .entry(publisher.clone())
+                            .or_default()
+                            .push(finding);
+                    }
+                }
+                _ => {}
+            }
             if matches!(verdict, Verdict::Inconsistent | Verdict::LinkInconsistent) {
                 self.trigger(
                     position,
@@ -859,15 +996,213 @@ impl ExtensionHistory {
                     verdict,
                 });
         }
+        let resets = std::mem::take(&mut self.block_resets);
+        let lifts = std::mem::take(&mut self.block_lifts);
+        let mut publishers: Vec<String> = resets.iter().chain(&lifts).cloned().collect();
+        publishers.extend(new_findings.keys().cloned());
+        publishers.sort();
+        publishers.dedup();
+        for publisher in publishers {
+            let ladder = self.ladders.entry(publisher.clone()).or_default();
+            ladder.apply_block(SanctionBlock {
+                height,
+                sealed_at_s,
+                reset: resets.contains(&publisher),
+                lift: lifts.contains(&publisher),
+                voids: &[],
+                findings: new_findings
+                    .get(&publisher)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default(),
+            });
+            let level1 = ladder.active()[0].is_some();
+            let rungs = self.rungs.entry(publisher).or_default();
+            if rungs.last().is_none_or(|(_, active)| *active != level1) {
+                rungs.push((height, level1));
+            }
+        }
         Ok(())
     }
 
-    fn derive_selection(
-        &self,
-        auditor_id: &str,
-        height: u64,
-        prior: &dyn Fn(&str, u64) -> PriorState,
-    ) -> Vec<String> {
+    fn confirm(
+        &mut self,
+        index: usize,
+        publisher: &str,
+        delta_id: &str,
+        audited_height: u64,
+        change: ChangeType,
+        link: bool,
+    ) -> Option<OrderedFinding> {
+        if self
+            .findings
+            .iter()
+            .any(|finding| finding.delta_id == delta_id && finding.link == link)
+        {
+            return None;
+        }
+        let record = &self.records[index];
+        let id: [u8; 32] = record
+            .record_id
+            .as_deref()
+            .and_then(|id| id.strip_prefix("sha256:"))
+            .and_then(|hex| wist_core::crypto::hex_decode(hex).ok())
+            .and_then(|bytes| bytes.try_into().ok())?;
+        let block = &self.blocks[record.position.block_number as usize];
+        let entry = FindingRecord {
+            position: record.position,
+            sealed_at_s: record.sealed_at_s,
+            auditor_id: record.auditor_id.clone(),
+            effective_similarity: verdict::effective_similarity(
+                record.similarity.unwrap_or(0),
+                change,
+            ),
+            confirm_window_hours: block.confirm_window_hours,
+            confirm_auditors: block.confirm_auditors,
+        };
+        let (position, sealed_at_s) = (record.position, record.sealed_at_s);
+        let records = self
+            .finding_records
+            .entry((delta_id.to_owned(), link))
+            .or_default();
+        records.push(entry);
+        let candidates: Vec<CandidateRecord<'_>> = records
+            .iter()
+            .map(|r| CandidateRecord {
+                block_height: r.position.block_number,
+                entry_index: r.position.entry_index as u64,
+                block_sealed_at_s: r.sealed_at_s,
+                auditor_id: &r.auditor_id,
+                effective_similarity: r.effective_similarity,
+            })
+            .collect();
+        let last = candidates.len() - 1;
+        let confirmed = confirming_index_including(
+            &candidates,
+            records[last].confirm_window_hours,
+            records[last].confirm_auditors,
+            last,
+        )
+        .ok()
+        .flatten()
+        .is_some_and(|i| i == last);
+        if !confirmed {
+            return None;
+        }
+        let severity = if link {
+            1
+        } else {
+            ci_severity(&candidates, last).ok()?
+        };
+        let confirming_record_id = format!("sha256:{}", wist_core::crypto::hex_encode(&id));
+        self.findings.push(Finding {
+            publisher: publisher.to_owned(),
+            delta_id: delta_id.to_owned(),
+            link,
+            audited_height,
+            confirming: position,
+            confirming_sealed_at_s: sealed_at_s,
+            confirming_record_id,
+            severity,
+        });
+        let reset = most_recent_reset(
+            self.resets
+                .get(publisher)
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+            position.block_number,
+        );
+        if reset.is_some_and(|r| audited_height < r) {
+            return None;
+        }
+        Some(OrderedFinding {
+            record_id: id,
+            entry_index: position.entry_index as u64,
+            severity,
+        })
+    }
+
+    pub fn reputation(&self, publisher: &str, height: u64) -> Option<ReputationState> {
+        let at = self.blocks.get(height as usize)?;
+        let reset = most_recent_reset(
+            self.resets
+                .get(publisher)
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+            height,
+        );
+        let accepted = self
+            .accepted
+            .get(publisher)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let age_days = age_days(accepted, reset, height, at.block.sealed_at_s).ok()?;
+        let audits: Vec<ConsistentAudit<'_>> = self
+            .audits
+            .get(publisher)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .map(|audit| ConsistentAudit {
+                height: audit.height,
+                audited_height: audit.audited_height,
+                url: &audit.url,
+                change: audit.change,
+            })
+            .collect();
+        let c = c_count(&audits, reset, height);
+        let findings: Vec<wist_core::derivation::ConfirmedFinding<'_>> = self
+            .findings
+            .iter()
+            .filter(|finding| {
+                finding.publisher == publisher && finding.confirming.block_number <= height
+            })
+            .map(|finding| wist_core::derivation::ConfirmedFinding {
+                confirming_height: finding.confirming.block_number,
+                audited_height: finding.audited_height,
+                confirming_sealed_at_s: finding.confirming_sealed_at_s,
+                delta_id: &finding.delta_id,
+                severity: finding.severity,
+            })
+            .collect();
+        let inputs = penalty_inputs(&findings, reset, height, at.block.sealed_at_s).ok()?;
+        let penalty_n = penalty_n_within(&inputs, DecayTable::builtin(), at.decay_horizon_days);
+        let formula = reputation_formula_u(base_u(age_days), c, penalty_n);
+        Some(ReputationState {
+            age_days,
+            c,
+            penalty_n,
+            provisional: is_provisional(age_days, c),
+            reputation_u: apply_provisional_cap(formula, age_days, c),
+        })
+    }
+
+    pub fn level1_sanction(&self, publisher: &str, height: u64) -> bool {
+        self.rungs
+            .get(publisher)
+            .and_then(|rungs| rungs.iter().rev().find(|(at, _)| *at <= height))
+            .is_some_and(|(_, active)| *active)
+    }
+
+    pub fn prior_state(&self, publisher: &str, height: Option<u64>) -> PriorState {
+        let Some(height) = height else {
+            return PriorState {
+                reputation_u: PROVISIONAL_CAP_U,
+                level1_sanction: false,
+            };
+        };
+        PriorState {
+            reputation_u: self
+                .reputation(publisher, height)
+                .map_or(PROVISIONAL_CAP_U, |state| state.reputation_u),
+            level1_sanction: self.level1_sanction(publisher, height),
+        }
+    }
+
+    pub fn findings(&self) -> &[Finding] {
+        &self.findings
+    }
+
+    fn derive_selection(&self, auditor_id: &str, height: u64) -> Vec<String> {
         let block = &self.blocks[height as usize];
         let beta = self.coverage[&(auditor_id.to_owned(), height)]
             .beta
@@ -883,7 +1218,7 @@ impl ExtensionHistory {
                 if fact.excluded || sampling::self_audit_barred(auditor_id, &fact.publisher) {
                     return false;
                 }
-                let state = prior(&fact.publisher, height);
+                let state = self.prior_state(&fact.publisher, height.checked_sub(1));
                 let p_1e7 = sampling::p_1e7(
                     state.reputation_u,
                     state.level1_sanction,
@@ -959,8 +1294,8 @@ impl ExtensionHistory {
         self.coverage.get(&(auditor_id.to_owned(), height))
     }
 
-    pub fn rejected_attestations(&self) -> &[RejectedAttestation] {
-        &self.rejected_attestations
+    pub fn rejected_acts(&self) -> &[RejectedAct] {
+        &self.rejected_acts
     }
 
     fn beta_at(

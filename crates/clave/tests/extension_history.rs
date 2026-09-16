@@ -2,9 +2,7 @@ mod common;
 
 use clave::db::BlockRow;
 use clave::history::declarations::Position;
-use clave::history::extension::{
-    ExtensionHistory, PriorState, RecordStanding, Standing, Trigger, VoidReason,
-};
+use clave::history::extension::{ExtensionHistory, RecordStanding, Standing, Trigger, VoidReason};
 use clave::record::Duty;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -18,7 +16,7 @@ use wist_core::{block, envelope, jcs, merkle, vrf};
 const START: i64 = 1_800_000_000;
 const HOUR: i64 = 3_600;
 const CEILING: u64 = 5_000_000;
-const FLOOR: u64 = 200_000;
+const PROVISIONAL: u64 = 2_900_000;
 const PUBLISHER: &str = "site.example.com";
 
 fn ts(at: i64) -> String {
@@ -172,11 +170,8 @@ impl Fixture {
         self.append(START + height as i64 * HOUR, entries)
     }
 
-    fn reconstruct(
-        &self,
-        prior: &dyn Fn(&str, u64) -> PriorState,
-    ) -> Result<ExtensionHistory, clave::Error> {
-        ExtensionHistory::reconstruct(self.data.path(), self.head.clone(), prior)
+    fn reconstruct(&self) -> Result<ExtensionHistory, clave::Error> {
+        ExtensionHistory::reconstruct(self.data.path(), self.head.clone())
     }
 
     fn record_body(&self, position: Position) -> Value {
@@ -247,11 +242,33 @@ fn coverage_attestation(
 }
 
 fn declaration(domain: &str, scope: &[&str], key_label: &str) -> Value {
+    declaration_seq(domain, scope, key_label, 0)
+}
+
+fn declaration_seq(domain: &str, scope: &[&str], key_label: &str, seq: u64) -> Value {
+    declaration_after(domain, scope, key_label, seq, None)
+}
+
+fn declaration_after(
+    domain: &str,
+    scope: &[&str],
+    key_label: &str,
+    seq: u64,
+    previous: Option<&Value>,
+) -> Value {
     let mut publisher = json!({
         "wist_version": "1.0.0", "domain": domain,
         "keys": [{"key_id": "k1", "alg": "Ed25519", "public_key": public(key_label), "valid_from": "2026-08-01T00:00:00Z"}],
-        "seq": 0,
+        "seq": seq,
     });
+    if let Some(previous) = previous {
+        publisher["prev_declaration"] = json!(format!(
+            "sha256:{}",
+            hex_encode(&Sha256::digest(
+                jcs::canonicalize(&previous["body"]["publisher"]).unwrap()
+            ))
+        ));
+    }
     if !scope.is_empty() {
         publisher["subdomain_scope"] = json!(scope);
     }
@@ -388,13 +405,6 @@ fn record(audit: &Audit<'_>) -> Value {
     )
 }
 
-fn ceiling(_: &str, _: u64) -> PriorState {
-    PriorState {
-        reputation_u: 0,
-        level1_sanction: true,
-    }
-}
-
 fn standing_of<'a>(
     history: &'a ExtensionHistory,
     height: u64,
@@ -452,7 +462,7 @@ fn records_bind_to_the_block_their_proof_is_over() {
         beta("checker.example.org", &audited),
     );
     let d = first(&deltas, &|id| {
-        drawn(&filer_beta, id, CEILING) && !drawn(&peer_beta, id, CEILING)
+        drawn(&filer_beta, id, PROVISIONAL) && !drawn(&peer_beta, id, PROVISIONAL)
     });
     let trigger = fx.hourly(
         2,
@@ -512,7 +522,7 @@ fn records_bind_to_the_block_their_proof_is_over() {
         ],
     );
     for attempt in 0..2 {
-        let history = fx.reconstruct(&ceiling).unwrap();
+        let history = fx.reconstruct().unwrap();
         assert_eq!(
             history.through().map(|row| row.block_number),
             Some(4),
@@ -608,13 +618,13 @@ fn triggers_follow_log_order_ration_and_independence() {
     let mut genesis: Vec<Value> = roster.iter().map(|auditor| fx.admit_own(auditor)).collect();
     genesis.push(declaration(publisher, &[], "site"));
     fx.hourly(0, genesis);
-    let deltas = pages(publisher, "site", "t", 96);
+    let deltas = pages(publisher, "site", "t", 192);
     let audited = fx.hourly(1, deltas.clone());
     let betas: BTreeMap<&str, [u8; 64]> = roster
         .iter()
         .map(|auditor| (*auditor, beta(auditor, &audited)))
         .collect();
-    let by = |auditor: &str, id: &str| drawn(&betas[auditor], id, CEILING);
+    let by = |auditor: &str, id: &str| drawn(&betas[auditor], id, PROVISIONAL);
     let filer_only = pick(&deltas, &|id| {
         by("audit.example.net", id) && !by("checker.example.org", id)
     });
@@ -684,7 +694,7 @@ fn triggers_follow_log_order_ration_and_independence() {
         reset_height,
         vec![filed("audit.example.net", c, "inconsistent")],
     );
-    let history = fx.reconstruct(&ceiling).unwrap();
+    let history = fx.reconstruct().unwrap();
     assert!(history.roster().rejected().is_empty());
     let prior: Vec<&Trigger> = history
         .triggers()
@@ -849,7 +859,7 @@ fn contradiction_vectors_escalate_the_domain_from_the_closing_block() {
         let earlier = pages(PUBLISHER, "site", "prior", 32);
         let earlier_row = fx.hourly(1, earlier.clone());
         let earlier_beta = beta(trigger_auditor, &earlier_row);
-        let prior_deltas = pick(&earlier, &|id| drawn(&earlier_beta, id, CEILING));
+        let prior_deltas = pick(&earlier, &|id| drawn(&earlier_beta, id, PROVISIONAL));
         assert!(prior_deltas.len() >= 3, "{label}");
         for height in 2..=4 {
             let entries = if summoned_case {
@@ -865,7 +875,7 @@ fn contradiction_vectors_escalate_the_domain_from_the_closing_block() {
             };
             fx.hourly(height, entries);
         }
-        let deltas = pages(PUBLISHER, "site", "d", 96);
+        let deltas = pages(PUBLISHER, "site", "d", 512);
         let audited = fx.hourly(audited_height, deltas.clone());
         let vrf_auditors: BTreeSet<&str> = std::iter::once(trigger_auditor)
             .chain(records.iter().filter_map(|record| {
@@ -882,7 +892,7 @@ fn contradiction_vectors_escalate_the_domain_from_the_closing_block() {
             .map(|auditor| beta(auditor, &audited))
             .collect();
         let d = first(&deltas, &|id| {
-            betas.iter().all(|beta| drawn(beta, id, CEILING))
+            betas.iter().all(|beta| drawn(beta, id, PROVISIONAL))
         });
         for height in audited_height + 1..trigger_height {
             fx.hourly(height, vec![]);
@@ -934,7 +944,7 @@ fn contradiction_vectors_escalate_the_domain_from_the_closing_block() {
                 trigger_row = Some(row);
             }
         }
-        let history = fx.reconstruct(&ceiling).unwrap();
+        let history = fx.reconstruct().unwrap();
         assert!(history.roster().rejected().is_empty(), "{label}");
         let trigger = trigger_at(&history, trigger_height, &d);
         assert_eq!(trigger.summons, summoned_case, "{label}");
@@ -1027,9 +1037,7 @@ fn escalation_displaces_the_formula_for_later_blocks_of_the_domain_only() {
     let deltas = pages(PUBLISHER, "site", "first", 96);
     let audited = fx.hourly(1, deltas.clone());
     let filer_beta = beta("audit.example.net", &audited);
-    let d = first(&deltas, &|id| {
-        drawn(&filer_beta, id, CEILING) && !drawn(&filer_beta, id, FLOOR)
-    });
+    let d = first(&deltas, &|id| drawn(&filer_beta, id, PROVISIONAL));
     let trigger = fx.hourly(
         2,
         vec![record(&Audit {
@@ -1074,7 +1082,7 @@ fn escalation_displaces_the_formula_for_later_blocks_of_the_domain_only() {
     let between = |block: &BlockRow, deltas: &[Value]| {
         let filer_beta = beta("audit.example.net", block);
         first(deltas, &|id| {
-            !drawn(&filer_beta, id, FLOOR) && drawn(&filer_beta, id, CEILING)
+            !drawn(&filer_beta, id, PROVISIONAL) && drawn(&filer_beta, id, CEILING)
         })
     };
     let probes = [
@@ -1100,24 +1108,7 @@ fn escalation_displaces_the_formula_for_later_blocks_of_the_domain_only() {
             })
             .collect(),
     );
-    let established = |_: &str, _: u64| PriorState {
-        reputation_u: 1_000_000,
-        level1_sanction: false,
-    };
-    let sanctioned_first = |_: &str, height: u64| PriorState {
-        reputation_u: 1_000_000,
-        level1_sanction: height == 1,
-    };
-    let unselected = fx.reconstruct(&established).unwrap();
-    assert!(
-        unselected.escalations().is_empty() && unselected.triggers().is_empty(),
-        "at the floor the filer's own draw did not select the Delta"
-    );
-    assert_eq!(
-        standing_of(&unselected, 2, "audit.example.net").standing,
-        Standing::Void(VoidReason::ProofWithoutStanding)
-    );
-    let history = fx.reconstruct(&sanctioned_first).unwrap();
+    let history = fx.reconstruct().unwrap();
     assert_eq!(history.escalations().len(), 1);
     assert_eq!(history.escalations()[0].establishing_height, closing);
     assert_eq!(history.escalations()[0].publisher, PUBLISHER);
@@ -1167,7 +1158,7 @@ fn void_and_rejected_records_trigger_nothing() {
             declaration("blog.example.com", &[], "blog"),
         ],
     );
-    let own = pages(PUBLISHER, "site", "own", 64);
+    let own = pages(PUBLISHER, "site", "own", 128);
     let parent_for_blog = delta(PUBLISHER, "https://blog.example.com/post", "site");
     let audited = fx.hourly(1, [own.clone(), vec![parent_for_blog.clone()]].concat());
     let (filer_beta, gone_beta) = (
@@ -1175,7 +1166,7 @@ fn void_and_rejected_records_trigger_nothing() {
         beta("gone.sample.net", &audited),
     );
     let d = first(&own, &|id| {
-        drawn(&filer_beta, id, CEILING) && drawn(&gone_beta, id, CEILING)
+        drawn(&filer_beta, id, PROVISIONAL) && drawn(&gone_beta, id, PROVISIONAL)
     });
     fx.hourly(
         2,
@@ -1251,7 +1242,7 @@ fn void_and_rejected_records_trigger_nothing() {
             malformed,
         ],
     );
-    let history = fx.reconstruct(&ceiling).unwrap();
+    let history = fx.reconstruct().unwrap();
     assert!(history.triggers().is_empty());
     assert!(history.duties().is_empty());
     assert!(history.escalations().is_empty());
@@ -1323,7 +1314,7 @@ fn reconstruction_requires_the_complete_pinned_prefix_and_rereads_repaired_files
     let deltas = pages(PUBLISHER, "site", "r", 32);
     let audited = fx.hourly(1, deltas.clone());
     let filer_beta = beta("audit.example.net", &audited);
-    let d = first(&deltas, &|id| drawn(&filer_beta, id, CEILING));
+    let d = first(&deltas, &|id| drawn(&filer_beta, id, PROVISIONAL));
     let trigger = fx.hourly(
         2,
         vec![record(&Audit {
@@ -1346,21 +1337,20 @@ fn reconstruction_requires_the_complete_pinned_prefix_and_rereads_repaired_files
     );
     let original = std::fs::read(fx.path(2)).unwrap();
     std::fs::write(fx.path(2), b"corrupt").unwrap();
-    assert!(fx.reconstruct(&ceiling).is_err());
+    assert!(fx.reconstruct().is_err());
     std::fs::write(fx.path(2), original).unwrap();
-    let full = fx.reconstruct(&ceiling).unwrap();
+    let full = fx.reconstruct().unwrap();
     assert_eq!(full.triggers().len(), 1);
     assert_eq!(full.records().len(), 2);
     assert_eq!(
         standing_of(&full, 3, "checker.example.org").standing,
         Standing::Extension { trigger_height: 2 }
     );
-    let pinned =
-        ExtensionHistory::reconstruct(fx.data.path(), Some(audited.clone()), &ceiling).unwrap();
+    let pinned = ExtensionHistory::reconstruct(fx.data.path(), Some(audited.clone())).unwrap();
     assert!(pinned.triggers().is_empty() && pinned.records().is_empty());
     assert_eq!(pinned.through().map(|row| row.block_number), Some(1));
     let through_trigger =
-        ExtensionHistory::reconstruct(fx.data.path(), Some(trigger.clone()), &ceiling).unwrap();
+        ExtensionHistory::reconstruct(fx.data.path(), Some(trigger.clone())).unwrap();
     assert_eq!(through_trigger.triggers().len(), 1);
     assert!(through_trigger.triggers()[0].outcome.is_none());
     assert_eq!(through_trigger.named("checker.example.org", 2).len(), 1);
@@ -1370,7 +1360,6 @@ fn reconstruction_requires_the_complete_pinned_prefix_and_rereads_repaired_files
             block_hash: format!("sha256:{}", "0".repeat(64)),
             ..later.clone()
         }),
-        &ceiling
     )
     .is_err());
     assert_eq!(full.anchor_hash(), through_trigger.anchor_hash());
@@ -1713,7 +1702,7 @@ fn evidence_vectors_replay_as_signed_histories() {
                 .map(|auditor| beta(auditor, &audited))
                 .collect();
             let chosen = first(&deltas, &|id| {
-                !used.contains(id) && betas.iter().all(|beta| drawn(beta, id, CEILING))
+                !used.contains(id) && betas.iter().all(|beta| drawn(beta, id, PROVISIONAL))
             });
             used.insert(chosen.clone());
             delta_of.insert(vector_delta, chosen);
@@ -1820,7 +1809,7 @@ fn evidence_vectors_replay_as_signed_histories() {
             let row = fx.hourly(height, entries);
             rows.insert(height, row);
         }
-        let history = fx.reconstruct(&ceiling).unwrap();
+        let history = fx.reconstruct().unwrap();
         assert!(history.roster().rejected().is_empty(), "{label}");
         let mut expected_triggers = case["triggers"].as_array().unwrap().iter();
         for (i, record) in records.iter().enumerate() {
@@ -1993,7 +1982,7 @@ fn unpublished_duties_fail_at_the_fallback_and_exclude_records_past_the_maximum(
     let deltas = pages(PUBLISHER, "site", "c", 64);
     let audited = fx.hourly(100, deltas.clone());
     let filer_beta = beta("audit.example.net", &audited);
-    let d = first(&deltas, &|id| drawn(&filer_beta, id, CEILING));
+    let d = first(&deltas, &|id| drawn(&filer_beta, id, PROVISIONAL));
     for height in 101..=130 {
         let entries = if height == 119 || height == 120 {
             vec![record(&Audit {
@@ -2008,8 +1997,8 @@ fn unpublished_duties_fail_at_the_fallback_and_exclude_records_past_the_maximum(
         };
         fx.hourly(height, entries);
     }
-    let history = fx.reconstruct(&ceiling).unwrap();
-    assert!(history.rejected_attestations().is_empty());
+    let history = fx.reconstruct().unwrap();
+    assert!(history.rejected_acts().is_empty());
     let silent = history.coverage_duty("audit.example.net", 5).unwrap();
     assert!(!silent.published());
     assert_eq!(silent.selection, None);
@@ -2105,6 +2094,19 @@ fn coverage_attestations_discharge_empty_selections_and_pulls_establish_at_their
                         malformed["body"]["update"]["details"]["found"] = json!(["not an id"]);
                         malformed
                     },
+                    {
+                        let mut unchained =
+                            coverage_attestation(filer, filer, &key_id(filer), &previous(11), None);
+                        let mut update = unchained["body"]["update"].clone();
+                        update["details"]
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("prev_record");
+                        unchained["body"] =
+                            envelope::sign_envelope(&update, "update", &key_id(filer), &key(filer))
+                                .unwrap();
+                        unchained
+                    },
                 ]
             }
             80 => vec![fx.pull(checker, &previous(5), &[])],
@@ -2120,7 +2122,7 @@ fn coverage_attestations_discharge_empty_selections_and_pulls_establish_at_their
         let row = fx.hourly(height, entries);
         rows.insert(height, row);
     }
-    let history = fx.reconstruct(&ceiling).unwrap();
+    let history = fx.reconstruct().unwrap();
     let attested = history.coverage_duty(filer, 5).unwrap();
     assert_eq!(attested.selection.as_deref(), Some(&[][..]));
     assert_eq!(attested.attested_empty_at, Some(10));
@@ -2131,7 +2133,7 @@ fn coverage_attestations_discharge_empty_selections_and_pulls_establish_at_their
         "pairs establish at the fallback 96 Blocks after their Block; the attested pair is complete"
     );
     let mut codes: Vec<(u64, String, &str, String)> = history
-        .rejected_attestations()
+        .rejected_acts()
         .iter()
         .map(|r| {
             (
@@ -2150,6 +2152,12 @@ fn coverage_attestations_discharge_empty_selections_and_pulls_establish_at_their
                 12,
                 "coverage_attestation".to_owned(),
                 "WIST4-E01",
+                filer.to_owned()
+            ),
+            (
+                12,
+                "coverage_attestation".to_owned(),
+                "WIST4-E04",
                 filer.to_owned()
             ),
             (
@@ -2190,7 +2198,7 @@ fn coverage_attestations_discharge_empty_selections_and_pulls_establish_at_their
             ),
         ]
     );
-    for height in [6, 7, 9] {
+    for height in [6, 7, 9, 11] {
         assert_eq!(
             history.coverage_duty(filer, height).unwrap().complete_at,
             None,
@@ -2231,7 +2239,7 @@ fn records_discharge_selected_and_named_deltas_and_partial_completion_fails() {
     let deltas = pages(PUBLISHER, "site", "s", 48);
     let audited = fx.hourly(1, deltas.clone());
     let filer_beta = beta(filer, &audited);
-    let selected: Vec<String> = pick(&deltas, &|id| drawn(&filer_beta, id, CEILING));
+    let selected: Vec<String> = pick(&deltas, &|id| drawn(&filer_beta, id, PROVISIONAL));
     assert!(selected.len() >= 3);
     let (last, rest) = selected.split_last().unwrap();
     let filed = |id: &str, fetched_at: i64| {
@@ -2246,7 +2254,7 @@ fn records_discharge_selected_and_named_deltas_and_partial_completion_fails() {
     fx.hourly(2, rest.iter().map(|id| filed(id, START + HOUR)).collect());
     let checked = fx.hourly(3, vec![filed(last, START + HOUR + 1)]);
     let checker_beta = beta(checker, &audited);
-    let e = first(&deltas, &|id| drawn(&checker_beta, id, CEILING));
+    let e = first(&deltas, &|id| drawn(&checker_beta, id, PROVISIONAL));
     let trigger = fx.hourly(
         4,
         vec![record(&Audit {
@@ -2271,8 +2279,8 @@ fn records_discharge_selected_and_named_deltas_and_partial_completion_fails() {
     for height in 7..=100 {
         fx.hourly(height, vec![]);
     }
-    let history = fx.reconstruct(&ceiling).unwrap();
-    assert!(history.rejected_attestations().is_empty());
+    let history = fx.reconstruct().unwrap();
+    assert!(history.rejected_acts().is_empty());
     let pair = history.coverage_duty(filer, 1).unwrap();
     let mut expected = selected.clone();
     expected.sort();
@@ -2281,8 +2289,7 @@ fn records_discharge_selected_and_named_deltas_and_partial_completion_fails() {
     assert_eq!(pair.discharged.len(), selected.len());
     assert_eq!(pair.discharged[last], 3);
     assert_eq!(pair.complete_at, Some(checked.block_number));
-    let partial =
-        ExtensionHistory::reconstruct(fx.data.path(), Some(fx.rows[2].clone()), &ceiling).unwrap();
+    let partial = ExtensionHistory::reconstruct(fx.data.path(), Some(fx.rows[2].clone())).unwrap();
     let open = partial.coverage_duty(filer, 1).unwrap();
     assert_eq!(open.discharged.len(), selected.len() - 1);
     assert_eq!(
@@ -2375,8 +2382,8 @@ fn pair_specific_exemption_reads_the_aggregators_receipt() {
             }
             rows.insert(height, fx.hourly(height, entries));
         }
-        let history = fx.reconstruct(&ceiling).unwrap();
-        assert!(history.rejected_attestations().is_empty(), "{label}");
+        let history = fx.reconstruct().unwrap();
+        assert!(history.rejected_acts().is_empty(), "{label}");
         let pair = history.coverage_duty(filer, 5).unwrap();
         assert_eq!(
             pair.pull.as_ref().unwrap().position.block_number,
@@ -2423,7 +2430,7 @@ fn late_discharge_vectors_replay_as_signed_histories() {
         };
         let audited = fx.hourly(offset, deltas.clone());
         let filer_beta = beta(filer, &audited);
-        let drawn_ids = pick(&deltas, &|id| drawn(&filer_beta, id, CEILING));
+        let drawn_ids = pick(&deltas, &|id| drawn(&filer_beta, id, PROVISIONAL));
         assert!(
             selected.is_empty() || drawn_ids.len() > selected.len(),
             "{label}"
@@ -2488,8 +2495,8 @@ fn late_discharge_vectors_replay_as_signed_histories() {
             }
             fx.hourly(height, entries);
         }
-        let history = fx.reconstruct(&ceiling).unwrap();
-        assert!(history.rejected_attestations().is_empty(), "{label}");
+        let history = fx.reconstruct().unwrap();
+        assert!(history.rejected_acts().is_empty(), "{label}");
         let pair = history.coverage_duty(filer, offset).unwrap();
         let mut expected: Vec<String> = drawn_ids.clone();
         expected.sort();
@@ -2504,4 +2511,330 @@ fn late_discharge_vectors_replay_as_signed_histories() {
         exercised += 1;
     }
     assert_eq!(exercised, 5);
+}
+
+fn lift(fx: &Fixture, subject: &str) -> Value {
+    fx.log_signed(json!({
+        "wist_version": "1.0.0", "action": "sanction_lift", "subject": subject,
+        "details": {"reason": "discretionary"}, "effective_at": ts(START),
+    }))
+}
+
+#[test]
+fn reputation_and_the_first_rung_derive_from_evidence_findings_and_lifts() {
+    use wist_core::reputation::{base_u, reputation_formula_u, DecayTable};
+    let mut fx = Fixture::new();
+    fx.attest_empty = true;
+    let (filer, checker, watcher) = (
+        "audit.example.net",
+        "checker.example.org",
+        "watch.sample.net",
+    );
+    fx.hourly(
+        0,
+        vec![
+            fx.admit_own(filer),
+            fx.admit_own(checker),
+            fx.admit_own(watcher),
+            declaration(PUBLISHER, &[], "site"),
+        ],
+    );
+    let deltas = pages(PUBLISHER, "site", "r", 64);
+    let audited = fx.hourly(1, deltas.clone());
+    let betas: BTreeMap<&str, [u8; 64]> = [filer, checker, watcher]
+        .into_iter()
+        .map(|auditor| (auditor, beta(auditor, &audited)))
+        .collect();
+    let by = |auditor: &str, id: &str| drawn(&betas[auditor], id, PROVISIONAL);
+    let shared = pick(&deltas, &|id| by(filer, id) && by(checker, id));
+    let linked = pick(&deltas, &|id| {
+        by(checker, id) && by(watcher, id) && !shared.contains(&id.to_owned())
+    });
+    let filer_only: Vec<String> = pick(&deltas, &|id| by(filer, id))
+        .into_iter()
+        .filter(|id| !shared.contains(id) && !linked.contains(id))
+        .take(3)
+        .collect();
+    assert!(!shared.is_empty() && !linked.is_empty() && filer_only.len() == 3);
+    let (d0, d1) = (&shared[0], &linked[0]);
+    let audit =
+        |auditor: &'static str, id: &str, verdict: &'static str, over: &BlockRow, at: i64| {
+            record(&Audit {
+                auditor,
+                audited: id,
+                proof_over: over,
+                fetched_at: at,
+                verdict,
+            })
+        };
+    fx.hourly(
+        2,
+        filer_only
+            .iter()
+            .map(|id| audit(filer, id, "consistent", &audited, START + HOUR))
+            .collect(),
+    );
+    fx.hourly(
+        3,
+        vec![audit(filer, d0, "inconsistent", &audited, START + HOUR + 1)],
+    );
+    let confirming = fx.hourly(
+        4,
+        vec![
+            audit(checker, d0, "inconsistent", &audited, START + HOUR + 2),
+            audit(checker, d1, "link_inconsistent", &audited, START + HOUR + 3),
+        ],
+    );
+    fx.hourly(
+        5,
+        vec![audit(
+            watcher,
+            d1,
+            "link_inconsistent",
+            &audited,
+            START + HOUR + 4,
+        )],
+    );
+    let later = pages(PUBLISHER, "site", "later", 64);
+    let escalated_block = fx.hourly(6, later.clone());
+    let filer_later = beta(filer, &escalated_block);
+    let e = first(&later, &|id| {
+        drawn(&filer_later, id, CEILING) && !drawn(&filer_later, id, PROVISIONAL)
+    });
+    fx.hourly(
+        7,
+        vec![audit(
+            filer,
+            &e,
+            "consistent",
+            &escalated_block,
+            START + 6 * HOUR,
+        )],
+    );
+    fx.hourly(8, vec![lift(&fx, PUBLISHER)]);
+    fx.hourly(9, {
+        let update = json!({
+            "wist_version": "1.0.0", "action": "sanction_lift", "subject": PUBLISHER,
+            "details": {}, "effective_at": ts(START),
+        });
+        vec![json!({"type": "registry_update", "body": envelope::sign_envelope(&update, "update", &key_id(filer), &key(filer)).unwrap()})]
+    });
+    let after = pages(PUBLISHER, "site", "after", 64);
+    let lifted_block = fx.hourly(10, after.clone());
+    let penalised = reputation_formula_u(base_u(0), 3, 3 * DecayTable::builtin().decay(0) as u128);
+    let lifted_rate = 200_000 + 3 * (1_000_000 - penalised);
+    let filer_after = beta(filer, &lifted_block);
+    let f = first(&after, &|id| {
+        drawn(&filer_after, id, CEILING) && !drawn(&filer_after, id, lifted_rate)
+    });
+    fx.hourly(
+        11,
+        vec![audit(
+            filer,
+            &f,
+            "consistent",
+            &lifted_block,
+            START + 10 * HOUR,
+        )],
+    );
+    for height in 12..=30 {
+        fx.hourly(height, vec![]);
+    }
+    let history = fx.reconstruct().unwrap();
+    let findings = history.findings();
+    assert_eq!(findings.len(), 2);
+    let extract = &findings[0];
+    assert_eq!(
+        (extract.delta_id.as_str(), extract.link, extract.severity),
+        (d0.as_str(), false, 2)
+    );
+    assert_eq!(extract.confirming.block_number, 4);
+    assert_eq!(extract.audited_height, 1);
+    assert_eq!(extract.publisher, PUBLISHER);
+    let link = &findings[1];
+    assert_eq!(
+        (link.delta_id.as_str(), link.link, link.severity),
+        (d1.as_str(), true, 1)
+    );
+    assert_eq!(link.confirming.block_number, 5);
+    let clean = history.reputation(PUBLISHER, 3).unwrap();
+    assert_eq!(
+        (
+            clean.age_days,
+            clean.c,
+            clean.penalty_n,
+            clean.provisional,
+            clean.reputation_u
+        ),
+        (0, 3, 0, true, 100_000)
+    );
+    let at_confirmation = history.reputation(PUBLISHER, 4).unwrap();
+    assert_eq!(
+        at_confirmation.penalty_n,
+        2 * DecayTable::builtin().decay(0) as u128
+    );
+    assert_eq!(
+        at_confirmation.reputation_u,
+        reputation_formula_u(base_u(0), 3, at_confirmation.penalty_n)
+    );
+    let both = history.reputation(PUBLISHER, 5).unwrap();
+    assert_eq!(both.penalty_n, 3 * DecayTable::builtin().decay(0) as u128);
+    assert_eq!(both.reputation_u, penalised);
+    let aged = history.reputation(PUBLISHER, 29).unwrap();
+    assert_eq!(aged.age_days, 1);
+    assert_eq!(aged.penalty_n, 3 * DecayTable::builtin().decay(1) as u128);
+    assert_eq!(
+        history
+            .reputation("other.example.org", 29)
+            .unwrap()
+            .reputation_u,
+        100_000
+    );
+    assert!(!history.level1_sanction(PUBLISHER, 3));
+    assert!(history.level1_sanction(PUBLISHER, 4));
+    assert!(history.level1_sanction(PUBLISHER, 7));
+    assert!(!history.level1_sanction(PUBLISHER, 8));
+    assert!(!history.level1_sanction(PUBLISHER, 30));
+    assert_eq!(
+        history
+            .rejected_acts()
+            .iter()
+            .map(|r| (r.position.block_number, r.action.as_str(), r.code))
+            .collect::<Vec<_>>(),
+        vec![(9, "sanction_lift", "WIST4-E11")]
+    );
+    assert!(history.prior_state(PUBLISHER, Some(5)).level1_sanction);
+    assert_eq!(history.prior_state(PUBLISHER, None).reputation_u, 100_000);
+    let escalated = standing_of(&history, 7, filer);
+    assert_eq!(
+        escalated.standing,
+        Standing::Selected,
+        "the first rung raises the draw to the ceiling"
+    );
+    assert!(escalated.evidence());
+    let relapsed = standing_of(&history, 11, filer);
+    assert_eq!(
+        relapsed.standing,
+        Standing::Void(VoidReason::ProofWithoutStanding),
+        "after the lift the formula rate applies"
+    );
+    assert_eq!(
+        history
+            .coverage_duty(filer, 6)
+            .unwrap()
+            .selection
+            .as_ref()
+            .map(|s| s.contains(&e)),
+        Some(true)
+    );
+    assert_eq!(
+        history
+            .coverage_duty(filer, 10)
+            .unwrap()
+            .selection
+            .as_ref()
+            .map(|s| s.contains(&f)),
+        Some(false)
+    );
+    assert_eq!(confirming.block_number, 4);
+}
+
+#[test]
+fn a_fresh_identity_resets_reputation_inputs_and_rungs() {
+    let mut fx = Fixture::new();
+    fx.attest_empty = true;
+    let (filer, checker) = ("audit.example.net", "checker.example.org");
+    let genesis_declaration = declaration(PUBLISHER, &[], "site");
+    fx.hourly(
+        0,
+        vec![
+            fx.admit_own(filer),
+            fx.admit_own(checker),
+            genesis_declaration.clone(),
+        ],
+    );
+    let deltas = pages(PUBLISHER, "site", "i", 64);
+    let audited = fx.hourly(1, deltas.clone());
+    let (filer_beta, checker_beta) = (beta(filer, &audited), beta(checker, &audited));
+    let d = first(&deltas, &|id| {
+        drawn(&filer_beta, id, PROVISIONAL) && drawn(&checker_beta, id, PROVISIONAL)
+    });
+    let audit =
+        |auditor: &'static str, id: &str, verdict: &'static str, over: &BlockRow, at: i64| {
+            record(&Audit {
+                auditor,
+                audited: id,
+                proof_over: over,
+                fetched_at: at,
+                verdict,
+            })
+        };
+    fx.hourly(
+        2,
+        vec![audit(filer, &d, "inconsistent", &audited, START + HOUR)],
+    );
+    fx.hourly(
+        3,
+        vec![audit(
+            checker,
+            &d,
+            "inconsistent",
+            &audited,
+            START + HOUR + 1,
+        )],
+    );
+    for height in 4..8 {
+        fx.hourly(height, vec![]);
+    }
+    fx.hourly(
+        8,
+        vec![declaration_after(
+            PUBLISHER,
+            &[],
+            "site-fresh",
+            1,
+            Some(&genesis_declaration),
+        )],
+    );
+    let fresh = pages(PUBLISHER, "site-fresh", "fresh", 8);
+    fx.hourly(9, fresh.clone());
+    let late = fx.hourly(
+        10,
+        vec![audit(
+            checker,
+            &d,
+            "inconsistent",
+            &audited,
+            START + HOUR + 2,
+        )],
+    );
+    for height in 11..=40 {
+        fx.hourly(height, vec![]);
+    }
+    let history = fx.reconstruct().unwrap();
+    assert_eq!(history.findings().len(), 1);
+    assert!(history.level1_sanction(PUBLISHER, 7));
+    let before = history.reputation(PUBLISHER, 7).unwrap();
+    assert!(before.penalty_n > 0 && before.age_days == 0);
+    assert!(
+        !history.level1_sanction(PUBLISHER, 8),
+        "a fresh identity lifts every rung at its Block"
+    );
+    let reset = history.reputation(PUBLISHER, 8).unwrap();
+    assert_eq!(
+        (reset.penalty_n, reset.c, reset.age_days, reset.reputation_u),
+        (0, 0, 0, 100_000)
+    );
+    let aged = history.reputation(PUBLISHER, 40).unwrap();
+    assert_eq!(
+        aged.age_days, 1,
+        "age is measured from the fresh identity's first accepted Delta"
+    );
+    assert_eq!(
+        aged.penalty_n, 0,
+        "a finding for a Delta sealed below the reset never returns"
+    );
+    assert!(!history.level1_sanction(PUBLISHER, 40));
+    assert_eq!(late.block_number, 10);
+    assert!(standing_of(&history, 10, checker).evidence());
 }

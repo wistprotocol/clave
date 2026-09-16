@@ -34,9 +34,14 @@ pub struct VerifiedBlock {
     coverage_profile: coverage::CoverageProfile,
     extension_triggers_max: u64,
     clock_skew_seconds: i64,
+    decay_horizon_days: u64,
 }
 
 impl VerifiedBlock {
+    pub fn decay_horizon_days(&self) -> u64 {
+        self.decay_horizon_days
+    }
+
     pub fn block(&self) -> &Block {
         &self.block
     }
@@ -309,6 +314,12 @@ impl History {
                 .unwrap()
                 .value_at("clock_skew_seconds", at)
                 .unwrap(),
+            decay_horizon_days: self
+                .schedule
+                .as_ref()
+                .unwrap()
+                .value_at("decay_horizon_days", at)
+                .unwrap() as u64,
         }))
     }
 
