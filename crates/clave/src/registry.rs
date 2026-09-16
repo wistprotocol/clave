@@ -19,6 +19,32 @@ pub fn validate(name: &str, value: i64, lookup: impl Fn(&str) -> i64) -> Result<
         .map_err(|err| Error::ParamChange(err.to_string()))
 }
 
+/// `0000-01-01T00:00:00Z`, the first instant a Log timestamp denotes.
+pub const LOG_TIMESTAMP_MIN_S: i64 = -62_167_219_200;
+
+/// The whole-second UTC spelling of an instant anywhere in the Log's
+/// four-digit-year range, the inverse of `epoch`.
+pub fn instant(epoch_s: i64) -> Result<String> {
+    let out_of_range = || Error::ParamChange("instant is outside the Log timestamp range".into());
+    if !(LOG_TIMESTAMP_MIN_S..=wist_core::parameters::LOG_TIMESTAMP_MAX_S).contains(&epoch_s) {
+        return Err(out_of_range());
+    }
+    let days = i32::try_from(epoch_s.div_euclid(86_400)).map_err(|_| out_of_range())?;
+    let date = jiff::civil::date(1970, 1, 1)
+        .checked_add(jiff::Span::new().days(days))
+        .map_err(|_| out_of_range())?;
+    let seconds = epoch_s.rem_euclid(86_400);
+    Ok(format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        date.year(),
+        date.month(),
+        date.day(),
+        seconds / 3600,
+        seconds % 3600 / 60,
+        seconds % 60
+    ))
+}
+
 pub(crate) fn epoch(at: &str) -> Result<i64> {
     let bytes = at.as_bytes();
     if bytes.len() != 20
@@ -66,6 +92,25 @@ pub(crate) fn block_cap(schedule: &wist_core::parameters::Schedule, at: i64) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn instants_round_trip_across_the_whole_log_range() {
+        for (seconds, spelled) in [
+            (LOG_TIMESTAMP_MIN_S, "0000-01-01T00:00:00Z"),
+            (0, "1970-01-01T00:00:00Z"),
+            (951_782_400, "2000-02-29T00:00:00Z"),
+            (253_402_214_400, "9999-12-31T00:00:00Z"),
+            (
+                wist_core::parameters::LOG_TIMESTAMP_MAX_S,
+                "9999-12-31T23:59:59Z",
+            ),
+        ] {
+            assert_eq!(instant(seconds).unwrap(), spelled);
+            assert_eq!(epoch(spelled).unwrap(), seconds);
+        }
+        assert!(instant(LOG_TIMESTAMP_MIN_S - 1).is_err());
+        assert!(instant(wist_core::parameters::LOG_TIMESTAMP_MAX_S + 1).is_err());
+    }
 
     fn defaults(name: &str) -> i64 {
         spec(name).unwrap().default.unwrap()

@@ -260,7 +260,7 @@ fn log_key() -> SigningKey {
 }
 
 fn timestamp(at: i64) -> String {
-    jiff::Timestamp::from_second(at).unwrap().to_string()
+    clave::registry::instant(at).unwrap()
 }
 
 fn digest(value: &Value) -> String {
@@ -744,20 +744,28 @@ fn recovery_declaration(previous: Option<&Value>) -> Value {
 
 #[test]
 fn authenticated_parameter_schedules_freeze_window_length_at_each_owner() {
-    const BASE: i64 = 1_800_000_000;
-    for case in vector("wist4/parameter-combinations")["recovery_window_cases"]
-        .as_array()
-        .unwrap()
-    {
+    let vector = vector("wist4/parameter-combinations");
+    let base = vector["recovery_window_base_s"].as_i64().unwrap();
+    for case in vector["recovery_window_cases"].as_array().unwrap() {
         let initial = recovery_declaration(None);
         let mut entries = vec![json!({"type":"publisher_declaration","body":initial})];
-        for amendment in case["accepted_amendments"].as_array().unwrap() {
+        let rejected_amendments = case["rejected_amendments"].as_array().unwrap();
+        for amendment in case["accepted_amendments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(rejected_amendments)
+        {
             assert_eq!(amendment["sealed_at_s"], 0);
-            let update = json!({"wist_version":"1.0.0","action":"parameter_change","subject":"recovery_window_days","effective_at":timestamp(BASE+amendment["effective_at_s"].as_i64().unwrap()),"details":{"parameter":"recovery_window_days","value":amendment["value"]}});
+            let update = json!({"wist_version":"1.0.0","action":"parameter_change","subject":"recovery_window_days","effective_at":timestamp(base+amendment["effective_at_s"].as_i64().unwrap()),"details":{"parameter":"recovery_window_days","value":amendment["value"]}});
             entries.push(json!({"type":"registry_update","body":envelope::sign_envelope(&update,"update","test-log-k1",&log_key()).unwrap()}));
         }
         let events = case["eligible_recoveries"].as_array().unwrap();
         let probes = case["probes"].as_array().unwrap();
+        let unsealable = events
+            .iter()
+            .find(|event| event["sealable"] == false)
+            .map(|event| event["sealed_at_s"].as_i64().unwrap());
         let mut timeline = std::collections::BTreeMap::<i64, Vec<Value>>::new();
         timeline.insert(0, entries);
         let mut previous = initial;
@@ -776,24 +784,48 @@ fn authenticated_parameter_schedules_freeze_window_length_at_each_owner() {
         }
         let mut blocks = Vec::new();
         for (at, entries) in timeline {
-            blocks.push(signed_block(&blocks, &timestamp(BASE + at), entries));
+            blocks.push(signed_block(&blocks, &timestamp(base + at), entries));
         }
         let fixture = Fixture::new(&blocks);
         let mut reader = fixture.reader();
         let mut state = Declarations::default();
+        let mut stopped = false;
         while let Some(block) = reader.next_block().unwrap() {
-            assert!(block.rejected_parameters().is_empty());
+            let at = block.sealed_at_s() - base;
+            assert_eq!(
+                block.rejected_parameters().len(),
+                if at == 0 {
+                    rejected_amendments.len()
+                } else {
+                    0
+                },
+                "{}",
+                case["label"]
+            );
+            if unsealable == Some(at) {
+                let failure = state
+                    .apply(&block)
+                    .err()
+                    .map(|e| e.to_string())
+                    .unwrap_or_default();
+                assert!(
+                    failure.contains("WIST1-E08"),
+                    "{}: {failure}",
+                    case["label"]
+                );
+                stopped = true;
+                break;
+            }
             state.apply(&block).unwrap();
-            let at = block.sealed_at_s() - BASE;
             for event in events.iter().filter(|event| event["sealed_at_s"] == at) {
                 let window = state.domains()["example.com"].window().unwrap();
                 assert_eq!(
                     window.owner().sealed_at_s(),
-                    BASE + event["owner_at_s"].as_i64().unwrap()
+                    base + event["owner_at_s"].as_i64().unwrap()
                 );
                 assert_eq!(
                     window.end_s(),
-                    i128::from(BASE)
+                    i128::from(base)
                         + event["window_end_s"]
                             .as_str()
                             .unwrap()
@@ -822,10 +854,14 @@ fn authenticated_parameter_schedules_freeze_window_length_at_each_owner() {
                 );
             }
         }
-        assert_eq!(
-            format!("{:?}", fixture.restore().unwrap()),
-            format!("{state:?}")
-        );
+        if stopped {
+            assert!(fixture.restore().is_err(), "{}", case["label"]);
+        } else {
+            assert_eq!(
+                format!("{:?}", fixture.restore().unwrap()),
+                format!("{state:?}")
+            );
+        }
     }
 }
 

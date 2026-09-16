@@ -19,9 +19,7 @@ type OwnedPublisherState = (
 
 fn instant(epoch: i128) -> Result<String> {
     let epoch = i64::try_from(epoch).map_err(|_| Error::History("instant out of range".into()))?;
-    Ok(jiff::Timestamp::from_second(epoch)
-        .map_err(|_| Error::History("instant out of range".into()))?
-        .to_string())
+    crate::registry::instant(epoch).map_err(|_| Error::History("instant out of range".into()))
 }
 
 pub fn refresh(db: &Db, data_dir: &Path, sk: &SigningKey) -> Result<()> {

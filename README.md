@@ -1256,8 +1256,11 @@ timestamps. Stores with at most one outstanding Delta per domain can upgrade
 without deciding an unknown within-domain order. For already-discarded copies,
 see [Delta index reconciliation](#delta-index-reconciliation).
 
-Exact recovery ends outside the supported timestamp range stop sealing before
-publication; full-range Snapshot representation requires specification resolution.
+A recovery Declaration whose window would end after 9999-12-31T23:59:59Z
+stops sealing before publication, and history replay rejects a Block sealing
+one under WIST1-E08 (WIST-1 §5.2); window ends up to that instant are spelled
+by `registry::instant`, which covers the whole four-digit-year range, so every
+published window end is a Log timestamp.
 Correct sealing source selection does not establish complete recovery admission,
 Delta chains, schema validation, Audit Record eligibility or sanctions.
 
@@ -1523,7 +1526,11 @@ Parameter admission checks the accepted schedule and queued amendments in
 canonical Entry order. Sealing repeats validation at the actual Block
 instant: delayed or conflicting amendments are dropped with WIST4-E03.
 Every prospective map is checked, including grace changes and cadence
-transitions that could outlive an older extension window.
+transitions that could outlive an older extension window. A
+`recovery_window_days` amendment whose window from its own `effective_at`
+would end after 9999-12-31T23:59:59Z is rejected at acceptance (WIST4-E03,
+WIST-4 §9); the signed-history test replays the rejected amendment, the
+largest representable window and an unsealable opening near the range end.
 
 Caps cover the largest complete JCS Block through each amendment's own
 height. Pending reductions constrain packing immediately; deferred Entries

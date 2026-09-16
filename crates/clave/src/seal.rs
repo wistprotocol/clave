@@ -1031,9 +1031,10 @@ pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<
             state.window().map(|window| {
                 let window_end = i64::try_from(window.end_s())
                     .ok()
-                    .and_then(|end| jiff::Timestamp::from_second(end).ok())
-                    .ok_or_else(|| Error::Seal("recovery window end out of range".into()))?
-                    .to_string();
+                    .and_then(|end| crate::registry::instant(end).ok())
+                    .ok_or_else(|| {
+                        Error::Seal("recovery window end exceeds the Log timestamp range".into())
+                    })?;
                 Ok((domain, window, window_end))
             })
         })

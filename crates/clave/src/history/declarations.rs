@@ -317,11 +317,17 @@ impl Declarations {
                         window.competitors.push(declaration.clone());
                     }
                 } else if decision == Decision::Recovery {
+                    let end_s = i128::from(sealed_at_s) + i128::from(recovery_window_days) * 86_400;
+                    if end_s > i128::from(wist_core::parameters::LOG_TIMESTAMP_MAX_S) {
+                        return Err(failure(
+                            "WIST1-E08 recovery window end exceeds the Log timestamp range",
+                        ));
+                    }
                     state.window = Some(RecoveryWindow {
                         owner: declaration.clone(),
                         head: declaration.clone(),
                         before: previous,
-                        end_s: i128::from(sealed_at_s) + i128::from(recovery_window_days) * 86_400,
+                        end_s,
                         competitors: Vec::new(),
                     });
                     installation.opens_window = true;
