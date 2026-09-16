@@ -18,6 +18,7 @@ pub struct IngestReport {
     pub rejected: Vec<(String, String)>,
     pub noise: Option<&'static str>,
     pub suspended: bool,
+    pub submissions: Vec<String>,
 }
 
 /// WIST-2 §4: `host` MUST be a bare authority (`host[:port]`) — no scheme,
@@ -668,6 +669,12 @@ pub fn run_with_clock(
                 }
             },
             None => break,
+        }
+    }
+
+    if !suspended {
+        if let Ok(Some((_, served))) = meter.get(client, &format!("{base}registry.json")) {
+            report.submissions = crate::submissions::queue_served(db, host, Some(&served))?.queued;
         }
     }
 

@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS derived_publisher_state(domain TEXT NOT NULL, block_n
 CREATE TABLE IF NOT EXISTS derived_reputation_inputs(domain TEXT NOT NULL, block_number INTEGER NOT NULL, first_accepted_at TEXT NOT NULL, reset_height INTEGER, counted_total INTEGER NOT NULL, counted_json TEXT NOT NULL, penalties_json TEXT NOT NULL, PRIMARY KEY(domain, block_number));
 CREATE TABLE IF NOT EXISTS derived_escalations(domain TEXT NOT NULL, block_number INTEGER NOT NULL, establishing_at TEXT NOT NULL, PRIMARY KEY(domain, block_number));
 CREATE TABLE IF NOT EXISTS derived_coverage_failures(auditor_id TEXT NOT NULL, block_number INTEGER NOT NULL, duty_block INTEGER NOT NULL, PRIMARY KEY(auditor_id, block_number, duty_block));
+CREATE TABLE IF NOT EXISTS sealed_updates(update_id TEXT PRIMARY KEY, block_number INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS derived_exclusions(publisher TEXT NOT NULL, url TEXT NOT NULL, block_number INTEGER NOT NULL, since_height INTEGER NOT NULL, PRIMARY KEY(publisher, url, block_number));
 CREATE TABLE IF NOT EXISTS derived_auditor_state(auditor_id TEXT NOT NULL, block_number INTEGER NOT NULL, sealed_at TEXT NOT NULL, coverage_failure INTEGER NOT NULL, PRIMARY KEY(auditor_id, block_number));
 ";
@@ -1415,6 +1416,26 @@ impl Db {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    pub fn record_sealed_updates(&self, block_number: u64, update_ids: &[String]) -> Result<()> {
+        let tx = self.mutation()?;
+        for id in update_ids {
+            tx.execute(
+                "INSERT OR IGNORE INTO sealed_updates(update_id, block_number) VALUES (?1, ?2)",
+                (id, block_number as i64),
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn registry_update_sealed(&self, update_id: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sealed_updates WHERE update_id = ?1)",
+            [update_id],
+            |row| row.get(0),
+        )?)
     }
 
     pub fn record_derived_exclusions(

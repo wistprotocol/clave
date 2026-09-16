@@ -1360,6 +1360,22 @@ The schema gate does not establish exact Page cardinality, publication/history
 partitioning, supported-major policy or durable selected-source provenance;
 target validation is described under [Feed next targets](#feed-next-targets).
 
+## Submissions path pulls
+
+Every Feed pull also fetches the domain's
+`/.well-known/wist/registry.json` (WIST-4 §9.1): a JSON array of the
+Registry Updates the domain signs for itself. `submissions::pull` queues each
+`observer_register`, `observer_checkpoint`, `canary_commitment` or
+`canary_reveal` whose `subject` is the serving domain and that authenticates
+under §9.1's signing rule — the key it registers, the key registered for the
+Observer, or the domain's stored Declaration Key Set — unless the pending
+queue or a sealed Block already carries its Registry Update ID; seals record
+every sealed Registry Update ID for that check. An absent or malformed path
+queues nothing and is no fault; subject shape, contract and §5.1 rules are
+decided at sealing and replay. Budgeted Observer pulls per epoch are not
+implemented. Live tests cover queueing, foreign subjects, forged signatures,
+Aggregator-signed items, repeats and sealed items.
+
 ## Feed next targets
 
 The walk reads `next` only after the carrying Feed or Page passed the field,

@@ -100,9 +100,18 @@ fn signed_field_dispositions_and_retry_counts_survive_restart() {
                     .count(),
                 1
             );
+            let submissions = paths
+                .iter()
+                .filter(|path| path.ends_with("/registry.json"))
+                .count();
+            assert_eq!(
+                submissions,
+                usize::from(case["expected"] == "accepted"),
+                "{name}: the submissions path is pulled with an accepted Feed only"
+            );
             assert_eq!(
                 paths.len(),
-                2 + case["declaration_retries"].as_u64().unwrap() as usize
+                2 + submissions + case["declaration_retries"].as_u64().unwrap() as usize
             );
             assert_eq!(db.count_pending_entries("delta").unwrap(), 0);
             assert_eq!(*response.lock().unwrap(), raw);

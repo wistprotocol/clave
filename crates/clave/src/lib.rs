@@ -25,6 +25,7 @@ pub mod sanctions;
 pub mod seal;
 pub mod serve;
 pub mod snapshot;
+pub mod submissions;
 
 pub use error::Error;
 

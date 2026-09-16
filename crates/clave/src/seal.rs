@@ -1168,6 +1168,12 @@ pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<
     }
 
     mutation.commit()?;
+    let sealed_update_ids: Vec<String> = seal_entries
+        .iter()
+        .filter(|e| e.entry_type == "registry_update")
+        .filter_map(|e| crate::governance::update_id(&e.body["update"]).ok())
+        .collect();
+    db.record_sealed_updates(block_number, &sealed_update_ids)?;
     crate::derived::refresh(db, data_dir, sk)?;
 
     if !withdrawals.is_empty() {
