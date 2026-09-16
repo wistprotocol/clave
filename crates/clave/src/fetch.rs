@@ -28,8 +28,14 @@ fn system_lookup(host: &str) -> std::io::Result<Vec<IpAddr>> {
         .collect())
 }
 
+/// A loopback literal, `localhost` or a name under `.localhost`, which
+/// RFC 6761 §6.3 resolves to loopback by definition.
 fn is_loopback_host(host: &str) -> bool {
     host.eq_ignore_ascii_case("localhost")
+        || host
+            .strip_suffix(".localhost")
+            .or_else(|| host.strip_suffix(".LOCALHOST"))
+            .is_some_and(|prefix| !prefix.is_empty())
         || host
             .parse::<std::net::IpAddr>()
             .is_ok_and(|ip| ip.is_loopback())
@@ -379,6 +385,9 @@ mod tests {
 
         let url = url::Url::parse("http://localhost:8080/x.json").unwrap();
         assert!(guard_target(&url, true).is_ok());
+        let url = url::Url::parse("http://www.localhost:8080/x.json").unwrap();
+        assert!(guard_target(&url, true).is_ok());
+        assert!(guard_target(&url, false).is_err());
     }
 
     #[test]

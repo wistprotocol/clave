@@ -429,12 +429,26 @@ struct Meter<'a> {
     domain: &'a str,
     day: &'a str,
     budget: i64,
-    subdomain_scope: Vec<String>,
     caps: ObjectCaps,
     work: std::cell::Cell<(u64, u32)>,
 }
 
 impl Meter<'_> {
+    /// WIST-2 §8: the hosts a redirect may reach are those the Publisher's
+    /// Declaration lists at the moment the request is issued, so a
+    /// replacement admitted earlier in the pull governs the requests after
+    /// it; before the first accepted Declaration a redirect stays on the
+    /// requested host.
+    fn scope(&self) -> Result<Vec<String>> {
+        Ok(self
+            .db
+            .get_publisher_declaration(self.domain)?
+            .and_then(|raw| crate::json::parse(&raw).ok())
+            .and_then(|doc| declaration::publisher_of(&doc).ok())
+            .and_then(|p| p.subdomain_scope)
+            .unwrap_or_default())
+    }
+
     /// Fetches one content object under the remaining daily budget, the
     /// pull's work limits and the object's own cap. `None` suspends the
     /// walk: the budget or the work is spent, or the object would cross
@@ -448,7 +462,7 @@ impl Meter<'_> {
         }
         let cap = self.caps.of(object);
         let limit = cap.min((self.budget - spent) as u64).min(work_bytes);
-        match client.get_json_bounded(url, &self.subdomain_scope, limit) {
+        match client.get_json_bounded(url, &self.scope()?, limit) {
             Ok((raw, value)) => {
                 self.db
                     .add_ingest_bytes(self.domain, self.day, raw.len() as i64)?;
@@ -573,19 +587,12 @@ pub fn run_bounded(
 
     let day = now.get(..10).unwrap_or(now);
     let budget = crate::registry::effective(db, "ingest_budget_bytes_day", now)?;
-    let stored_scope = db
-        .get_publisher_declaration(host)?
-        .and_then(|raw| crate::json::parse(&raw).ok())
-        .and_then(|doc| declaration::publisher_of(&doc).ok())
-        .and_then(|p| p.subdomain_scope)
-        .unwrap_or_default();
     let now_epoch = crate::registry::epoch(now)?;
     let meter = Meter {
         db,
         domain: host,
         day,
         budget,
-        subdomain_scope: stored_scope,
         caps: ObjectCaps::from_schedule(&db.parameter_schedule(now_epoch)?, now_epoch),
         work: std::cell::Cell::new((limits.work_bytes, limits.work_objects)),
     };
@@ -603,7 +610,7 @@ pub fn run_bounded(
 
     if known {
         let publisher_url = format!("{base}publisher.json");
-        match client.get_json_in_scope(&publisher_url, &meter.subdomain_scope) {
+        match client.get_json_in_scope(&publisher_url, &meter.scope()?) {
             Ok((raw, value)) => {
                 current_doc =
                     admit_fetched_declaration(db, data_dir, host, now, &clock, raw, value)?;
@@ -700,7 +707,7 @@ pub fn run_bounded(
         if !verified && !feed_refresh_attempted {
             feed_refresh_attempted = true;
             if let Ok((raw, value)) =
-                client.get_json_in_scope(&format!("{base}publisher.json"), &meter.subdomain_scope)
+                client.get_json_in_scope(&format!("{base}publisher.json"), &meter.scope()?)
             {
                 admit_fetched_declaration(db, data_dir, host, now, &clock, raw, value)?;
             }
@@ -870,7 +877,7 @@ pub fn run_bounded(
             host,
             now,
             &clock,
-            &meter.subdomain_scope,
+            &meter.scope()?,
             &base,
             id,
             &delta_value,
@@ -1055,7 +1062,7 @@ pub fn run_bounded(
             host,
             now,
             &clock,
-            &meter.subdomain_scope,
+            &meter.scope()?,
             &base,
             id,
             &delta_value,

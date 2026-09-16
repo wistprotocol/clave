@@ -158,6 +158,12 @@ the moment the connection is made: name resolution runs through a
 resolver that refuses the whole answer when any address fails the policy,
 so a name that rebinds between two fetches is refused on the second. A
 refused destination is a failed fetch with the address class named.
+A redirect may leave the requested Canonical Host only for a host the
+Publisher's Declaration lists in `subdomain_scope` at the moment the
+request is issued (WIST-2 §8): a replacement Declaration admitted
+earlier in the same pull governs the requests after it, a scope it
+withdrew no longer authorizes a redirect, and before the first accepted
+Declaration a redirect stays on the requested host.
 
 `serve` bounds the work a Ping can start: at most 4 pulls run at once and
 at most 64 accepted Pings wait for a slot. A Ping for a host with a pull
@@ -1822,9 +1828,10 @@ resolves `wist-core` from `../core` — both must be sibling checkouts.
 The following transport setting supports integration tests:
 
 - **Plain HTTP to loopback.** `--allow-http` lets pulls and pings use
-  `http` when the host is a loopback address, which WIST-2 §8 forbids
-  for any `wist` resource. Without the flag every fetch is HTTPS, and
-  the flag never relaxes the scheme for a non-loopback host.
+  `http` when the host is a loopback address, `localhost` or a name under
+  `.localhost` (RFC 6761), which WIST-2 §8 forbids for any `wist`
+  resource. Without the flag every fetch is HTTPS, and the flag never
+  relaxes the scheme for a non-loopback host.
 
 Declaration identities are port-free Canonical Hosts. Integration fixtures
 use signed `localhost` identities with an explicit DNS override to each
