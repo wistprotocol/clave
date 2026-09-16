@@ -4,7 +4,7 @@ use crate::db::BlockRow;
 use crate::error::{Error, Result};
 use crate::record::SigningBinding;
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use wist_core::crypto::PublicKey;
 use wist_core::envelope::verify_envelope;
@@ -86,6 +86,7 @@ pub(crate) enum Outcome {
     NotRoster,
     Accepted(AcceptedAct),
     Rejected(Rejection),
+    Idempotent,
 }
 
 #[derive(Clone)]
@@ -99,6 +100,8 @@ pub struct RosterHistory {
     registrations: Vec<(String, u64)>,
     checkpoints: Vec<SealedCheckpoint>,
     rejected: Vec<RejectedAct>,
+    accepted_ids: BTreeSet<String>,
+    idempotent: Vec<Position>,
 }
 
 const ROSTER_ACTIONS: [&str; 4] = [
@@ -129,6 +132,8 @@ impl RosterHistory {
             registrations: Vec::new(),
             checkpoints: Vec::new(),
             rejected: Vec::new(),
+            accepted_ids: BTreeSet::new(),
+            idempotent: Vec::new(),
         }
     }
 
@@ -159,17 +164,20 @@ impl RosterHistory {
             log_key,
         )?;
         for (entry_index, outcome) in outcomes.into_iter().enumerate() {
-            if let Outcome::Rejected(rejection) = outcome {
-                self.rejected.push(RejectedAct {
-                    position: Position {
-                        block_number: height,
-                        entry_index,
-                    },
+            let position = Position {
+                block_number: height,
+                entry_index,
+            };
+            match outcome {
+                Outcome::Rejected(rejection) => self.rejected.push(RejectedAct {
+                    position,
                     action: rejection.action,
                     subject: rejection.subject,
                     code: rejection.code,
                     reason: rejection.reason,
-                });
+                }),
+                Outcome::Idempotent => self.idempotent.push(position),
+                _ => {}
             }
         }
         Ok(())
@@ -186,17 +194,29 @@ impl RosterHistory {
         let mut outcomes = vec![Outcome::NotRoster; entries.len()];
         let mut acts: Vec<(usize, RosterCandidate)> = Vec::new();
         let mut checkpoints: Vec<(usize, CheckpointCandidate)> = Vec::new();
+        let mut ids: BTreeMap<usize, String> = BTreeMap::new();
         for (index, entry) in entries.iter().enumerate() {
             if entry["type"] != "registry_update" {
                 continue;
             }
-            match classify(&entry["body"], log_key_id, log_key) {
-                None => {}
-                Some(Err(rejection)) => outcomes[index] = Outcome::Rejected(rejection),
-                Some(Ok(RosterEntry::Act(candidate))) => acts.push((index, candidate)),
-                Some(Ok(RosterEntry::Checkpoint(candidate))) => {
-                    checkpoints.push((index, candidate))
+            let classified = match classify(&entry["body"], log_key_id, log_key) {
+                None => continue,
+                Some(Err(rejection)) => {
+                    outcomes[index] = Outcome::Rejected(rejection);
+                    continue;
                 }
+                Some(Ok(classified)) => classified,
+            };
+            if let Ok(id) = crate::governance::update_id(&entry["body"]["update"]) {
+                if self.accepted_ids.contains(&id) || ids.values().any(|seen| *seen == id) {
+                    outcomes[index] = Outcome::Idempotent;
+                    continue;
+                }
+                ids.insert(index, id);
+            }
+            match classified {
+                RosterEntry::Act(candidate) => acts.push((index, candidate)),
+                RosterEntry::Checkpoint(candidate) => checkpoints.push((index, candidate)),
             }
         }
         let roster_acts: Vec<RosterAct<'_>> = acts
@@ -314,6 +334,13 @@ impl RosterHistory {
                 })
             };
         }
+        for (index, outcome) in outcomes.iter().enumerate() {
+            if matches!(outcome, Outcome::Accepted(_)) {
+                if let Some(id) = ids.get(&index) {
+                    self.accepted_ids.insert(id.clone());
+                }
+            }
+        }
         Ok(outcomes)
     }
 
@@ -381,6 +408,10 @@ impl RosterHistory {
 
     pub fn checkpoints(&self) -> &[SealedCheckpoint] {
         &self.checkpoints
+    }
+
+    pub fn idempotent(&self) -> &[Position] {
+        &self.idempotent
     }
 
     pub fn rejected(&self) -> &[RejectedAct] {

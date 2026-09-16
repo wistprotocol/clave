@@ -862,7 +862,7 @@ with E11 before E04 and both before authenticity and roster rules. Rejection
 leaves the roster unchanged and the Block valid, and a rejected act is no
 batch candidate. Removals apply before the Block's admissions and
 registrations; checkpoints read the roster after the Block's roster acts; an
-admission reads Observer history and citable checkpoints below its Block.
+admission reads Observer history and citable checkpoints below its Block. A Registry Update whose ID an accepted act already carries — at a lower Block or earlier in the same Block — is idempotent for roster acts, checkpoints, attestations, lifts and withdrawals alike (WIST-4 §9.1, ADR-0036): it applies nothing and rejects nothing, and the roster-acts vector's repeated checkpoint and admission replay as such.
 
 `admitted_key_at`, `registered_key_at`, `admitted_at`, `registered_at` and
 `tenure` read key custody from Block `sealed_at` instants: a key is held from

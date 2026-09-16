@@ -1066,11 +1066,12 @@ fn roster_act_vectors_replay_in_signed_histories() {
             continue;
         }
         let mut blocks = Vec::new();
-        let mut expectations: Vec<(Value, String)> = Vec::new();
+        let mut expectations: Vec<(usize, Value, String)> = Vec::new();
         let mut last_at = START;
         for block in case["blocks"].as_array().unwrap() {
             let height = block["height"].as_u64().unwrap();
             last_at = START + height as i64 * HOUR;
+            let block_index = blocks.len();
             let entries: Vec<Value> = block["entries"]
                 .as_array()
                 .unwrap()
@@ -1080,6 +1081,7 @@ fn roster_act_vectors_replay_in_signed_histories() {
                         serde_json::from_str(entry["envelope_json"].as_str().unwrap()).unwrap();
                     let wrapped = wrap(resign_log_act(&fx, envelope, log_key_id, &log_key));
                     expectations.push((
+                        block_index,
                         wrapped.clone(),
                         entry["expect"].as_str().unwrap().to_string(),
                     ));
@@ -1094,12 +1096,19 @@ fn roster_act_vectors_replay_in_signed_histories() {
             .iter()
             .map(|r| (r.position, r.code))
             .collect();
-        for (wrapped, expect) in &expectations {
-            let position = positions_of(&blocks, std::slice::from_ref(wrapped))
-                .into_iter()
-                .next()
-                .unwrap();
-            let got = rejected.get(&position).copied().unwrap_or("accepted");
+        for (block_index, wrapped, expect) in &expectations {
+            let position = positions_of(
+                &blocks[*block_index..=*block_index],
+                std::slice::from_ref(wrapped),
+            )
+            .into_iter()
+            .next()
+            .unwrap();
+            let got = if roster.idempotent().contains(&position) {
+                "idempotent"
+            } else {
+                rejected.get(&position).copied().unwrap_or("accepted")
+            };
             assert_eq!(got, expect, "{label}: {:?}", roster.rejected());
             if let Some(rejection) = roster.rejected().iter().find(|r| r.position == position) {
                 assert!(
@@ -1180,6 +1189,7 @@ fn roster_act_vectors_replay_in_signed_histories() {
         seen,
         [
             "accepted",
+            "idempotent",
             "WIST1-E05",
             "WIST4-E04",
             "WIST4-E07",

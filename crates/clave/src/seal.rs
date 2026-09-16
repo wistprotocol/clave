@@ -289,7 +289,7 @@ fn check_roster_acts(
                     for_cause: act.for_cause,
                 });
             }
-            Outcome::Accepted(_) => {}
+            Outcome::Accepted(_) | Outcome::Idempotent => {}
         }
     }
     db.record_roster_acts(&accepted)?;

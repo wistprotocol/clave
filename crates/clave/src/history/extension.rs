@@ -374,6 +374,7 @@ pub struct ExtensionHistory {
     processes: BTreeMap<String, PublisherProcesses>,
     withdrawn: BTreeMap<String, u64>,
     url_records: BTreeMap<(String, String), Vec<UrlRecord>>,
+    applied_acts: BTreeSet<String>,
 }
 
 impl ExtensionHistory {
@@ -420,6 +421,7 @@ impl ExtensionHistory {
             processes: BTreeMap::new(),
             withdrawn: BTreeMap::new(),
             url_records: BTreeMap::new(),
+            applied_acts: BTreeSet::new(),
         };
         while let Some(block) = history.next_block()? {
             let effects = declarations.apply(&block)?;
@@ -833,7 +835,11 @@ impl ExtensionHistory {
         let height = position.block_number;
         let sealed_at_s = block.sealed_at_s();
         if let Ok(id) = crate::governance::update_id(&body["update"]) {
-            self.sealed_ids.entry(id).or_insert(height);
+            if self.applied_acts.contains(&id) {
+                return Ok(());
+            }
+            self.sealed_ids.entry(id.clone()).or_insert(height);
+            self.applied_acts.insert(id);
         }
         let envelope: RegistryUpdateEnvelope =
             serde_json::from_value(body.clone()).map_err(|e| {
