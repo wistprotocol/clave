@@ -376,6 +376,70 @@ fn apply_sanctions(db: &Db, records: Vec<RecordRow>, at: &str) -> Result<Vec<Rec
     Ok(kept)
 }
 
+/// WIST-3 §7, one URL, one Publisher: a self-declared host's own record,
+/// else the nearest ancestor Publisher's, else the least non-ancestor
+/// domain in ascending octet order; the other records are excluded.
+fn prefer_one_publisher(db: &Db, records: Vec<RecordRow>) -> Result<Vec<RecordRow>> {
+    let mut by_url: std::collections::HashMap<&str, Vec<usize>> = std::collections::HashMap::new();
+    for (index, record) in records.iter().enumerate() {
+        by_url.entry(record.url.as_str()).or_default().push(index);
+    }
+    let mut declared: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    let mut keep = vec![true; records.len()];
+    for (url, indices) in by_url {
+        let host = crate::declaration::url_host(url);
+        let own = indices
+            .iter()
+            .copied()
+            .find(|index| records[*index].publisher == host);
+        if own.is_none()
+            && indices
+                .iter()
+                .all(|index| records[*index].publisher == host)
+        {
+            continue;
+        }
+        let self_declared = own.is_some()
+            || match declared.get(host) {
+                Some(known) => *known,
+                None => {
+                    let sealed = !db.sealed_declarations(host)?.is_empty();
+                    declared.insert(host.to_owned(), sealed);
+                    sealed
+                }
+            };
+        let preferred = if self_declared {
+            own
+        } else {
+            let ancestor = |index: &usize| {
+                host.strip_suffix(records[*index].publisher.as_str())
+                    .is_some_and(|prefix| prefix.ends_with('.'))
+            };
+            indices
+                .iter()
+                .copied()
+                .filter(ancestor)
+                .max_by_key(|index| records[*index].publisher.len())
+                .or_else(|| {
+                    indices.iter().copied().min_by(|a, b| {
+                        records[*a]
+                            .publisher
+                            .as_bytes()
+                            .cmp(records[*b].publisher.as_bytes())
+                    })
+                })
+        };
+        for index in indices {
+            keep[index] = preferred == Some(index);
+        }
+    }
+    Ok(records
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(record, kept)| kept.then_some(record))
+        .collect())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn build(
     db: &Db,
@@ -386,7 +450,7 @@ pub fn build(
     snapshot_date: &str,
     sealed_at: &str,
 ) -> Result<()> {
-    let records = apply_sanctions(db, db.list_records()?, sealed_at)?;
+    let records = prefer_one_publisher(db, apply_sanctions(db, db.list_records()?, sealed_at)?)?;
     let snapshot_dir = data_dir.join("snapshots").join(snapshot_date);
 
     let shard_count = db.param("snapshot_shard_count").unwrap_or(1).max(1) as u64;
@@ -486,6 +550,25 @@ mod tests {
     }
 
     fn seal_record(db: &Db, block: u64, sealed_epoch: i64, url: &str) {
+        seal_record_as(db, block, sealed_epoch, url, "example.com", &[]);
+    }
+
+    fn seal_record_as(
+        db: &Db,
+        block: u64,
+        sealed_epoch: i64,
+        url: &str,
+        publisher: &str,
+        declared: &[&str],
+    ) {
+        let declarations: Vec<crate::db::SealedDeclarationRow<'_>> = declared
+            .iter()
+            .map(|domain| crate::db::SealedDeclarationRow {
+                domain,
+                seq: 0,
+                declaration_json: b"{}",
+            })
+            .collect();
         db.commit_seal(
             &[],
             block,
@@ -493,7 +576,7 @@ mod tests {
             &ts(sealed_epoch),
             &[RecordUpsert {
                 url,
-                publisher: "example.com",
+                publisher,
                 delta_id: &format!("sha256:{:064x}", block),
                 observed_at: &ts(sealed_epoch),
                 weight: "full",
@@ -503,10 +586,59 @@ mod tests {
             }],
             &[],
             &[],
-            &[],
+            &declarations,
             0,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn one_url_one_publisher_prefers_self_then_nearest_ancestor_then_octet_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+        let rows: [(&str, &str, &[&str]); 11] = [
+            ("https://a.example.com/x", "example.com", &[]),
+            (
+                "https://a.example.com/x",
+                "a.example.com",
+                &["a.example.com"],
+            ),
+            ("https://d.example.com/x", "example.com", &["d.example.com"]),
+            ("https://a.b.example.com/x", "example.com", &[]),
+            ("https://a.b.example.com/x", "b.example.com", &[]),
+            ("https://c.example.com/x", "zeta.example", &[]),
+            ("https://c.example.com/x", "example.com", &[]),
+            ("https://e.example.com/x", "zeta.example", &[]),
+            ("https://e.example.com/x", "alpha.example", &[]),
+            ("https://a.notexample.com/x", "example.com", &[]),
+            ("https://a.notexample.com/x", "beta.example", &[]),
+        ];
+        for (block, (url, publisher, declared)) in rows.iter().enumerate() {
+            seal_record_as(
+                &db,
+                block as u64,
+                T0 + block as i64,
+                url,
+                publisher,
+                declared,
+            );
+        }
+        let kept = prefer_one_publisher(&db, db.list_records().unwrap()).unwrap();
+        let mut pairs: Vec<(&str, &str)> = kept
+            .iter()
+            .map(|r| (r.url.as_str(), r.publisher.as_str()))
+            .collect();
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            [
+                ("https://a.b.example.com/x", "b.example.com"),
+                ("https://a.example.com/x", "a.example.com"),
+                ("https://a.notexample.com/x", "beta.example"),
+                ("https://c.example.com/x", "example.com"),
+                ("https://e.example.com/x", "alpha.example"),
+            ]
+        );
     }
 
     #[test]

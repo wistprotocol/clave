@@ -619,7 +619,12 @@ where an open appeal-sealing or ruling deadline in that row is at or before
 falls to the fallback, so a lapse between Blocks is enforced before the next
 seal records it. Ingestion refuses a level-3 domain's pulls and Pings, status
 reports quarantine or delisting, and Snapshots reduce level-2 weights and
-exclude level-4 Deltas from that state. `quota::quota_q(database, domain,
+exclude level-4 Deltas from that state. After those exclusions a Snapshot
+carries one record per URL under WIST-3 §7 and ADR-0039: the self-declared
+host's own record when the host's Declaration has sealed, else the nearest
+ancestor Publisher's, else the least non-ancestor domain in ascending octet
+order; a unit test fixes the five outcomes, including a label-boundary host
+and a self-declared host whose only record is a parent's. `quota::quota_q(database, domain,
 at)` reads `reputation_u` at the highest Block sealed strictly before the
 UTC day of `at` (WIST-4 §6.4), the new-domain value where none exists.
 
