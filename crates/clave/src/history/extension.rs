@@ -1701,7 +1701,29 @@ impl ExtensionHistory {
         }
     }
 
-    fn epoch_of(&self, height: u64) -> Option<wist_core::observer::Epoch> {
+    /// WIST-4 §3.1: the Observers an epoch budgets, read from the
+    /// registrations at the epoch's first Block and that Block's budget.
+    pub fn budgeted_observers(&self, epoch: &wist_core::observer::Epoch) -> Vec<String> {
+        let Some(first) = self.blocks.get(epoch.first as usize) else {
+            return Vec::new();
+        };
+        let Some(budget) = std::num::NonZeroU64::new(first.canary.checkpoint_budget) else {
+            return Vec::new();
+        };
+        let registered: Vec<&str> = self
+            .roster
+            .registered_at(first.block.sealed_at_s)
+            .into_iter()
+            .map(|(observer_id, _)| observer_id)
+            .collect();
+        wist_core::observer::epoch_budget(&registered, epoch.number, budget)
+            .budgeted
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    pub fn epoch_of(&self, height: u64) -> Option<wist_core::observer::Epoch> {
         wist_core::observer::epoch_of_block(height, |first| {
             self.blocks
                 .get(first as usize)

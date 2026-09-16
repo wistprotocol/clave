@@ -69,6 +69,42 @@ pub fn queue_served(db: &Db, domain: &str, served: Option<&Value>) -> Result<Sub
     Ok(report)
 }
 
+/// WIST-4 §3.1: once the head Block closes a budgeting epoch, the Observers
+/// that epoch budgets are due a submissions pull before the following
+/// epoch's last Block seals. Returns the closed epoch and its Observers.
+pub fn epoch_pull_targets(
+    history: &crate::history::extension::ExtensionHistory,
+) -> Option<(u64, Vec<String>)> {
+    let head = history.through()?.block_number;
+    let epoch = history.epoch_of(head)?;
+    if u128::from(head) != epoch.last() {
+        return None;
+    }
+    Some((epoch.number, history.budgeted_observers(&epoch)))
+}
+
+/// Pulls the submissions path of every Observer the just-closed epoch
+/// budgets, once per epoch, queueing what verifies.
+pub fn poll_epoch(db: &Db, client: &Client, data_dir: &std::path::Path) -> Result<Vec<String>> {
+    let Some(head) = db.last_block()? else {
+        return Ok(Vec::new());
+    };
+    let history =
+        crate::history::extension::ExtensionHistory::reconstruct(data_dir, Some(head.clone()))?;
+    let Some((epoch, observers)) = epoch_pull_targets(&history) else {
+        return Ok(Vec::new());
+    };
+    if db.epoch_pulled(epoch)? {
+        return Ok(Vec::new());
+    }
+    let mut queued = Vec::new();
+    for observer in observers {
+        queued.extend(pull(db, client, &observer)?.queued);
+    }
+    db.record_epoch_pull(epoch, head.block_number)?;
+    Ok(queued)
+}
+
 fn eligible(db: &Db, domain: &str, item: &Value) -> std::result::Result<(), &'static str> {
     let update = &item["update"];
     let action = update["action"].as_str().ok_or("missing action")?;

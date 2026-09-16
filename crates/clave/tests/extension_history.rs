@@ -3689,6 +3689,54 @@ fn canary_act_vectors_replay_as_signed_histories() {
     }
 }
 
+fn register(subject: &str, key_label: &str, key_id: &str) -> Value {
+    let update = json!({
+        "wist_version": "1.0.0", "action": "observer_register", "subject": subject,
+        "details": {"key_id": key_id, "alg": "Ed25519", "public_key": public(key_label)},
+        "effective_at": ts(START),
+    });
+    json!({
+        "type": "registry_update",
+        "body": envelope::sign_envelope(&update, "update", key_id, &key(key_label)).unwrap(),
+    })
+}
+
+#[test]
+fn a_closed_epoch_budgets_its_registered_observers_for_a_submissions_pull() {
+    let mut fx = Fixture::new();
+    fx.hourly(
+        0,
+        vec![
+            register("watch.sample.net", "watch", "w1"),
+            register("check.other.org", "check", "c1"),
+        ],
+    );
+    for height in 1..23 {
+        fx.hourly(height, Vec::new());
+    }
+    let before = fx.reconstruct().unwrap();
+    assert_eq!(clave::submissions::epoch_pull_targets(&before), None);
+    fx.hourly(23, Vec::new());
+    let history = fx.reconstruct().unwrap();
+    let epoch = history.epoch_of(23).unwrap();
+    assert_eq!((epoch.number, epoch.first, epoch.last()), (0, 0, 23));
+    let mut budgeted = history.budgeted_observers(&epoch);
+    budgeted.sort();
+    assert_eq!(budgeted, ["check.other.org", "watch.sample.net"]);
+    let (number, targets) = clave::submissions::epoch_pull_targets(&history).unwrap();
+    assert_eq!(number, 0);
+    assert_eq!(targets.len(), 2);
+    assert!(
+        history.epoch_of(24).is_none(),
+        "an epoch's length reads its first Block"
+    );
+    fx.hourly(24, Vec::new());
+    let history = fx.reconstruct().unwrap();
+    let next = history.epoch_of(24).unwrap();
+    assert_eq!((next.number, next.first), (1, 24));
+    assert_eq!(clave::submissions::epoch_pull_targets(&history), None);
+}
+
 fn withdrawal_update(subject: &str, delta_id: &str, basis: &str) -> Value {
     json!({
         "wist_version": "1.0.0", "action": "payload_withdrawal", "subject": subject,

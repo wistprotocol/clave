@@ -99,6 +99,12 @@ enum Command {
         #[arg(long = "allow-http")]
         allow_http: bool,
     },
+    PollSubmissions {
+        #[arg(long)]
+        data: PathBuf,
+        #[arg(long = "allow-http")]
+        allow_http: bool,
+    },
     Mirror {
         #[arg(long)]
         data: PathBuf,
@@ -260,6 +266,17 @@ fn main() -> Result<(), clave::Error> {
                 jiff::Timestamp::now().as_second(),
             )?;
             println!("queued payload withdrawal {}", report.update_id);
+        }
+        Command::PollSubmissions { data, allow_http } => {
+            let db = clave::db::Db::open(&data.join("clave.sqlite"))?;
+            let client = clave::fetch::Client::new(allow_http);
+            let queued = clave::submissions::poll_epoch(&db, &client, &data)?;
+            if queued.is_empty() {
+                println!("no budgeted submissions due");
+            }
+            for id in queued {
+                println!("queued {id}");
+            }
         }
         Command::PollAppeals { data, allow_http } => {
             let db = clave::db::Db::open(&data.join("clave.sqlite"))?;

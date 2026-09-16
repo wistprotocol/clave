@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS derived_escalations(domain TEXT NOT NULL, block_numbe
 CREATE TABLE IF NOT EXISTS derived_coverage_failures(auditor_id TEXT NOT NULL, block_number INTEGER NOT NULL, duty_block INTEGER NOT NULL, PRIMARY KEY(auditor_id, block_number, duty_block));
 CREATE TABLE IF NOT EXISTS sealed_updates(update_id TEXT PRIMARY KEY, block_number INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS derived_canary_commitments(update_id TEXT NOT NULL, block_number INTEGER NOT NULL, planter TEXT NOT NULL, root TEXT NOT NULL, leaves INTEGER NOT NULL, sealing_height INTEGER NOT NULL, PRIMARY KEY(update_id, block_number));
+CREATE TABLE IF NOT EXISTS epoch_pulls(epoch_number INTEGER PRIMARY KEY, block_number INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS derived_observers(observer_id TEXT NOT NULL, block_number INTEGER NOT NULL, key_id TEXT NOT NULL, public_key TEXT NOT NULL, registered_height INTEGER NOT NULL, PRIMARY KEY(observer_id, block_number));
 CREATE TABLE IF NOT EXISTS derived_exclusions(publisher TEXT NOT NULL, url TEXT NOT NULL, block_number INTEGER NOT NULL, since_height INTEGER NOT NULL, PRIMARY KEY(publisher, url, block_number));
 CREATE TABLE IF NOT EXISTS derived_auditor_state(auditor_id TEXT NOT NULL, block_number INTEGER NOT NULL, sealed_at TEXT NOT NULL, coverage_failure INTEGER NOT NULL, PRIMARY KEY(auditor_id, block_number));
@@ -1485,6 +1486,22 @@ impl Db {
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Error::Db)
+    }
+
+    pub fn epoch_pulled(&self, epoch_number: u64) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM epoch_pulls WHERE epoch_number = ?1)",
+            [epoch_number as i64],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn record_epoch_pull(&self, epoch_number: u64, block_number: u64) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO epoch_pulls(epoch_number, block_number) VALUES (?1, ?2)",
+            (epoch_number as i64, block_number as i64),
+        )?;
+        Ok(())
     }
 
     pub fn record_derived_observers(

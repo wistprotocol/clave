@@ -1405,9 +1405,13 @@ registered for the Observer, or the domain's stored Declaration Key Set — unle
 queue or a sealed Block already carries its Registry Update ID; seals record
 every sealed Registry Update ID for that check. An absent or malformed path
 queues nothing and is no fault; subject shape, contract and §5.1 rules are
-decided at sealing and replay. Budgeted Observer pulls per epoch are not
-implemented. Live tests cover queueing, foreign subjects, forged signatures,
-Aggregator-signed items, repeats and sealed items.
+decided at sealing and replay. `poll-submissions` (`submissions::poll_epoch`)
+pulls, once the head Block closes a budgeting epoch, the submissions path of
+every Observer that epoch budgets — the registrations at the epoch's first
+Block grouped by two-label suffix and walked by `observer_checkpoint_budget`
+per WIST-4 §3.1 — once per epoch. Live tests cover queueing, foreign
+subjects, forged signatures, Aggregator-signed items, repeats and sealed
+items; a signed history checks the closed-epoch targets.
 
 ## Feed next targets
 
