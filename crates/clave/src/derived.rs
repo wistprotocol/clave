@@ -197,6 +197,7 @@ pub fn refresh(db: &Db, data_dir: &Path, sk: &SigningKey) -> Result<()> {
         })
         .collect();
     db.record_derived_snapshot_inputs(height, &reputation_rows, &escalations, &failures)?;
+    db.record_derived_exclusions(height, &history.exclusions(height))?;
     remove_failed_auditors(db, sk, &history, &head, &auditors)
 }
 

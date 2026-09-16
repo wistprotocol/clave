@@ -12,9 +12,9 @@ use wist_core::crypto::{hex_encode, SigningKey};
 use wist_core::envelope::sign_envelope;
 use wist_core::objects::{
     AggregatorKeyEntry, AuditorEntry, CoverageFailureEntry, DeclarationEntry, EscalationEntry,
-    ParameterEntry, RecordEntry, RecoveryWindowEntry, ReputationInputsEntry, SanctionStateEntry,
-    SnapshotFile, SnapshotIndex, SnapshotIndexEntry, SnapshotManifest, SnapshotState,
-    SnapshotStateFile, StateEntry,
+    ExclusionEntry, ParameterEntry, RecordEntry, RecoveryWindowEntry, ReputationInputsEntry,
+    SanctionStateEntry, SnapshotFile, SnapshotIndex, SnapshotIndexEntry, SnapshotManifest,
+    SnapshotState, SnapshotStateFile, StateEntry,
 };
 use wist_core::snapshot::{content_digest, state_digest};
 
@@ -294,6 +294,13 @@ fn build_state(
             establishing_sealed_at,
         }));
     }
+    for (publisher, url, excluded_since_height) in db.derived_exclusions_at(log_position)? {
+        entries.push(StateEntry::Exclusion(ExclusionEntry {
+            publisher,
+            url,
+            excluded_since_height,
+        }));
+    }
     for (auditor_id, block_number) in db.derived_coverage_failures_at(log_position)? {
         entries.push(StateEntry::CoverageFailure(CoverageFailureEntry {
             auditor_id,
@@ -402,6 +409,21 @@ fn apply_sanctions(db: &Db, records: Vec<RecordRow>, at: &str) -> Result<Vec<Rec
     Ok(kept)
 }
 
+/// WIST-4 §5 and WIST-3 §7: a URL unauditable at the Snapshot's
+/// `log_position` materializes nothing until an independent measurement
+/// clears it or its blocking pair ages out.
+fn apply_exclusions(db: &Db, records: Vec<RecordRow>, log_position: u64) -> Result<Vec<RecordRow>> {
+    let excluded: std::collections::HashSet<(String, String)> = db
+        .derived_exclusions_at(log_position)?
+        .into_iter()
+        .map(|(publisher, url, _)| (publisher, url))
+        .collect();
+    Ok(records
+        .into_iter()
+        .filter(|record| !excluded.contains(&(record.publisher.clone(), record.url.clone())))
+        .collect())
+}
+
 /// WIST-3 §7, one URL, one Publisher: a self-declared host's own record,
 /// else the nearest ancestor Publisher's, else the least non-ancestor
 /// domain in ascending octet order; the other records are excluded.
@@ -477,7 +499,8 @@ pub fn build(
     sealed_at: &str,
     domains: &BTreeMap<String, Domain>,
 ) -> Result<()> {
-    let records = prefer_one_publisher(db, apply_sanctions(db, db.list_records()?, sealed_at)?)?;
+    let records = apply_sanctions(db, db.list_records()?, sealed_at)?;
+    let records = prefer_one_publisher(db, apply_exclusions(db, records, log_position)?)?;
     let snapshot_dir = data_dir.join("snapshots").join(snapshot_date);
 
     let shard_count = db.param("snapshot_shard_count").unwrap_or(1).max(1) as u64;
@@ -617,6 +640,28 @@ mod tests {
             0,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn unauditable_urls_leave_materialization_at_the_snapshot_height() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+        seal_record(&db, 0, T0, "https://example.com/open");
+        seal_record(&db, 1, T0 + DAY, "https://example.com/shut");
+        db.record_derived_exclusions(
+            1,
+            &[("example.com".into(), "https://example.com/shut".into(), 1)],
+        )
+        .unwrap();
+        let kept = apply_exclusions(&db, db.list_records().unwrap(), 1).unwrap();
+        let urls: Vec<&str> = kept.iter().map(|r| r.url.as_str()).collect();
+        assert_eq!(urls, ["https://example.com/open"]);
+        assert_eq!(
+            apply_exclusions(&db, db.list_records().unwrap(), 0)
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[test]

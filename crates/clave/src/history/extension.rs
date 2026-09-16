@@ -181,6 +181,7 @@ pub struct RecordStanding {
     pub verdict: Option<Verdict>,
     pub reference_delta: Option<String>,
     pub similarity: Option<u64>,
+    pub blocking: bool,
     pub record_id: Option<String>,
     pub standing: Standing,
     pub duty: Duty,
@@ -304,6 +305,7 @@ struct BlockFact {
     confirm_auditors: u64,
     extension_triggers_max: u64,
     coverage: super::coverage::CoverageProfile,
+    unauditable_horizon_days: u64,
     decay_horizon_days: u64,
     process: super::ProcessProfile,
 }
@@ -323,6 +325,14 @@ struct Evidence {
     sealed_at_s: i64,
     auditor_id: String,
     verdict: Verdict,
+}
+
+#[derive(Clone)]
+struct UrlRecord {
+    sealed_at_s: i64,
+    auditor_id: String,
+    verdict: Verdict,
+    blocking: bool,
 }
 
 pub struct ExtensionHistory {
@@ -363,6 +373,7 @@ pub struct ExtensionHistory {
     sanction_acts: Vec<SanctionRecord>,
     processes: BTreeMap<String, PublisherProcesses>,
     withdrawn: BTreeMap<String, u64>,
+    url_records: BTreeMap<(String, String), Vec<UrlRecord>>,
 }
 
 impl ExtensionHistory {
@@ -408,6 +419,7 @@ impl ExtensionHistory {
             sanction_acts: Vec::new(),
             processes: BTreeMap::new(),
             withdrawn: BTreeMap::new(),
+            url_records: BTreeMap::new(),
         };
         while let Some(block) = history.next_block()? {
             let effects = declarations.apply(&block)?;
@@ -485,6 +497,7 @@ impl ExtensionHistory {
             extension_triggers_max: block.extension_triggers_max(),
             coverage: *block.coverage_profile(),
             decay_horizon_days: block.decay_horizon_days(),
+            unauditable_horizon_days: block.unauditable_horizon_days(),
             process: *block.process_profile(),
         });
         Ok(())
@@ -731,6 +744,11 @@ impl ExtensionHistory {
             verdict,
             reference_delta: record["reference_delta"].as_str().map(str::to_owned),
             similarity: record["similarity"].as_u64(),
+            blocking: match verdict {
+                Some(Verdict::Unreachable) => record["robots_excluded"] == true,
+                Some(Verdict::NotAuditable) => record["unmeasured"] == "observed",
+                _ => false,
+            },
             record_id,
             standing,
             duty,
@@ -1097,6 +1115,7 @@ impl ExtensionHistory {
             if !record.evidence() {
                 continue;
             }
+            let blocking = record.blocking;
             let (Some(verdict), Some(publisher)) = (record.verdict, record.publisher.clone())
             else {
                 continue;
@@ -1119,6 +1138,15 @@ impl ExtensionHistory {
                     "evidence Record lost its authenticated Delta bindings".into(),
                 ));
             };
+            self.url_records
+                .entry((publisher.clone(), url.clone()))
+                .or_default()
+                .push(UrlRecord {
+                    sealed_at_s,
+                    auditor_id: auditor_id.clone(),
+                    verdict,
+                    blocking,
+                });
             match verdict {
                 Verdict::Consistent => {
                     self.audits
@@ -1419,6 +1447,63 @@ impl ExtensionHistory {
                 .map(|(_, sealed_at_s, severity)| (sealed_at_s, severity))
                 .collect(),
         })
+    }
+
+    pub fn unauditable(&self, publisher: &str, url: &str, height: u64) -> bool {
+        let Some(at) = self.blocks.get(height as usize) else {
+            return false;
+        };
+        let Some(records) = self
+            .url_records
+            .get(&(publisher.to_owned(), url.to_owned()))
+        else {
+            return false;
+        };
+        let sealed: Vec<&UrlRecord> = records
+            .iter()
+            .filter(|record| record.sealed_at_s <= at.block.sealed_at_s)
+            .collect();
+        let blocking: Vec<wist_core::unauditable::SealedBy<'_>> = sealed
+            .iter()
+            .filter(|record| record.blocking)
+            .map(|record| wist_core::unauditable::SealedBy {
+                auditor_id: &record.auditor_id,
+                sealed_at_s: record.sealed_at_s,
+            })
+            .collect();
+        let verdicts: Vec<wist_core::unauditable::VerdictRecord<'_>> = sealed
+            .iter()
+            .map(|record| wist_core::unauditable::VerdictRecord {
+                sealed_by: wist_core::unauditable::SealedBy {
+                    auditor_id: &record.auditor_id,
+                    sealed_at_s: record.sealed_at_s,
+                },
+                verdict: sealed_verdict(record.verdict),
+            })
+            .collect();
+        wist_core::unauditable::unauditable_at(
+            &blocking,
+            &verdicts,
+            at.block.sealed_at_s,
+            at.unauditable_horizon_days,
+        )
+    }
+
+    pub fn exclusions(&self, height: u64) -> Vec<(String, String, u64)> {
+        self.url_records
+            .iter()
+            .filter(|(_, records)| records.iter().any(|record| record.blocking))
+            .filter_map(|((publisher, url), _)| {
+                if !self.unauditable(publisher, url, height) {
+                    return None;
+                }
+                let mut since = height;
+                while since > 0 && self.unauditable(publisher, url, since - 1) {
+                    since -= 1;
+                }
+                Some((publisher.clone(), url.clone(), since))
+            })
+            .collect()
     }
 
     pub fn live_escalation(&self, publisher: &str, height: u64) -> Option<i64> {

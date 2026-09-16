@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS derived_publisher_state(domain TEXT NOT NULL, block_n
 CREATE TABLE IF NOT EXISTS derived_reputation_inputs(domain TEXT NOT NULL, block_number INTEGER NOT NULL, first_accepted_at TEXT NOT NULL, reset_height INTEGER, counted_total INTEGER NOT NULL, counted_json TEXT NOT NULL, penalties_json TEXT NOT NULL, PRIMARY KEY(domain, block_number));
 CREATE TABLE IF NOT EXISTS derived_escalations(domain TEXT NOT NULL, block_number INTEGER NOT NULL, establishing_at TEXT NOT NULL, PRIMARY KEY(domain, block_number));
 CREATE TABLE IF NOT EXISTS derived_coverage_failures(auditor_id TEXT NOT NULL, block_number INTEGER NOT NULL, duty_block INTEGER NOT NULL, PRIMARY KEY(auditor_id, block_number, duty_block));
+CREATE TABLE IF NOT EXISTS derived_exclusions(publisher TEXT NOT NULL, url TEXT NOT NULL, block_number INTEGER NOT NULL, since_height INTEGER NOT NULL, PRIMARY KEY(publisher, url, block_number));
 CREATE TABLE IF NOT EXISTS derived_auditor_state(auditor_id TEXT NOT NULL, block_number INTEGER NOT NULL, sealed_at TEXT NOT NULL, coverage_failure INTEGER NOT NULL, PRIMARY KEY(auditor_id, block_number));
 ";
 
@@ -1414,6 +1415,37 @@ impl Db {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    pub fn record_derived_exclusions(
+        &self,
+        block_number: u64,
+        exclusions: &[(String, String, u64)],
+    ) -> Result<()> {
+        let tx = self.mutation()?;
+        for (publisher, url, since) in exclusions {
+            tx.execute(
+                "INSERT OR REPLACE INTO derived_exclusions(publisher, url, block_number, since_height) VALUES (?1, ?2, ?3, ?4)",
+                (publisher, url, block_number as i64, *since as i64),
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn derived_exclusions_at(&self, block_number: u64) -> Result<Vec<(String, String, u64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT publisher, url, since_height FROM derived_exclusions WHERE block_number = ?1 ORDER BY publisher, url",
+        )?;
+        let rows = stmt.query_map([block_number as i64], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)? as u64,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Error::Db)
     }
 
     pub fn derived_reputation_inputs_at(

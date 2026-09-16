@@ -3105,6 +3105,106 @@ fn record_not_auditable(audit: &Audit<'_>, unmeasured: &str) -> Value {
     })
 }
 
+fn record_unreachable(audit: &Audit<'_>, robots_excluded: bool) -> Value {
+    let body = json!({
+        "wist_version": "1.0.0",
+        "audited_delta": audit.audited,
+        "reference_delta": audit.audited,
+        "auditor_id": audit.auditor,
+        "fetched_at": ts(audit.fetched_at),
+        "verdict": "unreachable",
+        "robots_excluded": robots_excluded,
+        "vrf_proof": hex_encode(&proof(audit.auditor, audit.proof_over)),
+        "prev_record": null,
+    });
+    json!({
+        "type": "audit_record",
+        "body": envelope::sign_envelope(&body, "record", &key_id(audit.auditor), &key(audit.auditor))
+            .unwrap(),
+    })
+}
+
+#[test]
+fn two_independent_blocking_records_exclude_the_url_until_a_third_auditor_measures_it() {
+    let mut fx = Fixture::new();
+    fx.attest_empty = true;
+    let (filer, checker, watcher) = (
+        "audit.example.net",
+        "checker.example.org",
+        "watch.sample.net",
+    );
+    fx.hourly(
+        0,
+        vec![
+            fx.admit_own(filer),
+            fx.admit_own(checker),
+            fx.admit_own(watcher),
+            declaration(PUBLISHER, &[], "site"),
+        ],
+    );
+    let deltas = pages(PUBLISHER, "site", "u", 512);
+    let audited = fx.hourly(1, deltas.clone());
+    let betas: BTreeMap<&str, [u8; 64]> = [filer, checker, watcher]
+        .into_iter()
+        .map(|auditor| (auditor, beta(auditor, &audited)))
+        .collect();
+    let target = first(&deltas, &|id| {
+        [filer, checker, watcher]
+            .iter()
+            .all(|auditor| drawn(&betas[auditor], id, PROVISIONAL))
+    });
+    let url = deltas
+        .iter()
+        .find(|entry| delta_id(entry) == target)
+        .unwrap()["body"]["delta"]["url"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    fx.hourly(
+        2,
+        vec![record_not_auditable(
+            &audit_of(filer, &audited, &target, 2, "consistent"),
+            "observed",
+        )],
+    );
+    fx.hourly(
+        3,
+        vec![record_unreachable(
+            &audit_of(checker, &audited, &target, 3, "consistent"),
+            true,
+        )],
+    );
+    fx.hourly(4, Vec::new());
+    fx.hourly(
+        5,
+        vec![record(&audit_of(
+            watcher,
+            &audited,
+            &target,
+            5,
+            "consistent",
+        ))],
+    );
+    let history = fx.reconstruct().unwrap();
+    assert!(!history.unauditable(PUBLISHER, &url, 2));
+    assert!(history.unauditable(PUBLISHER, &url, 3));
+    assert!(history.unauditable(PUBLISHER, &url, 4));
+    assert_eq!(
+        history.exclusions(4),
+        [(PUBLISHER.to_owned(), url.clone(), 3)]
+    );
+    assert!(!history.unauditable(PUBLISHER, &url, 5));
+    assert!(history.exclusions(5).is_empty());
+    let standing = |height: u64| {
+        history
+            .records()
+            .iter()
+            .find(|r| r.position.block_number == height)
+            .unwrap()
+    };
+    assert!(standing(2).blocking && standing(3).blocking && !standing(5).blocking);
+}
+
 fn withdrawal_update(subject: &str, delta_id: &str, basis: &str) -> Value {
     json!({
         "wist_version": "1.0.0", "action": "payload_withdrawal", "subject": subject,

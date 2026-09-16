@@ -622,10 +622,17 @@ the latest establishing instant of any escalation inside WIST-4 §4's
 Auditor. The Snapshot state carries them as `reputation_inputs`,
 `escalation` and `coverage_failure` tuples (WIST-3 §7); a domain with no
 accepted Delta under its current identity has no `reputation_inputs`
-tuple. Unauditable `exclusion` tuples are not derived. The governance
-scenario checks the reputation tuple after two Confirmed Inconsistencies,
-and a unit test reproduces the counted-URL digests of the specification's
-state example.
+tuple. The same refresh derives WIST-4 §5's unauditable URLs from evidence
+Records: a `robots_excluded` or observed-side `not_auditable` Record blocks,
+two blocking Records by independent Auditors inside the Block's
+`unauditable_horizon_days` window exclude the URL until an independent
+Auditor's measured Record seals after the later of them or the pair ages
+out, and the `exclusion` tuple dates the current unbroken run (WIST-3 §7).
+Snapshot building drops an excluded URL's records before the one-URL
+preference. The governance scenario checks the reputation tuple after two
+Confirmed Inconsistencies, a signed history arms, holds and clears an
+exclusion, and a unit test reproduces the counted-URL digests of the
+specification's state example.
 
 `sanctions::sanction_state(database, domain, at)` reads the row of the
 highest Block sealed at or before `at`. Its level is the enforceable level;
