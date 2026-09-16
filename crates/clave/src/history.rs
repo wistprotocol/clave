@@ -40,16 +40,7 @@ pub struct VerifiedBlock {
     canary_profile: CanaryProfile,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CanaryProfile {
-    pub lead_blocks: u64,
-    pub leaves_max: u64,
-    pub commitments_max: u64,
-    pub reveal_min_blocks: u64,
-    pub lifetime_blocks: u64,
-    pub epoch_blocks: u64,
-    pub checkpoint_budget: u64,
-}
+pub use wist_core::canary_replay::CanaryProfile;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProcessProfile {
