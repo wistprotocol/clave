@@ -39,19 +39,12 @@ pub(super) fn block(
         windows,
         record_updates,
     } = prepared;
-    let blocks_dir = data_dir.join("log/blocks");
-    std::fs::create_dir_all(&blocks_dir)?;
     let block_bytes = jcs::canonicalize(&serde_json::to_value(&block)?)?;
     if block_bytes.len() as u64 > cap as u64 {
         return Err(Error::Seal(
             "serialized Block exceeds the decompressed cap".into(),
         ));
     }
-    let compressed = zstd::bulk::compress(&block_bytes, zstd::DEFAULT_COMPRESSION_LEVEL)?;
-    std::fs::write(
-        blocks_dir.join(format!("{block_number:09}.json.zst")),
-        &compressed,
-    )?;
 
     let checkpoint = Checkpoint {
         wist_version: WIST_VERSION.into(),
@@ -62,13 +55,6 @@ pub(super) fn block(
     let checkpoint_value = serde_json::to_value(&checkpoint)?;
     let checkpoint_envelope = sign_envelope(&checkpoint_value, "checkpoint", GENESIS_KEY_ID, sk)?;
     let checkpoint_bytes = serde_json::to_vec(&checkpoint_envelope)?;
-    let checkpoints_dir = data_dir.join("log/checkpoints");
-    std::fs::create_dir_all(&checkpoints_dir)?;
-    std::fs::write(data_dir.join("log/checkpoint.json"), &checkpoint_bytes)?;
-    std::fs::write(
-        checkpoints_dir.join(format!("{block_number:09}.json")),
-        &checkpoint_bytes,
-    )?;
 
     let records: Vec<RecordUpsert> = record_updates
         .iter()
@@ -138,6 +124,7 @@ pub(super) fn block(
         &declaration_rows,
         block_bytes.len() as u64,
     )?;
+    db.record_publication(block_number, &block_bytes, &checkpoint_bytes)?;
 
     for window in &windows {
         db.store_sealed_recovery_window(
@@ -166,6 +153,8 @@ pub(super) fn block(
     }
 
     mutation.commit()?;
+    crate::publication::publish(data_dir, block_number, &block_bytes, &checkpoint_bytes)?;
+    db.mark_published(block_number)?;
     let sealed_update_ids: Vec<String> = seal_entries
         .iter()
         .filter(|e| e.entry_type == "registry_update")

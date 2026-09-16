@@ -38,6 +38,7 @@ pub(super) const GOVERNANCE_ACTIONS: [&str; 6] = [
 ];
 
 pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<SealReport> {
+    crate::publication::recover(db, data_dir)?;
     let mutation = db.mutation()?;
     let prepared = prepare::block(db, data_dir, sk, now_epoch)?;
     publish::block(db, data_dir, sk, mutation, prepared)

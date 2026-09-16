@@ -173,6 +173,26 @@ and counts as neither noise nor a pull, so the Publisher retries later
 under its own backoff. Quota (429) and quarantine (403) are answered
 before admission.
 
+## Sealing publication and recovery
+
+A seal commits the Block row, the acceptance records, the schedule and
+governance rows and the exact Block and Checkpoint bytes it signed in one
+store transaction before any file is written (WIST-3 §5). Publication
+then writes each file through a sibling temporary file, syncing the file
+and its directory: the Block file first, then the numbered Checkpoint
+copy, then `/log/checkpoint.json`, so no Checkpoint names a Block that is
+not yet durable and retrievable. The store marks the height published
+only after the last write. `seal` and `serve` start by finishing every
+publication the store committed to that the disk does not hold as
+recorded, republishing the recorded bytes and never sealing or signing
+the height again; a restart therefore honors every Checkpoint it may
+have served. A missing, torn or re-encoded head Block file is repaired
+from the record; a head file holding a different Block is refused, since
+the store and the disk then disagree beyond a torn write. Lower Blocks
+are checked by `verify-history` and reopening, not at every start.
+Snapshot files and the derived-state refresh follow the same seal
+outside that record.
+
 ## Concurrency
 
 No pull holds a process-wide lock. Each pull, Ping check, status request

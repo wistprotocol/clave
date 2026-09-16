@@ -1459,7 +1459,7 @@ fn corrupt_pinned_history_cannot_settle_a_queue() {
         ingest(&r, "2026-08-09T15:00:00Z").queued,
         std::slice::from_ref(&delta)
     );
-    let block = r.data.path().join("log/blocks/000000001.json.zst");
+    let block = r.data.path().join("log/blocks/000000000.json.zst");
     let original = std::fs::read(&block).unwrap();
     std::fs::write(&block, b"invalid frame").unwrap();
     assert!(clave::seal::run(&r.db, r.data.path(), &r.sk, start + 3600 + 7 * DAY).is_err());

@@ -356,6 +356,9 @@ fn exec_upsert_record(conn: &Connection, r: &RecordUpsert, sealed_at: &str) -> R
     Ok(())
 }
 
+/// A sealed height with the Block and Checkpoint bytes it committed to.
+pub type Publication = (u64, Vec<u8>, Vec<u8>);
+
 pub struct Db {
     conn: Connection,
 }
@@ -1081,6 +1084,56 @@ impl Db {
             })
             .collect::<Result<_>>()?;
         Ok((entries, max_rowid))
+    }
+
+    /// Records the exact Block and Checkpoint bytes a seal committed to,
+    /// before either file is published, so a restart republishes the
+    /// same bytes instead of sealing the height again (WIST-3 §5).
+    pub fn record_publication(
+        &self,
+        block_number: u64,
+        block_json: &[u8],
+        checkpoint_json: &[u8],
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO publications(block_number, block_json, checkpoint_json, published) VALUES (?1, ?2, ?3, 0)",
+            (block_number as i64, block_json, checkpoint_json),
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_published(&self, block_number: u64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE publications SET published = 1 WHERE block_number = ?1",
+            [block_number as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Every recorded publication whose files are not yet confirmed on
+    /// disk, lowest height first.
+    pub fn unpublished_publications(&self) -> Result<Vec<Publication>> {
+        let mut statement = self.conn.prepare(
+            "SELECT block_number, block_json, checkpoint_json FROM publications WHERE published = 0 ORDER BY block_number",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)? as u64, row.get(1)?, row.get(2)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// The recorded bytes of the highest sealed Block's publication.
+    pub fn head_publication(&self) -> Result<Option<Publication>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT block_number, block_json, checkpoint_json FROM publications ORDER BY block_number DESC LIMIT 1",
+                [],
+                |row| Ok((row.get::<_, i64>(0)? as u64, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?)
     }
 
     #[allow(clippy::too_many_arguments)]

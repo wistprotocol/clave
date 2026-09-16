@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS epoch_pulls(epoch_number INTEGER PRIMARY KEY, block_n
 CREATE TABLE IF NOT EXISTS derived_observers(observer_id TEXT NOT NULL, block_number INTEGER NOT NULL, key_id TEXT NOT NULL, public_key TEXT NOT NULL, registered_height INTEGER NOT NULL, PRIMARY KEY(observer_id, block_number));
 CREATE TABLE IF NOT EXISTS derived_exclusions(publisher TEXT NOT NULL, url TEXT NOT NULL, block_number INTEGER NOT NULL, since_height INTEGER NOT NULL, PRIMARY KEY(publisher, url, block_number));
 CREATE TABLE IF NOT EXISTS derived_auditor_state(auditor_id TEXT NOT NULL, block_number INTEGER NOT NULL, sealed_at TEXT NOT NULL, coverage_failure INTEGER NOT NULL, PRIMARY KEY(auditor_id, block_number));
+CREATE TABLE IF NOT EXISTS publications(block_number INTEGER PRIMARY KEY, block_json BLOB NOT NULL, checkpoint_json BLOB NOT NULL, published INTEGER NOT NULL DEFAULT 0);
 ";
 
 pub(super) fn add_missing_columns(conn: &Connection) -> Result<()> {

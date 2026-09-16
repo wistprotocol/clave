@@ -312,7 +312,7 @@ pub fn run_with_options(
     client: Client,
     options: ServeOptions,
 ) -> Result<()> {
-    drop(Db::open(&db_path)?);
+    crate::publication::recover(&Db::open(&db_path)?, &data_dir)?;
     let state = AppState {
         db_path,
         client: Arc::new(client),
