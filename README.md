@@ -1309,9 +1309,28 @@ receive WIST2-E04 without retry, even with a bad signature.
 `feed-fields.json` supplies 134 signed probes; live HTTP tests exercise 133
 through first contact and restart, checking persisted diagnostics, noise and
 request counts. Page field regressions stop before Delta/Payload admission.
-The schema gate does not establish complete `next` URL/authority validation,
-exact Page cardinality, publication/history
-partitioning, supported-major policy or durable selected-source provenance.
+The schema gate does not establish exact Page cardinality, publication/history
+partitioning, supported-major policy or durable selected-source provenance;
+target validation is described under [Feed next targets](#feed-next-targets).
+
+## Feed next targets
+
+The walk reads `next` only after the carrying Feed or Page passed the field,
+domain, signature and live regression checks and lists an unseen Delta ID. A
+read target is fetched only when it is byte-identical to its Normalized URL
+and begins with `https://`, the requested Canonical Host and
+`/.well-known/wist/` (WIST-2 §3.2, ADR-0038); no Declaration or
+`subdomain_scope` host takes part, and the query is requested as written. A
+loopback deployment under `--allow-http` rewrites only the scheme. A failing
+target records WIST2-E01 without noise, is never requested, and stops the
+walk while the Deltas of the objects already fetched proceed to admission.
+
+`feed-next.json` drives the field and target dispositions of every case
+through the same functions the walk uses; live HTTP tests show dot-segment,
+encoded, port, scope-host and encoded-separator spellings stop the walk
+without a Page request while the live Feed's Delta is admitted, a query
+survives retrieval byte for byte, and an ingested or empty object never
+reads its `next`.
 
 ## Feed rollback protection
 

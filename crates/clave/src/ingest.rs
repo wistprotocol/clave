@@ -389,21 +389,23 @@ impl Meter<'_> {
     }
 }
 
-/// WIST-2 §3.2: `next` MUST be an absolute URL whose authority is the
-/// Publisher's own. The scheme is re-derived per host so a loopback
-/// deployment can follow the https URLs a Publisher writes into sealed
-/// pages.
+/// WIST-2 §3.2 target rule: a read `next` is fetched only when it is
+/// byte-identical to its Normalized URL and begins with the requested
+/// Canonical Host's well-known prefix. The scheme is re-derived per host
+/// so a loopback deployment can follow the https URLs a Publisher writes
+/// into sealed pages.
 fn next_page_url(next: &str, host: &str, allow_http: bool) -> Option<String> {
-    let parsed = url::Url::parse(next).ok()?;
-    let authority = match parsed.port() {
-        Some(port) => format!("{}:{port}", parsed.host_str()?),
-        None => parsed.host_str()?.to_string(),
-    };
-    if !authority.eq_ignore_ascii_case(host) {
+    let prefix = format!("https://{host}/.well-known/wist/");
+    if !next.starts_with(&prefix)
+        || wist_core::extract::normalize_url(next, next).as_deref() != Some(next)
+    {
         return None;
     }
     let scheme = crate::fetch::scheme_for_host(host, allow_http);
-    Some(format!("{scheme}://{host}{}", parsed.path()))
+    Some(format!(
+        "{scheme}://{host}{}",
+        &next["https://".len() + host.len()..]
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -660,9 +662,9 @@ pub fn run_with_clock(
                         "WIST2-E01",
                         now,
                         None,
-                        "feed next is not a URL in the publisher's own authority",
+                        "feed next fails the target rule: not its Normalized URL under the requested host's well-known prefix",
                     )?;
-                    return Ok(report);
+                    break;
                 }
             },
             None => break,
@@ -1002,6 +1004,42 @@ pub fn run_with_clock(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn next_targets_follow_the_feed_next_vectors() {
+        let root = std::env::var_os("WIST_SPEC_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../spec")
+            });
+        let vector: Value = serde_json::from_slice(
+            &std::fs::read(root.join("vectors/wist2/feed-next.json")).unwrap(),
+        )
+        .unwrap();
+        let host = vector["host"].as_str().unwrap();
+        let mut read = 0;
+        for case in vector["cases"].as_array().unwrap() {
+            let name = case["name"].as_str().unwrap();
+            let parsed = feed::validate_fields(&case["envelope"]);
+            assert_eq!(parsed.is_ok(), case["expected"] != "fields", "{name}");
+            let Some(next) = parsed.ok().and_then(|envelope| envelope.feed.next) else {
+                continue;
+            };
+            if !case["next_read"].as_bool().unwrap() {
+                continue;
+            }
+            read += 1;
+            let followed = next_page_url(&next, host, false);
+            assert_eq!(followed.is_some(), case["expected"] == "followed", "{name}");
+            assert_eq!(followed.as_deref(), case["fetch"].as_str(), "{name}");
+            assert_eq!(
+                next_page_url(&next, host, true).is_some(),
+                followed.is_some(),
+                "{name}"
+            );
+        }
+        assert!(read >= 20);
+    }
 
     #[test]
     fn signed_pages_consume_keyset_resolution_vectors() {

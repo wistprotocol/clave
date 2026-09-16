@@ -186,6 +186,33 @@ pub fn reserve_addr() -> (std::net::TcpListener, String, clave::fetch::Client) {
     (listener, "localhost".into(), client)
 }
 
+pub fn serve_recording(
+    listener: std::net::TcpListener,
+    dir: std::path::PathBuf,
+) -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
+    let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let recorded = requests.clone();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+                recorded.lock().unwrap().push(uri.to_string());
+                let body = fs::read(dir.join(uri.path().trim_start_matches('/')));
+                async move {
+                    match body {
+                        Ok(bytes) => (axum::http::StatusCode::OK, bytes),
+                        Err(_) => (axum::http::StatusCode::NOT_FOUND, Vec::new()),
+                    }
+                }
+            });
+            axum::serve(tokio::net::TcpListener::from_std(listener).unwrap(), app)
+                .await
+                .unwrap();
+        });
+    });
+    requests
+}
+
 pub fn serve_static(listener: std::net::TcpListener, dir: std::path::PathBuf) {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
