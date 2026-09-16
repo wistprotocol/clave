@@ -6,65 +6,7 @@ pub(crate) fn read(path: &Path, bound: u64) -> Result<Vec<u8>> {
 }
 
 fn decode(raw: &[u8], bound: u64) -> Result<Vec<u8>> {
-    if !raw.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
-        return Err(failure("standard Block frame required"));
-    }
-    let declared = zstd::zstd_safe::get_frame_content_size(raw)
-        .map_err(|_| failure("invalid Block frame"))?
-        .filter(|&size| size <= bound)
-        .ok_or_else(|| failure("missing or excessive Block frame size"))?;
-    let compressed_size = zstd::zstd_safe::find_frame_compressed_size(raw)
-        .map_err(|_| failure("invalid or truncated Block frame"))?;
-    if compressed_size != raw.len() {
-        return Err(failure("Block file must contain exactly one frame"));
-    }
-    validate_data_blocks(raw, declared)?;
-    let bytes = zstd::bulk::decompress(
-        raw,
-        usize::try_from(declared).map_err(|_| failure("Block size is not addressable"))?,
-    )
-    .map_err(|e| failure(&format!("invalid compressed Block: {e}")))?;
-    if bytes.len() as u64 != declared {
-        return Err(failure("false Block frame size"));
-    }
-    Ok(bytes)
-}
-
-fn validate_data_blocks(raw: &[u8], declared: u64) -> Result<()> {
-    let descriptor = raw[4];
-    let single = descriptor & 32 != 0;
-    let mut position = 5;
-    let window = if single {
-        declared
-    } else {
-        let descriptor = *raw
-            .get(position)
-            .ok_or_else(|| failure("missing frame window"))?;
-        position += 1;
-        let base = 1u64 << (10 + (descriptor >> 3));
-        base + (base >> 3) * u64::from(descriptor & 7)
-    };
-    position += [0, 1, 2, 4][usize::from(descriptor & 3)];
-    position += [usize::from(single), 2, 4, 8][usize::from(descriptor >> 6)];
-    loop {
-        let header = raw
-            .get(position..position + 3)
-            .ok_or_else(|| failure("truncated data block header"))?;
-        let header = u32::from_le_bytes([header[0], header[1], header[2], 0]);
-        let kind = (header >> 1) & 3;
-        let size = header >> 3;
-        if kind == 3 || u64::from(size) > window.min(131072) {
-            return Err(failure("data block exceeds its frame window or size limit"));
-        }
-        position += 3 + if kind == 1 { 1 } else { size as usize };
-        if header & 1 != 0 {
-            return Ok(());
-        }
-    }
-}
-
-fn failure(message: &str) -> Error {
-    Error::History(format!("WIST3-E03 {message}"))
+    wist_core::block_frames::decode(raw, bound).map_err(|e| Error::History(e.to_string()))
 }
 
 #[cfg(test)]

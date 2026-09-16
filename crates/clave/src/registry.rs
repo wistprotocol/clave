@@ -19,60 +19,16 @@ pub fn validate(name: &str, value: i64, lookup: impl Fn(&str) -> i64) -> Result<
         .map_err(|err| Error::ParamChange(err.to_string()))
 }
 
-/// `0000-01-01T00:00:00Z`, the first instant a Log timestamp denotes.
-pub const LOG_TIMESTAMP_MIN_S: i64 = -62_167_219_200;
+pub use wist_core::timestamp::LOG_TIMESTAMP_MIN_S;
 
 /// The whole-second UTC spelling of an instant anywhere in the Log's
 /// four-digit-year range, the inverse of `epoch`.
 pub fn instant(epoch_s: i64) -> Result<String> {
-    let out_of_range = || Error::ParamChange("instant is outside the Log timestamp range".into());
-    if !(LOG_TIMESTAMP_MIN_S..=wist_core::parameters::LOG_TIMESTAMP_MAX_S).contains(&epoch_s) {
-        return Err(out_of_range());
-    }
-    let days = i32::try_from(epoch_s.div_euclid(86_400)).map_err(|_| out_of_range())?;
-    let date = jiff::civil::date(1970, 1, 1)
-        .checked_add(jiff::Span::new().days(days))
-        .map_err(|_| out_of_range())?;
-    let seconds = epoch_s.rem_euclid(86_400);
-    Ok(format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        date.year(),
-        date.month(),
-        date.day(),
-        seconds / 3600,
-        seconds % 3600 / 60,
-        seconds % 60
-    ))
+    wist_core::timestamp::instant(epoch_s).map_err(|e| Error::ParamChange(e.to_string()))
 }
 
 pub(crate) fn epoch(at: &str) -> Result<i64> {
-    let bytes = at.as_bytes();
-    if bytes.len() != 20
-        || !bytes.iter().enumerate().all(|(index, byte)| match index {
-            4 | 7 => *byte == b'-',
-            10 => *byte == b'T',
-            13 | 16 => *byte == b':',
-            19 => *byte == b'Z',
-            _ => byte.is_ascii_digit(),
-        })
-        || bytes[17] > b'5'
-    {
-        return Err(Error::ParamChange(
-            "timestamp must be whole-second UTC with trailing Z".into(),
-        ));
-    }
-    let civil = at[..19]
-        .parse::<jiff::civil::DateTime>()
-        .map_err(|e| Error::ParamChange(e.to_string()))?;
-    let days = civil
-        .date()
-        .since((jiff::Unit::Day, jiff::civil::date(1970, 1, 1)))
-        .map_err(|e| Error::ParamChange(e.to_string()))?
-        .get_days();
-    Ok(i64::from(days) * 86_400
-        + i64::from(civil.hour()) * 3600
-        + i64::from(civil.minute()) * 60
-        + i64::from(civil.second()))
+    wist_core::timestamp::log_seconds(at).map_err(|e| Error::ParamChange(e.to_string()))
 }
 
 pub(crate) fn accept(

@@ -2471,6 +2471,7 @@ dependencies = [
  "unicode-normalization",
  "unicode-segmentation",
  "zerovec",
+ "zstd",
 ]
 
 [[package]]
