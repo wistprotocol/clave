@@ -1,5 +1,4 @@
 use crate::error::{Error, Result};
-use crate::history::declarations::DeclarationsReplay;
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::Value;
 use std::path::Path;
@@ -7,101 +6,8 @@ use wist_core::objects::{PublisherState, StatusRejection};
 
 mod delta_history;
 mod delta_indexes;
-
-const SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS publishers(domain TEXT PRIMARY KEY, declaration_json BLOB NOT NULL, key_id TEXT NOT NULL, public_key TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'new', last_pull_at TEXT, declaration_fetched_at TEXT);
-CREATE TABLE IF NOT EXISTS declaration_floors(domain TEXT PRIMARY KEY, seq INTEGER NOT NULL CHECK(typeof(seq) = 'integer' AND seq BETWEEN 0 AND 9007199254740991));
-CREATE TABLE IF NOT EXISTS seen_deltas(delta_id TEXT PRIMARY KEY, domain TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS pending_entries(rowid INTEGER PRIMARY KEY AUTOINCREMENT, entry_type TEXT NOT NULL, domain TEXT NOT NULL, entry_json BLOB NOT NULL, chain_pos INTEGER NOT NULL, turn_block INTEGER, acceptance_order INTEGER);
-CREATE TABLE IF NOT EXISTS records(url TEXT NOT NULL, publisher TEXT NOT NULL, delta_id TEXT NOT NULL, observed_at TEXT NOT NULL, weight TEXT NOT NULL, title TEXT NOT NULL, abstract TEXT, lang TEXT NOT NULL, sealed_at TEXT NOT NULL DEFAULT '', PRIMARY KEY(url, publisher));
-CREATE TABLE IF NOT EXISTS blocks(block_number INTEGER PRIMARY KEY, block_hash TEXT NOT NULL, sealed_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS rejections(domain TEXT NOT NULL, code TEXT NOT NULL, at TEXT NOT NULL, delta_id TEXT, detail TEXT);
-CREATE TABLE IF NOT EXISTS params(name TEXT PRIMARY KEY, value INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS url_tips(url TEXT NOT NULL, domain TEXT NOT NULL, tip TEXT NOT NULL, PRIMARY KEY(domain, url));
-CREATE TABLE IF NOT EXISTS param_changes(parameter TEXT NOT NULL, value INTEGER NOT NULL, effective_at TEXT NOT NULL, block_number INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS noise_pings(domain TEXT NOT NULL, day TEXT NOT NULL, count INTEGER NOT NULL, PRIMARY KEY(domain, day));
-CREATE TABLE IF NOT EXISTS ingest_meter(domain TEXT NOT NULL, day TEXT NOT NULL, bytes INTEGER NOT NULL, PRIMARY KEY(domain, day));
-CREATE TABLE IF NOT EXISTS walk_state(domain TEXT PRIMARY KEY, suspended INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS feed_observations(domain TEXT PRIMARY KEY, generated_at_s INTEGER NOT NULL CHECK(typeof(generated_at_s) = 'integer' AND generated_at_s BETWEEN -62167219200 AND 253402300799));
-CREATE TABLE IF NOT EXISTS governance(update_id TEXT PRIMARY KEY, action TEXT NOT NULL, domain TEXT NOT NULL, level INTEGER, notice_id TEXT, outcome TEXT, sealed_at TEXT NOT NULL, block_number INTEGER NOT NULL, kind TEXT);
-CREATE TABLE IF NOT EXISTS recovery_windows(domain TEXT PRIMARY KEY, declaration_json BLOB NOT NULL, prior_declaration_json BLOB NOT NULL, owner_declaration_json BLOB NOT NULL, opened_block INTEGER, window_end TEXT);
-CREATE TABLE IF NOT EXISTS recovery_settlements(domain TEXT NOT NULL, owner_hash TEXT NOT NULL, PRIMARY KEY(domain, owner_hash));
-CREATE TABLE IF NOT EXISTS sealed_declarations(domain TEXT NOT NULL, seq INTEGER NOT NULL, block_number INTEGER NOT NULL, sealed_at TEXT NOT NULL, declaration_json BLOB NOT NULL, PRIMARY KEY(domain, seq));
-CREATE TABLE IF NOT EXISTS roster_acts(block_number INTEGER NOT NULL, act_index INTEGER NOT NULL, sealed_at TEXT NOT NULL, action TEXT NOT NULL, auditor_id TEXT NOT NULL, key_id TEXT NOT NULL, public_key TEXT NOT NULL, for_cause INTEGER NOT NULL, PRIMARY KEY(block_number, act_index));
-CREATE TABLE IF NOT EXISTS queued_deltas(rowid INTEGER PRIMARY KEY AUTOINCREMENT, domain TEXT NOT NULL, delta_id TEXT NOT NULL, entry_json BLOB NOT NULL, url TEXT NOT NULL, chain_pos INTEGER NOT NULL, acceptance_order INTEGER);
-CREATE TABLE IF NOT EXISTS derived_publisher_state(domain TEXT NOT NULL, block_number INTEGER NOT NULL, sealed_at TEXT NOT NULL, reputation_u INTEGER NOT NULL, level INTEGER NOT NULL, enforceable_level INTEGER NOT NULL, fallback_level INTEGER NOT NULL, level_since TEXT NOT NULL, evidence_json TEXT NOT NULL, deadlines_json TEXT NOT NULL, PRIMARY KEY(domain, block_number));
-CREATE TABLE IF NOT EXISTS derived_reputation_inputs(domain TEXT NOT NULL, block_number INTEGER NOT NULL, first_accepted_at TEXT NOT NULL, reset_height INTEGER, counted_total INTEGER NOT NULL, counted_json TEXT NOT NULL, penalties_json TEXT NOT NULL, PRIMARY KEY(domain, block_number));
-CREATE TABLE IF NOT EXISTS derived_escalations(domain TEXT NOT NULL, block_number INTEGER NOT NULL, establishing_at TEXT NOT NULL, PRIMARY KEY(domain, block_number));
-CREATE TABLE IF NOT EXISTS derived_coverage_failures(auditor_id TEXT NOT NULL, block_number INTEGER NOT NULL, duty_block INTEGER NOT NULL, PRIMARY KEY(auditor_id, block_number, duty_block));
-CREATE TABLE IF NOT EXISTS sealed_updates(update_id TEXT PRIMARY KEY, block_number INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS derived_canary_commitments(update_id TEXT NOT NULL, block_number INTEGER NOT NULL, planter TEXT NOT NULL, root TEXT NOT NULL, leaves INTEGER NOT NULL, sealing_height INTEGER NOT NULL, PRIMARY KEY(update_id, block_number));
-CREATE TABLE IF NOT EXISTS epoch_pulls(epoch_number INTEGER PRIMARY KEY, block_number INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS derived_observers(observer_id TEXT NOT NULL, block_number INTEGER NOT NULL, key_id TEXT NOT NULL, public_key TEXT NOT NULL, registered_height INTEGER NOT NULL, PRIMARY KEY(observer_id, block_number));
-CREATE TABLE IF NOT EXISTS derived_exclusions(publisher TEXT NOT NULL, url TEXT NOT NULL, block_number INTEGER NOT NULL, since_height INTEGER NOT NULL, PRIMARY KEY(publisher, url, block_number));
-CREATE TABLE IF NOT EXISTS derived_auditor_state(auditor_id TEXT NOT NULL, block_number INTEGER NOT NULL, sealed_at TEXT NOT NULL, coverage_failure INTEGER NOT NULL, PRIMARY KEY(auditor_id, block_number));
-";
-
-fn add_missing_columns(conn: &Connection) -> Result<()> {
-    for statement in [
-        "ALTER TABLE governance ADD COLUMN kind TEXT",
-        "ALTER TABLE records ADD COLUMN sealed_at TEXT NOT NULL DEFAULT ''",
-        "ALTER TABLE publishers ADD COLUMN declaration_fetched_at TEXT",
-        "ALTER TABLE pending_entries ADD COLUMN turn_block INTEGER",
-        "ALTER TABLE pending_entries ADD COLUMN acceptance_order INTEGER",
-        "ALTER TABLE queued_deltas ADD COLUMN acceptance_order INTEGER",
-        "ALTER TABLE param_changes ADD COLUMN entry_index INTEGER",
-        "ALTER TABLE blocks ADD COLUMN decompressed_bytes INTEGER",
-        "ALTER TABLE recovery_windows ADD COLUMN owner_declaration_json BLOB",
-    ] {
-        match conn.execute(statement, []) {
-            Ok(_) => {}
-            Err(rusqlite::Error::SqliteFailure(_, Some(ref m)))
-                if m.contains("duplicate column") => {}
-            Err(e) => return Err(Error::Db(e)),
-        }
-    }
-    Ok(())
-}
-
-fn restore_acceptance_order(conn: &Connection) -> Result<()> {
-    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
-    let ambiguous: bool = tx.query_row(
-        "SELECT EXISTS(SELECT domain FROM (SELECT domain, acceptance_order FROM pending_entries WHERE entry_type = 'publisher_delta' UNION ALL SELECT domain, acceptance_order FROM queued_deltas) GROUP BY domain HAVING COUNT(*) > 1 AND COUNT(acceptance_order) < COUNT(*))",
-        [],
-        |row| row.get(0),
-    )?;
-    if ambiguous {
-        return Err(Error::History(
-            "legacy Delta copies lack a provable acceptance order; restore an independently retained admission order before reopening".into(),
-        ));
-    }
-    tx.execute_batch("CREATE TABLE IF NOT EXISTS acceptance_clock(id INTEGER PRIMARY KEY CHECK(id = 1), position INTEGER NOT NULL CHECK(typeof(position) = 'integer' AND position >= 0));
-        INSERT OR IGNORE INTO acceptance_clock VALUES (1, 0);
-        UPDATE acceptance_clock SET position = MAX(position, COALESCE((SELECT MAX(acceptance_order) FROM pending_entries), 0), COALESCE((SELECT MAX(acceptance_order) FROM queued_deltas), 0));")?;
-    for table in ["pending_entries", "queued_deltas"] {
-        let rows = tx
-            .prepare(&format!(
-                "SELECT rowid FROM {table} WHERE acceptance_order IS NULL ORDER BY rowid"
-            ))?
-            .query_map([], |row| row.get::<_, i64>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        for rowid in rows {
-            tx.execute("UPDATE acceptance_clock SET position = position + 1", [])?;
-            tx.execute(&format!(
-                "UPDATE {table} SET acceptance_order = (SELECT position FROM acceptance_clock) WHERE rowid = ?1"
-            ), [rowid])?;
-        }
-        tx.execute_batch(&format!(
-            "CREATE UNIQUE INDEX IF NOT EXISTS {table}_acceptance_order ON {table}(acceptance_order);
-            CREATE TRIGGER IF NOT EXISTS {table}_assign_order AFTER INSERT ON {table} WHEN NEW.acceptance_order IS NULL BEGIN
-                UPDATE acceptance_clock SET position = position + 1;
-                UPDATE {table} SET acceptance_order = (SELECT position FROM acceptance_clock) WHERE rowid = NEW.rowid;
-            END;"
-        ))?;
-    }
-    tx.commit()?;
-    Ok(())
-}
+mod restore;
+mod schema;
 
 pub(crate) struct Mutation<'a> {
     conn: &'a Connection,
@@ -109,7 +15,7 @@ pub(crate) struct Mutation<'a> {
 }
 
 impl<'a> Mutation<'a> {
-    fn new(conn: &'a Connection) -> Result<Self> {
+    pub(super) fn new(conn: &'a Connection) -> Result<Self> {
         conn.execute_batch("SAVEPOINT clave_mutation")?;
         Ok(Self {
             conn,
@@ -385,7 +291,7 @@ fn exec_insert_seen_delta(conn: &Connection, delta_id: &str, domain: &str) -> Re
     Ok(())
 }
 
-fn exec_retain_declaration_seq(conn: &Connection, domain: &str, seq: u64) -> Result<()> {
+pub(super) fn exec_retain_declaration_seq(conn: &Connection, domain: &str, seq: u64) -> Result<()> {
     conn.execute(
         "INSERT INTO declaration_floors(domain, seq) VALUES (?1, ?2) ON CONFLICT(domain) DO UPDATE SET seq = MAX(seq, excluded.seq)",
         (domain, seq),
@@ -393,7 +299,7 @@ fn exec_retain_declaration_seq(conn: &Connection, domain: &str, seq: u64) -> Res
     Ok(())
 }
 
-fn accepted_declaration_seq(domain: &str, doc: &Value) -> Result<u64> {
+pub(super) fn accepted_declaration_seq(domain: &str, doc: &Value) -> Result<u64> {
     let publisher = crate::declaration::validate_fields(doc)
         .map_err(|(code, detail)| Error::History(format!("{code} {detail}")))?
         .publisher;
@@ -459,69 +365,10 @@ impl Db {
         let conn = Connection::open(path)?;
         conn.busy_timeout(std::time::Duration::from_millis(5000))?;
         let _mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
-        conn.execute_batch(SCHEMA)?;
-        add_missing_columns(&conn)?;
-        restore_acceptance_order(&conn)?;
-        let old_tips: bool = conn.query_row(
-            "SELECT pk = 0 FROM pragma_table_info('url_tips') WHERE name = 'domain'",
-            [],
-            |row| row.get(0),
-        )?;
-        if old_tips {
-            let tx = Mutation::new(&conn)?;
-            tx.execute_batch("ALTER TABLE url_tips RENAME TO old_url_tips;
-                CREATE TABLE url_tips(url TEXT NOT NULL, domain TEXT NOT NULL, tip TEXT NOT NULL, PRIMARY KEY(domain, url));
-                INSERT INTO url_tips SELECT url, domain, tip FROM old_url_tips;
-                DROP TABLE old_url_tips;")?;
-            tx.commit()?;
-        }
+        schema::migrate(&conn)?;
         let db = Db { conn };
-        db.restore_block_sizes(path)?;
-        db.parameter_schedule(0)?;
-        db.restore_recovery_owners(path)?;
-        db.restore_declaration_floors(path)?;
-        db.restore_delta_indexes(path)?;
+        restore::run(&db, path)?;
         Ok(db)
-    }
-
-    fn restore_declaration_floors(&self, path: &Path) -> Result<()> {
-        let tx = rusqlite::Transaction::new_unchecked(
-            &self.conn,
-            rusqlite::TransactionBehavior::Immediate,
-        )?;
-        let rows = tx
-            .prepare("SELECT domain, declaration_json FROM publishers WHERE domain NOT IN (SELECT domain FROM declaration_floors) ORDER BY domain")?
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        if rows.is_empty() {
-            tx.commit()?;
-            return Ok(());
-        }
-        let head = self.last_block()?;
-        let history = if head.is_some() {
-            crate::history::declarations::Declarations::reconstruct(
-                path.parent().unwrap_or_else(|| Path::new(".")),
-                head,
-            )?
-        } else {
-            crate::history::declarations::Declarations::default()
-        };
-        let pending = self.peek_pending_entries()?.0;
-        for (domain, raw) in rows {
-            let current: Value = crate::json::parse(&raw)?;
-            let mut seq = accepted_declaration_seq(&domain, &current)?;
-            if let Some(state) = history.domains().get(&domain) {
-                seq = seq.max(state.highest_accepted_seq());
-            }
-            for entry in pending.iter().filter(|entry| {
-                entry.domain == domain && entry.entry_type == "publisher_declaration"
-            }) {
-                seq = seq.max(accepted_declaration_seq(&domain, &entry.entry_json)?);
-            }
-            exec_retain_declaration_seq(&tx, &domain, seq)?;
-        }
-        tx.commit()?;
-        Ok(())
     }
 
     pub fn highest_accepted_declaration_seq(&self, domain: &str) -> Result<Option<u64>> {
@@ -533,77 +380,6 @@ impl Db {
                 |row| row.get(0),
             )
             .optional()?)
-    }
-
-    fn restore_recovery_owners(&self, path: &Path) -> Result<()> {
-        let mut statement = self.conn.prepare(
-            "SELECT domain, prior_declaration_json, opened_block FROM recovery_windows WHERE owner_declaration_json IS NULL ORDER BY domain",
-        )?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
-                    row.get::<_, Option<u64>>(2)?,
-                ))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        if rows.is_empty() {
-            return Ok(());
-        }
-        let history = if rows.iter().any(|(_, _, opened)| opened.is_some()) {
-            Some(crate::history::declarations::Declarations::reconstruct(
-                path.parent().unwrap_or_else(|| Path::new(".")),
-                self.last_block()?,
-            )?)
-        } else {
-            None
-        };
-        let pending = self.peek_pending_entries()?.0;
-        let tx = self.mutation()?;
-        for (domain, prior, opened) in rows {
-            let prior: Value = crate::json::parse(&prior)?;
-            let unavailable = || {
-                Error::History(format!(
-                    "cannot restore the fixed recovery owner for {domain}"
-                ))
-            };
-            let owner = if let Some(opened) = opened {
-                let window = history
-                    .as_ref()
-                    .and_then(|state| state.domains().get(&domain))
-                    .and_then(|state| state.window())
-                    .ok_or_else(unavailable)?;
-                if window.owner().position().block_number != opened
-                    || *window.before().envelope() != prior
-                {
-                    return Err(unavailable());
-                }
-                window.owner().envelope().clone()
-            } else {
-                let mut candidates = Vec::new();
-                for entry in &pending {
-                    if entry.entry_type == "publisher_declaration"
-                        && entry.domain == domain
-                        && crate::declaration::evaluate(&prior, &entry.entry_json)
-                            == Ok(crate::declaration::Decision::Recovery)
-                        && !candidates.contains(&entry.entry_json)
-                    {
-                        candidates.push(entry.entry_json.clone());
-                    }
-                }
-                if candidates.len() != 1 {
-                    return Err(unavailable());
-                }
-                candidates.pop().unwrap()
-            };
-            tx.execute(
-                "UPDATE recovery_windows SET owner_declaration_json = ?2 WHERE domain = ?1",
-                (&domain, serde_json::to_vec(&owner)?),
-            )?;
-        }
-        tx.commit()?;
-        Ok(())
     }
 
     pub fn param(&self, name: &str) -> Result<i64> {
@@ -1842,139 +1618,6 @@ impl Db {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
-    }
-
-    fn restore_block_sizes(&self, path: &Path) -> Result<()> {
-        let missing: bool = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM blocks WHERE decompressed_bytes IS NULL) OR EXISTS(SELECT 1 FROM param_changes WHERE entry_index IS NULL)",
-            [], |row| row.get(0),
-        )?;
-        if !missing {
-            return Ok(());
-        }
-        let directory = path.parent().unwrap_or_else(|| Path::new("."));
-        let anchor: Value = crate::json::parse(&std::fs::read(directory.join("anchor.json"))?)?;
-        let public_key = anchor["anchor"]["genesis_key"]["public_key"]
-            .as_str()
-            .ok_or_else(|| Error::Key("stored Log Anchor has no genesis public key".into()))?;
-        let key = wist_core::crypto::PublicKey::from_b64u(public_key)?;
-        wist_core::envelope::verify_envelope(&anchor, "anchor", &key)?;
-        let mut stmt = self.conn.prepare(
-            "SELECT block_number, block_hash, sealed_at FROM blocks ORDER BY block_number",
-        )?;
-        let blocks = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, u64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        let first = blocks
-            .first()
-            .map(|b| crate::registry::epoch(&b.2))
-            .transpose()?
-            .unwrap_or(0);
-        let mut schedule = wist_core::parameters::Schedule::new(first);
-        let mut largest = 0;
-        let mut prior_at = None;
-        let mut prior_hash = "sha256:genesis".to_string();
-        let tx = self.mutation()?;
-        for (index, (height, hash, sealed_at)) in blocks.into_iter().enumerate() {
-            let bound = prior_at.map_or(
-                crate::registry::spec("block_decompressed_cap_bytes")
-                    .unwrap()
-                    .default
-                    .unwrap() as u64,
-                |at| schedule.block_size_bounds(at).1,
-            );
-            let file = directory.join(format!("log/blocks/{height:09}.json.zst"));
-            let bytes = crate::block_file::read(&file, bound).map_err(|error| match error {
-                Error::History(message) => Error::Seal(message),
-                error => error,
-            })?;
-            let block: Value = crate::json::parse(&bytes)?;
-            wist_core::block::verify_block(&block, &key)?;
-            wist_core::block::verify_chain_link(&block["header"], &prior_hash)?;
-            if height != index as u64
-                || block["header"]["block_number"] != height
-                || block["header"]["sealed_at"] != sealed_at
-                || wist_core::block::block_hash(&block["header"])? != hash
-            {
-                return Err(Error::Seal(
-                    "stored Block does not match its history row".into(),
-                ));
-            }
-            let at = crate::registry::epoch(&sealed_at)?;
-            if prior_at.is_some_and(|prior| at <= prior) {
-                return Err(Error::Seal(
-                    "stored Block timestamps are not increasing".into(),
-                ));
-            }
-            let canonical = wist_core::jcs::canonicalize(&block)?;
-            let size = canonical.len() as u64;
-            largest = largest.max(size);
-            tx.execute(
-                "DELETE FROM param_changes WHERE block_number = ?1",
-                [height],
-            )?;
-            for (entry_index, entry) in block["entries"].as_array().unwrap().iter().enumerate() {
-                let update = &entry["body"]["update"];
-                if entry["type"] != "registry_update" || update["action"] != "parameter_change" {
-                    continue;
-                }
-                wist_core::envelope::verify_envelope(&entry["body"], "update", &key)?;
-                let Some(parameter) = update["details"]["parameter"].as_str() else {
-                    continue;
-                };
-                let Some(value) = update["details"]["value"].as_i64() else {
-                    continue;
-                };
-                let Some(effective_at) = update["effective_at"].as_str() else {
-                    continue;
-                };
-                let Ok(effective_at_s) = crate::registry::epoch(effective_at) else {
-                    continue;
-                };
-                let amendment = wist_core::parameters::Amendment {
-                    parameter: parameter.into(),
-                    value,
-                    block_number: height,
-                    entry_index: entry_index as u64,
-                    sealed_at_s: at,
-                    effective_at_s,
-                };
-                let _ = crate::registry::accept(&mut schedule, amendment, largest);
-                tx.execute(
-                    "INSERT INTO param_changes(parameter, value, effective_at, block_number, entry_index) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    (parameter, value, effective_at, height, entry_index as u64),
-                )?;
-            }
-            if largest > schedule.block_size_bounds(at).0 {
-                return Err(Error::Seal(format!(
-                    "WIST3-E03 Block {height} exceeds the accepted size schedule"
-                )));
-            }
-            if bytes != canonical {
-                use std::io::Write;
-                let temporary = file.with_extension("zst.tmp");
-                let compressed = zstd::bulk::compress(&canonical, zstd::DEFAULT_COMPRESSION_LEVEL)?;
-                let mut output = std::fs::File::create(&temporary)?;
-                output.write_all(&compressed)?;
-                output.sync_all()?;
-                std::fs::rename(&temporary, &file)?;
-                std::fs::File::open(file.parent().unwrap())?.sync_all()?;
-            }
-            tx.execute(
-                "UPDATE blocks SET decompressed_bytes = ?1 WHERE block_number = ?2",
-                (size, height),
-            )?;
-            prior_at = Some(at);
-            prior_hash = hash;
-        }
-        tx.commit()?;
-        Ok(())
     }
 
     pub fn largest_block_bytes(&self) -> Result<u64> {
