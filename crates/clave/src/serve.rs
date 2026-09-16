@@ -105,6 +105,22 @@ impl IngestGate {
     }
 }
 
+impl IngestGate {
+    /// Admits a background pull for `host` unless a pull for it is
+    /// already running or waiting; background work takes no pending slot.
+    pub fn begin_background(self: &Arc<Self>, host: &str) -> Option<InflightGuard> {
+        let mut set = self.inflight.lock().unwrap_or_else(PoisonError::into_inner);
+        if !set.insert(host.to_string()) {
+            return None;
+        }
+        Some(InflightGuard {
+            gate: self.clone(),
+            host: host.to_string(),
+            pending: false,
+        })
+    }
+}
+
 impl InflightGuard {
     /// Marks the pull as running: its pending slot frees for another Ping
     /// while the host stays in flight until the guard drops.
@@ -130,7 +146,7 @@ impl Drop for InflightGuard {
 
 #[derive(Clone)]
 struct AppState {
-    db: Arc<Mutex<Db>>,
+    db_path: PathBuf,
     client: Arc<Client>,
     data_dir: PathBuf,
     gate: Arc<IngestGate>,
@@ -189,11 +205,11 @@ async fn ingest_handler(State(state): State<AppState>, body: Bytes) -> axum::res
     let now = now_utc();
 
     let quota = {
-        let db = state.db.clone();
+        let db_path = state.db_path.clone();
         let host = payload.host.clone();
         let at = now.clone();
         tokio::task::spawn_blocking(move || {
-            let db = db.lock().unwrap_or_else(PoisonError::into_inner);
+            let db = Db::connect(&db_path)?;
             let level = crate::sanctions::sanction_level(&db, &host, &at)?;
             crate::quota::quota_remaining(&db, &host, &at).map(|q| (level, q))
         })
@@ -227,7 +243,7 @@ async fn ingest_handler(State(state): State<AppState>, body: Bytes) -> axum::res
         }
     };
     let semaphore = state.gate.semaphore.clone();
-    let db = state.db.clone();
+    let db_path = state.db_path.clone();
     let client = state.client.clone();
     let data_dir = state.data_dir.clone();
     tokio::spawn(async move {
@@ -237,7 +253,9 @@ async fn ingest_handler(State(state): State<AppState>, body: Bytes) -> axum::res
         guard.started();
         let _guard = guard;
         let _ = tokio::task::spawn_blocking(move || {
-            let db = db.lock().unwrap_or_else(PoisonError::into_inner);
+            let Ok(db) = Db::connect(&db_path) else {
+                return;
+            };
             let report = ingest::run_with_clock(
                 &db,
                 &client,
@@ -262,9 +280,9 @@ async fn status_handler(
     State(state): State<AppState>,
     Path(domain): Path<String>,
 ) -> std::result::Result<Json<Status>, StatusCode> {
-    let db = state.db.clone();
+    let db_path = state.db_path.clone();
     let outcome = tokio::task::spawn_blocking(move || {
-        let db = db.lock().unwrap_or_else(PoisonError::into_inner);
+        let db = Db::connect(&db_path)?;
         load_status(&db, &domain)
     })
     .await
@@ -294,9 +312,9 @@ pub fn run_with_options(
     client: Client,
     options: ServeOptions,
 ) -> Result<()> {
-    let db = Db::open(&db_path)?;
+    drop(Db::open(&db_path)?);
     let state = AppState {
-        db: Arc::new(Mutex::new(db)),
+        db_path,
         client: Arc::new(client),
         data_dir: data_dir.clone(),
         gate: IngestGate::with_pending(options.max_concurrent_ingests, options.max_pending_ingests),
@@ -323,14 +341,19 @@ pub fn run_with_options(
                 let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
                 loop {
                     ticker.tick().await;
-                    let db = bg_state.db.clone();
+                    let db_path = bg_state.db_path.clone();
                     let client = bg_state.client.clone();
                     let data = bg_data.clone();
                     let sk = sk.clone();
+                    let gate = bg_state.gate.clone();
                     let _ = tokio::task::spawn_blocking(move || {
-                        let db = db.lock().unwrap_or_else(PoisonError::into_inner);
+                        let Ok(db) = Db::connect(&db_path) else {
+                            return;
+                        };
                         let now_epoch = jiff::Timestamp::now().as_second();
-                        let _ = crate::baseline::run_pass(&db, &client, &sk, &data, now_epoch);
+                        let _ = crate::baseline::run_pass_gated(
+                            &db, &client, &sk, &data, now_epoch, &gate,
+                        );
                     })
                     .await;
                 }

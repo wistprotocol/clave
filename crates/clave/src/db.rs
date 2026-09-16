@@ -9,23 +9,38 @@ mod delta_indexes;
 mod restore;
 mod schema;
 
+/// A write transaction: at the top level it begins immediately, taking
+/// the store's write lock before any read so a concurrent connection can
+/// neither invalidate what it read nor make its commit fail; nested, it
+/// is a savepoint inside the enclosing transaction.
 pub(crate) struct Mutation<'a> {
     conn: &'a Connection,
     committed: bool,
+    top_level: bool,
 }
 
 impl<'a> Mutation<'a> {
     pub(super) fn new(conn: &'a Connection) -> Result<Self> {
-        conn.execute_batch("SAVEPOINT clave_mutation")?;
+        let top_level = conn.is_autocommit();
+        if top_level {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+        } else {
+            conn.execute_batch("SAVEPOINT clave_mutation")?;
+        }
         Ok(Self {
             conn,
             committed: false,
+            top_level,
         })
     }
 
     pub(crate) fn commit(mut self) -> Result<()> {
-        self.conn
-            .execute_batch("RELEASE SAVEPOINT clave_mutation")?;
+        if self.top_level {
+            self.conn.execute_batch("COMMIT")?;
+        } else {
+            self.conn
+                .execute_batch("RELEASE SAVEPOINT clave_mutation")?;
+        }
         self.committed = true;
         Ok(())
     }
@@ -41,11 +56,16 @@ impl std::ops::Deref for Mutation<'_> {
 
 impl Drop for Mutation<'_> {
     fn drop(&mut self) {
-        if !self.committed {
-            let _ = self.conn.execute_batch(
-                "ROLLBACK TO SAVEPOINT clave_mutation; RELEASE SAVEPOINT clave_mutation",
-            );
+        if self.committed {
+            return;
         }
+        let _ = if self.top_level {
+            self.conn.execute_batch("ROLLBACK")
+        } else {
+            self.conn.execute_batch(
+                "ROLLBACK TO SAVEPOINT clave_mutation; RELEASE SAVEPOINT clave_mutation",
+            )
+        };
     }
 }
 
@@ -362,13 +382,21 @@ impl Db {
     }
 
     pub fn open(path: &Path) -> Result<Db> {
+        let db = Db::connect(path)?;
+        schema::migrate(&db.conn)?;
+        restore::run(&db, path)?;
+        Ok(db)
+    }
+
+    /// Another connection to a store `open` has already migrated and
+    /// restored, for work that must not share a connection: each pull,
+    /// status request and background pass takes its own so a slow one
+    /// holds nothing another needs. SQLite serializes their writes.
+    pub fn connect(path: &Path) -> Result<Db> {
         let conn = Connection::open(path)?;
         conn.busy_timeout(std::time::Duration::from_millis(5000))?;
         let _mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
-        schema::migrate(&conn)?;
-        let db = Db { conn };
-        restore::run(&db, path)?;
-        Ok(db)
+        Ok(Db { conn })
     }
 
     pub fn highest_accepted_declaration_seq(&self, domain: &str) -> Result<Option<u64>> {

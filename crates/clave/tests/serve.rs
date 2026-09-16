@@ -383,3 +383,118 @@ fn pings_beyond_the_pending_bound_are_refused_with_retry_after() {
         "status answers while the gate is saturated"
     );
 }
+
+/// Serves `dir` after `delay` on every request.
+fn serve_static_slow(listener: std::net::TcpListener, dir: std::path::PathBuf, delay: Duration) {
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+                let body = std::fs::read(dir.join(uri.path().trim_start_matches('/')));
+                async move {
+                    tokio::time::sleep(delay).await;
+                    match body {
+                        Ok(bytes) => (axum::http::StatusCode::OK, bytes),
+                        Err(_) => (axum::http::StatusCode::NOT_FOUND, Vec::new()),
+                    }
+                }
+            });
+            axum::serve(tokio::net::TcpListener::from_std(listener).unwrap(), app)
+                .await
+                .unwrap();
+        });
+    });
+}
+
+#[test]
+fn a_slow_domain_blocks_neither_other_domains_nor_status() {
+    let slow_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let fast_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let slow_addr = slow_listener.local_addr().unwrap();
+    let fast_addr = fast_listener.local_addr().unwrap();
+    slow_listener.set_nonblocking(true).unwrap();
+    fast_listener.set_nonblocking(true).unwrap();
+    let slow = make_publisher_with_scope("localhost", &["example.com"]);
+    let fast = make_publisher_with_scope("www.localhost", &["example.com"]);
+    let slow_id = add_delta(&slow, "https://example.com/slow", "slow content", None);
+    let fast_id = add_delta(&fast, "https://example.com/fast", "fast content", None);
+    write_feed(&slow, "localhost", &[slow_id], "2026-08-09T12:00:00Z");
+    write_feed(
+        &fast,
+        "www.localhost",
+        std::slice::from_ref(&fast_id),
+        "2026-08-09T12:00:00Z",
+    );
+    serve_static_slow(
+        slow_listener,
+        slow.dir.path().to_path_buf(),
+        Duration::from_secs(1),
+    );
+    serve_static(fast_listener, fast.dir.path().to_path_buf());
+    let transport = clave::fetch::Client::with_builder(
+        true,
+        reqwest::blocking::Client::builder()
+            .no_proxy()
+            .resolve("localhost", slow_addr)
+            .resolve("www.localhost", fast_addr),
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    clave::init::run("127.0.0.1:0", tmp.path()).unwrap();
+    let addr = spawn_server_with_client(tmp.path(), transport);
+    let c = reqwest::blocking::Client::new();
+    let ping = |host: &str| {
+        c.post(format!("{addr}/ingest"))
+            .json(&serde_json::json!({"host": host}))
+            .send()
+            .unwrap()
+            .status()
+    };
+    let started = std::time::Instant::now();
+    assert_eq!(ping("localhost"), 202);
+    assert_eq!(ping("www.localhost"), 202);
+    let status = c
+        .get(format!("{addr}/status/unknown.example"))
+        .send()
+        .unwrap()
+        .status();
+    assert_eq!(status, 404);
+    assert!(
+        started.elapsed() < Duration::from_millis(1500),
+        "pings and status waited on the slow pull: {:?}",
+        started.elapsed()
+    );
+    let deadline = started + Duration::from_millis(1800);
+    loop {
+        let r = c
+            .get(format!("{addr}/status/www.localhost"))
+            .send()
+            .unwrap();
+        if r.status() == 200 {
+            let status: serde_json::Value = r.json().unwrap();
+            if status["last_pull_at"].is_string() {
+                break;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the fast domain's pull waited on the slow one"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let r = c.get(format!("{addr}/status/localhost")).send().unwrap();
+        if r.status() == 200 {
+            let status: serde_json::Value = r.json().unwrap();
+            if status["last_pull_at"].is_string() {
+                break;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the slow domain's pull never completed"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}

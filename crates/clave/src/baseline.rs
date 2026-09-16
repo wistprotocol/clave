@@ -35,11 +35,42 @@ pub fn run_pass(
     data_dir: &Path,
     now_epoch: i64,
 ) -> Result<Vec<String>> {
+    run_pass_inner(db, client, sk, data_dir, now_epoch, None)
+}
+
+/// A pass that leaves alone every domain the gate already has a pull
+/// running or waiting for, so a background pull never overlaps a Ping's.
+pub fn run_pass_gated(
+    db: &Db,
+    client: &Client,
+    sk: &SigningKey,
+    data_dir: &Path,
+    now_epoch: i64,
+    gate: &std::sync::Arc<crate::serve::IngestGate>,
+) -> Result<Vec<String>> {
+    run_pass_inner(db, client, sk, data_dir, now_epoch, Some(gate))
+}
+
+fn run_pass_inner(
+    db: &Db,
+    client: &Client,
+    sk: &SigningKey,
+    data_dir: &Path,
+    now_epoch: i64,
+    gate: Option<&std::sync::Arc<crate::serve::IngestGate>>,
+) -> Result<Vec<String>> {
     let now = jiff::Timestamp::from_second(now_epoch)
         .map_err(|_| crate::error::Error::Governance("timestamp out of range".into()))?
         .to_string();
     let due = due_domains(db, now_epoch)?;
     for domain in &due {
+        let _guard = match gate {
+            Some(gate) => match gate.begin_background(domain) {
+                Some(guard) => Some(guard),
+                None => continue,
+            },
+            None => None,
+        };
         let _ =
             crate::ingest::run_with_clock(db, client, data_dir, domain, &now, jiff::Timestamp::now);
     }

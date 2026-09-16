@@ -171,9 +171,24 @@ running or waiting is accepted (202) without new work; a Ping beyond the
 waiting bound is refused with 503 and `Retry-After: 30`, is not queued,
 and counts as neither noise nor a pull, so the Publisher retries later
 under its own backoff. Quota (429) and quarantine (403) are answered
-before admission. `serve` still runs each pull under the shared store
-lock, so a Ping's quota check waits for the pull in progress; taking
-fetches and verification outside that lock is a separate requirement.
+before admission.
+
+## Concurrency
+
+No pull holds a process-wide lock. Each pull, Ping check, status request
+and baseline pass opens its own store connection (`Db::connect`), so a
+slow origin delays only its own domain while other domains, status
+answers and background passes proceed; SQLite serializes the writes.
+One pull runs per host at a time across Pings and the baseline pass.
+Fetching and state-independent verification happen outside any write
+transaction; each Delta's persistence is one immediate write transaction
+that first re-reads the sanction level, the admission Declarations and
+the URL's chain tip, stopping the pull if the domain became quarantined
+meanwhile and re-verifying the Delta if its authority or predecessor
+changed, so a concurrent seal or admission cannot be bypassed. Every
+top-level write transaction begins immediately, taking the write lock
+before its reads. Durable publication and partitioned ingestion remain
+separate requirements.
 
 ## JSON input eligibility
 

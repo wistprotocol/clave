@@ -1055,7 +1055,7 @@ pub fn run_bounded(
             None
         };
 
-        let (window_open, authority) = verify_delta_with_refresh(
+        let (_, authority) = verify_delta_with_refresh(
             db,
             client,
             data_dir,
@@ -1080,7 +1080,16 @@ pub fn run_bounded(
             report.rejected.push((id.clone(), code.into()));
             continue;
         }
-        if delta_env.delta.prev != db.url_tip(host, &delta_env.delta.url)? {
+        let admission = db.mutation()?;
+        if crate::sanctions::sanction_level(db, host, now)? >= 3 {
+            drop(admission);
+            return Ok(report);
+        }
+        let (window_open, sources) = delta_admission_sources(db, host)?;
+        let authority =
+            declaration::verify_delta_authority(&sources.iter().collect::<Vec<_>>(), &delta_value);
+        if authority.is_err() || delta_env.delta.prev != db.url_tip(host, &delta_env.delta.url)? {
+            drop(admission);
             resolved_prev.remove(id);
             attempt_profiles.insert(id.clone(), attempt);
             prefetched.insert(id.clone(), delta_value);
@@ -1099,6 +1108,7 @@ pub fn run_bounded(
             db.record_accepted_delta(host, id, &delta_value, chain_pos, &delta_env.delta.url, id)?;
             report.accepted.push(id.clone());
         }
+        admission.commit()?;
         chain_pos += 1;
     }
 
