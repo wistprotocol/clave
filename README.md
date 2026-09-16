@@ -464,11 +464,12 @@ under the key the subject holds at its Block (or the duty Block's key after
 removal) verify and its proof verifies over the named Block; it completes an
 empty duty set and otherwise only reveals the draw. A `pull_attestation` must
 be signed by the Log key, name an earlier sealed Block and a subject with a
-duty there; the earliest sealed one fixes the pair's attested height.
-Field, version and signature failures are reported as `WIST4-E11`, malformed
-details, unknown Blocks and pairs without a duty as `WIST4-E04`, and a
-coverage attestation whose proof does not verify as `WIST4-E01`
-(`rejected_acts()`). Every sealed Record and Registry Update ID counts as
+duty there; the earliest sealed one fixes the pair's attested height. Checks
+run in WIST-4 §4's order: Envelope and contract fields, then authenticity,
+then the named Block and duty, then the proof. Field, version and signature
+failures are reported as `WIST4-E11`, malformed details, unknown Blocks and
+pairs without a duty as `WIST4-E04`, and a coverage attestation whose proof
+does not verify as `WIST4-E01` (`rejected_acts()`). Every sealed Record and Registry Update ID counts as
 sealed for the exemption test below, whatever its validity; only a Record
 with valid non-evidence fields and an authentic signature is the Auditor's
 publication for that test.
@@ -499,8 +500,8 @@ Inconsistency or Confirmed Link Inconsistency is established at the first
 evidence `inconsistent` or `link_inconsistent` Record for a Delta at which
 the quorum and window in force at that Record's Block are met, with the
 §7 severity of the closed confirming set (fixed at 1 for a link finding);
-`decay_horizon_days` is read at the height. `level1_sanction(publisher,
-height)` reads core's derived ladder, fed per Block with identity resets,
+`decay_horizon_days` is read at the height. `sanction_level(publisher,
+height)` and `level1_sanction` read core's derived ladder, fed per Block with identity resets,
 Log-signed `sanction_lift` acts (rejected as WIST4-E11/E04 like other acts)
 and the Block's new findings in confirming-Record order; a finding whose
 Delta is sealed below the identity's reset arms nothing. Notice-scoped
@@ -537,7 +538,11 @@ establishing heights, and rejected attestations. Reputation tests derive
 `A`, `C`, penalties with decay, the Provisional cap, extract and link
 findings, the first rung raising later draws to the ceiling, a Log-signed
 lift restoring the formula rate, a rejected lift, and a fresh identity
-clearing rungs and penalties.
+clearing rungs and penalties, including a pre-reset Delta confirmed after
+the reset. `coverage.json` attestation cases and `sanctions.json` lift cases
+are transplanted onto fixture keys and Blocks and replayed as signed
+histories; the exemption-after-fallback, forged-successor and same-Block
+discharge readings have dedicated histories.
 
 ## Historical coverage clocks
 

@@ -272,7 +272,7 @@ pub struct ExtensionHistory {
     finding_records: BTreeMap<(String, bool), Vec<FindingRecord>>,
     findings: Vec<Finding>,
     ladders: BTreeMap<String, Ladder>,
-    rungs: BTreeMap<String, Vec<(u64, bool)>>,
+    rungs: BTreeMap<String, Vec<(u64, u8)>>,
     block_resets: Vec<String>,
     block_lifts: Vec<String>,
 }
@@ -753,23 +753,19 @@ impl ExtensionHistory {
             .filter(|hash| digest(hash))
             .ok_or(("WIST4-E04", "details.block is not a Block Hash".to_owned()))?;
         let subject = update.subject.clone();
-        let duty_height = *self
+        let duty_height = self
             .heights
             .get(block_hash)
-            .filter(|duty| **duty < height)
-            .ok_or((
-                "WIST4-E04",
-                "details.block names no earlier sealed Block".to_owned(),
-            ))?;
-        if !self.coverage.contains_key(&(subject.clone(), duty_height)) {
-            return Err((
-                "WIST4-E04",
-                "the subject held no coverage duty for the named Block".into(),
-            ));
+            .copied()
+            .filter(|duty| *duty < height);
+        let duty_sealed_at_s = duty_height.map(|duty| self.blocks[duty as usize].block.sealed_at_s);
+        enum Parsed {
+            Pull(Vec<String>),
+            Coverage([u8; vrf::PROOF_LEN], Option<String>),
         }
-        match update.action {
-            wist_core::objects::audit::RegistryAction::PullAttestation => {
-                let found: Vec<String> = details["found"]
+        let parsed = match update.action {
+            RegistryAction::PullAttestation => Parsed::Pull(
+                details["found"]
                     .as_array()
                     .ok_or(("WIST4-E04", "details.found is not an array".to_owned()))?
                     .iter()
@@ -782,21 +778,9 @@ impl ExtensionHistory {
                                 "details.found carries a malformed ID".to_owned(),
                             ))
                     })
-                    .collect::<std::result::Result<_, _>>()?;
-                if envelope.sig.key_id != log_key_id
-                    || verify_envelope(body, "update", log_key).is_err()
-                {
-                    return Err((
-                        "WIST4-E11",
-                        "signature does not verify under the Log key".into(),
-                    ));
-                }
-                let pair = self.coverage.get_mut(&(subject, duty_height)).unwrap();
-                if pair.pull.is_none() {
-                    pair.pull = Some(PullAttestation { position, found });
-                }
-            }
-            wist_core::objects::audit::RegistryAction::CoverageAttestation => {
+                    .collect::<std::result::Result<_, _>>()?,
+            ),
+            RegistryAction::CoverageAttestation => {
                 let proof = details["vrf_proof"]
                     .as_str()
                     .filter(|hex| {
@@ -816,24 +800,51 @@ impl ExtensionHistory {
                         ))
                     }
                 };
-                let duty_sealed_at_s = self.blocks[duty_height as usize].block.sealed_at_s;
-                let signer = [
-                    self.roster.admitted_key_at(&subject, sealed_at_s),
-                    self.roster.admitted_key_at(&subject, duty_sealed_at_s),
-                ]
-                .into_iter()
-                .flatten()
-                .find(|key| key.key_id == envelope.sig.key_id);
-                let authentic = signer.is_some_and(|key| {
-                    PublicKey::from_b64u(key.public_key)
-                        .is_ok_and(|key| verify_envelope(body, "update", &key).is_ok())
-                });
-                if !authentic {
-                    return Err((
-                        "WIST4-E11",
-                        "signature does not verify under a key the subject held".into(),
-                    ));
+                Parsed::Coverage(proof, prev_record)
+            }
+            _ => unreachable!("only attestation actions reach attest_inner"),
+        };
+        let authentic = match &parsed {
+            Parsed::Pull(_) => {
+                envelope.sig.key_id == log_key_id
+                    && verify_envelope(body, "update", log_key).is_ok()
+            }
+            Parsed::Coverage(..) => [
+                self.roster.admitted_key_at(&subject, sealed_at_s),
+                duty_sealed_at_s.and_then(|at| self.roster.admitted_key_at(&subject, at)),
+            ]
+            .into_iter()
+            .flatten()
+            .find(|key| key.key_id == envelope.sig.key_id)
+            .is_some_and(|key| {
+                PublicKey::from_b64u(key.public_key)
+                    .is_ok_and(|key| verify_envelope(body, "update", &key).is_ok())
+            }),
+        };
+        if !authentic {
+            return Err((
+                "WIST4-E11",
+                "signature does not verify under the key the action's signing rule names".into(),
+            ));
+        }
+        let duty_height = duty_height.ok_or((
+            "WIST4-E04",
+            "details.block names no earlier sealed Block".to_owned(),
+        ))?;
+        if !self.coverage.contains_key(&(subject.clone(), duty_height)) {
+            return Err((
+                "WIST4-E04",
+                "the subject held no coverage duty for the named Block".into(),
+            ));
+        }
+        match parsed {
+            Parsed::Pull(found) => {
+                let pair = self.coverage.get_mut(&(subject, duty_height)).unwrap();
+                if pair.pull.is_none() {
+                    pair.pull = Some(PullAttestation { position, found });
                 }
+            }
+            Parsed::Coverage(proof, prev_record) => {
                 let mut key_seen = false;
                 let beta = self
                     .beta_at(
@@ -856,7 +867,6 @@ impl ExtensionHistory {
                 pair.beta.get_or_insert(beta);
                 pair.attested_empty_at.get_or_insert(height);
             }
-            _ => unreachable!("only attestation actions reach attest_inner"),
         }
         Ok(())
     }
@@ -1015,10 +1025,10 @@ impl ExtensionHistory {
                     .map(Vec::as_slice)
                     .unwrap_or_default(),
             });
-            let level1 = ladder.active()[0].is_some();
+            let level = ladder.level();
             let rungs = self.rungs.entry(publisher).or_default();
-            if rungs.last().is_none_or(|(_, active)| *active != level1) {
-                rungs.push((height, level1));
+            if rungs.last().is_none_or(|(_, recorded)| *recorded != level) {
+                rungs.push((height, level));
             }
         }
         Ok(())
@@ -1176,11 +1186,15 @@ impl ExtensionHistory {
         })
     }
 
-    pub fn level1_sanction(&self, publisher: &str, height: u64) -> bool {
+    pub fn sanction_level(&self, publisher: &str, height: u64) -> u8 {
         self.rungs
             .get(publisher)
             .and_then(|rungs| rungs.iter().rev().find(|(at, _)| *at <= height))
-            .is_some_and(|(_, active)| *active)
+            .map_or(0, |(_, level)| *level)
+    }
+
+    pub fn level1_sanction(&self, publisher: &str, height: u64) -> bool {
+        self.sanction_level(publisher, height) >= 1
     }
 
     pub fn prior_state(&self, publisher: &str, height: Option<u64>) -> PriorState {

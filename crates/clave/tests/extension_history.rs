@@ -2798,21 +2798,42 @@ fn a_fresh_identity_resets_reputation_inputs_and_rungs() {
     );
     let fresh = pages(PUBLISHER, "site-fresh", "fresh", 8);
     fx.hourly(9, fresh.clone());
+    let d2 = first(&deltas, &|id| {
+        *id != d && drawn(&filer_beta, id, PROVISIONAL) && drawn(&checker_beta, id, PROVISIONAL)
+    });
     let late = fx.hourly(
         10,
+        vec![
+            audit(checker, &d, "inconsistent", &audited, START + HOUR + 2),
+            audit(filer, &d2, "inconsistent", &audited, START + HOUR + 3),
+        ],
+    );
+    fx.hourly(
+        11,
         vec![audit(
             checker,
-            &d,
+            &d2,
             "inconsistent",
             &audited,
-            START + HOUR + 2,
+            START + HOUR + 4,
         )],
     );
-    for height in 11..=40 {
+    for height in 12..=40 {
         fx.hourly(height, vec![]);
     }
     let history = fx.reconstruct().unwrap();
-    assert_eq!(history.findings().len(), 1);
+    assert_eq!(
+        history.findings().len(),
+        2,
+        "a pre-reset Delta still confirms after the reset"
+    );
+    assert_eq!(history.findings()[1].confirming.block_number, 11);
+    assert!(
+        !history.level1_sanction(PUBLISHER, 11),
+        "a finding for a Delta sealed below the reset arms no rung of the fresh identity"
+    );
+    assert_eq!(history.sanction_level(PUBLISHER, 11), 0);
+    assert_eq!(history.reputation(PUBLISHER, 11).unwrap().penalty_n, 0);
     assert!(history.level1_sanction(PUBLISHER, 7));
     let before = history.reputation(PUBLISHER, 7).unwrap();
     assert!(before.penalty_n > 0 && before.age_days == 0);
@@ -2837,4 +2858,427 @@ fn a_fresh_identity_resets_reputation_inputs_and_rungs() {
     assert!(!history.level1_sanction(PUBLISHER, 40));
     assert_eq!(late.block_number, 10);
     assert!(standing_of(&history, 10, checker).evidence());
+}
+
+fn vector_signer<'a>(
+    doc: &Value,
+    keys: &'a [(String, wist_core::crypto::PublicKey)],
+) -> Option<&'a str> {
+    keys.iter()
+        .find(|(key_id, public_key)| {
+            doc["sig"]["key_id"] == key_id.as_str()
+                && envelope::verify_envelope(doc, "update", public_key).is_ok()
+        })
+        .map(|(key_id, _)| key_id.as_str())
+}
+
+fn resign(update: &Value, key_id: &str, signer: &SigningKey) -> Value {
+    json!({
+        "type": "registry_update",
+        "body": envelope::sign_envelope(update, "update", key_id, signer).unwrap(),
+    })
+}
+
+#[test]
+fn attestation_vectors_replay_as_signed_histories() {
+    let vectors = coverage_vectors();
+    let log_key_id = vectors["attestation_log_key"]["key_id"].as_str().unwrap();
+    let mut keys: Vec<(String, wist_core::crypto::PublicKey)> = vec![(
+        log_key_id.to_owned(),
+        wist_core::crypto::PublicKey::from_b64u(
+            vectors["attestation_log_key"]["public_key"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap(),
+    )];
+    let auditors: Vec<(String, String)> = vectors["attestation_auditors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| {
+            keys.push((
+                a["key_id"].as_str().unwrap().to_owned(),
+                wist_core::crypto::PublicKey::from_b64u(a["public_key"].as_str().unwrap()).unwrap(),
+            ));
+            (
+                a["auditor_id"].as_str().unwrap().to_owned(),
+                a["key_id"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    let duty_hash = vectors["attestation_duty_block"].as_str().unwrap();
+    let (filer, checker) = (auditors[0].0.as_str(), auditors[1].0.as_str());
+    let filer_key_id = auditors[0].1.as_str();
+    let mut exercised = BTreeSet::new();
+    for case in vectors["attestation_cases"].as_array().unwrap() {
+        let label = case["label"].as_str().unwrap();
+        let doc: Value = serde_json::from_str(
+            case["record_json"]
+                .as_str()
+                .unwrap_or(case["envelope_json"].as_str().unwrap()),
+        )
+        .unwrap();
+        let context = &case["context"];
+        let admitted = context["subject_admitted_at_block"] == true;
+        let held_at_block = context["key_held_at_block"] == true;
+        let held_at_duty = context["key_held_at_duty_block"] == true;
+        let empty = context["duty_set_empty"] == true;
+        let mut fx = Fixture::new();
+        let mut genesis = vec![fx.admit_own(checker), declaration(PUBLISHER, &[], "site")];
+        if admitted {
+            genesis.push(fx.admit_own(filer));
+        }
+        fx.hourly(0, genesis);
+        let deltas = if empty {
+            Vec::new()
+        } else {
+            pages(PUBLISHER, "site", "a", 32)
+        };
+        let duty = fx.hourly(1, deltas);
+        let rotated_label = format!("{filer}#rotated");
+        let mut block_two = Vec::new();
+        if !admitted {
+            block_two.push(fx.admit_own(filer));
+        } else if !held_at_block && held_at_duty {
+            block_two.push(fx.remove(filer, &key_id(filer)));
+            block_two.push(fx.admit(filer, &rotated_label, &format!("key:{filer}:2")));
+        }
+        fx.hourly(2, block_two);
+        let mut update = doc["update"].clone();
+        let unsealed = context["block_sealed_below"] != true;
+        let named = if unsealed {
+            format!("sha256:{}", "1".repeat(64))
+        } else {
+            duty.block_hash.clone()
+        };
+        if update["details"].get("block").is_some() && update["details"]["block"] == duty_hash {
+            update["details"]["block"] = json!(named);
+        }
+        if let Some(hex) = update["details"]["vrf_proof"].as_str().map(str::to_owned) {
+            let bytes = wist_core::crypto::hex_decode(&hex).ok();
+            let proof_key = bytes.as_ref().and_then(|bytes| {
+                <[u8; vrf::PROOF_LEN]>::try_from(bytes.as_slice())
+                    .ok()
+                    .and_then(|pi| {
+                        keys.iter().skip(1).find(|(_, public_key)| {
+                            let alpha = sampling::alpha_from_block_hash(duty_hash).unwrap();
+                            let raw: [u8; 32] =
+                                wist_core::crypto::b64u_decode(&public_key.to_b64u())
+                                    .unwrap()
+                                    .try_into()
+                                    .unwrap();
+                            vrf::verify(&raw, &alpha, &pi).is_ok()
+                        })
+                    })
+            });
+            let replacement = match proof_key.map(|(key_id, _)| key_id.as_str()) {
+                Some(id) if id == filer_key_id => Some(hex_encode(&proof(filer, &duty))),
+                Some(_) => Some(hex_encode(&proof(checker, &duty))),
+                None if hex.len() == 2 * vrf::PROOF_LEN => {
+                    Some(hex_encode(&proof(filer, &fx.rows[0].clone())))
+                }
+                None => None,
+            };
+            if let Some(replacement) = replacement {
+                update["details"]["vrf_proof"] = json!(replacement);
+            }
+        }
+        let signer =
+            vector_signer(&doc, &keys).unwrap_or(if case["action"] == "pull_attestation" {
+                log_key_id
+            } else {
+                filer_key_id
+            });
+        let entry = if signer == log_key_id {
+            resign(&update, "log1", &fx.sk)
+        } else if signer == filer_key_id {
+            if held_at_block || held_at_duty || !admitted {
+                resign(&update, &key_id(filer), &key(filer))
+            } else {
+                resign(&update, "key:stranger", &key("stranger"))
+            }
+        } else {
+            resign(&update, &key_id(checker), &key(checker))
+        };
+        fx.hourly(3, vec![entry]);
+        for height in 4..=6 {
+            fx.hourly(height, vec![]);
+        }
+        let history = fx.reconstruct().unwrap();
+        let rejected: Vec<(u64, String, &str)> = history
+            .rejected_acts()
+            .iter()
+            .map(|r| (r.position.block_number, r.action.clone(), r.code))
+            .collect();
+        match case["code"].as_str() {
+            Some(code) => assert_eq!(
+                rejected,
+                vec![(3, case["action"].as_str().unwrap().to_owned(), code)],
+                "{label}"
+            ),
+            None => assert!(rejected.is_empty(), "{label}: {rejected:?}"),
+        }
+        let pair = history.coverage_duty(filer, 1);
+        match case["effect"].as_str().unwrap() {
+            "attested" => assert_eq!(
+                pair.unwrap().pull.as_ref().map(|p| p.position.block_number),
+                Some(3),
+                "{label}"
+            ),
+            "discharged" => {
+                let pair = pair.unwrap();
+                assert_eq!(
+                    (pair.attested_empty_at, pair.complete_at),
+                    (Some(3), Some(3)),
+                    "{label}"
+                );
+            }
+            "draw" => {
+                let pair = pair.unwrap();
+                assert!(
+                    pair.beta.is_some() && pair.attested_empty_at == Some(3),
+                    "{label}"
+                );
+                assert!(
+                    !pair.selection.as_ref().unwrap().is_empty() && pair.complete_at.is_none(),
+                    "{label}"
+                );
+            }
+            "ignored" => {
+                if let Some(pair) = pair {
+                    assert!(
+                        pair.pull.is_none() && pair.attested_empty_at.is_none(),
+                        "{label}"
+                    );
+                }
+            }
+            other => panic!("{label}: unknown effect {other}"),
+        }
+        exercised.insert(case["effect"].as_str().unwrap().to_owned());
+    }
+    assert_eq!(
+        exercised,
+        BTreeSet::from_iter(["attested", "discharged", "draw", "ignored"].map(str::to_owned))
+    );
+}
+
+#[test]
+fn lift_vectors_replay_as_signed_histories() {
+    let vectors: Value = serde_json::from_slice(
+        &std::fs::read(common::spec_dir().join("vectors/wist4/sanctions.json")).unwrap(),
+    )
+    .unwrap();
+    let log_key_id = vectors["lift_log_key"]["key_id"].as_str().unwrap();
+    let log_key = wist_core::crypto::PublicKey::from_b64u(
+        vectors["lift_log_key"]["public_key"].as_str().unwrap(),
+    )
+    .unwrap();
+    let (filer, checker) = ("audit.example.net", "checker.example.org");
+    let mut seen = BTreeSet::new();
+    for case in vectors["lift_cases"].as_array().unwrap() {
+        let label = case["label"].as_str().unwrap();
+        let doc: Value = serde_json::from_str(case["envelope_json"].as_str().unwrap()).unwrap();
+        let subject = doc["update"]["subject"].as_str().unwrap();
+        let mut fx = Fixture::new();
+        fx.attest_empty = true;
+        let mut genesis = vec![fx.admit_own(filer), fx.admit_own(checker)];
+        let hosted = crate_host_ok(subject);
+        if hosted {
+            genesis.push(declaration(subject, &[], "site"));
+        }
+        fx.hourly(0, genesis);
+        let deltas = if hosted {
+            pages(subject, "site", "l", 48)
+        } else {
+            Vec::new()
+        };
+        let audited = fx.hourly(1, deltas.clone());
+        let (fb, cb) = (beta(filer, &audited), beta(checker, &audited));
+        let d = if hosted {
+            Some(first(&deltas, &|id| {
+                drawn(&fb, id, PROVISIONAL) && drawn(&cb, id, PROVISIONAL)
+            }))
+        } else {
+            None
+        };
+        let audit = |auditor: &'static str, id: &str, at: i64| {
+            record(&Audit {
+                auditor,
+                audited: id,
+                proof_over: &audited,
+                fetched_at: at,
+                verdict: "inconsistent",
+            })
+        };
+        fx.hourly(
+            2,
+            d.iter().map(|id| audit(filer, id, START + HOUR)).collect(),
+        );
+        fx.hourly(
+            3,
+            d.iter()
+                .map(|id| audit(checker, id, START + HOUR + 1))
+                .collect(),
+        );
+        let entry = if doc["sig"]["key_id"] == log_key_id
+            && envelope::verify_envelope(&doc, "update", &log_key).is_ok()
+        {
+            resign(&doc["update"], "log1", &fx.sk)
+        } else {
+            resign(&doc["update"], &key_id(filer), &key(filer))
+        };
+        fx.hourly(4, vec![entry]);
+        fx.hourly(5, vec![]);
+        let history = fx.reconstruct().unwrap();
+        let codes: Vec<(u64, &str)> = history
+            .rejected_acts()
+            .iter()
+            .map(|r| (r.position.block_number, r.code))
+            .collect();
+        match case["code"].as_str() {
+            Some(code) => assert_eq!(codes, vec![(4, code)], "{label}"),
+            None => assert!(codes.is_empty(), "{label}: {codes:?}"),
+        }
+        if hosted {
+            assert!(history.level1_sanction(subject, 3), "{label}");
+            assert_eq!(
+                history.level1_sanction(subject, 4),
+                case["code"].as_str().is_some(),
+                "{label}: an accepted lift clears the rung, a rejected one clears nothing"
+            );
+        }
+        seen.insert(case["code"].as_str().map(str::to_owned));
+    }
+    assert_eq!(seen.len(), 3);
+}
+
+fn crate_host_ok(subject: &str) -> bool {
+    !subject.is_empty()
+        && subject
+            .bytes()
+            .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.'))
+}
+
+#[test]
+fn exemptions_after_the_fallback_and_forged_successors() {
+    let (filer, checker) = ("audit.example.net", "checker.example.org");
+    let mut fx = Fixture::new();
+    fx.hourly(
+        0,
+        vec![
+            fx.admit_own(filer),
+            fx.admit_own(checker),
+            declaration(PUBLISHER, &[], "site"),
+        ],
+    );
+    let mut rows: BTreeMap<u64, BlockRow> = BTreeMap::new();
+    for height in 1..=9 {
+        rows.insert(height, fx.hourly(height, vec![]));
+    }
+    let missing_x = coverage_attestation(filer, filer, &key_id(filer), &rows[&7], None);
+    let missing_y = coverage_attestation(filer, filer, &key_id(filer), &rows[&8], None);
+    let (x, y) = (update_id(&missing_x), update_id(&missing_y));
+    for height in 10..=110 {
+        let mut entries = Vec::new();
+        match height {
+            80 => entries.push(fx.pull(filer, &rows[&6], std::slice::from_ref(&y))),
+            81 => {
+                let mut forged =
+                    coverage_attestation(filer, filer, &key_id(filer), &rows[&9], Some(&y));
+                forged["body"]["sig"]["value"] = json!(wist_core::crypto::b64u_encode(&[0u8; 64]));
+                entries.push(forged);
+            }
+            105 => entries.push(fx.pull(filer, &rows[&5], std::slice::from_ref(&x))),
+            106 => entries.push(coverage_attestation(
+                filer,
+                filer,
+                &key_id(filer),
+                &rows[&9],
+                Some(&x),
+            )),
+            _ => {}
+        }
+        rows.insert(height, fx.hourly(height, entries));
+    }
+    let history = fx.reconstruct().unwrap();
+    assert_eq!(
+        history
+            .rejected_acts()
+            .iter()
+            .map(|r| (r.position.block_number, r.code))
+            .collect::<Vec<_>>(),
+        vec![(81, "WIST4-E11")],
+        "the forged successor is rejected"
+    );
+    let five = history.coverage_duty(filer, 5).unwrap();
+    assert_eq!(five.unattested_height, Some(101));
+    assert_eq!(
+        five.pull.as_ref().map(|p| p.position.block_number),
+        Some(105)
+    );
+    assert_eq!(five.establishing_height(), Some(101));
+    assert!(history.counting_failures(filer, 104).contains(&5));
+    assert!(history.counting_failures(filer, 105).contains(&5));
+    assert!(
+        !history.counting_failures(filer, 106).contains(&5),
+        "an attested pair is exempt while contradicted even after the fallback established it"
+    );
+    assert!(!history.counting_failures(filer, 110).contains(&5));
+    let six = history.coverage_duty(filer, 6).unwrap();
+    assert_eq!(six.establishing_height(), Some(80));
+    assert!(
+        history.counting_failures(filer, 90).contains(&6),
+        "a forged successor supplies no exemption"
+    );
+}
+
+#[test]
+fn same_block_discharges_settle_before_the_blocks_records_are_weighed() {
+    let filer = "audit.example.net";
+    let mut fx = Fixture::new();
+    fx.hourly(
+        0,
+        vec![fx.admit_own(filer), declaration(PUBLISHER, &[], "site")],
+    );
+    let mut rows: BTreeMap<u64, BlockRow> = BTreeMap::new();
+    for height in 1..100 {
+        rows.insert(height, fx.hourly(height, vec![]));
+    }
+    let deltas = pages(PUBLISHER, "site", "s", 64);
+    let audited = fx.hourly(100, deltas.clone());
+    let filer_beta = beta(filer, &audited);
+    let d = first(&deltas, &|id| drawn(&filer_beta, id, PROVISIONAL));
+    let genesis = fx.rows[0].clone();
+    for height in 101..=125 {
+        let entries = if height == 120 {
+            vec![
+                coverage_attestation(filer, filer, &key_id(filer), &genesis, None),
+                coverage_attestation(filer, filer, &key_id(filer), &rows[&1], None),
+                record(&Audit {
+                    auditor: filer,
+                    audited: &d,
+                    proof_over: &audited,
+                    fetched_at: START + 100 * HOUR,
+                    verdict: "consistent",
+                }),
+            ]
+        } else {
+            Vec::new()
+        };
+        fx.hourly(height, entries);
+    }
+    let history = fx.reconstruct().unwrap();
+    assert!(history.rejected_acts().is_empty());
+    assert_eq!(
+        history.coverage_duty(filer, 0).unwrap().complete_at,
+        Some(120)
+    );
+    assert_eq!(history.counting_failures(filer, 120).len(), 23);
+    assert!(!history.in_coverage_failure(filer, 120));
+    let weighed = standing_of(&history, 120, filer);
+    assert!(weighed.evidence() && !weighed.coverage_failure);
+    assert_eq!(history.counting_failures(filer, 121).len(), 24);
+    assert!(!history.in_coverage_failure(filer, 121));
+    assert!(history.in_coverage_failure(filer, 122));
 }
