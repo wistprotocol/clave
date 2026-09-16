@@ -582,6 +582,22 @@ unappealed ruling sealed after the window closed discharges it. The
 `sanctions.json` process, notice-target and notice-evidence cases are
 consumed by core.
 
+Payload withdrawals replay under WIST-4 §9.1 and ADR-0036: a
+`payload_withdrawal` is accepted only under the Log key (WIST4-E11 otherwise)
+and only when `details.delta_id` names a Delta sealed at or below its Block
+whose signed publisher is the subject, with non-empty `legal_basis` and
+`jurisdiction` (WIST4-E04 otherwise); the earliest accepted withdrawal's
+Block is the height read for repeats, exposed by `withdrawn_at`. From that
+Block, a Record sealed in a higher Block whose `reference_delta` is the
+withdrawn Delta is evidence only as `not_auditable` with `unmeasured`
+`reference`; any other verdict is WIST4-E02, discharging its duty. Records
+sealed at or below the withdrawal's Block stand. The `withdraw` command
+refuses a Delta the database has not seen for the subject; replay remains the
+authority. A signed history covers same-Block, later measured, later
+`not_auditable` on either side, another reference, foreign-subject,
+unsealed-Delta, Auditor-signed and repeated withdrawals; `withdrawal.json`
+fixes the act and Record dispositions.
+
 ## Derived state
 
 `derived::refresh(directory, database)` runs after every sealed Block: it
@@ -718,8 +734,9 @@ validate supplied bytes through [Historical Payload validation](#historical-payl
 
 This relation establishes no Record signature, complete field eligibility,
 Auditor standing, verdict or finding. Extension standing must additionally
-enforce the B₁ fetch lower bound; sanctions, withdrawal, availability and durable
-source retention remain separate requirements. Work and memory bounds follow
+enforce the B₁ fetch lower bound; sanctions, availability and durable source
+retention remain separate requirements, and withdrawn references are
+dispositioned under [Historical extension path](#historical-extension-path). Work and memory bounds follow
 [Historical audit references](#historical-audit-references).
 
 Signed histories exercise all ten `superseded-audit.json` reference cases and

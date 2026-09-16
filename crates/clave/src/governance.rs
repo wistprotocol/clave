@@ -222,6 +222,11 @@ pub fn withdraw(
             "payload_withdrawal requires legal_basis and jurisdiction (WIST-3 \u{a7}6.2)".into(),
         ));
     }
+    if !db.is_delta_seen_for(delta_id, domain)? {
+        return Err(Error::Governance(format!(
+            "{delta_id} is not a sealed or accepted Delta of {domain} (WIST-4 \u{a7}9.1)"
+        )));
+    }
     let now = whole_second(now_epoch)?;
     let update = serde_json::json!({
         "wist_version": WIST_VERSION,

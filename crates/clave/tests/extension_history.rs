@@ -3063,6 +3063,149 @@ fn attestation_vectors_replay_as_signed_histories() {
     );
 }
 
+fn record_not_auditable(audit: &Audit<'_>, unmeasured: &str) -> Value {
+    let body = json!({
+        "wist_version": "1.0.0",
+        "audited_delta": audit.audited,
+        "reference_delta": audit.audited,
+        "auditor_id": audit.auditor,
+        "fetched_at": ts(audit.fetched_at),
+        "verdict": "not_auditable",
+        "unmeasured": unmeasured,
+        "vrf_proof": hex_encode(&proof(audit.auditor, audit.proof_over)),
+        "prev_record": null,
+    });
+    json!({
+        "type": "audit_record",
+        "body": envelope::sign_envelope(&body, "record", &key_id(audit.auditor), &key(audit.auditor))
+            .unwrap(),
+    })
+}
+
+fn withdrawal_update(subject: &str, delta_id: &str, basis: &str) -> Value {
+    json!({
+        "wist_version": "1.0.0", "action": "payload_withdrawal", "subject": subject,
+        "details": {"delta_id": delta_id, "legal_basis": basis, "jurisdiction": "BR"},
+        "effective_at": ts(START),
+    })
+}
+
+fn audit_of<'a>(
+    auditor: &'a str,
+    audited: &'a BlockRow,
+    id: &'a str,
+    height: u64,
+    verdict: &'a str,
+) -> Audit<'a> {
+    Audit {
+        auditor,
+        audited: id,
+        proof_over: audited,
+        fetched_at: START + height as i64 * HOUR - 60,
+        verdict,
+    }
+}
+
+#[test]
+fn withdrawals_void_later_measured_records_and_name_only_sealed_deltas_of_the_subject() {
+    let mut fx = Fixture::new();
+    fx.attest_empty = true;
+    let auditor = "audit.example.net";
+    fx.hourly(
+        0,
+        vec![fx.admit_own(auditor), declaration(PUBLISHER, &[], "site")],
+    );
+    let deltas = pages(PUBLISHER, "site", "w", 192);
+    let audited = fx.hourly(1, deltas.clone());
+    let draws = beta(auditor, &audited);
+    let picks = pick(&deltas, &|id| drawn(&draws, id, PROVISIONAL));
+    let (target, other) = (picks[0].clone(), picks[1].clone());
+    let unsealed = delta_id(&delta(
+        PUBLISHER,
+        "https://site.example.com/unsealed",
+        "site",
+    ));
+    fx.hourly(
+        2,
+        vec![
+            fx.log_signed(withdrawal_update(PUBLISHER, &target, "court order")),
+            record(&audit_of(auditor, &audited, &target, 2, "consistent")),
+            fx.log_signed(withdrawal_update(
+                "other.example.org",
+                &other,
+                "court order",
+            )),
+            fx.log_signed(withdrawal_update(PUBLISHER, &unsealed, "court order")),
+            resign(
+                &withdrawal_update(PUBLISHER, &other, "court order"),
+                &key_id(auditor),
+                &key(auditor),
+            ),
+        ],
+    );
+    let measured = audit_of(auditor, &audited, &target, 3, "consistent");
+    let reference_gone = audit_of(auditor, &audited, &target, 3, "consistent");
+    fx.hourly(
+        3,
+        vec![
+            record(&measured),
+            record_not_auditable(&reference_gone, "reference"),
+            record_not_auditable(&reference_gone, "observed"),
+            record(&audit_of(auditor, &audited, &other, 3, "consistent")),
+            fx.log_signed(withdrawal_update(PUBLISHER, &target, "second order")),
+        ],
+    );
+    let history = fx.reconstruct().unwrap();
+    assert_eq!(history.withdrawn_at(&target), Some(2));
+    assert_eq!(history.withdrawn_at(&other), None);
+    assert_eq!(history.withdrawn_at(&unsealed), None);
+    let rejected: BTreeMap<&str, &str> = history
+        .rejected_acts()
+        .iter()
+        .filter(|act| act.action == "payload_withdrawal")
+        .map(|act| (act.reason.as_str(), act.code))
+        .collect();
+    assert_eq!(
+        rejected.values().copied().collect::<Vec<_>>(),
+        ["WIST4-E04", "WIST4-E04", "WIST4-E11"]
+    );
+    assert!(rejected
+        .keys()
+        .any(|reason| reason.contains("signed publisher")));
+    assert!(rejected
+        .keys()
+        .any(|reason| reason.contains("no Delta sealed")));
+    let standing = |height: u64, id: &str, verdict: Verdict, unmeasured: Option<&str>| {
+        history
+            .records()
+            .iter()
+            .find(|r| {
+                r.position.block_number == height
+                    && r.audited_delta == id
+                    && r.verdict == Some(verdict)
+                    && unmeasured
+                        .is_none_or(|side| fx.record_body(r.position)["unmeasured"] == side)
+            })
+            .unwrap()
+    };
+    assert!(standing(2, &target, Verdict::Consistent, None).evidence());
+    assert_eq!(
+        standing(3, &target, Verdict::Consistent, None).diagnostic,
+        Some("WIST4-E02")
+    );
+    assert!(standing(3, &target, Verdict::NotAuditable, Some("reference")).evidence());
+    assert_eq!(
+        standing(3, &target, Verdict::NotAuditable, Some("observed")).diagnostic,
+        Some("WIST4-E02")
+    );
+    assert!(standing(3, &other, Verdict::Consistent, None).evidence());
+    assert!(history
+        .records()
+        .iter()
+        .filter(|r| r.position.block_number == 3 && r.audited_delta == target)
+        .all(|r| r.discharges_coverage || r.evidence()));
+}
+
 #[test]
 fn lift_vectors_replay_as_signed_histories() {
     let vectors: Value = serde_json::from_slice(

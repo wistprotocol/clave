@@ -353,6 +353,7 @@ pub struct ExtensionHistory {
     acts: Vec<ActRecord>,
     sanction_acts: Vec<SanctionRecord>,
     processes: BTreeMap<String, PublisherProcesses>,
+    withdrawn: BTreeMap<String, u64>,
 }
 
 impl ExtensionHistory {
@@ -397,6 +398,7 @@ impl ExtensionHistory {
             acts: Vec::new(),
             sanction_acts: Vec::new(),
             processes: BTreeMap::new(),
+            withdrawn: BTreeMap::new(),
         };
         while let Some(block) = history.next_block()? {
             let effects = declarations.apply(&block)?;
@@ -662,7 +664,7 @@ impl ExtensionHistory {
                 && wist_core::envelope::verify_envelope(body, "record", binding.public_key).is_ok()
         });
         let semantic_evidence_error = fields.evidence_valid()
-            && !self.evidence_semantics_valid(record, fact, anchor_s, sealed_at_s, verdict);
+            && !self.evidence_semantics_valid(record, fact, anchor_s, height, sealed_at_s, verdict);
         let disposition = envelope.disposition(&ReplayContext {
             signing,
             duty,
@@ -770,7 +772,7 @@ impl ExtensionHistory {
         let action = body["update"]["action"].as_str().unwrap_or("");
         if !matches!(
             action,
-            "pull_attestation" | "coverage_attestation" | "sanction_lift"
+            "pull_attestation" | "coverage_attestation" | "sanction_lift" | "payload_withdrawal"
         ) {
             return Ok(());
         }
@@ -847,6 +849,51 @@ impl ExtensionHistory {
                 ));
             }
             self.block_lifts.push(update.subject.clone());
+            return Ok(());
+        }
+        if matches!(update.action, RegistryAction::PayloadWithdrawal) {
+            if envelope.sig.key_id != log_key_id
+                || verify_envelope(body, "update", log_key).is_err()
+            {
+                return Err((
+                    "WIST4-E11",
+                    "signature does not verify under the Log key".into(),
+                ));
+            }
+            let details = update
+                .details
+                .as_ref()
+                .filter(|details| details.is_object())
+                .ok_or(("WIST4-E04", "details are missing".to_owned()))?;
+            let delta_id = details["delta_id"]
+                .as_str()
+                .filter(|id| digest(id))
+                .ok_or(("WIST4-E04", "details.delta_id is not a Delta ID".to_owned()))?;
+            if !["legal_basis", "jurisdiction"].iter().all(|member| {
+                details[member]
+                    .as_str()
+                    .is_some_and(|value| !value.is_empty())
+            }) {
+                return Err((
+                    "WIST4-E04",
+                    "legal_basis and jurisdiction are required".into(),
+                ));
+            }
+            let fact = self
+                .deltas
+                .get(delta_id)
+                .filter(|fact| fact.height <= height)
+                .ok_or((
+                    "WIST4-E04",
+                    "delta_id names no Delta sealed at or below the Block".to_owned(),
+                ))?;
+            if fact.publisher != update.subject {
+                return Err((
+                    "WIST4-E04",
+                    "subject is not the named Delta's signed publisher".into(),
+                ));
+            }
+            self.withdrawn.entry(delta_id.to_owned()).or_insert(height);
             return Ok(());
         }
         let details = update
@@ -2004,6 +2051,10 @@ impl ExtensionHistory {
         &self.rejected_acts
     }
 
+    pub fn withdrawn_at(&self, delta_id: &str) -> Option<u64> {
+        self.withdrawn.get(delta_id).copied()
+    }
+
     fn beta_at(
         &self,
         auditor_id: &str,
@@ -2027,6 +2078,7 @@ impl ExtensionHistory {
         record: &Value,
         audited: Option<&DeltaFact>,
         anchor_s: Option<i64>,
+        height: u64,
         sealed_at_s: i64,
         verdict: Option<Verdict>,
     ) -> bool {
@@ -2043,15 +2095,23 @@ impl ExtensionHistory {
         if fetched_at_s > sealed_at_s || anchor_s.is_some_and(|anchor| fetched_at_s < anchor) {
             return false;
         }
-        let Some(reference) = record["reference_delta"]
+        let Some((reference_id, reference)) = record["reference_delta"]
             .as_str()
-            .and_then(|id| self.deltas.get(id))
+            .and_then(|id| self.deltas.get(id).map(|fact| (id, fact)))
         else {
             return false;
         };
         if reference.chain != audited.chain
             || reference.index < audited.index
             || self.blocks[reference.height as usize].block.sealed_at_s > fetched_at_s
+        {
+            return false;
+        }
+        if self
+            .withdrawn
+            .get(reference_id)
+            .is_some_and(|withdrawn| *withdrawn < height)
+            && !(verdict == Verdict::NotAuditable && record["unmeasured"] == "reference")
         {
             return false;
         }
