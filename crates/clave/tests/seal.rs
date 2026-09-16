@@ -48,7 +48,7 @@ fn seal_produces_verifiable_chain() {
     assert_eq!(record.lang, "en");
 
     assert!(clave::seal::run(&db, data.path(), &sk, SEAL_START).is_err());
-    let r1 = clave::seal::run(&db, data.path(), &sk, SEAL_START + 1).unwrap();
+    let r1 = clave::seal::run(&db, data.path(), &sk, SEAL_START + 3600).unwrap();
     assert_eq!(r1.block_number, 1);
     assert_eq!(r1.entry_count, 0);
     let b1: serde_json::Value = serde_json::from_slice(
@@ -364,7 +364,7 @@ fn a_roster_act_the_e07_rules_reject_is_not_sealed() {
     let envelope = wist_core::envelope::sign_envelope(&again, "update", "log1", &sk).unwrap();
     db.insert_pending_entry("registry_update", "", &envelope, 0)
         .unwrap();
-    let second = clave::seal::run(&db, data.path(), &sk, SEAL_START + 1).unwrap();
+    let second = clave::seal::run(&db, data.path(), &sk, SEAL_START + 3600).unwrap();
     assert_eq!(second.entry_count, 0, "dropped {:?}", second.dropped);
     assert!(
         second.dropped.iter().any(|d| d.contains("WIST4-E07")),

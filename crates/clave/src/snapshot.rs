@@ -255,7 +255,7 @@ fn build_state(
             removed_height,
         }));
     }
-    for domain in db.sanctioned_domains()? {
+    for domain in db.derived_sanctioned_domains(&head_sealed_at)? {
         let state = crate::sanctions::sanction_state(db, &domain, &head_sealed_at)?;
         if state.level == 0 {
             continue;
@@ -476,7 +476,7 @@ pub fn build(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{GovernanceRow, RecordUpsert};
+    use crate::db::RecordUpsert;
 
     const DAY: i64 = 86400;
     const T0: i64 = 1_800_000_000;
@@ -514,24 +514,21 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
         seal_record(&db, 0, T0, "https://example.com/before");
-        db.commit_seal(
-            &[],
+        seal_record(&db, 1, T0 + DAY, "https://example.com/at");
+        db.record_derived_state(
             1,
-            "sha256:h1",
             &ts(T0 + DAY),
-            &[],
-            &[],
-            &[GovernanceRow {
-                update_id: "sha256:s1",
-                action: "sanction",
+            &[crate::db::DerivedPublisherRow {
                 domain: "example.com",
-                level: Some(3),
-                notice_id: None,
-                outcome: None,
-                kind: None,
+                reputation_u: 100_000,
+                level: 3,
+                enforceable_level: 3,
+                fallback_level: 1,
+                level_since: &ts(T0 + DAY),
+                evidence: &[],
+                deadlines: &[],
             }],
             &[],
-            0,
         )
         .unwrap();
         seal_record(&db, 2, T0 + 2 * DAY, "https://example.com/after");

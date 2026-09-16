@@ -154,7 +154,7 @@ fn fractional_key_bound_survives_ingest_reopen_and_sealing() {
     assert_eq!(report.rejected, vec![(rejected, "WIST1-E02".into())]);
     drop(r.db);
     let db = clave::db::Db::open(&r.data.path().join("clave.sqlite")).unwrap();
-    let now = "2026-08-09T12:00:06Z"
+    let now = "2026-08-09T13:00:00Z"
         .parse::<jiff::Timestamp>()
         .unwrap()
         .as_second();
@@ -419,7 +419,7 @@ fn recovery_flow_queues_settles_and_rejects_superseded_deltas() {
     assert_eq!(b2.block_number, 2);
     assert!(r.db.get_recovery_window(&r.host).unwrap().is_some());
 
-    let b3 = clave::seal::run(&r.db, r.data.path(), &r.sk, T0 + 7200 + 7 * DAY + 60).unwrap();
+    let b3 = clave::seal::run(&r.db, r.data.path(), &r.sk, T0 + 7200 + 7 * DAY + 3600).unwrap();
     assert_eq!(b3.block_number, 3);
     assert!(r.db.get_recovery_window(&r.host).unwrap().is_none());
     assert!(rejection_codes(&r).contains(&"WIST1-E13".to_string()));

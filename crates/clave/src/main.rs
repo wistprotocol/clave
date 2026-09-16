@@ -59,6 +59,8 @@ enum Command {
         #[arg(long, value_delimiter = ',')]
         evidence: Vec<String>,
         #[arg(long)]
+        finding: String,
+        #[arg(long)]
         reason: Option<String>,
     },
     Rule {
@@ -186,16 +188,19 @@ fn main() -> Result<(), clave::Error> {
             level,
             severity,
             evidence,
+            finding,
             reason,
         } => {
             let db = clave::db::Db::open(&data.join("clave.sqlite"))?;
             let sk = clave::keys::load(&data.join("keys/seed"))?;
             let report = clave::governance::sanction(
                 &db,
+                &data,
                 &sk,
                 &domain,
                 level,
                 severity,
+                &finding,
                 &evidence,
                 reason.as_deref(),
                 jiff::Timestamp::now().as_second(),

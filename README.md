@@ -532,10 +532,11 @@ act's level precedes it. `sanction_level(publisher, height)` reads the full
 ladder with notice-scoped voids; `enforceable_level` additionally requires,
 for rungs 3 and 4, an accepted unvoided notice of that level for the active
 activation at or below the height, which is the Aggregator's own
-notice-before-enforcement bound. Live ingestion and serving still read the
-database summaries; adopting the derived state there, Mirror evidence
-retention through `retention_end_at_s`, the `auditor_remove` a coverage
-failure requires, live pulls and attestation sealing are not implemented.
+notice-before-enforcement bound. Live ingestion, serving, quota and
+Snapshot state read this derived state through
+[Derived state](#derived-state); Mirror evidence retention through
+`retention_end_at_s`, the `auditor_remove` a coverage failure requires,
+live pulls and attestation sealing are not implemented.
 Observers hold no coverage duty. Reconstruction retains every Block
 profile, Delta binding, Record, duty, publication, audit, finding, notice
 and act in memory without a work bound, exposes nothing after a prefix
@@ -579,6 +580,45 @@ and after the notice, and the sealing deadline voiding state unless an
 unappealed ruling sealed after the window closed discharges it. The
 `sanctions.json` process, notice-target and notice-evidence cases are
 consumed by core.
+
+## Derived state
+
+`derived::refresh(directory, database)` runs after every sealed Block: it
+reconstructs [Historical extension path](#historical-extension-path) through
+the new head and records, for the head Block, each Publisher's derived
+`reputation_u`, ladder level, enforceable level, the highest active rung at
+or below 2 (the fallback a notice-scoped void leaves), the instant the level
+took effect, the Audit Record IDs of the active rungs' activations and the
+appeal, sealing and ruling deadlines still open, plus each admitted
+Auditor's coverage-failure state. The rows are the WIST-3 §7 `sanction_state`
+and `coverage_failure` inputs and the Aggregator's own enforcement bound.
+
+`sanctions::sanction_state(database, domain, at)` reads the row of the
+highest Block sealed at or before `at`. Its level is the enforceable level;
+where an open appeal-sealing or ruling deadline in that row is at or before
+`at`, the level-3 or level-4 state is void from that instant and the level
+falls to the fallback, so a lapse between Blocks is enforced before the next
+seal records it. Ingestion refuses a level-3 domain's pulls and Pings, status
+reports quarantine or delisting, and Snapshots reduce level-2 weights and
+exclude level-4 Deltas from that state. `quota::quota_q(database, domain,
+at)` reads `reputation_u` at the highest Block sealed strictly before the
+UTC day of `at` (WIST-4 §6.4), the new-domain value where none exists.
+
+`governance::sanction` records a ladder action the derived state already
+shows: the named `finding` must be a first confirming Record of the domain
+with the severity its closed confirming set fixes, `evidence` must include
+it, the requested level must not exceed the derived ladder, and a level-3 or
+level-4 action seals a `notice` whose `activation` is the active rung's
+confirming Record. Sanction acts, not findings, remain operator-issued; the
+`auditor_remove` a coverage failure requires is not issued.
+
+Each refresh replays the complete history without a work bound, so sealing
+cost grows with the Log; incremental derivation is deferred to the durable
+ingestion work. Database rows written by local parameter overrides do not
+change the authenticated schedule the replay reads. Tests drive the whole
+path through sealed Records: findings that reach levels 1 to 4, the notice
+before enforcement, lapsed and discharged sealing deadlines, a lift, and
+the quota read from a Block sealed before the day.
 
 ## Historical coverage clocks
 

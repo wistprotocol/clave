@@ -299,35 +299,20 @@ fn sanctioned_domain_ping_gets_403_and_status_shows_state() {
         let sealed = jiff::Timestamp::from_second(now - 3600)
             .unwrap()
             .to_string();
-        db.commit_seal(
-            &[],
+        db.record_derived_state(
             0,
-            "sha256:h0",
             &sealed,
+            &[clave::db::DerivedPublisherRow {
+                domain: "example.com",
+                reputation_u: 100_000,
+                level: 3,
+                enforceable_level: 3,
+                fallback_level: 0,
+                level_since: &sealed,
+                evidence: &[],
+                deadlines: &[],
+            }],
             &[],
-            &[],
-            &[
-                clave::db::GovernanceRow {
-                    update_id: "sha256:n1",
-                    action: "notice",
-                    domain: "example.com",
-                    level: None,
-                    notice_id: None,
-                    outcome: None,
-                    kind: None,
-                },
-                clave::db::GovernanceRow {
-                    update_id: "sha256:s1",
-                    action: "sanction",
-                    domain: "example.com",
-                    level: Some(3),
-                    notice_id: Some("sha256:n1"),
-                    outcome: None,
-                    kind: None,
-                },
-            ],
-            &[],
-            0,
         )
         .unwrap();
     }

@@ -44,13 +44,20 @@ fn is_evidence_id(id: &str) -> bool {
         .is_some_and(|h| h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
+/// WIST-4 §7/§9.1: a `sanction` records a ladder action the derived state
+/// already shows; its primary finding is a first confirming Record of the
+/// domain with the severity the closed confirming set fixes, and a level-3
+/// or level-4 action seals a notice naming the activation that armed the
+/// rung before the sanction can be enforced.
 #[allow(clippy::too_many_arguments)]
 pub fn sanction(
     db: &Db,
+    data_dir: &std::path::Path,
     sk: &SigningKey,
     domain: &str,
     level: i64,
     severity: i64,
+    finding: &str,
     evidence: &[String],
     reason: Option<&str>,
     now_epoch: i64,
@@ -63,10 +70,46 @@ pub fn sanction(
             "severity must be 1-3, got {severity}"
         )));
     }
+    if !is_evidence_id(finding) {
+        return Err(Error::Governance(format!(
+            "malformed finding id {finding:?}"
+        )));
+    }
     if evidence.len() < 2 || !evidence.iter().all(|e| is_evidence_id(e)) {
         return Err(Error::Governance(
             "evidence must name at least two Audit Record IDs (WIST-4 \u{a7}9.1)".into(),
         ));
+    }
+    if !evidence.iter().any(|id| id == finding) {
+        return Err(Error::Governance(
+            "evidence must include the primary finding's first confirming Record (WIST-4 \u{a7}9.1)".into(),
+        ));
+    }
+    let head = db.last_block()?.ok_or_else(|| {
+        Error::Governance("no sealed history: a sanction records a derived finding".into())
+    })?;
+    let history =
+        crate::history::extension::ExtensionHistory::reconstruct(data_dir, Some(head.clone()))?;
+    let derived = history
+        .findings()
+        .iter()
+        .find(|f| f.publisher == domain && f.confirming_record_id == finding)
+        .ok_or_else(|| {
+            Error::Governance(format!(
+                "{finding} is not a first confirming Record of a finding against {domain}"
+            ))
+        })?;
+    if i64::from(derived.severity) != severity {
+        return Err(Error::Governance(format!(
+            "the finding's closed confirming set has severity {}, not {severity} (WIST-4 \u{a7}7)",
+            derived.severity
+        )));
+    }
+    let ladder = history.sanction_level(domain, head.block_number);
+    if i64::from(ladder) < level {
+        return Err(Error::Governance(format!(
+            "the derived ladder for {domain} reaches level {ladder}, not {level} (WIST-4 \u{a7}7)"
+        )));
     }
     let now = whole_second(now_epoch)?;
 
@@ -76,13 +119,23 @@ pub fn sanction(
                 "a level 3/4 sanction notice requires --reason (WIST-4 \u{a7}7)".into(),
             )
         })?;
+        let activation = history
+            .processes(domain)
+            .and_then(|processes| processes.activations.last())
+            .and_then(|(_, activations)| activations[(level - 1) as usize].clone())
+            .ok_or_else(|| {
+                Error::Governance(format!(
+                    "no active level-{level} activation for {domain} (WIST-4 \u{a7}7)"
+                ))
+            })?;
         let window_days = registry::effective(db, "appeal_window_days", &now)?;
         let appeal_deadline = whole_second(now_epoch + window_days * DAY)?;
         let notice = serde_json::json!({
             "wist_version": WIST_VERSION,
             "action": "notice",
             "subject": domain,
-            "details": {"kind": "sanction", "reason": reason, "appeal_deadline": appeal_deadline},
+            "details": {"kind": "sanction", "level": level, "activation": activation,
+                        "reason": reason, "appeal_deadline": appeal_deadline},
             "evidence": evidence,
             "effective_at": now,
         });
@@ -96,7 +149,7 @@ pub fn sanction(
         "wist_version": WIST_VERSION,
         "action": "sanction",
         "subject": domain,
-        "details": {"level": level, "severity": severity},
+        "details": {"level": level, "severity": severity, "finding": finding},
         "evidence": evidence,
         "effective_at": now,
     });

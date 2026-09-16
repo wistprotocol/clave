@@ -28,6 +28,8 @@ CREATE TABLE IF NOT EXISTS recovery_settlements(domain TEXT NOT NULL, owner_hash
 CREATE TABLE IF NOT EXISTS sealed_declarations(domain TEXT NOT NULL, seq INTEGER NOT NULL, block_number INTEGER NOT NULL, sealed_at TEXT NOT NULL, declaration_json BLOB NOT NULL, PRIMARY KEY(domain, seq));
 CREATE TABLE IF NOT EXISTS roster_acts(block_number INTEGER NOT NULL, act_index INTEGER NOT NULL, sealed_at TEXT NOT NULL, action TEXT NOT NULL, auditor_id TEXT NOT NULL, key_id TEXT NOT NULL, public_key TEXT NOT NULL, for_cause INTEGER NOT NULL, PRIMARY KEY(block_number, act_index));
 CREATE TABLE IF NOT EXISTS queued_deltas(rowid INTEGER PRIMARY KEY AUTOINCREMENT, domain TEXT NOT NULL, delta_id TEXT NOT NULL, entry_json BLOB NOT NULL, url TEXT NOT NULL, chain_pos INTEGER NOT NULL, acceptance_order INTEGER);
+CREATE TABLE IF NOT EXISTS derived_publisher_state(domain TEXT NOT NULL, block_number INTEGER NOT NULL, sealed_at TEXT NOT NULL, reputation_u INTEGER NOT NULL, level INTEGER NOT NULL, enforceable_level INTEGER NOT NULL, fallback_level INTEGER NOT NULL, level_since TEXT NOT NULL, evidence_json TEXT NOT NULL, deadlines_json TEXT NOT NULL, PRIMARY KEY(domain, block_number));
+CREATE TABLE IF NOT EXISTS derived_auditor_state(auditor_id TEXT NOT NULL, block_number INTEGER NOT NULL, sealed_at TEXT NOT NULL, coverage_failure INTEGER NOT NULL, PRIMARY KEY(auditor_id, block_number));
 ";
 
 fn add_missing_columns(conn: &Connection) -> Result<()> {
@@ -199,6 +201,54 @@ pub struct GovernanceRow<'a> {
     pub notice_id: Option<&'a str>,
     pub outcome: Option<&'a str>,
     pub kind: Option<&'a str>,
+}
+
+pub struct DerivedPublisherRow<'a> {
+    pub domain: &'a str,
+    pub reputation_u: u64,
+    pub level: u8,
+    pub enforceable_level: u8,
+    pub fallback_level: u8,
+    pub level_since: &'a str,
+    pub evidence: &'a [String],
+    pub deadlines: &'a [(wist_core::objects::SanctionDeadlineLabel, String)],
+}
+
+pub struct DerivedAuditorRow<'a> {
+    pub auditor_id: &'a str,
+    pub coverage_failure: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct DerivedPublisherState {
+    pub block_number: u64,
+    pub sealed_at: String,
+    pub reputation_u: u64,
+    pub level: u8,
+    pub enforceable_level: u8,
+    pub fallback_level: u8,
+    pub level_since: String,
+    pub evidence: Vec<String>,
+    pub deadlines: Vec<(wist_core::objects::SanctionDeadlineLabel, String)>,
+}
+
+type DerivedStateRow = (i64, String, i64, i64, i64, i64, String, String, String);
+
+fn deadline_label_name(label: &wist_core::objects::SanctionDeadlineLabel) -> &'static str {
+    match label {
+        wist_core::objects::SanctionDeadlineLabel::Appeal => "appeal",
+        wist_core::objects::SanctionDeadlineLabel::AppealSealing => "appeal_sealing",
+        wist_core::objects::SanctionDeadlineLabel::Ruling => "ruling",
+    }
+}
+
+fn deadline_label(name: &str) -> Option<wist_core::objects::SanctionDeadlineLabel> {
+    match name {
+        "appeal" => Some(wist_core::objects::SanctionDeadlineLabel::Appeal),
+        "appeal_sealing" => Some(wist_core::objects::SanctionDeadlineLabel::AppealSealing),
+        "ruling" => Some(wist_core::objects::SanctionDeadlineLabel::Ruling),
+        _ => None,
+    }
 }
 
 pub struct GovernanceEntry {
@@ -1259,6 +1309,145 @@ impl Db {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    pub fn record_derived_state(
+        &self,
+        block_number: u64,
+        sealed_at: &str,
+        publishers: &[DerivedPublisherRow],
+        auditors: &[DerivedAuditorRow],
+    ) -> Result<()> {
+        let tx = self.mutation()?;
+        for row in publishers {
+            let deadlines: Vec<(&str, &str)> = row
+                .deadlines
+                .iter()
+                .map(|(label, at)| (deadline_label_name(label), at.as_str()))
+                .collect();
+            tx.execute(
+                "INSERT OR REPLACE INTO derived_publisher_state(domain, block_number, sealed_at, reputation_u, level, enforceable_level, fallback_level, level_since, evidence_json, deadlines_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                (
+                    row.domain,
+                    block_number as i64,
+                    sealed_at,
+                    row.reputation_u as i64,
+                    i64::from(row.level),
+                    i64::from(row.enforceable_level),
+                    i64::from(row.fallback_level),
+                    row.level_since,
+                    serde_json::to_string(row.evidence)?,
+                    serde_json::to_string(&deadlines)?,
+                ),
+            )?;
+        }
+        for row in auditors {
+            tx.execute(
+                "INSERT OR REPLACE INTO derived_auditor_state(auditor_id, block_number, sealed_at, coverage_failure) VALUES (?1, ?2, ?3, ?4)",
+                (
+                    row.auditor_id,
+                    block_number as i64,
+                    sealed_at,
+                    i64::from(row.coverage_failure),
+                ),
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn derived_publisher_state_where(
+        &self,
+        domain: &str,
+        instant: &str,
+        comparison: &str,
+    ) -> Result<Option<DerivedPublisherState>> {
+        let sql = format!(
+            "SELECT block_number, sealed_at, reputation_u, level, enforceable_level, fallback_level, level_since, evidence_json, deadlines_json FROM derived_publisher_state WHERE domain = ?1 AND sealed_at {comparison} ?2 ORDER BY block_number DESC LIMIT 1"
+        );
+        let row: Option<DerivedStateRow> = self
+            .conn
+            .query_row(&sql, (domain, instant), |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                    r.get(8)?,
+                ))
+            })
+            .optional()?;
+        let Some((
+            block_number,
+            sealed_at,
+            reputation_u,
+            level,
+            enforceable,
+            fallback,
+            since,
+            evidence,
+            deadlines,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        let evidence: Vec<String> = serde_json::from_str(&evidence)?;
+        let deadlines: Vec<(String, String)> = serde_json::from_str(&deadlines)?;
+        Ok(Some(DerivedPublisherState {
+            block_number: block_number as u64,
+            sealed_at,
+            reputation_u: reputation_u as u64,
+            level: level as u8,
+            enforceable_level: enforceable as u8,
+            fallback_level: fallback as u8,
+            level_since: since,
+            evidence,
+            deadlines: deadlines
+                .into_iter()
+                .filter_map(|(label, at)| deadline_label(&label).map(|label| (label, at)))
+                .collect(),
+        }))
+    }
+
+    pub fn derived_publisher_state_at(
+        &self,
+        domain: &str,
+        at: &str,
+    ) -> Result<Option<DerivedPublisherState>> {
+        self.derived_publisher_state_where(domain, at, "<=")
+    }
+
+    pub fn derived_publisher_state_before(
+        &self,
+        domain: &str,
+        instant: &str,
+    ) -> Result<Option<DerivedPublisherState>> {
+        self.derived_publisher_state_where(domain, instant, "<")
+    }
+
+    pub fn derived_sanctioned_domains(&self, at: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT d.domain FROM derived_publisher_state d WHERE d.sealed_at <= ?1 AND d.block_number = (SELECT MAX(block_number) FROM derived_publisher_state WHERE domain = d.domain AND sealed_at <= ?1) AND d.enforceable_level > 0 ORDER BY d.domain",
+        )?;
+        let rows = stmt.query_map([at], |r| r.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn auditor_in_coverage_failure(&self, auditor_id: &str, at: &str) -> Result<bool> {
+        let row: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT coverage_failure FROM derived_auditor_state WHERE auditor_id = ?1 AND sealed_at <= ?2 ORDER BY block_number DESC LIMIT 1",
+                (auditor_id, at),
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(row.is_some_and(|value| value != 0))
     }
 
     pub fn bump_noise_ping(&self, domain: &str, day: &str) -> Result<()> {

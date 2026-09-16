@@ -76,6 +76,9 @@ pub struct ProcessSummary {
     pub unappealed: Option<Position>,
     pub void_at_s: Option<i128>,
     pub retention_end_at_s: Option<i128>,
+    pub appeal_window_close_s: i128,
+    pub seal_deadline_s: i128,
+    pub ruling_deadline_s: Option<i128>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1343,6 +1346,19 @@ impl ExtensionHistory {
         self.processes.get(publisher)
     }
 
+    pub fn publishers(&self) -> BTreeSet<String> {
+        let mut publishers: BTreeSet<String> = self.accepted.keys().cloned().collect();
+        publishers.extend(self.processes.keys().cloned());
+        publishers.extend(self.findings.iter().map(|f| f.publisher.clone()));
+        publishers
+    }
+
+    pub fn block_sealed_at_s(&self, height: u64) -> Option<i64> {
+        self.blocks
+            .get(height as usize)
+            .map(|b| b.block.sealed_at_s)
+    }
+
     fn process_act(
         &mut self,
         block: &VerifiedBlock,
@@ -1764,6 +1780,14 @@ impl ExtensionHistory {
                 .find(|n| n.id == accepted.notice.id)
                 .ok_or_else(|| Error::History("accepted notice left its candidates".into()))?;
             let at = |index: Option<usize>| index.map(|i| routed[i].position);
+            let window_close = i128::from(accepted.notice.sealed_at_s)
+                + i128::from(accepted.notice.appeal_window_days) * 86_400;
+            let seal_deadline =
+                window_close + i128::from(accepted.notice.appeal_seal_days) * 86_400;
+            let ruling_deadline = accepted.state.appeal_index.map(|i| {
+                i128::from(routed[i].sealed_at_s)
+                    + i128::from(routed[i].ruling_deadline_days) * 86_400
+            });
             state.accepted.push(ProcessSummary {
                 notice: notice.position,
                 id: accepted.notice.id.to_owned(),
@@ -1780,6 +1804,9 @@ impl ExtensionHistory {
                 unappealed: at(accepted.state.unappealed_index),
                 void_at_s: accepted.state.void_at_s,
                 retention_end_at_s: accepted.state.retention_end_at_s,
+                appeal_window_close_s: window_close,
+                seal_deadline_s: seal_deadline,
+                ruling_deadline_s: ruling_deadline,
             });
         }
         state.rejected.sort_by_key(|(position, _)| *position);

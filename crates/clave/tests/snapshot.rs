@@ -385,18 +385,24 @@ fn the_state_artifact_carries_every_kind_with_live_instances() {
     let envelope = wist_core::envelope::sign_envelope(&admit, "update", "log1", &sk).unwrap();
     db.insert_pending_entry("registry_update", "", &envelope, 0)
         .unwrap();
-    clave::governance::sanction(
-        &db,
-        &sk,
-        "example.com",
-        2,
-        1,
-        &[
-            format!("sha256:{}", "1".repeat(64)),
-            format!("sha256:{}", "2".repeat(64)),
-        ],
-        None,
-        SEAL_START + 3600,
+    db.record_derived_state(
+        0,
+        &jiff::Timestamp::from_second(SEAL_START)
+            .unwrap()
+            .to_string(),
+        &[clave::db::DerivedPublisherRow {
+            domain: "example.com",
+            reputation_u: 100_000,
+            level: 2,
+            enforceable_level: 2,
+            fallback_level: 0,
+            level_since: &jiff::Timestamp::from_second(SEAL_START)
+                .unwrap()
+                .to_string(),
+            evidence: &[format!("sha256:{}", "1".repeat(64))],
+            deadlines: &[],
+        }],
+        &[],
     )
     .unwrap();
     clave::seal::run(&db, data.path(), &sk, SEAL_START + 3600).unwrap();
