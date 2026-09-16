@@ -1,13 +1,4 @@
-use std::cmp::Ordering;
 use wist_core::publisher_time;
-
-pub(super) fn valid(value: &str) -> bool {
-    publisher_time::valid(value)
-}
-
-pub(super) fn compare(left: &str, right: &str) -> Option<Ordering> {
-    publisher_time::compare(left, right)
-}
 
 pub(super) fn within_clock_bound(
     value: &str,

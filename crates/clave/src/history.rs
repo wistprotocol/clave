@@ -438,28 +438,7 @@ impl History {
 }
 
 fn validate_entry_order(entries: &[Value]) -> Result<()> {
-    let mut previous = None;
-    for entry in entries {
-        let kind = match entry["type"].as_str() {
-            Some("publisher_declaration") => 0,
-            Some("registry_update") => 1,
-            Some("publisher_delta") => 2,
-            Some("audit_record") => 3,
-            _ => return Err(failure("unknown Block Entry type")),
-        };
-        if entry.as_object().is_none_or(|object| object.len() != 2) || !entry["body"].is_object() {
-            return Err(failure("malformed Block Entry envelope"));
-        }
-        let order = (
-            kind,
-            wist_core::merkle::leaf_hash(&wist_core::jcs::canonicalize(entry)?),
-        );
-        if previous.is_some_and(|previous| previous > order) {
-            return Err(failure("Block Entries are not in canonical order"));
-        }
-        previous = Some(order);
-    }
-    Ok(())
+    wist_core::block::validate_entry_order(entries).map_err(|e| Error::History(e.to_string()))
 }
 
 fn failure(message: &str) -> Error {
