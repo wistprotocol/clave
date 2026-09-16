@@ -86,10 +86,23 @@ fn eligible(db: &Db, domain: &str, item: &Value) -> std::result::Result<(), &'st
             if update["details"]["key_id"] != key_id {
                 return Err("registration is not signed by the key it registers");
             }
-            update["details"]["public_key"]
+            let registered = update["details"]["public_key"]
                 .as_str()
-                .and_then(|key| PublicKey::from_b64u(key).ok())
-                .ok_or("registered key is unusable")?
+                .ok_or("registered key is missing")?;
+            let declared = db
+                .get_publisher_declaration(domain)
+                .map_err(|_| "declaration unavailable")?
+                .and_then(|raw| crate::json::parse(&raw).ok())
+                .and_then(|doc| crate::declaration::publisher_of(&doc).ok())
+                .map(|publisher| publisher.keys)
+                .unwrap_or_default();
+            if !declared
+                .iter()
+                .any(|key| key.key_id == key_id && key.public_key == registered)
+            {
+                return Err("registered key is not in the domain's Declaration");
+            }
+            PublicKey::from_b64u(registered).map_err(|_| "registered key is unusable")?
         }
         "observer_checkpoint" => db
             .accepted_roster_acts()

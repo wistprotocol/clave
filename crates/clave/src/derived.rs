@@ -212,6 +212,10 @@ pub fn refresh(db: &Db, data_dir: &Path, sk: &SigningKey) -> Result<()> {
         })
         .collect();
     db.record_derived_canary_commitments(height, &commitments)?;
+    db.record_derived_observers(
+        height,
+        &history.roster().registered_observers_at(sealed_at_s),
+    )?;
     remove_failed_auditors(db, sk, &history, &head, &auditors)
 }
 

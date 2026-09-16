@@ -131,3 +131,54 @@ fn a_sealed_act_is_not_queued_again_and_an_absent_path_is_not_a_fault() {
     assert_eq!(pull.skipped, [(commitment_id, "already queued or sealed")]);
     assert!(pending_ids(&db).is_empty());
 }
+
+#[test]
+fn a_registration_is_queued_only_when_the_declaration_carries_its_key() {
+    let (listener, host, client) = reserve_addr();
+    let p = make_publisher(&host);
+    write_feed(&p, &host, &[], NOW);
+    let declared = p.sk.public().to_b64u();
+    let stranger = wist_core::crypto::SigningKey::from_seed(&[9u8; 32])
+        .public()
+        .to_b64u();
+    let registration = signed_act(
+        &p,
+        "observer_register",
+        &host,
+        json!({"key_id": "k1", "alg": "Ed25519", "public_key": declared}),
+    );
+    let undeclared = signed_act(
+        &p,
+        "observer_register",
+        &host,
+        json!({"key_id": "k1", "alg": "Ed25519", "public_key": stranger}),
+    );
+    write_registry(&p, &[registration.clone(), undeclared.clone()]);
+    serve_static(listener, p.dir.path().to_path_buf());
+    let data = tempfile::tempdir().unwrap();
+    clave::init::run(&host, data.path()).unwrap();
+    let db = Db::open(&data.path().join("clave.sqlite")).unwrap();
+    clave::ingest::run(&db, &client, data.path(), &host, NOW).unwrap();
+    let pull = clave::submissions::pull(&db, &client, &host).unwrap();
+    assert!(
+        pull.queued.is_empty(),
+        "the ingest pull already queued the registration"
+    );
+    assert_eq!(
+        pending_ids(&db),
+        [clave::governance::update_id(&registration["update"]).unwrap()]
+    );
+    assert_eq!(
+        pull.skipped,
+        [
+            (
+                clave::governance::update_id(&registration["update"]).unwrap(),
+                "already queued or sealed"
+            ),
+            (
+                clave::governance::update_id(&undeclared["update"]).unwrap(),
+                "registered key is not in the domain's Declaration"
+            ),
+        ]
+    );
+}

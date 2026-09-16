@@ -1200,3 +1200,33 @@ fn roster_act_vectors_replay_in_signed_histories() {
         .collect()
     );
 }
+
+#[test]
+fn registered_observers_carry_their_key_and_registration_height() {
+    let fx = Fixture::new("log.example.org");
+    fx.append(START, vec![register("watch.example.info", "w3", "w3")]);
+    fx.append(
+        START + HOUR,
+        vec![register("watch.example.info", "w4", "w4")],
+    );
+    let roster = fx.roster();
+    assert_eq!(
+        roster.registered_observers_at(START),
+        [(
+            "watch.example.info".to_owned(),
+            "w3".to_owned(),
+            public("w3"),
+            0
+        )]
+    );
+    assert_eq!(
+        roster.registered_observers_at(START + HOUR),
+        [(
+            "watch.example.info".to_owned(),
+            "w4".to_owned(),
+            public("w4"),
+            1
+        )]
+    );
+    assert!(roster.registered_observers_at(START - 1).is_empty());
+}

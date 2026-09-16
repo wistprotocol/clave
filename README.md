@@ -1381,9 +1381,10 @@ batch: identical IDs count once, invalid candidates block nobody, and
 candidates sharing a commitment or Delta reject each other. An accepted
 reveal reserves its Deltas Log-wide. Derived-state refresh records the
 commitments live at the head, unrevealed and inside their lifetime, and
-Snapshot state emits them as `canary_commitment` tuples; scoreboards,
-`track_record` derivation from reveals and Observer tuples are not
-implemented. A signed history exercises the epoch ration, an early reveal,
+Snapshot state emits them as `canary_commitment` tuples, and the
+registrations holding at the head as `observer` tuples (observer, key
+identifier, public key, registration height, no end); scoreboards and
+`track_record` derivation from reveals are not implemented. A signed history exercises the epoch ration, an early reveal,
 a failing proof beside a valid reveal in one Block, a second reveal of a
 revealed commitment and a reserved Delta, and every `canary-acts.json` case
 replays as a signed history: the vector's acts are re-signed under fixture
@@ -1398,8 +1399,9 @@ Every Feed pull also fetches the domain's
 Registry Updates the domain signs for itself. `submissions::pull` queues each
 `observer_register`, `observer_checkpoint`, `canary_commitment` or
 `canary_reveal` whose `subject` is the serving domain and that authenticates
-under §9.1's signing rule — the key it registers, the key registered for the
-Observer, or the domain's stored Declaration Key Set — unless the pending
+under §9.1's signing rule — the key it registers, which the domain's stored
+Declaration must carry (WIST-4 §3.1's verification before sealing), the key
+registered for the Observer, or the domain's stored Declaration Key Set — unless the pending
 queue or a sealed Block already carries its Registry Update ID; seals record
 every sealed Registry Update ID for that check. An absent or malformed path
 queues nothing and is no fault; subject shape, contract and §5.1 rules are

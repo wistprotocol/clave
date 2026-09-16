@@ -12,7 +12,7 @@ use wist_core::crypto::{hex_encode, SigningKey};
 use wist_core::envelope::sign_envelope;
 use wist_core::objects::{
     AggregatorKeyEntry, AuditorEntry, CanaryCommitmentEntry, CoverageFailureEntry,
-    DeclarationEntry, EscalationEntry, ExclusionEntry, ParameterEntry, RecordEntry,
+    DeclarationEntry, EscalationEntry, ExclusionEntry, ObserverEntry, ParameterEntry, RecordEntry,
     RecoveryWindowEntry, ReputationInputsEntry, SanctionStateEntry, SnapshotFile, SnapshotIndex,
     SnapshotIndexEntry, SnapshotManifest, SnapshotState, SnapshotStateFile, StateEntry,
 };
@@ -292,6 +292,17 @@ fn build_state(
         entries.push(StateEntry::Escalation(EscalationEntry {
             domain,
             establishing_sealed_at,
+        }));
+    }
+    for (observer_id, key_id, public_key, registered_height) in
+        db.derived_observers_at(log_position)?
+    {
+        entries.push(StateEntry::Observer(ObserverEntry {
+            observer_id,
+            key_id,
+            public_key,
+            registered_height,
+            ended_height: None,
         }));
     }
     for (update_id, planter, root, leaves, sealing_height) in

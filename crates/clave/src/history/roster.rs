@@ -98,6 +98,7 @@ pub struct RosterHistory {
     roster: Roster,
     verifiers: BTreeMap<String, Option<PublicKey>>,
     registrations: Vec<(String, u64)>,
+    registration_instants: Vec<(String, u64, i64)>,
     checkpoints: Vec<SealedCheckpoint>,
     rejected: Vec<RejectedAct>,
     accepted_ids: BTreeSet<String>,
@@ -130,6 +131,7 @@ impl RosterHistory {
             roster: Roster::new(history.log_id()),
             verifiers: BTreeMap::new(),
             registrations: Vec::new(),
+            registration_instants: Vec::new(),
             checkpoints: Vec::new(),
             rejected: Vec::new(),
             accepted_ids: BTreeSet::new(),
@@ -284,6 +286,11 @@ impl RosterHistory {
                 None => {
                     if candidate.action == RosterAction::Register {
                         self.registrations.push((candidate.subject.clone(), height));
+                        self.registration_instants.push((
+                            candidate.subject.clone(),
+                            height,
+                            sealed_at_s,
+                        ));
                     }
                     if !matches!(candidate.action, RosterAction::Remove { .. }) {
                         self.verifiers
@@ -404,6 +411,32 @@ impl RosterHistory {
             key_id: binding.key_id,
             public_key,
         })
+    }
+
+    /// Registrations holding at an instant: `observer_id`, `key_id`,
+    /// `public_key` and the height of the registration act in force.
+    pub fn registered_observers_at(&self, sealed_at_s: i64) -> Vec<(String, String, String, u64)> {
+        self.roster
+            .registered_at(sealed_at_s)
+            .into_iter()
+            .filter_map(|(observer_id, key_id)| {
+                let public_key = self
+                    .roster
+                    .observer_public_key_at(observer_id, sealed_at_s)?;
+                let height = self
+                    .registration_instants
+                    .iter()
+                    .filter(|(subject, _, at)| subject == observer_id && *at <= sealed_at_s)
+                    .map(|(_, height, _)| *height)
+                    .max()?;
+                Some((
+                    observer_id.to_owned(),
+                    key_id.to_owned(),
+                    public_key.to_owned(),
+                    height,
+                ))
+            })
+            .collect()
     }
 
     pub fn checkpoints(&self) -> &[SealedCheckpoint] {
