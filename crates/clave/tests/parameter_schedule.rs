@@ -67,16 +67,17 @@ fn historical_size_vectors_replay_identically_after_reopening() {
                 .iter()
                 .map(|c| ts(c["effective_at_s"].as_i64().unwrap()))
                 .collect();
-            let changes: Vec<_> = b["amendments"]
-                .as_array()
-                .unwrap()
+            let amendments = b["amendments"].as_array().unwrap();
+            let changes: Vec<_> = amendments
                 .iter()
                 .enumerate()
-                .map(|(i, c)| ParamChangeRow {
-                    entry_index: i as u64,
-                    parameter: "block_decompressed_cap_bytes",
-                    value: c["value"].as_i64().unwrap(),
-                    effective_at: &effective[i],
+                .filter_map(|(i, c)| {
+                    Some(ParamChangeRow {
+                        entry_index: i as u64,
+                        parameter: "block_decompressed_cap_bytes",
+                        value: c["value"].as_i64()?,
+                        effective_at: &effective[i],
+                    })
                 })
                 .collect();
             db.commit_seal(
@@ -103,7 +104,7 @@ fn historical_size_vectors_replay_identically_after_reopening() {
                 break;
             }
             let replay = replay.unwrap();
-            let rejected: Vec<_> = (0..changes.len())
+            let rejected: Vec<_> = (0..amendments.len())
                 .filter(|&i| {
                     !replay
                         .accepted()

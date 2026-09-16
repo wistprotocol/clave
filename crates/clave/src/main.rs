@@ -32,6 +32,11 @@ enum Command {
     Seal {
         #[arg(long)]
         data: PathBuf,
+        /// The sealing instant as a whole-second UTC timestamp with a
+        /// literal Z, in place of the wall clock; it is floored to the
+        /// accepted cadence grid like the wall clock is.
+        #[arg(long)]
+        at: Option<String>,
     },
     VerifyHistory {
         #[arg(long)]
@@ -135,10 +140,13 @@ fn main() -> Result<(), clave::Error> {
             let db_path = data.join("clave.sqlite");
             clave::serve::run(data, db_path, bind, allow_http)?;
         }
-        Command::Seal { data } => {
+        Command::Seal { data, at } => {
             let db = clave::db::Db::open(&data.join("clave.sqlite"))?;
             let sk = clave::keys::load(&data.join("keys/seed"))?;
-            let now_epoch = jiff::Timestamp::now().as_second();
+            let now_epoch = match at {
+                Some(at) => wist_core::timestamp::log_seconds(&at)?,
+                None => jiff::Timestamp::now().as_second(),
+            };
             let report = clave::seal::run(&db, &data, &sk, now_epoch)?;
             println!(
                 "sealed block {} with {} entries",
