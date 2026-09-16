@@ -1298,3 +1298,592 @@ fn reconstruction_requires_the_complete_pinned_prefix_and_rereads_repaired_files
     .is_err());
     assert_eq!(full.anchor_hash(), through_trigger.anchor_hash());
 }
+
+fn vector_verdict(name: &str) -> Verdict {
+    match name {
+        "consistent" => Verdict::Consistent,
+        "inconsistent" => Verdict::Inconsistent,
+        "link_inconsistent" => Verdict::LinkInconsistent,
+        other => panic!("unsupported vector verdict {other}"),
+    }
+}
+
+fn evidence_vectors() -> Value {
+    serde_json::from_slice(
+        &std::fs::read(common::spec_dir().join("vectors/wist4/extension.json")).unwrap(),
+    )
+    .unwrap()
+}
+
+fn strings(value: &Value) -> Vec<String> {
+    value
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item.as_str().unwrap().to_owned())
+        .collect()
+}
+
+fn candidate(r: &Value) -> wist_core::confirmation::CandidateRecord<'_> {
+    wist_core::confirmation::CandidateRecord {
+        block_height: r["block_height"].as_u64().unwrap(),
+        entry_index: r["entry_index"].as_u64().unwrap(),
+        block_sealed_at_s: r["sealed_at_s"].as_i64().unwrap(),
+        auditor_id: r["auditor"].as_str().unwrap(),
+        effective_similarity: 0,
+    }
+}
+
+#[test]
+fn evidence_vectors_derive_rejection_from_signed_records() {
+    use clave::record::{RecordEnvelope, ReplayContext, SigningBinding};
+    use wist_core::coverage::Block;
+    use wist_core::crypto::PublicKey;
+    use wist_core::extension::{
+        evaluate, rationed_summons, summoned, trigger_indices, ExtensionClaim, ExtensionRecord,
+    };
+    use wist_core::verdict::{record_scores_valid, ChangeType, Thresholds};
+
+    let vectors = evidence_vectors();
+    let window = vectors["confirm_window_hours"].as_u64().unwrap();
+    let triggers_max = vectors["extension_triggers_max"].as_u64().unwrap();
+    let ration_days = vectors["ration_window_days"].as_u64().unwrap();
+    let roster = strings(&vectors["evidence_roster"]);
+    let roster: Vec<&str> = roster.iter().map(String::as_str).collect();
+    let publisher = vectors["evidence_publisher"].as_str().unwrap();
+    let keys: BTreeMap<String, (String, PublicKey)> = vectors["evidence_keys"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .map(|(auditor, key)| {
+            (
+                auditor.clone(),
+                (
+                    key["key_id"].as_str().unwrap().to_owned(),
+                    PublicKey::from_b64u(key["public_key"].as_str().unwrap()).unwrap(),
+                ),
+            )
+        })
+        .collect();
+    let th = &vectors["evidence_thresholds"];
+    let thresholds = Thresholds {
+        similarity_consistent: th["similarity_consistent"].as_u64().unwrap(),
+        similarity_variance_floor: th["similarity_variance_floor"].as_u64().unwrap(),
+        link_agreement_consistent: th["link_agreement_consistent"].as_u64().unwrap(),
+        link_variance_floor: th["link_variance_floor"].as_u64().unwrap(),
+        ..Thresholds::default()
+    };
+    let blocks: Vec<Block> = vectors["contradiction_blocks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|block| Block {
+            height: block["height"].as_u64().unwrap(),
+            sealed_at_s: block["sealed_at_s"].as_i64().unwrap(),
+        })
+        .collect();
+    let cases = vectors["evidence_cases"].as_array().unwrap();
+    assert!(cases.len() >= 16);
+    for case in cases {
+        let label = case["label"].as_str().unwrap();
+        let records = case["records"].as_array().unwrap();
+        let mut evidence: Vec<bool> = Vec::new();
+        for record in records {
+            let raw = record["record_json"].as_str().unwrap();
+            let rejected = strings(&record["rejected"]);
+            let diagnostic = match RecordEnvelope::parse(raw.as_bytes()) {
+                Err(code) => Some(code),
+                Ok(envelope) => {
+                    let original: Value = serde_json::from_str(raw).unwrap();
+                    let body = &original["record"];
+                    let auditor = body["auditor_id"].as_str().unwrap_or("");
+                    let binding = keys
+                        .get(auditor)
+                        .map(|(key_id, public_key)| SigningBinding {
+                            auditor_id: auditor,
+                            key_id,
+                            public_key,
+                        });
+                    let scores_valid = body["verdict"].as_str().is_some_and(|verdict| {
+                        record_scores_valid(
+                            ChangeType::New,
+                            vector_verdict(verdict),
+                            body["similarity"].as_u64(),
+                            body["link_agreement"].as_u64(),
+                            &thresholds,
+                        )
+                    });
+                    let context = &record["context"];
+                    let duty = if context["standing"] != true {
+                        Duty::Absent
+                    } else if context["removed"] == true {
+                        Duty::RemovedAfterAnchor
+                    } else {
+                        Duty::Active
+                    };
+                    envelope
+                        .disposition(&ReplayContext {
+                            signing: binding,
+                            duty,
+                            coverage_failure: context["coverage_failure"] == true,
+                            semantic_evidence_error: !scores_valid,
+                        })
+                        .diagnostic
+                }
+            };
+            assert_eq!(
+                diagnostic.is_none(),
+                rejected.is_empty(),
+                "{label}: {} {diagnostic:?}",
+                record["mutation"]
+            );
+            if let Some(code) = diagnostic {
+                assert!(
+                    rejected.iter().any(|value| value == code),
+                    "{label}: {code}"
+                );
+            }
+            evidence.push(diagnostic.is_none());
+        }
+        let mut summoning: Vec<(&str, i64)> = Vec::new();
+        let mut expected_triggers = case["triggers"].as_array().unwrap().iter();
+        for (i, record) in records.iter().enumerate() {
+            let verdict = vector_verdict(record["verdict"].as_str().unwrap());
+            let delta = record["delta"].as_str().unwrap();
+            let such = |r: &Value| {
+                r["delta"] == delta
+                    && matches!(
+                        vector_verdict(r["verdict"].as_str().unwrap()),
+                        Verdict::Inconsistent | Verdict::LinkInconsistent
+                    )
+            };
+            let prior: Vec<&Value> = records[..i]
+                .iter()
+                .zip(&evidence)
+                .filter(|(r, ok)| **ok && such(r))
+                .map(|(r, _)| r)
+                .collect();
+            let eligible = evidence[i]
+                && matches!(verdict, Verdict::Inconsistent | Verdict::LinkInconsistent)
+                && {
+                    let sequence: Vec<_> = prior
+                        .iter()
+                        .map(|r| candidate(r))
+                        .chain(std::iter::once(candidate(record)))
+                        .collect();
+                    trigger_indices(&sequence, window)
+                        .unwrap()
+                        .contains(&(sequence.len() - 1))
+                };
+            assert_eq!(eligible, record["eligible"], "{label} record {i}");
+            let summons = eligible && {
+                summoning.push((
+                    record["auditor"].as_str().unwrap(),
+                    record["sealed_at_s"].as_i64().unwrap(),
+                ));
+                let fired = *rationed_summons(&summoning, ration_days, triggers_max)
+                    .last()
+                    .unwrap();
+                if !fired {
+                    summoning.pop();
+                }
+                fired
+            };
+            assert_eq!(summons, record["summons"], "{label} record {i}");
+            let filers: Vec<&str> = prior
+                .iter()
+                .map(|r| r["auditor"].as_str().unwrap())
+                .chain(std::iter::once(record["auditor"].as_str().unwrap()))
+                .collect();
+            let peers: Vec<&str> = if summons {
+                summoned(&roster, &filers, publisher)
+                    .into_iter()
+                    .map(|index| roster[index])
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            assert_eq!(
+                peers,
+                strings(&record["summoned_auditors"]),
+                "{label} record {i}"
+            );
+            if !eligible {
+                continue;
+            }
+            let expected = expected_triggers.next().unwrap();
+            assert_eq!(
+                expected["record_index"].as_u64().unwrap() as usize,
+                i,
+                "{label}"
+            );
+            let same: Vec<ExtensionRecord> = records
+                .iter()
+                .zip(&evidence)
+                .filter(|(r, ok)| {
+                    **ok && r["delta"] == delta
+                        && r["sealed_at_s"].as_i64() >= record["sealed_at_s"].as_i64()
+                })
+                .map(|(r, _)| ExtensionRecord {
+                    position: candidate(r),
+                    verdict: match vector_verdict(r["verdict"].as_str().unwrap()) {
+                        Verdict::Consistent => wist_core::objects::audit::Verdict::Consistent,
+                        Verdict::Inconsistent => wist_core::objects::audit::Verdict::Inconsistent,
+                        _ => wist_core::objects::audit::Verdict::LinkInconsistent,
+                    },
+                })
+                .collect();
+            let trigger_index = same
+                .iter()
+                .position(|r| {
+                    r.position.block_height == record["block_height"].as_u64().unwrap()
+                        && r.position.entry_index == record["entry_index"].as_u64().unwrap()
+                })
+                .unwrap();
+            let outcome = evaluate(
+                &ExtensionClaim {
+                    trigger_index,
+                    summoned: summons,
+                    confirm_window_hours: window,
+                    confirm_auditors: 2,
+                },
+                &same,
+                &blocks,
+            )
+            .unwrap();
+            assert_eq!(
+                outcome.closing_block.map(|block| block.height),
+                expected["closes_at_height"].as_u64(),
+                "{label}"
+            );
+            assert_eq!(outcome.confirmed, expected["confirmed"], "{label}");
+            assert_eq!(
+                outcome.consistent_quorum, expected["independent_consistent_pair"],
+                "{label}"
+            );
+            assert_eq!(
+                outcome.establishing_block.map(|block| block.height),
+                expected["establishing_height"].as_u64(),
+                "{label}"
+            );
+            assert_eq!(
+                outcome.establishing_block.is_some(),
+                expected["contradicted"],
+                "{label}"
+            );
+        }
+        assert!(expected_triggers.next().is_none(), "{label}");
+    }
+}
+
+#[test]
+fn evidence_vectors_replay_as_signed_histories() {
+    let vectors = evidence_vectors();
+    let offset = 990u64;
+    let audited_height = 5u64;
+    let trigger_height = 10u64;
+    let last_height = 90u64;
+    let roster = strings(&vectors["evidence_roster"]);
+    let publisher = vectors["evidence_publisher"].as_str().unwrap();
+    let mut exercised: BTreeSet<String> = BTreeSet::new();
+    for case in vectors["evidence_cases"].as_array().unwrap() {
+        let label = case["label"].as_str().unwrap();
+        let records = case["records"].as_array().unwrap();
+        if records
+            .iter()
+            .any(|record| record["mutation"] == "coverage-failure")
+        {
+            continue;
+        }
+        let mut fx = Fixture::new();
+        let mut genesis: Vec<Value> = roster.iter().map(|auditor| fx.admit_own(auditor)).collect();
+        genesis.push(declaration(publisher, &[], "site"));
+        fx.hourly(0, genesis);
+        for height in 1..audited_height {
+            fx.hourly(height, vec![]);
+        }
+        let deltas = pages(publisher, "site", "e", 160);
+        let audited = fx.hourly(audited_height, deltas.clone());
+        let height_of = |record: &Value| record["block_height"].as_u64().unwrap() - offset;
+        let proof_height: Vec<Option<u64>> = records
+            .iter()
+            .enumerate()
+            .map(|(i, record)| {
+                records[..i].iter().find_map(|earlier| {
+                    (earlier["delta"] == record["delta"]
+                        && earlier["summons"] == true
+                        && strings(&earlier["summoned_auditors"])
+                            .contains(&record["auditor"].as_str().unwrap().to_owned()))
+                    .then(|| height_of(earlier))
+                })
+            })
+            .collect();
+        let mut delta_of: BTreeMap<String, String> = BTreeMap::new();
+        let mut used: BTreeSet<String> = BTreeSet::new();
+        for record in records {
+            let vector_delta = record["delta"].as_str().unwrap().to_owned();
+            if delta_of.contains_key(&vector_delta) {
+                continue;
+            }
+            let vrf_auditors: Vec<&str> = records
+                .iter()
+                .zip(&proof_height)
+                .filter(|(r, over)| r["delta"] == vector_delta && over.is_none())
+                .map(|(r, _)| r["auditor"].as_str().unwrap())
+                .collect();
+            let betas: Vec<[u8; 64]> = vrf_auditors
+                .iter()
+                .map(|auditor| beta(auditor, &audited))
+                .collect();
+            let chosen = first(&deltas, &|id| {
+                !used.contains(id) && betas.iter().all(|beta| drawn(beta, id, CEILING))
+            });
+            used.insert(chosen.clone());
+            delta_of.insert(vector_delta, chosen);
+        }
+        let removed: Vec<&str> = records
+            .iter()
+            .filter(|record| record["mutation"] == "removed")
+            .map(|record| record["auditor"].as_str().unwrap())
+            .collect();
+        for height in audited_height + 1..trigger_height {
+            let entries = match height {
+                7 => removed
+                    .iter()
+                    .map(|auditor| fx.remove(auditor, &key_id(auditor)))
+                    .collect(),
+                8 => removed
+                    .iter()
+                    .map(|auditor| {
+                        fx.admit(
+                            auditor,
+                            &format!("{auditor}#readmitted"),
+                            &format!("key:{auditor}:2"),
+                        )
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+            fx.hourly(height, entries);
+        }
+        let mut rows: BTreeMap<u64, BlockRow> = BTreeMap::new();
+        rows.insert(audited_height, audited.clone());
+        for height in trigger_height..=last_height {
+            let mut entries = Vec::new();
+            for (i, item) in records.iter().enumerate() {
+                if height_of(item) != height {
+                    continue;
+                }
+                let auditor = item["auditor"].as_str().unwrap();
+                let mutation = item["mutation"].as_str().unwrap();
+                exercised.insert(mutation.to_owned());
+                let over = match proof_height[i] {
+                    Some(trigger) => rows[&trigger].clone(),
+                    None => audited.clone(),
+                };
+                let audit = Audit {
+                    auditor,
+                    audited: &delta_of[item["delta"].as_str().unwrap()],
+                    proof_over: &over,
+                    fetched_at: START + over.block_number as i64 * HOUR,
+                    verdict: item["verdict"].as_str().unwrap(),
+                };
+                let own_id = key_id(auditor);
+                let resigned = |mut entry: Value, edit: &dyn Fn(&mut Value)| {
+                    let mut body = entry["body"]["record"].clone();
+                    edit(&mut body);
+                    entry["body"] =
+                        envelope::sign_envelope(&body, "record", &own_id, &key(auditor)).unwrap();
+                    entry
+                };
+                let entry = match mutation {
+                    "none" | "removed" => record(&audit),
+                    "mis-scored" => resigned(record(&audit), &|body| {
+                        body["similarity"] = json!(if audit.verdict == "inconsistent" {
+                            940_000
+                        } else {
+                            250_000
+                        });
+                    }),
+                    "missing-evidence" => resigned(record(&audit), &|body| {
+                        body.as_object_mut().unwrap().remove("evidence_commitment");
+                    }),
+                    "unsupported-major" => resigned(record(&audit), &|body| {
+                        body["wist_version"] = json!("2.0.0");
+                    }),
+                    "unknown-member" => {
+                        let mut entry = record(&audit);
+                        entry["body"]["unknown"] = json!(true);
+                        entry
+                    }
+                    "forged" => {
+                        let mut entry = record(&audit);
+                        entry["body"]["sig"]["value"] =
+                            json!(wist_core::crypto::b64u_encode(&[0u8; 64]));
+                        entry
+                    }
+                    "wrong-signer" => {
+                        let other = roster.iter().find(|peer| *peer != auditor).unwrap();
+                        record_signed(
+                            &audit,
+                            other,
+                            &key_id(other),
+                            &hex_encode(&proof(auditor, &over)),
+                        )
+                    }
+                    "no-standing" => {
+                        let mut pi = proof(auditor, &over);
+                        pi[7] ^= 1;
+                        record_signed(&audit, auditor, &own_id, &hex_encode(&pi))
+                    }
+                    other => panic!("{label}: unsupported mutation {other}"),
+                };
+                entries.push(entry);
+            }
+            let row = fx.hourly(height, entries);
+            rows.insert(height, row);
+        }
+        let history = fx.reconstruct(&ceiling).unwrap();
+        assert!(history.roster().rejected().is_empty(), "{label}");
+        let mut expected_triggers = case["triggers"].as_array().unwrap().iter();
+        for (i, record) in records.iter().enumerate() {
+            let auditor = record["auditor"].as_str().unwrap();
+            let height = height_of(record);
+            let delta = &delta_of[record["delta"].as_str().unwrap()];
+            let standing = history
+                .records()
+                .iter()
+                .find(|r| {
+                    r.position.block_number == height
+                        && r.auditor_id == auditor
+                        && r.audited_delta == *delta
+                })
+                .unwrap_or_else(|| panic!("{label}: no Record by {auditor} at Block {height}"));
+            let rejected = strings(&record["rejected"]);
+            assert_eq!(
+                standing.evidence(),
+                rejected.is_empty(),
+                "{label}: {} {:?}",
+                record["mutation"],
+                standing.diagnostic
+            );
+            if let Some(code) = standing.diagnostic {
+                assert!(
+                    rejected.iter().any(|value| value == code),
+                    "{label}: {code}"
+                );
+            }
+            match record["mutation"].as_str().unwrap() {
+                "removed" => {
+                    assert_eq!(standing.duty, Duty::RemovedAfterAnchor, "{label}");
+                    assert!(
+                        standing.authentic && standing.discharges_coverage,
+                        "{label}"
+                    );
+                }
+                "no-standing" => assert_eq!(
+                    standing.standing,
+                    Standing::Void(VoidReason::ProofWithoutStanding),
+                    "{label}"
+                ),
+                "unknown-member" => assert_eq!(
+                    standing.standing,
+                    Standing::Void(VoidReason::Malformed),
+                    "{label}"
+                ),
+                _ => assert_eq!(
+                    standing.standing,
+                    match proof_height[i] {
+                        Some(trigger_height) => Standing::Extension { trigger_height },
+                        None => Standing::Selected,
+                    },
+                    "{label}"
+                ),
+            }
+            let trigger = history.triggers().iter().find(|trigger| {
+                trigger.position.block_number == height
+                    && trigger.delta_id == *delta
+                    && trigger.auditor_id == auditor
+            });
+            assert_eq!(trigger.is_some(), record["eligible"], "{label} record {i}");
+            let Some(trigger) = trigger else {
+                continue;
+            };
+            assert_eq!(trigger.summons, record["summons"], "{label} record {i}");
+            assert_eq!(
+                trigger.summoned.iter().cloned().collect::<BTreeSet<_>>(),
+                strings(&record["summoned_auditors"])
+                    .into_iter()
+                    .collect::<BTreeSet<_>>(),
+                "{label} record {i}"
+            );
+            let expected = expected_triggers.next().unwrap();
+            assert_eq!(
+                expected["record_index"].as_u64().unwrap() as usize,
+                i,
+                "{label}"
+            );
+            if expected["closes_at_height"].is_null() {
+                assert!(
+                    trigger.outcome.is_none(),
+                    "{label}: the extension is still open"
+                );
+                continue;
+            }
+            let outcome = trigger
+                .outcome
+                .unwrap_or_else(|| panic!("{label}: extension never closed"));
+            assert_eq!(
+                outcome.closing_block.map(|block| block.height + offset),
+                expected["closes_at_height"].as_u64(),
+                "{label}"
+            );
+            assert_eq!(outcome.confirmed, expected["confirmed"], "{label}");
+            assert_eq!(
+                outcome.consistent_quorum, expected["independent_consistent_pair"],
+                "{label}"
+            );
+            assert_eq!(
+                outcome
+                    .establishing_block
+                    .map(|block| block.height + offset),
+                expected["establishing_height"].as_u64(),
+                "{label}"
+            );
+        }
+        assert!(expected_triggers.next().is_none(), "{label}");
+        let contradicted: Vec<u64> = case["triggers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|trigger| trigger["establishing_height"].as_u64())
+            .map(|height| height - offset)
+            .collect();
+        assert_eq!(
+            history
+                .escalations()
+                .iter()
+                .map(|escalation| escalation.establishing_height)
+                .collect::<Vec<_>>(),
+            contradicted,
+            "{label}"
+        );
+    }
+    assert_eq!(
+        exercised,
+        BTreeSet::from_iter(
+            [
+                "none",
+                "mis-scored",
+                "missing-evidence",
+                "unsupported-major",
+                "unknown-member",
+                "forged",
+                "wrong-signer",
+                "no-standing",
+                "removed",
+            ]
+            .map(str::to_owned)
+        )
+    );
+}

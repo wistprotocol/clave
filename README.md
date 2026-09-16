@@ -420,8 +420,9 @@ with those predicates plus a `fetched_at` inside the closed interval from the
 proof's Block to the Record's Block, a `reference_delta` in the audited Delta's
 authenticated Publisher/URL chain, not preceding it and sealed at or before the
 fetch, and verdict scores under the audited Block's thresholds. A Record with
-no diagnostic is evidence; only evidence enters triggers, filer sets and
-contradiction quorums.
+no diagnostic is evidence; under WIST-4 §4 (**Only evidence counts**) only
+evidence triggers, suppresses a later trigger, spends ration, excludes a
+peer as a filer or joins either contradiction quorum.
 
 An evidence `inconsistent` or `link_inconsistent` Record triggers when no
 earlier such evidence Record for the Delta is sealed inside the confirmation
@@ -467,6 +468,11 @@ establishing heights and escalation probes; the escalation displacing the
 floor for later Blocks of the escalated domain only; void, unauthentic,
 malformed, mis-scored, early-fetch, unknown-Delta, outside-domain, self-audit
 and removed-key Records; corrupt-file repair and pinned-prefix exclusion.
+`extension.json` evidence cases are consumed twice: the signed Records are
+parsed and dispositioned directly under their supplied contexts, and each
+case is rebuilt as an authenticated history whose replay must derive the
+same rejections, triggers, summoned sets and outcomes; the coverage-failure
+case is skipped there because that state is not derived.
 
 ## Historical coverage clocks
 
