@@ -1198,6 +1198,7 @@ pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<
         &block_hash,
         &snapshot_date,
         &sealed_at,
+        projection.domains(),
     )?;
 
     Ok(SealReport {

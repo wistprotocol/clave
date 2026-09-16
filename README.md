@@ -1633,6 +1633,14 @@ Block size, or validate other Entry bodies. A successful projection is therefore
 conditional on those checks. Recompute it if the timestamp, profile or selected
 Entries change.
 
+Snapshot `declaration` and `recovery_window` tuples are built from this
+projection at each seal (WIST-3 §7, ADR-0040): the current Envelope, its
+sealing height and the highest accepted `seq`; and, for an open window, the
+owner height, the window end, the recovery-chain head Envelope and its
+sealing height, so a resuming Consumer verifies followers against the head
+and keeps the floor a restored lower-sequence head leaves above the current
+`seq`. The live recovery test checks both tuples after a recovery rotation.
+
 The returned `Projection` exposes proposed domain state and effects, without
 an accepted head or a way to install it as authenticated history. Its Declaration
 positions, sealing times, identity resets and window openings are prospective.

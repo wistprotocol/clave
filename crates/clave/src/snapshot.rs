@@ -1,10 +1,12 @@
 use crate::db::{Db, RecordRow};
 use crate::error::{Error, Result};
+use crate::history::declarations::Domain;
 use crate::keys;
 use crate::WIST_VERSION;
 use rusqlite::Connection;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::path::Path;
 use wist_core::crypto::{hex_encode, SigningKey};
 use wist_core::envelope::sign_envelope;
@@ -203,19 +205,19 @@ fn build_state(
     data_dir: &Path,
     log_position: u64,
     records: &[RecordRow],
+    domains: &BTreeMap<String, Domain>,
 ) -> Result<(SnapshotState, String)> {
     let seed_bytes = std::fs::read(data_dir.join("keys/seed"))?;
     let seed: [u8; 32] = seed_bytes
         .try_into()
         .map_err(|_| Error::Key("seed file must be exactly 32 bytes".into()))?;
     let aggregator_public_key = keys::public_b64u(&seed);
-    let publishers = db.list_publishers()?;
     let head_sealed_at = db
         .last_block()?
         .map(|b| b.sealed_at)
         .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
 
-    let mut entries = Vec::with_capacity(2 + publishers.len() + records.len());
+    let mut entries = Vec::with_capacity(2 + domains.len() + records.len());
     entries.push(StateEntry::AggregatorKey(AggregatorKeyEntry {
         key_id: AGGREGATOR_KEY_ID.to_string(),
         public_key: aggregator_public_key,
@@ -229,21 +231,13 @@ fn build_state(
             value,
         }));
     }
-    for p in &publishers {
-        let declaration: Value = crate::json::parse(&p.declaration_json)?;
-        let seq = crate::declaration::publisher_of(&declaration)
-            .map_err(Error::History)?
-            .seq;
-        let sealing_height = db
-            .sealed_declarations(&p.domain)?
-            .into_iter()
-            .find(|d| d.seq == seq)
-            .map(|d| d.block_number)
-            .unwrap_or(0);
+    for (domain, state) in domains {
+        let current = state.current();
         entries.push(StateEntry::Declaration(DeclarationEntry {
-            domain: p.domain.clone(),
-            declaration,
-            sealing_height,
+            domain: domain.clone(),
+            declaration: current.envelope().clone(),
+            sealing_height: current.position().block_number,
+            highest_accepted_seq: state.highest_accepted_seq(),
         }));
     }
     for (auditor_id, key_id, public_key, admitted_height, removed_height) in db.roster_state()? {
@@ -267,11 +261,20 @@ fn build_state(
             deadlines: state.deadlines,
         }));
     }
-    for (domain, opened_block, window_end) in db.list_open_recovery_windows()? {
+    for (domain, state) in domains {
+        let Some(window) = state.window() else {
+            continue;
+        };
+        let end = i64::try_from(window.end_s())
+            .ok()
+            .and_then(|end| crate::registry::instant(end).ok())
+            .ok_or_else(|| Error::Snapshot("recovery window end is not a Log timestamp".into()))?;
         entries.push(StateEntry::RecoveryWindow(RecoveryWindowEntry {
-            domain,
-            declaration_height: opened_block as u64,
-            window_end,
+            domain: domain.clone(),
+            declaration_height: window.owner().position().block_number,
+            window_end: end,
+            head: window.head().envelope().clone(),
+            head_height: window.head().position().block_number,
         }));
     }
     // WIST-3 §7: a `record` tuple exists for every key the chain-tip
@@ -449,6 +452,7 @@ pub fn build(
     anchor_block_hash: &str,
     snapshot_date: &str,
     sealed_at: &str,
+    domains: &BTreeMap<String, Domain>,
 ) -> Result<()> {
     let records = prefer_one_publisher(db, apply_sanctions(db, db.list_records()?, sealed_at)?)?;
     let snapshot_dir = data_dir.join("snapshots").join(snapshot_date);
@@ -497,7 +501,7 @@ pub fn build(
     }
     let records = all_records;
 
-    let (state, state_digest_value) = build_state(db, data_dir, log_position, &records)?;
+    let (state, state_digest_value) = build_state(db, data_dir, log_position, &records, domains)?;
     let state_value = serde_json::to_value(&state)?;
     let state_envelope = sign_envelope(&state_value, "state", AGGREGATOR_KEY_ID, sk)?;
     let state_bytes = serde_json::to_vec(&state_envelope)?;

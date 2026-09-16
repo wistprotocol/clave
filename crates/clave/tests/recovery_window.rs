@@ -394,6 +394,20 @@ fn recovery_flow_queues_settles_and_rejects_superseded_deltas() {
     assert_eq!(window_entry[1], serde_json::json!(r.host));
     assert_eq!(window_entry[2], serde_json::json!(1));
     assert_eq!(window_entry[3], serde_json::json!(expected_end));
+    assert_eq!(window_entry[4]["publisher"]["seq"], serde_json::json!(1));
+    assert_eq!(window_entry[5], serde_json::json!(1));
+    let declaration_entry = state["state"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e[0] == "declaration" && e[1] == serde_json::json!(r.host))
+        .expect("snapshot state carries the current Declaration");
+    assert_eq!(
+        declaration_entry[2]["publisher"]["seq"],
+        serde_json::json!(1)
+    );
+    assert_eq!(declaration_entry[3], serde_json::json!(1));
+    assert_eq!(declaration_entry[4], serde_json::json!(1));
 
     let d4 = add_delta_signed(
         &r.p,
