@@ -257,12 +257,12 @@ fn build_state(
     }
     for domain in db.derived_sanctioned_domains(&head_sealed_at)? {
         let state = crate::sanctions::sanction_state(db, &domain, &head_sealed_at)?;
-        if state.level == 0 {
+        if state.derived_level == 0 {
             continue;
         }
         entries.push(StateEntry::SanctionState(SanctionStateEntry {
             domain,
-            level: state.level as u64,
+            level: state.derived_level as u64,
             evidence: state.evidence,
             deadlines: state.deadlines,
         }));

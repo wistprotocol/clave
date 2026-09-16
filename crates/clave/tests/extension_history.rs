@@ -455,7 +455,7 @@ fn records_bind_to_the_block_their_proof_is_over() {
             declaration(PUBLISHER, &[], "site"),
         ],
     );
-    let deltas = pages(PUBLISHER, "site", "a", 64);
+    let deltas = pages(PUBLISHER, "site", "a", 192);
     let audited = fx.hourly(1, deltas.clone());
     let (filer_beta, peer_beta) = (
         beta("audit.example.net", &audited),
@@ -856,7 +856,7 @@ fn contradiction_vectors_escalate_the_domain_from_the_closing_block() {
             .collect();
         genesis.push(declaration(PUBLISHER, &[], "site"));
         fx.hourly(0, genesis);
-        let earlier = pages(PUBLISHER, "site", "prior", 32);
+        let earlier = pages(PUBLISHER, "site", "prior", 192);
         let earlier_row = fx.hourly(1, earlier.clone());
         let earlier_beta = beta(trigger_auditor, &earlier_row);
         let prior_deltas = pick(&earlier, &|id| drawn(&earlier_beta, id, PROVISIONAL));
@@ -1034,7 +1034,7 @@ fn escalation_displaces_the_formula_for_later_blocks_of_the_domain_only() {
             declaration("other.example.org", &[], "other"),
         ],
     );
-    let deltas = pages(PUBLISHER, "site", "first", 96);
+    let deltas = pages(PUBLISHER, "site", "first", 192);
     let audited = fx.hourly(1, deltas.clone());
     let filer_beta = beta("audit.example.net", &audited);
     let d = first(&deltas, &|id| drawn(&filer_beta, id, PROVISIONAL));
@@ -1064,9 +1064,9 @@ fn escalation_displaces_the_formula_for_later_blocks_of_the_domain_only() {
         fx.hourly(height, vec![]);
     }
     let last_in_force = closing + 30 * 24 - 1;
-    let closing_pages = pages(PUBLISHER, "site", "closing", 96);
+    let closing_pages = pages(PUBLISHER, "site", "closing", 192);
     let at_closing = fx.hourly(closing, closing_pages.clone());
-    let after_pages = pages(PUBLISHER, "site", "after", 96);
+    let after_pages = pages(PUBLISHER, "site", "after", 192);
     let other_pages = pages("other.example.org", "other", "after", 96);
     let after = fx.hourly(
         closing + 1,
@@ -1075,9 +1075,9 @@ fn escalation_displaces_the_formula_for_later_blocks_of_the_domain_only() {
     for height in closing + 2..=last_in_force {
         fx.hourly(height, vec![]);
     }
-    let edge_pages = pages(PUBLISHER, "site", "edge", 96);
+    let edge_pages = pages(PUBLISHER, "site", "edge", 192);
     let edge = fx.hourly(last_in_force + 1, edge_pages.clone());
-    let expired_pages = pages(PUBLISHER, "site", "expired", 96);
+    let expired_pages = pages(PUBLISHER, "site", "expired", 192);
     let expired = fx.hourly(last_in_force + 2, expired_pages.clone());
     let between = |block: &BlockRow, deltas: &[Value]| {
         let filer_beta = beta("audit.example.net", block);
@@ -1311,7 +1311,7 @@ fn reconstruction_requires_the_complete_pinned_prefix_and_rereads_repaired_files
             declaration(PUBLISHER, &[], "site"),
         ],
     );
-    let deltas = pages(PUBLISHER, "site", "r", 32);
+    let deltas = pages(PUBLISHER, "site", "r", 192);
     let audited = fx.hourly(1, deltas.clone());
     let filer_beta = beta("audit.example.net", &audited);
     let d = first(&deltas, &|id| drawn(&filer_beta, id, PROVISIONAL));
@@ -1979,7 +1979,7 @@ fn unpublished_duties_fail_at_the_fallback_and_exclude_records_past_the_maximum(
     for height in 1..100 {
         fx.hourly(height, vec![]);
     }
-    let deltas = pages(PUBLISHER, "site", "c", 64);
+    let deltas = pages(PUBLISHER, "site", "c", 192);
     let audited = fx.hourly(100, deltas.clone());
     let filer_beta = beta("audit.example.net", &audited);
     let d = first(&deltas, &|id| drawn(&filer_beta, id, PROVISIONAL));
@@ -2236,7 +2236,7 @@ fn records_discharge_selected_and_named_deltas_and_partial_completion_fails() {
             declaration(PUBLISHER, &[], "site"),
         ],
     );
-    let deltas = pages(PUBLISHER, "site", "s", 48);
+    let deltas = pages(PUBLISHER, "site", "s", 192);
     let audited = fx.hourly(1, deltas.clone());
     let filer_beta = beta(filer, &audited);
     let selected: Vec<String> = pick(&deltas, &|id| drawn(&filer_beta, id, PROVISIONAL));
@@ -2426,7 +2426,7 @@ fn late_discharge_vectors_replay_as_signed_histories() {
         let deltas = if selected.is_empty() {
             Vec::new()
         } else {
-            pages(PUBLISHER, "site", "l", 64)
+            pages(PUBLISHER, "site", "l", 192)
         };
         let audited = fx.hourly(offset, deltas.clone());
         let filer_beta = beta(filer, &audited);
@@ -2539,7 +2539,7 @@ fn reputation_and_the_first_rung_derive_from_evidence_findings_and_lifts() {
             declaration(PUBLISHER, &[], "site"),
         ],
     );
-    let deltas = pages(PUBLISHER, "site", "r", 64);
+    let deltas = pages(PUBLISHER, "site", "r", 192);
     let audited = fx.hourly(1, deltas.clone());
     let betas: BTreeMap<&str, [u8; 64]> = [filer, checker, watcher]
         .into_iter()
@@ -2595,7 +2595,7 @@ fn reputation_and_the_first_rung_derive_from_evidence_findings_and_lifts() {
             START + HOUR + 4,
         )],
     );
-    let later = pages(PUBLISHER, "site", "later", 64);
+    let later = pages(PUBLISHER, "site", "later", 192);
     let escalated_block = fx.hourly(6, later.clone());
     let filer_later = beta(filer, &escalated_block);
     let e = first(&later, &|id| {
@@ -2619,7 +2619,7 @@ fn reputation_and_the_first_rung_derive_from_evidence_findings_and_lifts() {
         });
         vec![json!({"type": "registry_update", "body": envelope::sign_envelope(&update, "update", &key_id(filer), &key(filer)).unwrap()})]
     });
-    let after = pages(PUBLISHER, "site", "after", 64);
+    let after = pages(PUBLISHER, "site", "after", 192);
     let lifted_block = fx.hourly(10, after.clone());
     let penalised = reputation_formula_u(base_u(0), 3, 3 * DecayTable::builtin().decay(0) as u128);
     let lifted_rate = 200_000 + 3 * (1_000_000 - penalised);
@@ -2753,7 +2753,7 @@ fn a_fresh_identity_resets_reputation_inputs_and_rungs() {
             genesis_declaration.clone(),
         ],
     );
-    let deltas = pages(PUBLISHER, "site", "i", 64);
+    let deltas = pages(PUBLISHER, "site", "i", 192);
     let audited = fx.hourly(1, deltas.clone());
     let (filer_beta, checker_beta) = (beta(filer, &audited), beta(checker, &audited));
     let d = first(&deltas, &|id| {
@@ -2796,7 +2796,7 @@ fn a_fresh_identity_resets_reputation_inputs_and_rungs() {
             Some(&genesis_declaration),
         )],
     );
-    let fresh = pages(PUBLISHER, "site-fresh", "fresh", 8);
+    let fresh = pages(PUBLISHER, "site-fresh", "fresh", 192);
     fx.hourly(9, fresh.clone());
     let d2 = first(&deltas, &|id| {
         *id != d && drawn(&filer_beta, id, PROVISIONAL) && drawn(&checker_beta, id, PROVISIONAL)
@@ -2933,7 +2933,7 @@ fn attestation_vectors_replay_as_signed_histories() {
         let deltas = if empty {
             Vec::new()
         } else {
-            pages(PUBLISHER, "site", "a", 32)
+            pages(PUBLISHER, "site", "a", 192)
         };
         let duty = fx.hourly(1, deltas);
         let rotated_label = format!("{filer}#rotated");
@@ -3089,7 +3089,7 @@ fn lift_vectors_replay_as_signed_histories() {
         }
         fx.hourly(0, genesis);
         let deltas = if hosted {
-            pages(subject, "site", "l", 48)
+            pages(subject, "site", "l", 192)
         } else {
             Vec::new()
         };
@@ -3245,7 +3245,7 @@ fn same_block_discharges_settle_before_the_blocks_records_are_weighed() {
     for height in 1..100 {
         rows.insert(height, fx.hourly(height, vec![]));
     }
-    let deltas = pages(PUBLISHER, "site", "s", 64);
+    let deltas = pages(PUBLISHER, "site", "s", 192);
     let audited = fx.hourly(100, deltas.clone());
     let filer_beta = beta(filer, &audited);
     let d = first(&deltas, &|id| drawn(&filer_beta, id, PROVISIONAL));
@@ -3363,7 +3363,7 @@ fn notice_processes_replay_with_voids_and_enforceable_levels() {
             declaration(PUBLISHER, &[], "site"),
         ],
     );
-    let deltas = pages(PUBLISHER, "site", "n", 48);
+    let deltas = pages(PUBLISHER, "site", "n", 192);
     let audited = fx.hourly(1, deltas.clone());
     let (fb, cb) = (beta(filer, &audited), beta(checker, &audited));
     let d = first(&deltas, &|id| {
@@ -3539,7 +3539,7 @@ fn lapsed_appeal_sealing_deadline_voids_state_unless_an_unappealed_ruling_discha
                 declaration(PUBLISHER, &[], "site"),
             ],
         );
-        let deltas = pages(PUBLISHER, "site", "v", 48);
+        let deltas = pages(PUBLISHER, "site", "v", 192);
         let audited = fx.hourly(1, deltas.clone());
         let (fb, cb) = (beta(filer, &audited), beta(checker, &audited));
         let d = first(&deltas, &|id| {

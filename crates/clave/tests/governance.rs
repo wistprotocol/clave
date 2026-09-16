@@ -458,6 +458,28 @@ fn level4_excludes_domain_from_snapshots() {
         1,
         "level 4 is derived but not yet enforceable: the notice is unsealed"
     );
+    let state_raw = std::fs::read(s.data.path().join(format!(
+        "snapshots/{}/state.json",
+        &ts(NOW + 4 * HOUR)[..10]
+    )))
+    .unwrap();
+    let state: serde_json::Value = serde_json::from_slice(&state_raw).unwrap();
+    let tuple = state["state"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e[0] == "sanction_state" && e[1] == s.host.as_str())
+        .expect("the Snapshot state carries the derived rung before any notice");
+    assert_eq!(tuple[2], 4, "the tuple carries the derived level");
+    assert_eq!(
+        tuple[3].as_array().unwrap().len(),
+        2,
+        "the activations of rungs 3 and 4 are the finding Records that armed them"
+    );
+    assert!(
+        !snapshot_weights(s.data.path(), &ts(NOW + 4 * HOUR)[..10]).is_empty(),
+        "the Aggregator's own materialization waits for the notice"
+    );
     clave::governance::sanction(
         &s.db,
         s.data.path(),

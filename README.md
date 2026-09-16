@@ -591,8 +591,10 @@ the new head and records, for the head Block, each Publisher's derived
 or below 2 (the fallback a notice-scoped void leaves), the instant the level
 took effect, the Audit Record IDs of the active rungs' activations and the
 appeal, sealing and ruling deadlines still open, plus each admitted
-Auditor's coverage-failure state. The rows are the WIST-3 §7 `sanction_state`
-and `coverage_failure` inputs and the Aggregator's own enforcement bound.
+Auditor's coverage-failure state. The rows feed the WIST-3 §7
+`sanction_state` tuple, which carries the derived level and the activations'
+Audit Record IDs whether or not a notice has sealed, and the Aggregator's own
+enforcement bound, which is the enforceable level.
 
 `sanctions::sanction_state(database, domain, at)` reads the row of the
 highest Block sealed at or before `at`. Its level is the enforceable level;

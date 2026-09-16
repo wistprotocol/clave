@@ -1431,7 +1431,7 @@ impl Db {
 
     pub fn derived_sanctioned_domains(&self, at: &str) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare(
-            "SELECT d.domain FROM derived_publisher_state d WHERE d.sealed_at <= ?1 AND d.block_number = (SELECT MAX(block_number) FROM derived_publisher_state WHERE domain = d.domain AND sealed_at <= ?1) AND d.enforceable_level > 0 ORDER BY d.domain",
+            "SELECT d.domain FROM derived_publisher_state d WHERE d.sealed_at <= ?1 AND d.block_number = (SELECT MAX(block_number) FROM derived_publisher_state WHERE domain = d.domain AND sealed_at <= ?1) AND d.level > 0 ORDER BY d.domain",
         )?;
         let rows = stmt.query_map([at], |r| r.get::<_, String>(0))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()

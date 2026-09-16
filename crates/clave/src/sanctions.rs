@@ -12,6 +12,9 @@ pub fn sanction_level(db: &Db, domain: &str, at: &str) -> Result<u8> {
 /// by the accepted notice the Aggregator must seal before enforcing.
 pub struct SanctionState {
     pub level: u8,
+    /// WIST-4 §7's derived level, rungs 3 and 4 included whether or not a
+    /// notice has sealed: what the WIST-3 §7 `sanction_state` tuple carries.
+    pub derived_level: u8,
     pub effective_at: Option<String>,
     /// The Audit Record IDs of the active rungs' activations and each
     /// deadline still open against the state (WIST-3 §7's tuple).
@@ -23,19 +26,12 @@ pub fn sanction_state(db: &Db, domain: &str, at: &str) -> Result<SanctionState> 
     let Some(state) = crate::derived::publisher_state(db, domain, at)? else {
         return Ok(SanctionState {
             level: 0,
+            derived_level: 0,
             effective_at: None,
             evidence: Vec::new(),
             deadlines: Vec::new(),
         });
     };
-    if state.enforceable_level == 0 {
-        return Ok(SanctionState {
-            level: 0,
-            effective_at: None,
-            evidence: Vec::new(),
-            deadlines: Vec::new(),
-        });
-    }
     let lapsed = state.deadlines.iter().any(|(label, when)| {
         matches!(
             label,
@@ -47,8 +43,14 @@ pub fn sanction_state(db: &Db, domain: &str, at: &str) -> Result<SanctionState> 
     } else {
         state.enforceable_level
     };
+    let derived_level = if lapsed {
+        state.level.min(state.fallback_level)
+    } else {
+        state.level
+    };
     Ok(SanctionState {
         level,
+        derived_level,
         effective_at: (level > 0).then_some(state.level_since),
         evidence: state.evidence,
         deadlines: state
