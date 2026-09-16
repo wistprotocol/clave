@@ -146,7 +146,73 @@ pub fn refresh(db: &Db, data_dir: &Path, sk: &SigningKey) -> Result<()> {
         })
         .collect();
     db.record_derived_state(height, &head.sealed_at, &rows, &auditor_rows)?;
+    let mut reputation_inputs = Vec::new();
+    let mut escalations = Vec::new();
+    for publisher in history.publishers() {
+        if let Some(inputs) = history.reputation_inputs(&publisher, height) {
+            let mut digests: Vec<String> = inputs
+                .counted_urls
+                .iter()
+                .map(|url| counted_url_digest(&publisher, url))
+                .collect::<Result<_>>()?;
+            digests.sort();
+            let penalties = inputs
+                .penalties
+                .iter()
+                .map(|(at, severity)| instant(i128::from(*at)).map(|at| (at, u64::from(*severity))))
+                .collect::<Result<Vec<_>>>()?;
+            reputation_inputs.push((
+                publisher.clone(),
+                instant(i128::from(inputs.first_accepted_sealed_at_s))?,
+                inputs.reset_height,
+                inputs.counted_total,
+                digests,
+                penalties,
+            ));
+        }
+        if let Some(establishing) = history.live_escalation(&publisher, height) {
+            escalations.push((publisher.clone(), instant(i128::from(establishing))?));
+        }
+    }
+    let reputation_rows: Vec<crate::db::DerivedReputationInputsRow> = reputation_inputs
+        .iter()
+        .map(|(domain, first, reset, total, digests, penalties)| {
+            crate::db::DerivedReputationInputsRow {
+                domain,
+                first_accepted_at: first,
+                reset_height: *reset,
+                counted_total: *total,
+                counted_url_digests: digests,
+                penalties,
+            }
+        })
+        .collect();
+    let failures: Vec<(String, u64)> = auditors
+        .iter()
+        .flat_map(|(auditor_id, _)| {
+            history
+                .counting_failures(auditor_id, height)
+                .into_iter()
+                .map(move |duty| (auditor_id.clone(), duty))
+        })
+        .collect();
+    db.record_derived_snapshot_inputs(height, &reputation_rows, &escalations, &failures)?;
     remove_failed_auditors(db, sk, &history, &head, &auditors)
+}
+
+/// WIST-3 §7: the first 16 octets of SHA-256(JCS(domain) ‖ JCS(URL)),
+/// lowercase hex, standing in for a counted URL in the state artifact.
+pub fn counted_url_digest(domain: &str, url: &str) -> Result<String> {
+    use sha2::Digest;
+    let mut preimage = wist_core::jcs::canonicalize(&serde_json::Value::String(domain.to_owned()))
+        .map_err(|e| Error::History(e.to_string()))?;
+    preimage.extend(
+        wist_core::jcs::canonicalize(&serde_json::Value::String(url.to_owned()))
+            .map_err(|e| Error::History(e.to_string()))?,
+    );
+    Ok(wist_core::crypto::hex_encode(
+        &sha2::Sha256::digest(&preimage)[..16],
+    ))
 }
 
 /// WIST-4 §4: an Auditor in coverage failure MUST be removed by an
@@ -209,4 +275,45 @@ pub fn reputation_for_day(db: &Db, domain: &str, at: &str) -> Result<u64> {
     Ok(db
         .derived_publisher_state_before(domain, &day_start)?
         .map_or(PROVISIONAL_CAP_U, |state| state.reputation_u))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counted_url_digests_match_the_state_example() {
+        let root = std::env::var_os("WIST_SPEC_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../spec")
+            });
+        let state: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(root.join("examples/snapshot-state.json")).unwrap(),
+        )
+        .unwrap();
+        let entries = state["state"]["entries"].as_array().unwrap();
+        let inputs = entries
+            .iter()
+            .find(|e| e[0] == "reputation_inputs" && e[1] == "example.com")
+            .unwrap();
+        let digests: Vec<&str> = inputs[5]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d.as_str().unwrap())
+            .collect();
+        assert!(!digests.is_empty());
+        let matched = entries
+            .iter()
+            .filter(|e| e[0] == "record" && e[1] == "example.com")
+            .map(|e| counted_url_digest("example.com", e[2].as_str().unwrap()).unwrap())
+            .filter(|digest| digests.contains(&digest.as_str()))
+            .count();
+        assert_eq!(matched, digests.len());
+        assert_ne!(
+            counted_url_digest("example.com", "https://example.com/x").unwrap(),
+            counted_url_digest("other.example", "https://example.com/x").unwrap()
+        );
+    }
 }

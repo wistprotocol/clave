@@ -2680,6 +2680,26 @@ fn reputation_and_the_first_rung_derive_from_evidence_findings_and_lifts() {
     let both = history.reputation(PUBLISHER, 5).unwrap();
     assert_eq!(both.penalty_n, 3 * DecayTable::builtin().decay(0) as u128);
     assert_eq!(both.reputation_u, penalised);
+    let inputs = history.reputation_inputs(PUBLISHER, 5).unwrap();
+    assert_eq!(
+        inputs.first_accepted_sealed_at_s,
+        history.block_sealed_at_s(1).unwrap()
+    );
+    assert_eq!(inputs.reset_height, None);
+    assert_eq!((inputs.counted_total, inputs.counted_urls.len()), (3, 3));
+    assert_eq!(
+        inputs
+            .penalties
+            .iter()
+            .map(|(_, severity)| u128::from(*severity))
+            .sum::<u128>(),
+        3
+    );
+    assert!(inputs
+        .penalties
+        .windows(2)
+        .all(|pair| pair[0].0 <= pair[1].0));
+    assert_eq!(history.live_escalation(PUBLISHER, 5), None);
     let aged = history.reputation(PUBLISHER, 29).unwrap();
     assert_eq!(aged.age_days, 1);
     assert_eq!(aged.penalty_n, 3 * DecayTable::builtin().decay(1) as u128);
@@ -2834,6 +2854,9 @@ fn a_fresh_identity_resets_reputation_inputs_and_rungs() {
     );
     assert_eq!(history.sanction_level(PUBLISHER, 11), 0);
     assert_eq!(history.reputation(PUBLISHER, 11).unwrap().penalty_n, 0);
+    let after_reset = history.reputation_inputs(PUBLISHER, 11).unwrap();
+    assert_eq!(after_reset.reset_height, Some(8));
+    assert!(after_reset.penalties.is_empty() && after_reset.counted_urls.is_empty());
     assert!(history.level1_sanction(PUBLISHER, 7));
     let before = history.reputation(PUBLISHER, 7).unwrap();
     assert!(before.penalty_n > 0 && before.age_days == 0);

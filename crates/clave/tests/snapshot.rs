@@ -151,6 +151,7 @@ fn snapshot_build_produces_verifiable_tier0_state_and_signed_artifacts() {
     let mut saw_key = false;
     let mut saw_declaration = false;
     let mut saw_record = false;
+    let mut saw_inputs = false;
     for e in &state.entries {
         match e {
             StateEntry::AggregatorKey(k) => {
@@ -173,13 +174,21 @@ fn snapshot_build_produces_verifiable_tier0_state_and_signed_artifacts() {
                 assert_eq!(r.url, "https://example.com/alpha");
                 assert_eq!(r.delta_id, id1);
             }
+            StateEntry::ReputationInputs(inputs) => {
+                saw_inputs = true;
+                assert_eq!(inputs.domain, host);
+                assert_eq!(inputs.first_accepted_sealed_at, "2026-08-09T12:00:00Z");
+                assert_eq!(inputs.reset_height, None);
+                assert_eq!(inputs.counted_total, 0);
+                assert!(inputs.counted_url_digests.is_empty() && inputs.penalties.is_empty());
+            }
             other => panic!("unexpected state entry in this slice: {other:?}"),
         }
     }
-    assert!(saw_key && saw_declaration && saw_record);
+    assert!(saw_key && saw_declaration && saw_record && saw_inputs);
     assert_eq!(
         state.entries.len(),
-        3,
+        4,
         "no parameter is amended here, and WIST-3 §7 does not restate Registry defaults"
     );
 }

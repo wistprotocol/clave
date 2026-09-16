@@ -480,6 +480,33 @@ fn level4_excludes_domain_from_snapshots() {
         !snapshot_weights(s.data.path(), &ts(NOW + 4 * HOUR)[..10]).is_empty(),
         "the Aggregator's own materialization waits for the notice"
     );
+    let inputs = state["state"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e[0] == "reputation_inputs" && e[1] == s.host.as_str())
+        .expect("the Snapshot state carries the domain's reputation inputs");
+    assert_eq!(inputs[2], s.block0.sealed_at.as_str());
+    assert!(inputs[3].is_null());
+    assert_eq!(inputs[4], 0);
+    assert!(inputs[5].as_array().unwrap().is_empty());
+    let penalties = inputs[6].as_array().unwrap();
+    assert_eq!(
+        penalties.len(),
+        2,
+        "two Confirmed Inconsistencies penalize the domain"
+    );
+    assert!(penalties.iter().all(|p| {
+        p[0].as_str().is_some_and(|at| at.ends_with('Z'))
+            && p[1]
+                .as_u64()
+                .is_some_and(|severity| (1..=3).contains(&severity))
+    }));
+    assert!(state["state"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|e| e[0] != "escalation"));
     clave::governance::sanction(
         &s.db,
         s.data.path(),

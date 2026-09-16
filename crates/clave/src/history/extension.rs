@@ -43,6 +43,15 @@ pub struct PriorState {
     pub level1_sanction: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReputationInputs {
+    pub first_accepted_sealed_at_s: i64,
+    pub reset_height: Option<u64>,
+    pub counted_total: u64,
+    pub counted_urls: BTreeSet<String>,
+    pub penalties: Vec<(i64, u8)>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReputationState {
     pub age_days: u64,
@@ -1342,6 +1351,89 @@ impl ExtensionHistory {
             provisional: is_provisional(age_days, c),
             reputation_u: apply_provisional_cap(formula, age_days, c),
         })
+    }
+
+    pub fn reputation_inputs(&self, publisher: &str, height: u64) -> Option<ReputationInputs> {
+        self.blocks.get(height as usize)?;
+        let reset = most_recent_reset(
+            self.resets
+                .get(publisher)
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+            height,
+        );
+        let in_scope = |at: u64| at <= height && reset.is_none_or(|r| at >= r);
+        let first_accepted_sealed_at_s = self
+            .accepted
+            .get(publisher)?
+            .iter()
+            .filter(|delta| in_scope(delta.height))
+            .map(|delta| delta.sealed_at_s)
+            .min()?;
+        let audits: Vec<ConsistentAudit<'_>> = self
+            .audits
+            .get(publisher)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .map(|audit| ConsistentAudit {
+                height: audit.height,
+                audited_height: audit.audited_height,
+                url: &audit.url,
+                change: audit.change,
+            })
+            .collect();
+        let counted_urls: BTreeSet<String> = audits
+            .iter()
+            .filter(|audit| {
+                audit.height <= height
+                    && in_scope(audit.audited_height)
+                    && matches!(audit.change, ChangeType::New | ChangeType::Update)
+            })
+            .map(|audit| audit.url.to_owned())
+            .collect();
+        let mut penalties: Vec<(Position, i64, u8)> = self
+            .findings
+            .iter()
+            .filter(|finding| {
+                finding.publisher == publisher
+                    && finding.confirming.block_number <= height
+                    && in_scope(finding.audited_height)
+            })
+            .map(|finding| {
+                (
+                    finding.confirming,
+                    finding.confirming_sealed_at_s,
+                    finding.severity,
+                )
+            })
+            .collect();
+        penalties.sort_by_key(|(position, _, _)| *position);
+        Some(ReputationInputs {
+            first_accepted_sealed_at_s,
+            reset_height: reset,
+            counted_total: c_count(&audits, reset, height),
+            counted_urls,
+            penalties: penalties
+                .into_iter()
+                .map(|(_, sealed_at_s, severity)| (sealed_at_s, severity))
+                .collect(),
+        })
+    }
+
+    pub fn live_escalation(&self, publisher: &str, height: u64) -> Option<i64> {
+        let at = self.blocks.get(height as usize)?;
+        self.escalations
+            .iter()
+            .filter(|record| {
+                let age =
+                    i128::from(at.block.sealed_at_s) - i128::from(record.establishing_sealed_at_s);
+                record.publisher == publisher
+                    && record.establishing_height <= height
+                    && (0..i128::from(extension::ESCALATION_WINDOW_DAYS) * 86_400).contains(&age)
+            })
+            .map(|record| record.establishing_sealed_at_s)
+            .max()
     }
 
     pub fn sanction_level(&self, publisher: &str, height: u64) -> u8 {

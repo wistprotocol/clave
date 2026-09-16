@@ -29,6 +29,9 @@ CREATE TABLE IF NOT EXISTS sealed_declarations(domain TEXT NOT NULL, seq INTEGER
 CREATE TABLE IF NOT EXISTS roster_acts(block_number INTEGER NOT NULL, act_index INTEGER NOT NULL, sealed_at TEXT NOT NULL, action TEXT NOT NULL, auditor_id TEXT NOT NULL, key_id TEXT NOT NULL, public_key TEXT NOT NULL, for_cause INTEGER NOT NULL, PRIMARY KEY(block_number, act_index));
 CREATE TABLE IF NOT EXISTS queued_deltas(rowid INTEGER PRIMARY KEY AUTOINCREMENT, domain TEXT NOT NULL, delta_id TEXT NOT NULL, entry_json BLOB NOT NULL, url TEXT NOT NULL, chain_pos INTEGER NOT NULL, acceptance_order INTEGER);
 CREATE TABLE IF NOT EXISTS derived_publisher_state(domain TEXT NOT NULL, block_number INTEGER NOT NULL, sealed_at TEXT NOT NULL, reputation_u INTEGER NOT NULL, level INTEGER NOT NULL, enforceable_level INTEGER NOT NULL, fallback_level INTEGER NOT NULL, level_since TEXT NOT NULL, evidence_json TEXT NOT NULL, deadlines_json TEXT NOT NULL, PRIMARY KEY(domain, block_number));
+CREATE TABLE IF NOT EXISTS derived_reputation_inputs(domain TEXT NOT NULL, block_number INTEGER NOT NULL, first_accepted_at TEXT NOT NULL, reset_height INTEGER, counted_total INTEGER NOT NULL, counted_json TEXT NOT NULL, penalties_json TEXT NOT NULL, PRIMARY KEY(domain, block_number));
+CREATE TABLE IF NOT EXISTS derived_escalations(domain TEXT NOT NULL, block_number INTEGER NOT NULL, establishing_at TEXT NOT NULL, PRIMARY KEY(domain, block_number));
+CREATE TABLE IF NOT EXISTS derived_coverage_failures(auditor_id TEXT NOT NULL, block_number INTEGER NOT NULL, duty_block INTEGER NOT NULL, PRIMARY KEY(auditor_id, block_number, duty_block));
 CREATE TABLE IF NOT EXISTS derived_auditor_state(auditor_id TEXT NOT NULL, block_number INTEGER NOT NULL, sealed_at TEXT NOT NULL, coverage_failure INTEGER NOT NULL, PRIMARY KEY(auditor_id, block_number));
 ";
 
@@ -217,6 +220,25 @@ pub struct DerivedPublisherRow<'a> {
 pub struct DerivedAuditorRow<'a> {
     pub auditor_id: &'a str,
     pub coverage_failure: bool,
+}
+
+pub struct DerivedReputationInputsRow<'a> {
+    pub domain: &'a str,
+    pub first_accepted_at: &'a str,
+    pub reset_height: Option<u64>,
+    pub counted_total: u64,
+    pub counted_url_digests: &'a [String],
+    pub penalties: &'a [(String, u64)],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DerivedReputationInputs {
+    pub domain: String,
+    pub first_accepted_at: String,
+    pub reset_height: Option<u64>,
+    pub counted_total: u64,
+    pub counted_url_digests: Vec<String>,
+    pub penalties: Vec<(String, u64)>,
 }
 
 #[derive(Debug, Clone)]
@@ -1354,6 +1376,97 @@ impl Db {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    pub fn record_derived_snapshot_inputs(
+        &self,
+        block_number: u64,
+        reputation: &[DerivedReputationInputsRow],
+        escalations: &[(String, String)],
+        failures: &[(String, u64)],
+    ) -> Result<()> {
+        let tx = self.mutation()?;
+        for row in reputation {
+            tx.execute(
+                "INSERT OR REPLACE INTO derived_reputation_inputs(domain, block_number, first_accepted_at, reset_height, counted_total, counted_json, penalties_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                (
+                    row.domain,
+                    block_number as i64,
+                    row.first_accepted_at,
+                    row.reset_height.map(|h| h as i64),
+                    row.counted_total as i64,
+                    serde_json::to_string(row.counted_url_digests)?,
+                    serde_json::to_string(row.penalties)?,
+                ),
+            )?;
+        }
+        for (domain, establishing_at) in escalations {
+            tx.execute(
+                "INSERT OR REPLACE INTO derived_escalations(domain, block_number, establishing_at) VALUES (?1, ?2, ?3)",
+                (domain, block_number as i64, establishing_at),
+            )?;
+        }
+        for (auditor_id, duty_block) in failures {
+            tx.execute(
+                "INSERT OR REPLACE INTO derived_coverage_failures(auditor_id, block_number, duty_block) VALUES (?1, ?2, ?3)",
+                (auditor_id, block_number as i64, *duty_block as i64),
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn derived_reputation_inputs_at(
+        &self,
+        block_number: u64,
+    ) -> Result<Vec<DerivedReputationInputs>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT domain, first_accepted_at, reset_height, counted_total, counted_json, penalties_json FROM derived_reputation_inputs WHERE block_number = ?1 ORDER BY domain",
+        )?;
+        let rows = stmt
+            .query_map([block_number as i64], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter()
+            .map(|(domain, first, reset, total, counted, penalties)| {
+                Ok(DerivedReputationInputs {
+                    domain,
+                    first_accepted_at: first,
+                    reset_height: reset.map(|h| h as u64),
+                    counted_total: total as u64,
+                    counted_url_digests: serde_json::from_str(&counted)?,
+                    penalties: serde_json::from_str(&penalties)?,
+                })
+            })
+            .collect()
+    }
+
+    pub fn derived_escalations_at(&self, block_number: u64) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT domain, establishing_at FROM derived_escalations WHERE block_number = ?1 ORDER BY domain",
+        )?;
+        let rows = stmt.query_map([block_number as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Error::Db)
+    }
+
+    pub fn derived_coverage_failures_at(&self, block_number: u64) -> Result<Vec<(String, u64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT auditor_id, duty_block FROM derived_coverage_failures WHERE block_number = ?1 ORDER BY auditor_id, duty_block",
+        )?;
+        let rows = stmt.query_map([block_number as i64], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Error::Db)
     }
 
     fn derived_publisher_state_where(

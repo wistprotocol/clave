@@ -612,6 +612,21 @@ Auditor's coverage-failure state. The rows feed the WIST-3 §7
 Audit Record IDs whether or not a notice has sealed, and the Aggregator's own
 enforcement bound, which is the enforceable level.
 
+The same refresh records, for the head Block, each domain's reputation
+inputs (the first accepted Delta's `sealed_at` under the current identity,
+the reset height, `C`, the counted-URL digest set — the first 16 octets of
+SHA-256 over JCS(domain) followed by JCS(URL), lowercase hex, ascending —
+and the confirmed findings' `[sealed_at, severity]` pairs in Log order),
+the latest establishing instant of any escalation inside WIST-4 §4's
+30-day window, and every failed duty Block still counting for each admitted
+Auditor. The Snapshot state carries them as `reputation_inputs`,
+`escalation` and `coverage_failure` tuples (WIST-3 §7); a domain with no
+accepted Delta under its current identity has no `reputation_inputs`
+tuple. Unauditable `exclusion` tuples are not derived. The governance
+scenario checks the reputation tuple after two Confirmed Inconsistencies,
+and a unit test reproduces the counted-URL digests of the specification's
+state example.
+
 `sanctions::sanction_state(database, domain, at)` reads the row of the
 highest Block sealed at or before `at`. Its level is the enforceable level;
 where an open appeal-sealing or ruling deadline in that row is at or before

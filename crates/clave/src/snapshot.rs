@@ -11,9 +11,10 @@ use std::path::Path;
 use wist_core::crypto::{hex_encode, SigningKey};
 use wist_core::envelope::sign_envelope;
 use wist_core::objects::{
-    AggregatorKeyEntry, AuditorEntry, DeclarationEntry, ParameterEntry, RecordEntry,
-    RecoveryWindowEntry, SanctionStateEntry, SnapshotFile, SnapshotIndex, SnapshotIndexEntry,
-    SnapshotManifest, SnapshotState, SnapshotStateFile, StateEntry,
+    AggregatorKeyEntry, AuditorEntry, CoverageFailureEntry, DeclarationEntry, EscalationEntry,
+    ParameterEntry, RecordEntry, RecoveryWindowEntry, ReputationInputsEntry, SanctionStateEntry,
+    SnapshotFile, SnapshotIndex, SnapshotIndexEntry, SnapshotManifest, SnapshotState,
+    SnapshotStateFile, StateEntry,
 };
 use wist_core::snapshot::{content_digest, state_digest};
 
@@ -275,6 +276,28 @@ fn build_state(
             window_end: end,
             head: window.head().envelope().clone(),
             head_height: window.head().position().block_number,
+        }));
+    }
+    for row in db.derived_reputation_inputs_at(log_position)? {
+        entries.push(StateEntry::ReputationInputs(ReputationInputsEntry {
+            domain: row.domain,
+            first_accepted_sealed_at: row.first_accepted_at,
+            reset_height: row.reset_height,
+            counted_total: row.counted_total,
+            counted_url_digests: row.counted_url_digests,
+            penalties: row.penalties,
+        }));
+    }
+    for (domain, establishing_sealed_at) in db.derived_escalations_at(log_position)? {
+        entries.push(StateEntry::Escalation(EscalationEntry {
+            domain,
+            establishing_sealed_at,
+        }));
+    }
+    for (auditor_id, block_number) in db.derived_coverage_failures_at(log_position)? {
+        entries.push(StateEntry::CoverageFailure(CoverageFailureEntry {
+            auditor_id,
+            block_number,
         }));
     }
     // WIST-3 §7: a `record` tuple exists for every key the chain-tip
