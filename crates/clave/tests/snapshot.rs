@@ -77,7 +77,7 @@ fn snapshot_build_produces_verifiable_tier0_state_and_signed_artifacts() {
     let snapshot_dir = man_path.parent().unwrap();
 
     let files = man["manifest"]["files"].as_array().unwrap();
-    assert_eq!(files.len(), 3);
+    assert_eq!(files.len(), 6, "tier 0 and the five tier-1 tables");
     for f in files {
         let path = f["path"].as_str().unwrap();
         let bytes = std::fs::read(snapshot_dir.join(path)).unwrap();
@@ -325,7 +325,7 @@ fn sharded_snapshot_declares_count_digests_and_shard_labels() {
     let digest_bytes = Sha256::digest(host.as_bytes());
     let expected_shard = u64::from_be_bytes(digest_bytes[..8].try_into().unwrap()) % 2;
     let files = m["files"].as_array().unwrap();
-    assert_eq!(files.len(), 6, "three files per shard, both shards emitted");
+    assert_eq!(files.len(), 12, "six files per shard, both shards emitted");
     for f in files {
         let shard = f["shard"].as_u64().unwrap();
         assert!(shard < 2);

@@ -79,10 +79,11 @@ fn signed_observation_sequences_survive_restart() {
             );
             assert!(rejections.iter().all(|r| r.delta_id.is_none()));
             let paths = requests.lock().unwrap().clone();
+            let label_feed = usize::from(event["noise"] == "WIST2-E02");
             assert_eq!(
                 paths.len(),
-                2 + event["declaration_retries"].as_u64().unwrap() as usize,
-                "{name}"
+                2 + event["declaration_retries"].as_u64().unwrap() as usize + label_feed,
+                "{name}: {paths:?}"
             );
             drop(db);
             assert_eq!(

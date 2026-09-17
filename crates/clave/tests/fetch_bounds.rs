@@ -299,6 +299,7 @@ fn fetch_bounds_vector() {
         let bound = match case["object"].as_str().unwrap() {
             "declaration" | "feed" | "page" | "mirrors" => clave::fetch::OBJECT_CAP_BYTES,
             "delta" => caps.of(clave::ingest::Object::Delta),
+            "label" => caps.of(clave::ingest::Object::Label),
             "payload" => caps.of(clave::ingest::Object::Payload),
             other => panic!("{label}: unknown object {other}"),
         };

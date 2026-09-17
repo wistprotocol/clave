@@ -151,6 +151,7 @@ fn labels_and_disputes_are_pulled_sealed_and_carried() {
         "2026-08-09T12:00:00Z",
         null,
         null,
+        id,
         0
     ])));
 

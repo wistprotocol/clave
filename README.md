@@ -1,6 +1,6 @@
 # clave
 
-The signed Delta format targets [WIST specification revision `2d572b4d64e2f6fc01f57af87184b4e97be99b59`](https://github.com/wistprotocol/spec/tree/2d572b4d64e2f6fc01f57af87184b4e97be99b59). Object version `1.0.0` alone does not identify a compatible draft.
+The signed Delta format targets [WIST specification revision `daf4dbeb50dc946e18c29fcaa09fb8fd314bde1a`](https://github.com/wistprotocol/spec/tree/daf4dbeb50dc946e18c29fcaa09fb8fd314bde1a). Object version `1.0.0` alone does not identify a compatible draft.
 
 Delta ingestion checks the signed canonical `publisher` against the logical Feed domain before source selection and duplicate suppression, including fetched predecessors. Chain tips use `(publisher, url)` and persist across reopen; legacy index restoration is described under [Delta index reconciliation](#delta-index-reconciliation). Sealing and recovery settlement reject mismatches between queue ownership and the signed author. Complete authenticated Delta eligibility remains a separate validation requirement.
 

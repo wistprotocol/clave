@@ -100,9 +100,11 @@ fn signed_field_dispositions_and_retry_counts_survive_restart() {
                     .count(),
                 1
             );
+            let label_feed = usize::from(case["expected"] == "accepted");
             assert_eq!(
                 paths.len(),
-                2 + case["declaration_retries"].as_u64().unwrap() as usize
+                2 + case["declaration_retries"].as_u64().unwrap() as usize + label_feed,
+                "{name}: {paths:?}"
             );
             assert_eq!(db.count_pending_entries("delta").unwrap(), 0);
             assert_eq!(*response.lock().unwrap(), raw);
