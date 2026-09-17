@@ -551,11 +551,7 @@ fn prefer_one_publisher(db: &Db, records: Vec<RecordRow>) -> Result<Vec<RecordRo
             .iter()
             .copied()
             .find(|index| records[*index].publisher == host);
-        if own.is_none()
-            && indices
-                .iter()
-                .all(|index| records[*index].publisher == host)
-        {
+        if indices.len() == 1 && own.is_some() {
             continue;
         }
         let self_declared = own.is_some()
@@ -567,29 +563,15 @@ fn prefer_one_publisher(db: &Db, records: Vec<RecordRow>) -> Result<Vec<RecordRo
                     sealed
                 }
             };
-        let preferred = if self_declared {
-            own
-        } else {
-            let ancestor = |index: &usize| {
-                host.strip_suffix(records[*index].publisher.as_str())
-                    .is_some_and(|prefix| prefix.ends_with('.'))
-            };
+        let preferred = wist_core::materialization::preferred(
+            host,
+            self_declared,
             indices
                 .iter()
-                .copied()
-                .filter(ancestor)
-                .max_by_key(|index| records[*index].publisher.len())
-                .or_else(|| {
-                    indices.iter().copied().min_by(|a, b| {
-                        records[*a]
-                            .publisher
-                            .as_bytes()
-                            .cmp(records[*b].publisher.as_bytes())
-                    })
-                })
-        };
+                .map(|index| records[*index].publisher.as_str()),
+        );
         for index in indices {
-            keep[index] = preferred == Some(index);
+            keep[index] = preferred == Some(records[index].publisher.as_str());
         }
     }
     Ok(records
