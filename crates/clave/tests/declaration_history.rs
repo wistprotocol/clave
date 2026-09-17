@@ -832,6 +832,8 @@ fn legacy_recovery_owners_require_authenticated_matching_history() {
                     &[],
                     &[],
                     &[],
+                    &[],
+                    &[],
                     jcs::canonicalize(block).unwrap().len() as u64,
                 )
                 .unwrap();

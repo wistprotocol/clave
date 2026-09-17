@@ -1,7 +1,10 @@
 use super::prepare::PreparedBlock;
 use super::{SealReport, GENESIS_KEY_ID};
 use crate::db::Mutation;
-use crate::db::{Db, ParamChangeRow, RecordUpsert, SealedDeclarationRow, WithdrawalRow};
+use crate::db::{
+    Db, ParamChangeRow, RecordUpsert, SealedDeclarationRow, SealedDisputeRow, SealedLabelRow,
+    WithdrawalRow,
+};
 use crate::error::{Error, Result};
 use crate::WIST_VERSION;
 use std::path::Path;
@@ -88,6 +91,48 @@ pub(super) fn block(
             domain: &w.domain,
         })
         .collect();
+    let sealed_labels: Vec<(String, u64, wist_core::objects::Label)> = seal_entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.entry_type == "label")
+        .map(|(index, e)| {
+            Ok((
+                wist_core::label::label_id(&e.body["label"])
+                    .map_err(|r| Error::Seal(format!("sealed label: {r:?}")))?,
+                index as u64,
+                serde_json::from_value(e.body["label"].clone())?,
+            ))
+        })
+        .collect::<Result<_>>()?;
+    let label_rows: Vec<SealedLabelRow> = sealed_labels
+        .iter()
+        .map(|(id, index, label)| SealedLabelRow {
+            label_id: id,
+            entry_index: *index,
+            label,
+        })
+        .collect();
+    let sealed_disputes: Vec<(String, u64, wist_core::objects::Dispute)> = seal_entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.entry_type == "dispute")
+        .map(|(index, e)| {
+            Ok((
+                wist_core::label::dispute_id(&e.body["dispute"])
+                    .map_err(|r| Error::Seal(format!("sealed dispute: {r:?}")))?,
+                index as u64,
+                serde_json::from_value(e.body["dispute"].clone())?,
+            ))
+        })
+        .collect::<Result<_>>()?;
+    let dispute_rows: Vec<SealedDisputeRow> = sealed_disputes
+        .iter()
+        .map(|(id, index, dispute)| SealedDisputeRow {
+            dispute_id: id,
+            entry_index: *index,
+            dispute,
+        })
+        .collect();
     let sealed_declarations: Vec<(String, u64, Vec<u8>)> = seal_entries
         .iter()
         .filter(|e| e.entry_type == "publisher_declaration")
@@ -117,6 +162,8 @@ pub(super) fn block(
         &param_changes,
         &withdrawal_rows,
         &suffix_lists,
+        &label_rows,
+        &dispute_rows,
         &declaration_rows,
         block_bytes.len() as u64,
     )?;

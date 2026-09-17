@@ -10,11 +10,12 @@ pub(crate) use prepare::validate_pending_parameter;
 
 pub(super) const GENESIS_KEY_ID: &str = "log1";
 
-pub(super) const ENTRY_TYPE_ORDER: [&str; 4] = [
+pub(super) const ENTRY_TYPE_ORDER: [&str; 5] = [
     "publisher_declaration",
     "registry_update",
     "publisher_delta",
     "label",
+    "dispute",
 ];
 
 pub struct SealReport {

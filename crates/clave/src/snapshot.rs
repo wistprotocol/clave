@@ -10,10 +10,11 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use wist_core::crypto::{hex_encode, SigningKey};
 use wist_core::envelope::sign_envelope;
+use wist_core::label::{self, LabelerRow, SealedLabelCount};
 use wist_core::objects::{
-    AggregatorKeyEntry, DeclarationEntry, ParameterEntry, RecordEntry, RecoveryWindowEntry,
-    SnapshotFile, SnapshotIndex, SnapshotIndexEntry, SnapshotManifest, SnapshotState,
-    SnapshotStateFile, StateEntry, SuffixListEntry, WithdrawalEntry,
+    AggregatorKeyEntry, DeclarationEntry, DisputeEntry, LabelEntry, ParameterEntry, RecordEntry,
+    RecoveryWindowEntry, SnapshotFile, SnapshotIndex, SnapshotIndexEntry, SnapshotManifest,
+    SnapshotState, SnapshotStateFile, StateEntry, SuffixListEntry, WithdrawalEntry,
 };
 use wist_core::snapshot::{content_digest, state_digest};
 
@@ -129,6 +130,183 @@ fn write_parquet_strings(
     Ok(std::fs::read(path)?)
 }
 
+/// One column of a tier-1 table: required or optional, text or integer.
+enum Column {
+    Text(Vec<Vec<u8>>),
+    OptionalText(Vec<Option<Vec<u8>>>),
+    Int(Vec<i64>),
+    OptionalInt(Vec<Option<i64>>),
+}
+
+fn write_parquet_table(path: &Path, schema: &str, columns: &[Column]) -> Result<Vec<u8>> {
+    use parquet::data_type::{ByteArray, ByteArrayType, Int64Type};
+    use parquet::file::properties::WriterProperties;
+    use parquet::file::writer::SerializedFileWriter;
+    use parquet::schema::parser::parse_message_type;
+    let schema = std::sync::Arc::new(
+        parse_message_type(schema).map_err(|e| Error::Snapshot(format!("parquet schema: {e}")))?,
+    );
+    let props = std::sync::Arc::new(WriterProperties::builder().build());
+    let file = std::fs::File::create(path)?;
+    let mut writer = SerializedFileWriter::new(file, schema, props)
+        .map_err(|e| Error::Snapshot(format!("parquet writer: {e}")))?;
+    let mut rg = writer
+        .next_row_group()
+        .map_err(|e| Error::Snapshot(format!("parquet row group: {e}")))?;
+    for column in columns {
+        let mut col = rg
+            .next_column()
+            .map_err(|e| Error::Snapshot(format!("parquet column: {e}")))?
+            .ok_or_else(|| Error::Snapshot("parquet schema/column mismatch".into()))?;
+        let written = match column {
+            Column::Text(values) => {
+                let values: Vec<ByteArray> = values
+                    .iter()
+                    .map(|v| ByteArray::from(v.as_slice()))
+                    .collect();
+                col.typed::<ByteArrayType>()
+                    .write_batch(&values, None, None)
+            }
+            Column::OptionalText(values) => {
+                let levels: Vec<i16> = values.iter().map(|v| i16::from(v.is_some())).collect();
+                let present: Vec<ByteArray> = values
+                    .iter()
+                    .flatten()
+                    .map(|v| ByteArray::from(v.as_slice()))
+                    .collect();
+                col.typed::<ByteArrayType>()
+                    .write_batch(&present, Some(&levels), None)
+            }
+            Column::Int(values) => col.typed::<Int64Type>().write_batch(values, None, None),
+            Column::OptionalInt(values) => {
+                let levels: Vec<i16> = values.iter().map(|v| i16::from(v.is_some())).collect();
+                let present: Vec<i64> = values.iter().flatten().copied().collect();
+                col.typed::<Int64Type>()
+                    .write_batch(&present, Some(&levels), None)
+            }
+        };
+        written.map_err(|e| Error::Snapshot(format!("parquet write: {e}")))?;
+        col.close()
+            .map_err(|e| Error::Snapshot(format!("parquet close: {e}")))?;
+    }
+    rg.close()
+        .map_err(|e| Error::Snapshot(format!("parquet close: {e}")))?;
+    writer
+        .close()
+        .map_err(|e| Error::Snapshot(format!("parquet close: {e}")))?;
+    Ok(std::fs::read(path)?)
+}
+
+fn text(values: impl Iterator<Item = String>) -> Column {
+    Column::Text(values.map(String::into_bytes).collect())
+}
+
+fn optional_text(values: impl Iterator<Item = Option<String>>) -> Column {
+    Column::OptionalText(values.map(|v| v.map(String::into_bytes)).collect())
+}
+
+/// WIST-3 §7: the label, dispute and labeler tables of one shard.
+struct LabelTables {
+    labels: Vec<u8>,
+    disputes: Vec<u8>,
+    labelers: Vec<u8>,
+}
+
+fn build_label_tables(
+    dir: &Path,
+    labels: &[LabelEntry],
+    disputes: &[DisputeEntry],
+    labelers: &[LabelerRow],
+) -> Result<LabelTables> {
+    std::fs::create_dir_all(dir)?;
+    let labels_bytes = write_parquet_table(
+        &dir.join("labels.parquet"),
+        "message labels { required binary labeler (UTF8); required binary subject (UTF8); required binary name (UTF8); optional int64 value; required binary asserted_at (UTF8); optional binary expires_at (UTF8); optional binary delta (UTF8); }",
+        &[
+            text(labels.iter().map(|l| l.labeler.clone())),
+            text(labels.iter().map(|l| l.subject.clone())),
+            text(labels.iter().map(|l| l.name.clone())),
+            Column::OptionalInt(labels.iter().map(|l| l.value.map(|v| v as i64)).collect()),
+            text(labels.iter().map(|l| l.asserted_at.clone())),
+            optional_text(labels.iter().map(|l| l.expires_at.clone())),
+            optional_text(labels.iter().map(|l| l.delta.clone())),
+        ],
+    )?;
+    let disputes_bytes = write_parquet_table(
+        &dir.join("disputes.parquet"),
+        "message disputes { required binary label_id (UTF8); required binary disputant (UTF8); optional binary reason (UTF8); required binary asserted_at (UTF8); }",
+        &[
+            text(disputes.iter().map(|d| d.label_id.clone())),
+            text(disputes.iter().map(|d| d.disputant.clone())),
+            optional_text(disputes.iter().map(|d| d.reason.clone())),
+            text(disputes.iter().map(|d| d.asserted_at.clone())),
+        ],
+    )?;
+    let labelers_bytes = write_parquet_table(
+        &dir.join("labelers.parquet"),
+        "message labelers { required binary labeler (UTF8); required int64 label_count; required int64 retraction_count; required int64 distinct_subjects; required int64 first_seen_height; }",
+        &[
+            text(labelers.iter().map(|r| r.labeler.clone())),
+            Column::Int(labelers.iter().map(|r| r.label_count as i64).collect()),
+            Column::Int(labelers.iter().map(|r| r.retraction_count as i64).collect()),
+            Column::Int(labelers.iter().map(|r| r.distinct_subjects as i64).collect()),
+            Column::Int(labelers.iter().map(|r| r.first_seen_height as i64).collect()),
+        ],
+    )?;
+    Ok(LabelTables {
+        labels: labels_bytes,
+        disputes: disputes_bytes,
+        labelers: labelers_bytes,
+    })
+}
+
+/// WIST-2 §3.3 and WIST-3 §7: the current Labels and disputes the Log's
+/// sealed Entries leave at a Snapshot whose head Block is sealed at
+/// `head_sealed_at`, and the labeler statistics over every sealed Label.
+fn label_state(
+    db: &Db,
+    head_sealed_at: &str,
+) -> Result<(Vec<LabelEntry>, Vec<DisputeEntry>, Vec<LabelerRow>)> {
+    let sealed = db.sealed_labels()?;
+    let mut by_triple: BTreeMap<(String, String, String), Vec<&label::SealedLabel>> =
+        BTreeMap::new();
+    for entry in &sealed {
+        by_triple
+            .entry((
+                entry.label.labeler.clone(),
+                entry.label.subject.clone(),
+                entry.label.name.clone(),
+            ))
+            .or_default()
+            .push(entry);
+    }
+    let labels: Vec<LabelEntry> = by_triple
+        .values()
+        .filter_map(|group| label::current_label(group.iter().copied()))
+        .filter_map(|current| label::label_tuple(current, head_sealed_at))
+        .collect();
+    let disputes_sealed = db.sealed_disputes()?;
+    let mut by_pair: BTreeMap<(String, String), Vec<&label::SealedDispute>> = BTreeMap::new();
+    for entry in &disputes_sealed {
+        by_pair
+            .entry((entry.dispute.label.clone(), entry.dispute.disputant.clone()))
+            .or_default()
+            .push(entry);
+    }
+    let disputes: Vec<DisputeEntry> = by_pair
+        .values()
+        .filter_map(|group| label::current_dispute(group.iter().copied()))
+        .map(label::dispute_tuple)
+        .collect();
+    let labelers = label::labeler_rows(sealed.iter().map(|entry| SealedLabelCount {
+        height: entry.height,
+        labeler: &entry.label.labeler,
+        subject: &entry.label.subject,
+        retracted: entry.label.retracted == Some(true),
+    }));
+    Ok((labels, disputes, labelers))
+}
+
 fn build_tier1(dir: &Path, rows: &[Tier1Row]) -> Result<(Vec<u8>, Vec<u8>)> {
     std::fs::create_dir_all(dir)?;
     let extracts_bytes = write_parquet_strings(
@@ -236,6 +414,9 @@ fn build_state(
             sealing_height,
         }));
     }
+    let (labels, disputes, _) = label_state(db, &head_sealed_at)?;
+    entries.extend(labels.into_iter().map(StateEntry::Label));
+    entries.extend(disputes.into_iter().map(StateEntry::Dispute));
     for (domain, state) in domains {
         let current = state.current();
         entries.push(StateEntry::Declaration(DeclarationEntry {
@@ -429,6 +610,11 @@ pub fn build(
     }
     let content_digest_value = content_digest(&whole_projection)?;
 
+    let head_sealed_at = db
+        .last_block()?
+        .map(|b| b.sealed_at)
+        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
+    let (label_rows, dispute_rows, labeler_rows) = label_state(db, &head_sealed_at)?;
     let mut files = Vec::new();
     let mut shard_digests = Vec::new();
     let mut all_records = Vec::new();
@@ -442,10 +628,35 @@ pub fn build(
         let sqlite_bytes = build_tier0(&shard_base.join("tier0"), &shard_records)?;
         let tier1_rows = load_tier1_rows(data_dir, &shard_records);
         let (extracts_bytes, links_bytes) = build_tier1(&shard_base.join("tier1"), &tier1_rows)?;
+        let in_shard = |domain: &str| !sharded || shard_index(domain, shard_count) as usize == i;
+        let shard_labels: Vec<LabelEntry> = label_rows
+            .iter()
+            .filter(|l| in_shard(&l.labeler))
+            .cloned()
+            .collect();
+        let shard_disputes: Vec<DisputeEntry> = dispute_rows
+            .iter()
+            .filter(|d| in_shard(&d.disputant))
+            .cloned()
+            .collect();
+        let shard_labelers: Vec<LabelerRow> = labeler_rows
+            .iter()
+            .filter(|r| in_shard(&r.labeler))
+            .cloned()
+            .collect();
+        let tables = build_label_tables(
+            &shard_base.join("tier1"),
+            &shard_labels,
+            &shard_disputes,
+            &shard_labelers,
+        )?;
         for (rel, bytes, tier) in [
             ("tier0/index.sqlite", &sqlite_bytes, 0u8),
             ("tier1/extracts.parquet", &extracts_bytes, 1),
             ("tier1/links.parquet", &links_bytes, 1),
+            ("tier1/labels.parquet", &tables.labels, 1),
+            ("tier1/disputes.parquet", &tables.disputes, 1),
+            ("tier1/labelers.parquet", &tables.labelers, 1),
         ] {
             files.push(SnapshotFile {
                 path: format!("{prefix}{rel}"),
@@ -544,6 +755,8 @@ mod tests {
                 abstract_text: None,
                 lang: "en",
             }],
+            &[],
+            &[],
             &[],
             &[],
             &[],

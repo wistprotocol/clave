@@ -5,7 +5,7 @@ use crate::history::declarations::DeclarationsReplay;
 use serde_json::Value;
 use std::path::Path;
 use wist_core::delta::delta_id;
-use wist_core::objects::{DeltaEnvelope, FeedEnvelope, Publisher};
+use wist_core::objects::{DeltaEnvelope, FeedEnvelope, Publisher, PublisherEnvelope};
 
 use crate::declaration::{self, Decision};
 use crate::registry;
@@ -17,6 +17,8 @@ pub struct IngestReport {
     pub accepted: Vec<String>,
     pub queued: Vec<String>,
     pub rejected: Vec<(String, String)>,
+    /// Label and Dispute IDs accepted for sealing from the Label Feed.
+    pub labels: Vec<String>,
     pub noise: Option<&'static str>,
     pub suspended: bool,
 }
@@ -395,6 +397,8 @@ pub enum Object {
     Page,
     Delta,
     Payload,
+    /// A Label or Dispute Envelope, bounded as a Delta file is.
+    Label,
 }
 
 /// Per-object bounds: Feed pages by the shared object cap, a Delta file
@@ -417,7 +421,7 @@ impl ObjectCaps {
     pub fn of(&self, object: Object) -> u64 {
         match object {
             Object::Page => crate::fetch::OBJECT_CAP_BYTES,
-            Object::Delta => self.delta,
+            Object::Delta | Object::Label => self.delta,
             Object::Payload => self.payload,
         }
     }
@@ -1099,6 +1103,23 @@ pub fn run_bounded(
         chain_pos += 1;
     }
 
+    if !suspended {
+        let sizes = declaration::delta::SizeCaps::from_schedule(
+            &db.parameter_schedule(now_epoch)?,
+            now_epoch,
+        );
+        suspended = pull_labels(
+            db,
+            client,
+            data_dir,
+            host,
+            &base,
+            now,
+            &meter,
+            sizes.url_cap_bytes,
+            &mut report,
+        )?;
+    }
     db.set_walk_suspended(host, suspended)?;
     report.suspended = suspended;
     if !suspended {
@@ -1106,6 +1127,7 @@ pub fn run_bounded(
             && report.accepted.is_empty()
             && report.queued.is_empty()
             && report.rejected.is_empty()
+            && report.labels.is_empty()
         {
             report.noise = Some("WIST2-E02");
         }
@@ -1113,6 +1135,205 @@ pub fn run_bounded(
     }
 
     Ok(report)
+}
+
+/// WIST-2 §3.3: pulls the domain's Label Feed beside its Feed, walking it
+/// under §3.2's rules and the ingest budget, validates each unseen Label
+/// or dispute under the accepted Declaration and queues it as a `label`
+/// or `dispute` Entry; a failure is `WIST2-E06` at the status endpoint.
+/// Returns whether the walk suspended under the budget: a Label walk
+/// that cannot begin under a spent budget waits for the next pull
+/// without suspending the Feed walk that completed before it.
+#[allow(clippy::too_many_arguments)]
+fn pull_labels(
+    db: &Db,
+    client: &Client,
+    data_dir: &Path,
+    host: &str,
+    base: &str,
+    now: &str,
+    meter: &Meter,
+    url_cap_bytes: i64,
+    report: &mut IngestReport,
+) -> Result<bool> {
+    use wist_core::label::{self, LabelLookup};
+    let Some(raw) = db.get_publisher_declaration(host)? else {
+        return Ok(false);
+    };
+    let declaration_doc = crate::json::parse(&raw)?;
+    let declaration = PublisherEnvelope {
+        publisher: declaration::publisher_of(&declaration_doc)
+            .map_err(crate::error::Error::History)?,
+        sig: serde_json::from_value(declaration_doc["sig"].clone())?,
+    };
+    let mut page_url = format!("{base}label-feed.json");
+    let mut pages: Vec<Vec<String>> = Vec::new();
+    let mut page_key_sets = None;
+    loop {
+        let live = pages.is_empty();
+        let fetched = match meter.get(client, &page_url, Object::Page) {
+            Ok(Some(v)) => v,
+            Ok(None) => return Ok(!live),
+            Err(e) => {
+                if !live {
+                    record_rejection(db, host, "WIST2-E01", now, None, &e.to_string())?;
+                }
+                break;
+            }
+        };
+        let (_, value) = fetched;
+        let parsed = match feed::validate_fields(&value) {
+            Ok(feed) => feed,
+            Err(detail) => {
+                record_rejection(db, host, "WIST2-E06", now, None, detail)?;
+                break;
+            }
+        };
+        if parsed.feed.domain != host {
+            record_rejection(
+                db,
+                host,
+                "WIST2-E06",
+                now,
+                None,
+                "label feed domain does not match the host it was fetched from",
+            )?;
+            break;
+        }
+        let verified = if live {
+            verify_live_feed(db, host, &value)?
+        } else {
+            if page_key_sets.is_none() {
+                page_key_sets = Some(page_declarations(db, data_dir, host)?);
+            }
+            verify_sealed_page(
+                page_key_sets.as_ref().unwrap(),
+                &value,
+                &parsed.feed.generated_at,
+            )
+        };
+        if !verified {
+            record_rejection(
+                db,
+                host,
+                "WIST2-E06",
+                now,
+                None,
+                "label feed signature does not verify against the domain's Key Set",
+            )?;
+            break;
+        }
+        if live && !db.observe_label_feed_generated_at(host, &parsed.feed.generated_at)? {
+            record_rejection(
+                db,
+                host,
+                "WIST2-E05",
+                now,
+                None,
+                "live Label Feed generated_at precedes the retained authenticated observation",
+            )?;
+            break;
+        }
+        let mut unseen = false;
+        for id in &parsed.feed.deltas {
+            if !db.is_label_seen_for(id, host)? {
+                unseen = true;
+                break;
+            }
+        }
+        let next = parsed.feed.next.clone();
+        pages.push(parsed.feed.deltas.clone());
+        if !unseen {
+            break;
+        }
+        match next.and_then(|n| next_page_url(&n, host, client.allow_http())) {
+            Some(u) => page_url = u,
+            None => break,
+        }
+    }
+    let ids: Vec<String> = pages.iter().rev().flatten().cloned().collect();
+    for id in ids {
+        if db.is_label_seen_for(&id, host)? {
+            continue;
+        }
+        let Some(hex) = id.strip_prefix("sha256:") else {
+            record_rejection(db, host, "WIST2-E06", now, Some(&id), "malformed Label ID")?;
+            report.rejected.push((id, "WIST2-E06".into()));
+            continue;
+        };
+        let doc = match meter.get(client, &format!("{base}labels/{hex}.json"), Object::Label) {
+            Ok(Some((_, doc))) => doc,
+            Ok(None) => return Ok(true),
+            Err(e) => {
+                record_rejection(db, host, "WIST2-E06", now, Some(&id), &e.to_string())?;
+                report.rejected.push((id, "WIST2-E06".into()));
+                continue;
+            }
+        };
+        let (kind, computed, outcome) = if doc.get("label").is_some() {
+            (
+                "label",
+                label::label_id(&doc["label"]),
+                label::validate_label(&doc, &declaration, url_cap_bytes).map(|_| ()),
+            )
+        } else if doc.get("dispute").is_some() {
+            (
+                "dispute",
+                label::dispute_id(&doc["dispute"]),
+                label::validate_dispute(&doc, &declaration, |label_id| {
+                    db.sealed_label_subject(label_id)
+                        .ok()
+                        .flatten()
+                        .map_or(LabelLookup::Absent, |subject| LabelLookup::Known {
+                            subject,
+                        })
+                })
+                .map(|_| ()),
+            )
+        } else {
+            record_rejection(
+                db,
+                host,
+                "WIST2-E06",
+                now,
+                Some(&id),
+                "file carries neither a Label nor a dispute",
+            )?;
+            report.rejected.push((id, "WIST2-E06".into()));
+            continue;
+        };
+        if computed.as_deref() != Ok(id.as_str()) {
+            record_rejection(
+                db,
+                host,
+                "WIST2-E06",
+                now,
+                Some(&id),
+                "file does not carry the listed ID",
+            )?;
+            report.rejected.push((id, "WIST2-E06".into()));
+            continue;
+        }
+        match outcome {
+            Ok(()) => {
+                db.insert_pending_entry(kind, host, &doc, 0)?;
+                db.insert_seen_label(&id, host)?;
+                report.labels.push(id);
+            }
+            Err(rejection) => {
+                record_rejection(
+                    db,
+                    host,
+                    rejection.code(),
+                    now,
+                    Some(&id),
+                    &format!("{kind} rejected: {rejection:?}"),
+                )?;
+                report.rejected.push((id, rejection.code().into()));
+            }
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]

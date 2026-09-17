@@ -146,6 +146,7 @@ fn rotated_feed_retries_the_same_bytes_after_first_contact_or_cached_discovery()
                     format!("{PREFIX}publisher.json"),
                     format!("{PREFIX}deltas/{}.json", &id[7..]),
                     format!("{PREFIX}payloads/{}.json", &id[7..]),
+                    format!("{PREFIX}label-feed.json"),
                 ]
             );
             drop(db);

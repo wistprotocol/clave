@@ -128,7 +128,8 @@ pub(super) fn block(
 
     let (peeked, _up_to_rowid) = db.peek_pending_entries()?;
     let domain_cap = registry::effective(db, "domain_block_entries_max", &sealed_at)?;
-    let peeked = fit_to_domain_cap(db, peeked, domain_cap, block_number)?;
+    let labeler_cap = registry::effective(db, "labeler_block_entries_max", &sealed_at)?;
+    let peeked = fit_to_domain_cap(db, peeked, domain_cap, labeler_cap, block_number)?;
     let seal_entries = storage_order(peeked)?;
     let schedule = db.parameter_schedule(sealed_epoch)?;
     let mut cap = registry::block_cap(&schedule, sealed_epoch).min(registry::effective(
@@ -419,18 +420,23 @@ pub(crate) fn validate_pending_parameter(
 /// WIST-3 §3.2: a Block MUST NOT carry more than
 /// `domain_block_entries_max` `publisher_delta`, `label` and `dispute`
 /// Entries of one Registrable Domain under the snapshot in force at it
-/// (WIST-4 §3.1). The surplus waits its turn in acceptance order, and
-/// WIST-4 §6.4's inclusion ceiling runs from the Block an Entry's turn
-/// arrives in — the first with room for it — which is recorded here.
+/// (WIST-4 §3.1), nor more than `labeler_block_entries_max` `label` and
+/// `dispute` Entries of one. The surplus waits its turn in acceptance
+/// order, and WIST-4 §6.4's inclusion ceiling runs from the Block an
+/// Entry's turn arrives in — the first with room for it — which is
+/// recorded here.
 pub(super) fn fit_to_domain_cap(
     db: &Db,
     peeked: Vec<PendingEntryRow>,
     cap: i64,
+    labeler_cap: i64,
     block_number: u64,
 ) -> Result<Vec<PendingEntryRow>> {
     let cap = cap.max(0) as usize;
+    let labeler_cap = labeler_cap.max(0) as usize;
     let list = crate::suffix_list::in_force_at_block(db, block_number)?;
     let mut taken: HashMap<String, usize> = HashMap::new();
+    let mut labeled: HashMap<String, usize> = HashMap::new();
     let mut kept = Vec::with_capacity(peeked.len());
     for p in peeked {
         if !matches!(
@@ -441,9 +447,16 @@ pub(super) fn fit_to_domain_cap(
             continue;
         }
         let unit = wist_core::suffix_list::registrable_domain(&p.domain, list.as_deref()).domain;
-        let count = taken.entry(unit).or_insert(0);
+        let count = taken.entry(unit.clone()).or_insert(0);
         if *count >= cap {
             continue;
+        }
+        if p.entry_type != "publisher_delta" {
+            let opinions = labeled.entry(unit).or_insert(0);
+            if *opinions >= labeler_cap {
+                continue;
+            }
+            *opinions += 1;
         }
         *count += 1;
         db.set_turn_block(p.rowid, block_number)?;
@@ -462,7 +475,12 @@ pub(super) fn late_inclusions(
     let ceiling = ceiling.max(0) as u64;
     entries
         .iter()
-        .filter(|e| e.entry_type == "publisher_delta")
+        .filter(|e| {
+            matches!(
+                e.entry_type.as_str(),
+                "publisher_delta" | "label" | "dispute"
+            )
+        })
         .filter_map(|e| {
             let turn = e.turn_block?;
             (block_number > turn + ceiling).then(|| {
@@ -1031,6 +1049,8 @@ mod tests {
             &[],
             std::slice::from_ref(&identifier),
             &[],
+            &[],
+            &[],
             0,
         )
         .unwrap();
@@ -1039,10 +1059,10 @@ mod tests {
                 .unwrap();
         }
         let peeked = db.peek_pending_entries().unwrap().0;
-        let under_none = fit_to_domain_cap(&db, peeked, 1, 0).unwrap();
+        let under_none = fit_to_domain_cap(&db, peeked, 1, 1, 0).unwrap();
         assert_eq!(under_none.len(), 3);
         let peeked = db.peek_pending_entries().unwrap().0;
-        let under_list = fit_to_domain_cap(&db, peeked, 1, 1).unwrap();
+        let under_list = fit_to_domain_cap(&db, peeked, 1, 1, 1).unwrap();
         let kept: Vec<&str> = under_list.iter().map(|p| p.domain.as_str()).collect();
         assert_eq!(kept, ["a.example.com", "alice.github.io"]);
     }

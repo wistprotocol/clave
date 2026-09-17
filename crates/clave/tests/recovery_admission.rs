@@ -63,6 +63,8 @@ fn append(db: &Db, path: &std::path::Path, doc: &Value) {
         &[],
         &[],
         &[],
+        &[],
+        &[],
         bytes.len() as u64,
     )
     .unwrap();

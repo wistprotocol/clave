@@ -463,6 +463,8 @@ fn index_restoration_uses_signed_block_caps_and_rejects_oversized_history_atomic
                 &[],
                 &[],
                 &[],
+                &[],
+                &[],
                 jcs::canonicalize(doc).unwrap().len() as u64,
             )
             .unwrap();

@@ -137,6 +137,20 @@ pub struct WithdrawalRow<'a> {
 /// withdrawal, the WIST-3 §7 `withdrawal` tuple.
 pub type WithdrawalState = (String, String, u64);
 
+/// A `label` Entry this Block seals, at its canonical Entry index.
+pub struct SealedLabelRow<'a> {
+    pub label_id: &'a str,
+    pub entry_index: u64,
+    pub label: &'a wist_core::objects::Label,
+}
+
+/// A `dispute` Entry this Block seals, at its canonical Entry index.
+pub struct SealedDisputeRow<'a> {
+    pub dispute_id: &'a str,
+    pub entry_index: u64,
+    pub dispute: &'a wist_core::objects::Dispute,
+}
+
 pub struct SealedDeclarationRow<'a> {
     pub domain: &'a str,
     pub seq: u64,
@@ -1003,6 +1017,8 @@ impl Db {
         param_changes: &[ParamChangeRow],
         withdrawals: &[WithdrawalRow],
         suffix_lists: &[String],
+        labels: &[SealedLabelRow],
+        disputes: &[SealedDisputeRow],
         declarations: &[SealedDeclarationRow],
         decompressed_bytes: u64,
     ) -> Result<()> {
@@ -1049,8 +1065,156 @@ impl Db {
                 (block_number as i64, identifier),
             )?;
         }
+        for row in labels {
+            let label = row.label;
+            tx.execute(
+                "INSERT OR IGNORE INTO labels(label_id, labeler, subject, name, value, asserted_at, retracted, expires_at, delta, block_number, entry_index) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                rusqlite::params![
+                    row.label_id,
+                    label.labeler,
+                    label.subject,
+                    label.name,
+                    label.value,
+                    label.asserted_at,
+                    label.retracted == Some(true),
+                    label.expires_at,
+                    label.delta,
+                    block_number as i64,
+                    row.entry_index as i64,
+                ],
+            )?;
+            tx.execute(
+                "INSERT OR IGNORE INTO seen_labels(id, domain) VALUES (?1, ?2)",
+                (row.label_id, &label.labeler),
+            )?;
+        }
+        for row in disputes {
+            let dispute = row.dispute;
+            tx.execute(
+                "INSERT OR IGNORE INTO disputes(dispute_id, label_id, disputant, reason, asserted_at, block_number, entry_index) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    row.dispute_id,
+                    dispute.label,
+                    dispute.disputant,
+                    dispute.reason,
+                    dispute.asserted_at,
+                    block_number as i64,
+                    row.entry_index as i64,
+                ],
+            )?;
+            tx.execute(
+                "INSERT OR IGNORE INTO seen_labels(id, domain) VALUES (?1, ?2)",
+                (row.dispute_id, &dispute.disputant),
+            )?;
+        }
         tx.commit()?;
         Ok(())
+    }
+
+    /// WIST-2 §3.3: a Label ID or Dispute ID the Log sealed or holds
+    /// accepted for sealing is seen, exactly as a Delta ID is.
+    pub fn is_label_seen_for(&self, id: &str, domain: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM seen_labels WHERE id = ?1 AND domain = ?2",
+                (id, domain),
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    pub fn insert_seen_label(&self, id: &str, domain: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO seen_labels(id, domain) VALUES (?1, ?2)",
+            (id, domain),
+        )?;
+        Ok(())
+    }
+
+    /// The subject of a Label this Log sealed, for a dispute's check.
+    pub fn sealed_label_subject(&self, label_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT subject FROM labels WHERE label_id = ?1",
+                [label_id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// The Label Feed's retained authenticated observation (WIST-2 §3.3,
+    /// under §3.2's rules): accepted when `at` does not regress it.
+    pub(crate) fn observe_label_feed_generated_at(&self, domain: &str, at: &str) -> Result<bool> {
+        let at = crate::registry::epoch(at)?;
+        Ok(self
+            .conn
+            .query_row(
+                "INSERT INTO label_feed_observations(domain, generated_at_s) VALUES (?1, ?2)
+                 ON CONFLICT(domain) DO UPDATE SET generated_at_s = excluded.generated_at_s
+                 WHERE excluded.generated_at_s >= label_feed_observations.generated_at_s
+                 RETURNING generated_at_s",
+                rusqlite::params![domain, at],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// Every sealed `label` Entry in Log order.
+    pub fn sealed_labels(&self) -> Result<Vec<wist_core::label::SealedLabel>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT label_id, labeler, subject, name, value, asserted_at, retracted, expires_at, delta, block_number, entry_index FROM labels ORDER BY block_number, entry_index",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(wist_core::label::SealedLabel {
+                    label: wist_core::objects::Label {
+                        wist_version: crate::WIST_VERSION.to_string(),
+                        labeler: row.get(1)?,
+                        subject: row.get(2)?,
+                        name: row.get(3)?,
+                        value: row.get(4)?,
+                        asserted_at: row.get(5)?,
+                        retracted: row.get::<_, bool>(6)?.then_some(true),
+                        expires_at: row.get(7)?,
+                        delta: row.get(8)?,
+                    },
+                    label_id: row.get(0)?,
+                    height: row.get::<_, i64>(9)?.max(0) as u64,
+                    entry_index: row.get::<_, i64>(10)?.max(0) as u64,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Every sealed `dispute` Entry in Log order.
+    pub fn sealed_disputes(&self) -> Result<Vec<wist_core::label::SealedDispute>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT dispute_id, label_id, disputant, reason, asserted_at, block_number, entry_index FROM disputes ORDER BY block_number, entry_index",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(wist_core::label::SealedDispute {
+                    dispute: wist_core::objects::Dispute {
+                        wist_version: crate::WIST_VERSION.to_string(),
+                        disputant: row.get(2)?,
+                        label: row.get(1)?,
+                        log: String::new(),
+                        height: 0,
+                        reason: row.get(3)?,
+                        asserted_at: row.get(4)?,
+                    },
+                    dispute_id: row.get(0)?,
+                    height: row.get::<_, i64>(5)?.max(0) as u64,
+                    entry_index: row.get::<_, i64>(6)?.max(0) as u64,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     pub fn store_suffix_list(&self, identifier: &str, octets: &[u8]) -> Result<()> {
@@ -1775,6 +1939,8 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
+            &[],
             0,
         )
         .unwrap();
@@ -1800,6 +1966,8 @@ mod tests {
                 value: 800,
                 effective_at: "2026-01-20T00:00:00Z",
             }],
+            &[],
+            &[],
             &[],
             &[],
             &[],
@@ -2005,6 +2173,8 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
+            &[],
             0,
         )
         .unwrap();
@@ -2049,6 +2219,8 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
+            &[],
             0,
         )
         .unwrap();
@@ -2071,6 +2243,8 @@ mod tests {
             0,
             "sha256:blockhash0-conflict",
             "2026-08-09T00:01:00Z",
+            &[],
+            &[],
             &[],
             &[],
             &[],

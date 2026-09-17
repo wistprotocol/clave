@@ -1,6 +1,6 @@
 # clave
 
-The signed Delta format targets [WIST specification revision `d75bd49abcfbbe6a672e4fb695e078b489f51ba7`](https://github.com/wistprotocol/spec/tree/d75bd49abcfbbe6a672e4fb695e078b489f51ba7). Object version `1.0.0` alone does not identify a compatible draft.
+The signed Delta format targets [WIST specification revision `2d572b4d64e2f6fc01f57af87184b4e97be99b59`](https://github.com/wistprotocol/spec/tree/2d572b4d64e2f6fc01f57af87184b4e97be99b59). Object version `1.0.0` alone does not identify a compatible draft.
 
 Delta ingestion checks the signed canonical `publisher` against the logical Feed domain before source selection and duplicate suppression, including fetched predecessors. Chain tips use `(publisher, url)` and persist across reopen; legacy index restoration is described under [Delta index reconciliation](#delta-index-reconciliation). Sealing and recovery settlement reject mismatches between queue ownership and the signed author. Complete authenticated Delta eligibility remains a separate validation requirement.
 
@@ -31,6 +31,19 @@ is in force from the Block after it; `init --suffix-list <file>` pins
 one for Block 0, and without a pinned snapshot every Canonical Host is
 its own accounting unit), `mirror` (maintain the signed
 `/log/mirrors.json`).
+
+Every Feed pull also pulls the domain's Label Feed where it serves one
+(WIST-2 §3.3): `label-feed.json` and its Pages walk under the Feed's
+rules and the ingest budget, each unseen Label or dispute is fetched
+from `labels/<id>.json` and validated through core under the accepted
+Declaration — fields, the registry name, self-labeling, the disputed
+Label's sealing and authority, the signature — and queued as a `label`
+or `dispute` Entry, sealed after the Deltas under the per-domain
+capacity and the per-Labeler cap; a failure is `WIST2-E06` at the status
+endpoint with the ID, pulled again on the next pull. The Snapshot state
+carries the current Labels and disputes as `label` and `dispute`
+tuples, and tier 1 carries `labels.parquet`, `disputes.parquet` and
+`labelers.parquet` (WIST-3 §7).
 
 `serve` additionally enforces the flat `quota_base` ping quota (429 +
 Retry-After; only WIST2-E02/E04 pings count as noise), accounted per

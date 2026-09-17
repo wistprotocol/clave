@@ -90,6 +90,8 @@ fn historical_size_vectors_replay_identically_after_reopening() {
                 &[],
                 &[],
                 &[],
+                &[],
+                &[],
                 b["jcs_bytes"].as_u64().unwrap(),
             )
             .unwrap();
@@ -178,6 +180,8 @@ fn prospective_vectors_filter_rejected_history_and_preserve_every_future_map() {
                 &ts(group[0]["sealed_at_s"].as_i64().unwrap()),
                 &[],
                 &rows,
+                &[],
+                &[],
                 &[],
                 &[],
                 &[],
