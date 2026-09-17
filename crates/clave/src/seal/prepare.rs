@@ -225,6 +225,7 @@ pub(super) fn block(
     let candidate_bytes = jcs::canonicalize(&serde_json::to_value(&candidate)?)?.len() as u64;
     let mut outcome = enforce_governance(
         db,
+        &sk.public(),
         seal_entries,
         sealed_epoch,
         block_number,
@@ -578,42 +579,65 @@ pub(super) fn revalidate_queued_deltas(
     Ok((kept, dropped_rowids, dropped))
 }
 
-/// WIST-4 §5.1: a `payload_withdrawal` names a Delta sealed at or below
-/// its Block whose signed publisher is the act's subject; an act failing
-/// that contract is WIST4-E04 and is not sealed. A later withdrawal of an
-/// already withdrawn Delta seals and changes nothing.
+/// WIST-4 §5.1 through core's withdrawal replay: the act must verify under
+/// the Log key and name a Delta sealed at or below this Block — one this
+/// Block seals or one the store already holds — whose signed publisher is
+/// the subject; a failing act is dropped with its code, and a repeated
+/// withdrawal seals and changes nothing.
 fn check_withdrawal(
     db: &Db,
-    update: &Value,
-    block_deltas: &HashSet<(String, String)>,
-) -> std::result::Result<OwnedWithdrawal, String> {
-    let parsed: wist_core::objects::RegistryUpdate =
-        serde_json::from_value(update.clone()).map_err(|e| format!("WIST4-E11 {e}"))?;
-    let details = match parsed.typed_details().map_err(|e| e.to_string())? {
-        wist_core::objects::RegistryDetails::PayloadWithdrawal(details) => details,
-        _ => return Err("WIST4-E04 action is not a payload_withdrawal".into()),
+    replay: &mut wist_core::withdrawal::WithdrawalReplay,
+    log_key: &wist_core::crypto::PublicKey,
+    body: &Value,
+    block_number: u64,
+    block_deltas: &HashMap<String, String>,
+) -> std::result::Result<Option<OwnedWithdrawal>, String> {
+    use wist_core::withdrawal::{Disposition, SealedDelta};
+    let subject = body["update"]["subject"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let lookup = |delta_id: &str| match block_deltas.get(delta_id) {
+        Some(publisher) => SealedDelta::Known {
+            publisher: publisher.clone(),
+            height: block_number,
+        },
+        None => match db.is_delta_sealed_for(delta_id, &subject) {
+            Ok(true) => SealedDelta::Known {
+                publisher: subject.clone(),
+                height: block_number,
+            },
+            _ => SealedDelta::Absent,
+        },
     };
-    let domain = parsed.subject;
-    let in_block = block_deltas.contains(&(domain.clone(), details.delta_id.clone()));
-    if !in_block
-        && !db
-            .is_delta_sealed_for(&details.delta_id, &domain)
-            .map_err(|e| e.to_string())?
-    {
-        return Err(format!(
-            "WIST4-E04 {} is not a sealed Delta of {domain}",
-            details.delta_id
-        ));
+    match replay.apply(
+        block_number,
+        body,
+        |key_id| (key_id == GENESIS_KEY_ID).then(|| log_key.clone()),
+        lookup,
+    ) {
+        Disposition::Accepted {
+            delta_id,
+            publisher,
+            ..
+        } => Ok(Some(OwnedWithdrawal {
+            update_id: crate::governance::update_id(&body["update"]).map_err(|e| e.to_string())?,
+            delta_id,
+            domain: publisher,
+        })),
+        Disposition::Rejected(code) => Err(format!(
+            "{code} payload_withdrawal {} is not sealed",
+            body["update"]["details"]["delta_id"]
+                .as_str()
+                .unwrap_or("without a Delta ID")
+        )),
+        Disposition::NotWithdrawal => Ok(None),
     }
-    Ok(OwnedWithdrawal {
-        update_id: crate::governance::update_id(update).map_err(|e| e.to_string())?,
-        delta_id: details.delta_id,
-        domain,
-    })
 }
 
 pub(super) fn enforce_governance(
     db: &Db,
+    log_key: &wist_core::crypto::PublicKey,
     entries: Vec<SealEntry>,
     sealed_epoch: i64,
     block_number: u64,
@@ -628,16 +652,20 @@ pub(super) fn enforce_governance(
         dropped: Vec::new(),
         dropped_rowids: Vec::new(),
     };
-    let block_deltas: HashSet<(String, String)> = entries
+    let block_deltas: HashMap<String, String> = entries
         .iter()
         .filter(|e| e.entry_type == "publisher_delta")
         .map(|e| {
             Ok((
-                e.domain.clone(),
                 wist_core::delta::delta_id(&e.body["delta"])?,
+                e.domain.clone(),
             ))
         })
         .collect::<Result<_>>()?;
+    let mut replay = wist_core::withdrawal::WithdrawalReplay::new();
+    for (delta_id, domain, height) in db.withdrawal_state()? {
+        replay.adopt(&delta_id, &domain, height);
+    }
     for (index, e) in entries.into_iter().enumerate() {
         if e.entry_type != "registry_update" {
             out.kept.push(e);
@@ -663,16 +691,26 @@ pub(super) fn enforce_governance(
                     out.dropped_rowids.push(e.rowid);
                 }
             },
-            Some("payload_withdrawal") => match check_withdrawal(db, &update, &block_deltas) {
-                Ok(withdrawal) => {
-                    out.withdrawals.push(withdrawal);
-                    out.kept.push(e);
+            Some("payload_withdrawal") => {
+                match check_withdrawal(
+                    db,
+                    &mut replay,
+                    log_key,
+                    &e.body,
+                    block_number,
+                    &block_deltas,
+                ) {
+                    Ok(Some(withdrawal)) => {
+                        out.withdrawals.push(withdrawal);
+                        out.kept.push(e);
+                    }
+                    Ok(None) => out.kept.push(e),
+                    Err(reason) => {
+                        out.dropped.push(reason);
+                        out.dropped_rowids.push(e.rowid);
+                    }
                 }
-                Err(reason) => {
-                    out.dropped.push(reason);
-                    out.dropped_rowids.push(e.rowid);
-                }
-            },
+            }
             _ => out.kept.push(e),
         }
     }

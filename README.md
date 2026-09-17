@@ -19,10 +19,11 @@ rules checked, `effective_at` held past the grace period, applied to the
 live parameter set once its Block seals and the effective instant passes;
 a change whose grace window lapses while queued is dropped from the Block
 and reported by `seal`), `withdraw` (queue a `payload_withdrawal`, WIST-4
-§5.1 and WIST-3 §6.2: the act seals only beside or above the Delta it
-names, deletes the Payload, drops the record, stops serving snapshots that
-still contain it and leaves a `withdrawal` tuple in every later Snapshot
-state; a repeated withdrawal seals and changes nothing), `mirror`
+§5.1 and WIST-3 §6.2: at sealing the act replays through core's
+withdrawal engine under the Log key, seals only beside or above the
+Delta it names, deletes the Payload, drops the record, stops serving
+snapshots that still contain it and leaves a `withdrawal` tuple in every
+later Snapshot state; a repeated withdrawal seals and changes nothing), `mirror`
 (maintain the signed `/log/mirrors.json`).
 
 `serve` additionally enforces the flat `quota_base` ping quota (429 +
