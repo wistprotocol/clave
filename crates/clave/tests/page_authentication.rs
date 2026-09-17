@@ -35,22 +35,15 @@ impl Fixture {
         let previous = current_declaration(&self.publisher);
         let mut publisher = previous["publisher"].clone();
         publisher["seq"] = seq.into();
-        publisher["keys"] = json!([key_entry("k1", &K1_SEED, "2026-08-09T00:00:00Z"), page_key]);
+        publisher["keys"] = json!([key_entry(&K1_SEED, "2026-08-09T00:00:00Z"), page_key]);
         if seq > 0 {
             publisher["prev_declaration"] = declaration_hash(&previous).into();
         }
-        self.install_document(publisher, "k1", &K1_SEED, now, seal);
+        self.install_document(publisher, &K1_SEED, now, seal);
     }
 
-    fn install_document(
-        &self,
-        publisher: Value,
-        signer: &str,
-        seed: &[u8; 32],
-        now: &str,
-        seal: bool,
-    ) {
-        write_declaration(&self.publisher, &publisher, signer, seed);
+    fn install_document(&self, publisher: Value, seed: &[u8; 32], now: &str, seal: bool) {
+        write_declaration(&self.publisher, &publisher, seed);
         write_feed(&self.publisher, &self.host, &[], now);
         let report = self.ingest(now);
         assert!(report.rejected.is_empty());
@@ -116,7 +109,7 @@ impl Fixture {
                 now,
                 Some(&page_url(&self.host, 0)),
             );
-            write_feed_page_signed(&self.publisher, &self.host, 0, &[], cut, None, "page", seed);
+            write_feed_page_signed(&self.publisher, &self.host, 0, &[], cut, None, seed);
             let report = self.ingest(now);
             assert_eq!(
                 report.noise,
@@ -141,7 +134,7 @@ impl Fixture {
 }
 
 fn page_key(seed: &[u8; 32]) -> Value {
-    key_entry("page", seed, "2099-01-01T00:00:00Z")
+    key_entry(seed, "2099-01-01T00:00:00Z")
 }
 
 #[test]
@@ -169,28 +162,6 @@ fn reused_page_identifiers_preserve_current_and_first_next_authority() {
 }
 
 #[test]
-fn renamed_page_keys_use_only_current_and_first_next_named_entries() {
-    let mut fixture = Fixture::new();
-    fixture.install(
-        0,
-        key_entry("old", &K2_SEED, "2099-01-01T00:00:00Z"),
-        "2026-08-09T12:00:00Z",
-        true,
-    );
-    fixture.install(1, page_key(&K2_SEED), "2026-08-09T13:00:00Z", true);
-    fixture.install(
-        2,
-        key_entry("later", &K2_SEED, "2099-01-01T00:00:00Z"),
-        "2026-08-09T14:00:00Z",
-        true,
-    );
-    fixture.probe("2026-08-09T11:00:00Z", &K2_SEED, false);
-    fixture.probe("2026-08-09T12:30:00Z", &K2_SEED, true);
-    fixture.probe("2026-08-09T13:00:00Z", &K2_SEED, true);
-    fixture.probe("2026-08-09T14:00:00Z", &K2_SEED, false);
-}
-
-#[test]
 fn a_lower_sequence_in_the_selected_block_cannot_supply_page_keys() {
     let mut fixture = Fixture::new();
     fixture.install(0, page_key(&K2_SEED), "2026-08-09T12:00:00Z", true);
@@ -207,7 +178,7 @@ fn excluded_page_bindings_cannot_borrow_keys_from_other_declarations() {
     let mut fixture = Fixture::new();
     fixture.install(0, page_key(&K2_SEED), "2026-08-09T12:00:00Z", true);
     let mut excluded = page_key(&R1_SEED);
-    excluded["public_key"] = wist_core::crypto::b64u_encode(&[0; 32]).into();
+    rekey(&mut excluded, &wist_core::crypto::b64u_encode(&[0; 32]));
     fixture.install(1, excluded, "2026-08-09T13:00:00Z", true);
     fixture.install(2, page_key(&X1_SEED), "2026-08-09T14:00:00Z", true);
     fixture.probe("2026-08-09T13:30:00Z", &K2_SEED, false);
@@ -325,24 +296,24 @@ fn completed_recovery_excludes_page_sources_at_current_and_first_next_cutoffs() 
         .as_array_mut()
         .unwrap()
         .push(page_key(&K2_SEED));
-    initial["recovery_keys"] = json!([key_entry("r1", &R1_SEED, "2026-08-09T00:00:00Z")]);
-    fixture.install_document(initial, "k1", &K1_SEED, "2026-08-09T12:00:00Z", true);
+    initial["recovery_keys"] = json!([key_entry(&R1_SEED, "2026-08-09T00:00:00Z")]);
+    fixture.install_document(initial, &K1_SEED, "2026-08-09T12:00:00Z", true);
     let mut owner = current_declaration(&fixture.publisher)["publisher"].clone();
     owner["seq"] = 1.into();
     owner["prev_declaration"] = declaration_hash(&current_declaration(&fixture.publisher)).into();
     owner["keys"][1] = page_key(&X1_SEED);
-    fixture.install_document(owner, "r1", &R1_SEED, "2026-08-09T13:00:00Z", true);
+    fixture.install_document(owner, &R1_SEED, "2026-08-09T13:00:00Z", true);
     let owner = current_declaration(&fixture.publisher);
     let mut competitor = owner["publisher"].clone();
     competitor["seq"] = 2.into();
     competitor["prev_declaration"] = declaration_hash(&owner).into();
     competitor["keys"][1] = page_key(&[13; 32]);
-    fixture.install_document(competitor, "page", &[13; 32], "2026-08-09T14:00:00Z", true);
+    fixture.install_document(competitor, &[13; 32], "2026-08-09T14:00:00Z", true);
     let mut follower = owner["publisher"].clone();
     follower["seq"] = 3.into();
     follower["prev_declaration"] = declaration_hash(&owner).into();
     follower["keys"][1] = page_key(&[17; 32]);
-    fixture.install_document(follower, "k1", &K1_SEED, "2026-08-09T15:00:00Z", true);
+    fixture.install_document(follower, &K1_SEED, "2026-08-09T15:00:00Z", true);
     for now in ["2026-08-09T18:00:00Z", "2026-08-16T13:00:00Z"] {
         for cut in ["2026-08-09T13:30:00Z", "2026-08-09T14:00:00Z"] {
             fixture.probe_at(cut, &[13; 32], true, now);

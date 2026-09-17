@@ -71,8 +71,10 @@ fn seal_produces_verifiable_chain() {
 fn seal_orders_same_type_entries_by_ascending_leaf_hash() {
     let (listener, host, client) = reserve_addr();
     let p = make_publisher_with_scope(&host, &["example.com"]);
-    let id1 = add_delta(&p, "https://example.com/a0", "alpha body", None);
-    let id2 = add_delta(&p, "https://example.com/b0", "beta body", None);
+    // Ingested in the order below, whose leaf hashes invert it, so the test
+    // cannot pass without a real sort.
+    let id1 = add_delta(&p, "https://example.com/b0", "beta body", None);
+    let id2 = add_delta(&p, "https://example.com/a0", "alpha body", None);
     write_feed(
         &p,
         &host,

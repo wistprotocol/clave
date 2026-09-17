@@ -67,7 +67,7 @@ fn redeclare(p: &common::TestPub, seq: u64, scope: Option<&[&str]>) -> serde_jso
             next.as_object_mut().unwrap().remove("subdomain_scope");
         }
     }
-    write_declaration(p, &next, "k1", &[1u8; 32]);
+    write_declaration(p, &next, &[1u8; 32]);
     current_declaration(p)
 }
 

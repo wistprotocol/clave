@@ -4,6 +4,9 @@ use serde_json::{json, Value};
 use wist_core::crypto::SigningKey;
 use wist_core::{block, envelope, jcs, merkle};
 
+mod common;
+use common::{key_entry_public, kid};
+
 fn entry(declaration: &Value) -> Value {
     json!({"type": "publisher_declaration", "body": declaration})
 }
@@ -48,23 +51,23 @@ fn check_capped_chain(oversized_predecessor: bool, spellings: [&str; 2]) {
             .verifying_key()
             .to_bytes(),
     );
+    let kid = kid(&[71; 32]);
     let initial = envelope::sign_envelope(
         &json!({
             "wist_version": "1.0.0",
             "domain": "example.com",
             "seq": 0,
-            "keys": [{"key_id": "k1", "alg": "Ed25519", "public_key": public_key,
-                "valid_from": "2026-08-01T00:00:00Z"}]
+            "keys": [key_entry_public(&public_key, "2026-08-01T00:00:00Z")]
         }),
         "publisher",
-        "k1",
+        &kid,
         &publisher_key,
     )
     .unwrap();
     db.record_publisher_declaration(
         "example.com",
         &serde_json::to_vec(&initial).unwrap(),
-        "k1",
+        &kid,
         &public_key,
         &initial,
     )
@@ -82,7 +85,7 @@ fn check_capped_chain(oversized_predecessor: bool, spellings: [&str; 2]) {
             .collect::<Vec<_>>());
     }
     let predecessor =
-        envelope::sign_envelope(&predecessor_body, "publisher", "k1", &publisher_key).unwrap();
+        envelope::sign_envelope(&predecessor_body, "publisher", &kid, &publisher_key).unwrap();
     let successor = (0..256)
         .find_map(|nonce| {
             let mut body = predecessor_body.clone();
@@ -90,7 +93,7 @@ fn check_capped_chain(oversized_predecessor: bool, spellings: [&str; 2]) {
             body["prev_declaration"] = clave::declaration::inner_hash(&predecessor).unwrap().into();
             body["subdomain_scope"] = json!([format!("s{nonce}.example.com")]);
             let candidate =
-                envelope::sign_envelope(&body, "publisher", "k1", &publisher_key).unwrap();
+                envelope::sign_envelope(&body, "publisher", &kid, &publisher_key).unwrap();
             (leaf(&candidate) < leaf(&predecessor)).then_some(candidate)
         })
         .expect("a deterministic successor hashes before its predecessor");
@@ -122,7 +125,7 @@ fn check_capped_chain(oversized_predecessor: bool, spellings: [&str; 2]) {
         db.update_publisher_declaration(
             "example.com",
             &serde_json::to_vec(declaration).unwrap(),
-            "k1",
+            &kid,
             &public_key,
             declaration,
         )

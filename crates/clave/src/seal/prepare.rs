@@ -110,6 +110,15 @@ pub(super) fn block(
                 .default
                 .unwrap()
         });
+    let activation_blocks = history
+        .schedule()
+        .and_then(|schedule| schedule.value_at("declaration_activation_blocks", sealed_epoch))
+        .unwrap_or_else(|| {
+            registry::spec("declaration_activation_blocks")
+                .unwrap()
+                .default
+                .unwrap()
+        });
     crate::recovery::settle_due(db, &declarations, &sealed_at)?;
     divert_recovery_deltas(
         db,
@@ -124,7 +133,7 @@ pub(super) fn block(
             .map(|(domain, _)| domain.as_str())
             .collect(),
     )?;
-    let settlement = declarations.project(&sealed_at, recovery_days, &[])?;
+    let settlement = declarations.project(&sealed_at, recovery_days, activation_blocks, &[])?;
 
     let (peeked, _up_to_rowid) = db.peek_pending_entries()?;
     let domain_cap = registry::effective(db, "domain_block_entries_max", &sealed_at)?;
@@ -180,6 +189,7 @@ pub(super) fn block(
     let projection = declarations.project(
         &sealed_at,
         recovery_days,
+        activation_blocks,
         &seal_entries
             .iter()
             .map(|entry| entry.wrapped.clone())
@@ -267,7 +277,8 @@ pub(super) fn block(
     )?;
     let block_hash = wist_core::block::block_hash(&serde_json::to_value(&block.header)?)?;
 
-    let projection = declarations.project(&sealed_at, recovery_days, &block.entries)?;
+    let projection =
+        declarations.project(&sealed_at, recovery_days, activation_blocks, &block.entries)?;
     let windows = projection
         .domains()
         .iter()

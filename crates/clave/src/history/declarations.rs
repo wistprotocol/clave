@@ -32,6 +32,7 @@ impl DeclarationsReplay for Declarations {
             verified.hash(),
             &block.header.sealed_at,
             verified.recovery_window_days,
+            verified.declaration_activation_blocks,
             &block.entries,
         )?)
     }

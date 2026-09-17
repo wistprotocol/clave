@@ -26,8 +26,8 @@ fn signed_last_value_duplicates_reject_before_live_admission_and_retry_after_res
     for (object, name, escaped) in [
         ("publisher", "publisher", "publishe\\u0072"),
         ("publisher", "domain", "\\u0064omain"),
-        ("publisher", "public_key", "public_key"),
-        ("publisher", "key_id", "key_id"),
+        ("publisher", "x", "x"),
+        ("publisher", "kid", "kid"),
         ("feed", "feed", "feed"),
         ("feed", "domain", "\\u0064omain"),
         ("feed", "generated_at", "generated_at"),
@@ -165,7 +165,7 @@ fn retained_duplicates_reject_without_draining_pending_or_recovery_entries() {
                 wist_core::envelope::sign_envelope(
                     &json!({"action":"parameter_change", "subject":"quota_base"}),
                     "update",
-                    "k1",
+                    &p.kid,
                     &p.sk,
                 )
                 .unwrap(),
@@ -241,7 +241,7 @@ fn retained_declaration_duplicates_cannot_authorize_a_pull() {
     let db = Db::open(&path).unwrap();
     clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:02Z").unwrap();
     let original = db.get_publisher_declaration(&host).unwrap().unwrap();
-    let raw = duplicate(&original, "public_key", "public_\\u006bey");
+    let raw = duplicate(&original, "x", "\\u0078");
     Connection::open(&path)
         .unwrap()
         .execute(

@@ -621,7 +621,7 @@ fn invalid_first_declarations_remain_e04_noise_without_persistence() {
                 doc = wist_core::envelope::sign_envelope(
                     &doc["publisher"],
                     "publisher",
-                    "k1",
+                    &publisher.kid,
                     &publisher.sk,
                 )
                 .unwrap();
@@ -631,7 +631,7 @@ fn invalid_first_declarations_remain_e04_noise_without_persistence() {
                 doc = wist_core::envelope::sign_envelope(
                     &doc["publisher"],
                     "publisher",
-                    "k1",
+                    &publisher.kid,
                     &wist_core::crypto::SigningKey::from_seed(&[22; 32]),
                 )
                 .unwrap();
@@ -645,21 +645,21 @@ fn invalid_first_declarations_remain_e04_noise_without_persistence() {
                 doc["sig"]["value"] = encoded.into();
             }
             "excluded" => {
-                doc["publisher"]["keys"][0]["public_key"] =
-                    wist_core::crypto::b64u_encode(&[0; 32]).into();
+                common::rekey(
+                    &mut doc["publisher"]["keys"][0],
+                    &wist_core::crypto::b64u_encode(&[0; 32]),
+                );
                 doc = wist_core::envelope::sign_envelope(
                     &doc["publisher"],
                     "publisher",
-                    "k1",
+                    &publisher.kid,
                     &publisher.sk,
                 )
                 .unwrap();
             }
             "host" => doc["publisher"]["domain"] = format!("{host}:8080").into(),
             "scope" => doc["publisher"]["subdomain_scope"] = serde_json::json!(["EXAMPLE.com"]),
-            "timestamp" => {
-                doc["publisher"]["keys"][0]["valid_from"] = "2016-12-31T23:59:60Z".into()
-            }
+            "timestamp" => doc["publisher"]["keys"][0]["nbf"] = (-1).into(),
             "optional-null" => doc["publisher"]["contact"] = serde_json::Value::Null,
             _ => doc["extra"] = true.into(),
         }
@@ -691,15 +691,18 @@ fn unused_excluded_keys_survive_ingest_reopen_and_sealing_without_blocking_usabl
     let path = publisher.dir.path().join(".well-known/wist/publisher.json");
     let mut doc: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     let mut excluded = doc["publisher"]["keys"][0].clone();
-    excluded["key_id"] = "excluded".into();
-    excluded["public_key"] = wist_core::crypto::b64u_encode(&[0; 32]).into();
+    common::rekey(&mut excluded, &wist_core::crypto::b64u_encode(&[0; 32]));
     doc["publisher"]["keys"]
         .as_array_mut()
         .unwrap()
         .insert(0, excluded);
-    let signed =
-        wist_core::envelope::sign_envelope(&doc["publisher"], "publisher", "k1", &publisher.sk)
-            .unwrap();
+    let signed = wist_core::envelope::sign_envelope(
+        &doc["publisher"],
+        "publisher",
+        &publisher.kid,
+        &publisher.sk,
+    )
+    .unwrap();
     fs::write(&path, serde_json::to_vec(&signed).unwrap()).unwrap();
     let id = add_delta(
         &publisher,
@@ -760,10 +763,10 @@ fn declaration_field_rejections_preserve_signed_state_through_reopen_and_sealing
     let path = publisher.dir.path().join(".well-known/wist/publisher.json");
     let mut initial = common::current_declaration(&publisher)["publisher"].clone();
     initial["contact"] = "😀".repeat(256).into();
-    initial["keys"][0]["valid_from"] =
-        format!("0000-01-01t00:00:00.{}1+23:59", "0".repeat(5000)).into();
+    initial["keys"][0]["nbf"] = 0.into();
     let signed =
-        wist_core::envelope::sign_envelope(&initial, "publisher", "k1", &publisher.sk).unwrap();
+        wist_core::envelope::sign_envelope(&initial, "publisher", &publisher.kid, &publisher.sk)
+            .unwrap();
     fs::write(&path, serde_json::to_vec(&signed).unwrap()).unwrap();
     let id = add_delta(
         &publisher,
@@ -794,9 +797,7 @@ fn declaration_field_rejections_preserve_signed_state_through_reopen_and_sealing
         let mut incoming = signed.clone();
         match field {
             "signature" => incoming["sig"]["alg"] = "other".into(),
-            "timestamp" => {
-                incoming["publisher"]["keys"][0]["valid_from"] = "2030-12-31T23:59:60Z".into()
-            }
+            "timestamp" => incoming["publisher"]["keys"][0]["nbf"] = 253_402_300_800u64.into(),
             "hostname" => incoming["publisher"]["domain"] = "LOCALHOST".into(),
             "optional-null" => incoming["publisher"]["recovery_keys"] = serde_json::Value::Null,
             _ => incoming["publisher"]["contact"] = "😀".repeat(257).into(),

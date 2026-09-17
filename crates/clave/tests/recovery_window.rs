@@ -64,13 +64,13 @@ fn rotation_extends_key_set_and_enforces_valid_from() {
         "wist_version": "1.0.0", "domain": r.host,
         "subdomain_scope": ["example.com"],
         "keys": [
-            key_entry("k1", &K1_SEED, "2026-08-09T00:00:00Z"),
-            key_entry("k2", &K2_SEED, "2026-08-10T00:00:00Z"),
+            key_entry(&K1_SEED, "2026-08-09T00:00:00Z"),
+            key_entry(&K2_SEED, "2026-08-10T00:00:00Z"),
         ],
         "seq": 1,
         "prev_declaration": declaration_hash(&stored),
     });
-    write_declaration(&r.p, &rotated, "k1", &K1_SEED);
+    write_declaration(&r.p, &rotated, &K1_SEED);
 
     let d2 = add_delta_signed(
         &r.p,
@@ -78,7 +78,6 @@ fn rotation_extends_key_set_and_enforces_valid_from() {
         "beta",
         None,
         "2026-08-10T09:00:00Z",
-        "k2",
         &K2_SEED,
     );
     let d3 = add_delta_signed(
@@ -87,7 +86,6 @@ fn rotation_extends_key_set_and_enforces_valid_from() {
         "gamma",
         None,
         "2026-08-09T13:00:00Z",
-        "k2",
         &K2_SEED,
     );
     let d4 = add_delta_signed(
@@ -96,7 +94,6 @@ fn rotation_extends_key_set_and_enforces_valid_from() {
         "delta",
         None,
         "2026-08-10T09:00:00Z",
-        "kx",
         &X1_SEED,
     );
     write_feed_signed(
@@ -104,7 +101,6 @@ fn rotation_extends_key_set_and_enforces_valid_from() {
         &r.host,
         &[d2.clone(), d3.clone(), d4.clone()],
         "2026-08-10T09:00:00Z",
-        "k1",
         &K1_SEED,
     );
 
@@ -124,15 +120,14 @@ fn rotation_extends_key_set_and_enforces_valid_from() {
 fn fractional_key_bound_survives_ingest_reopen_and_sealing() {
     let r = rig(|h| make_publisher_with_scope(h, &["example.com"]));
     let mut declaration = current_declaration(&r.p)["publisher"].clone();
-    declaration["keys"][0]["valid_from"] = "2026-08-09T12:00:00Z".into();
-    write_declaration(&r.p, &declaration, "k1", &K1_SEED);
+    declaration["keys"][0]["nbf"] = nbf("2026-08-09T12:00:00Z").into();
+    write_declaration(&r.p, &declaration, &K1_SEED);
     let accepted = add_delta_signed(
         &r.p,
         "https://example.com/a",
         "alpha",
         None,
         "2026-08-09T12:00:00.5Z",
-        "k1",
         &K1_SEED,
     );
     let rejected = add_delta_signed(
@@ -141,7 +136,6 @@ fn fractional_key_bound_survives_ingest_reopen_and_sealing() {
         "beta",
         None,
         "2026-08-09T11:59:59.999Z",
-        "k1",
         &K1_SEED,
     );
     write_feed(
@@ -186,15 +180,14 @@ fn recovery_settlement_applies_the_followers_fractional_key_bound_after_reopen()
     let mut recovery = previous["publisher"].clone();
     recovery["seq"] = 1.into();
     recovery["prev_declaration"] = declaration_hash(&previous).into();
-    recovery["keys"] = serde_json::json!([key_entry("k2", &K2_SEED, "2026-08-09T12:00:00Z")]);
-    write_declaration(&r.p, &recovery, "r1", &R1_SEED);
+    recovery["keys"] = serde_json::json!([key_entry(&K2_SEED, "2026-08-09T12:00:00Z")]);
+    write_declaration(&r.p, &recovery, &R1_SEED);
     let survivor = add_delta_signed(
         &r.p,
         "https://example.com/a",
         "alpha",
         None,
         "2026-08-09T13:00:00.5Z",
-        "k2",
         &K2_SEED,
     );
     let rejected = add_delta_signed(
@@ -203,7 +196,6 @@ fn recovery_settlement_applies_the_followers_fractional_key_bound_after_reopen()
         "beta",
         None,
         "2026-08-09T12:59:59.9Z",
-        "k2",
         &K2_SEED,
     );
     write_feed_signed(
@@ -211,7 +203,6 @@ fn recovery_settlement_applies_the_followers_fractional_key_bound_after_reopen()
         &r.host,
         &[survivor.clone(), rejected.clone()],
         "2026-08-09T13:00:00Z",
-        "k2",
         &K2_SEED,
     );
     assert_eq!(
@@ -223,9 +214,9 @@ fn recovery_settlement_applies_the_followers_fractional_key_bound_after_reopen()
     let mut follower = previous["publisher"].clone();
     follower["seq"] = 2.into();
     follower["prev_declaration"] = declaration_hash(&previous).into();
-    follower["keys"][0]["valid_from"] = "2026-08-09T13:00:00Z".into();
-    write_declaration(&r.p, &follower, "k2", &K2_SEED);
-    write_feed_signed(&r.p, &r.host, &[], "2026-08-09T14:00:00Z", "k2", &K2_SEED);
+    follower["keys"][0]["nbf"] = nbf("2026-08-09T13:00:00Z").into();
+    write_declaration(&r.p, &follower, &K2_SEED);
+    write_feed_signed(&r.p, &r.host, &[], "2026-08-09T14:00:00Z", &K2_SEED);
     ingest(&r, "2026-08-09T14:00:01Z");
     clave::seal::run(&r.db, r.data.path(), &r.sk, opened_at + 7200).unwrap();
     assert!(r
@@ -272,13 +263,13 @@ fn stale_declaration_is_e08_and_stored_set_stays() {
         "wist_version": "1.0.0", "domain": r.host,
         "subdomain_scope": ["example.com"],
         "keys": [
-            key_entry("k1", &K1_SEED, "2026-08-09T00:00:00Z"),
-            key_entry("k2", &K2_SEED, "2026-08-10T00:00:00Z"),
+            key_entry(&K1_SEED, "2026-08-09T00:00:00Z"),
+            key_entry(&K2_SEED, "2026-08-10T00:00:00Z"),
         ],
         "seq": 1,
         "prev_declaration": declaration_hash(&seq0),
     });
-    write_declaration(&r.p, &rotated, "k1", &K1_SEED);
+    write_declaration(&r.p, &rotated, &K1_SEED);
     ingest(&r, "2026-08-10T09:00:05Z");
 
     std::fs::write(
@@ -292,7 +283,6 @@ fn stale_declaration_is_e08_and_stored_set_stays() {
         "beta",
         None,
         "2026-08-10T10:00:00Z",
-        "k2",
         &K2_SEED,
     );
     write_feed_signed(
@@ -300,7 +290,6 @@ fn stale_declaration_is_e08_and_stored_set_stays() {
         &r.host,
         std::slice::from_ref(&d2),
         "2026-08-10T10:00:00Z",
-        "k1",
         &K1_SEED,
     );
     let rep = ingest(&r, "2026-08-10T10:00:05Z");
@@ -327,12 +316,12 @@ fn recovery_flow_queues_settles_and_rejects_superseded_deltas() {
     let recovery = serde_json::json!({
         "wist_version": "1.0.0", "domain": r.host,
         "subdomain_scope": ["example.com"],
-        "keys": [key_entry("k2", &K2_SEED, "2026-08-09T13:00:00Z")],
-        "recovery_keys": [key_entry("r1", &R1_SEED, "2026-08-01T00:00:00Z")],
+        "keys": [key_entry(&K2_SEED, "2026-08-09T13:00:00Z")],
+        "recovery_keys": [key_entry(&R1_SEED, "2026-08-01T00:00:00Z")],
         "seq": 1,
         "prev_declaration": declaration_hash(&stored),
     });
-    write_declaration(&r.p, &recovery, "r1", &R1_SEED);
+    write_declaration(&r.p, &recovery, &R1_SEED);
 
     let d2 = add_delta_signed(
         &r.p,
@@ -340,7 +329,6 @@ fn recovery_flow_queues_settles_and_rejects_superseded_deltas() {
         "beta",
         None,
         "2026-08-09T14:00:00Z",
-        "k1",
         &K1_SEED,
     );
     let d3 = add_delta_signed(
@@ -349,7 +337,6 @@ fn recovery_flow_queues_settles_and_rejects_superseded_deltas() {
         "gamma",
         None,
         "2026-08-09T14:00:00Z",
-        "k2",
         &K2_SEED,
     );
     write_feed_signed(
@@ -357,7 +344,6 @@ fn recovery_flow_queues_settles_and_rejects_superseded_deltas() {
         &r.host,
         &[d2.clone(), d3.clone()],
         "2026-08-09T14:00:00Z",
-        "k2",
         &K2_SEED,
     );
     let rep = ingest(&r, "2026-08-09T14:00:05Z");
@@ -416,7 +402,6 @@ fn recovery_flow_queues_settles_and_rejects_superseded_deltas() {
         "epsilon",
         None,
         "2026-08-10T09:00:00Z",
-        "k2",
         &K2_SEED,
     );
     write_feed_signed(
@@ -424,7 +409,6 @@ fn recovery_flow_queues_settles_and_rejects_superseded_deltas() {
         &r.host,
         &[d2.clone(), d3.clone(), d4.clone()],
         "2026-08-10T09:00:00Z",
-        "k2",
         &K2_SEED,
     );
     let rep = ingest(&r, "2026-08-10T09:00:05Z");
@@ -474,12 +458,12 @@ fn declaration_outside_the_recovery_chain_is_superseded_at_the_windows_end() {
     let recovery = serde_json::json!({
         "wist_version": "1.0.0", "domain": r.host,
         "subdomain_scope": ["example.com"],
-        "keys": [key_entry("k2", &K2_SEED, "2026-08-09T13:00:00Z")],
-        "recovery_keys": [key_entry("r1", &R1_SEED, "2026-08-01T00:00:00Z")],
+        "keys": [key_entry(&K2_SEED, "2026-08-09T13:00:00Z")],
+        "recovery_keys": [key_entry(&R1_SEED, "2026-08-01T00:00:00Z")],
         "seq": 1,
         "prev_declaration": declaration_hash(&stored),
     });
-    write_declaration(&r.p, &recovery, "r1", &R1_SEED);
+    write_declaration(&r.p, &recovery, &R1_SEED);
     ingest(&r, "2026-08-09T14:00:05Z");
     clave::seal::run(&r.db, r.data.path(), &r.sk, T0).unwrap();
 
@@ -487,12 +471,12 @@ fn declaration_outside_the_recovery_chain_is_superseded_at_the_windows_end() {
     let thief = serde_json::json!({
         "wist_version": "1.0.0", "domain": r.host,
         "subdomain_scope": ["example.com"],
-        "keys": [key_entry("kx", &X1_SEED, "2026-08-09T15:00:00Z")],
-        "recovery_keys": [key_entry("r1", &R1_SEED, "2026-08-01T00:00:00Z")],
+        "keys": [key_entry(&X1_SEED, "2026-08-09T15:00:00Z")],
+        "recovery_keys": [key_entry(&R1_SEED, "2026-08-01T00:00:00Z")],
         "seq": 2,
         "prev_declaration": declaration_hash(&recovery_doc),
     });
-    write_declaration(&r.p, &thief, "kx", &X1_SEED);
+    write_declaration(&r.p, &thief, &X1_SEED);
     ingest(&r, "2026-08-09T16:00:05Z");
     assert!(
         !rejection_codes(&r).contains(&"WIST1-E08".to_string()),
@@ -508,7 +492,6 @@ fn declaration_outside_the_recovery_chain_is_superseded_at_the_windows_end() {
         "tau",
         None,
         "2026-08-09T17:00:00Z",
-        "kx",
         &X1_SEED,
     );
     write_feed_signed(
@@ -516,7 +499,6 @@ fn declaration_outside_the_recovery_chain_is_superseded_at_the_windows_end() {
         &r.host,
         std::slice::from_ref(&d_thief),
         "2026-08-09T17:00:00Z",
-        "kx",
         &X1_SEED,
     );
     ingest(&r, "2026-08-09T17:00:05Z");
@@ -553,11 +535,11 @@ fn a_queued_delta_whose_key_the_sealing_blocks_key_set_retired_is_not_sealed() {
     let stored = current_declaration(&r.p);
     let rotated = serde_json::json!({
         "wist_version": "1.0.0", "domain": r.host,
-        "keys": [key_entry("k2", &K2_SEED, "2026-08-09T13:00:00Z")],
+        "keys": [key_entry(&K2_SEED, "2026-08-09T13:00:00Z")],
         "seq": 1,
         "prev_declaration": declaration_hash(&stored),
     });
-    write_declaration(&r.p, &rotated, "k1", &K1_SEED);
+    write_declaration(&r.p, &rotated, &K1_SEED);
     ingest(&r, "2026-08-09T14:00:05Z");
 
     clave::seal::run(&r.db, r.data.path(), &r.sk, T0).unwrap();
@@ -595,12 +577,12 @@ fn a_delta_pending_when_the_window_opens_is_queued_not_sealed() {
     let stored = current_declaration(&r.p);
     let recovery = serde_json::json!({
         "wist_version": "1.0.0", "domain": r.host,
-        "keys": [key_entry("k2", &K2_SEED, "2026-08-09T13:00:00Z")],
-        "recovery_keys": [key_entry("r1", &R1_SEED, "2026-08-01T00:00:00Z")],
+        "keys": [key_entry(&K2_SEED, "2026-08-09T13:00:00Z")],
+        "recovery_keys": [key_entry(&R1_SEED, "2026-08-01T00:00:00Z")],
         "seq": 1,
         "prev_declaration": declaration_hash(&stored),
     });
-    write_declaration(&r.p, &recovery, "r1", &R1_SEED);
+    write_declaration(&r.p, &recovery, &R1_SEED);
     ingest(&r, "2026-08-09T14:00:05Z");
 
     clave::seal::run(&r.db, r.data.path(), &r.sk, T0).unwrap();
@@ -641,11 +623,11 @@ fn a_sealed_page_signed_by_a_since_retired_key_still_verifies() {
     let stored = current_declaration(&r.p);
     let rotated = serde_json::json!({
         "wist_version": "1.0.0", "domain": r.host,
-        "keys": [key_entry("k2", &K2_SEED, "2026-08-09T14:00:00Z")],
+        "keys": [key_entry(&K2_SEED, "2026-08-09T14:00:00Z")],
         "seq": 1,
         "prev_declaration": declaration_hash(&stored),
     });
-    write_declaration(&r.p, &rotated, "k1", &K1_SEED);
+    write_declaration(&r.p, &rotated, &K1_SEED);
 
     let paged = add_delta_signed(
         &r.p,
@@ -653,7 +635,6 @@ fn a_sealed_page_signed_by_a_since_retired_key_still_verifies() {
         "alpha body",
         None,
         "2026-08-09T15:00:00Z",
-        "k2",
         &K2_SEED,
     );
     let live = add_delta_signed(
@@ -662,7 +643,6 @@ fn a_sealed_page_signed_by_a_since_retired_key_still_verifies() {
         "beta body",
         None,
         "2026-08-09T15:00:00Z",
-        "k2",
         &K2_SEED,
     );
     // The Page was cut before the rotation and is never re-signed, so it
@@ -674,7 +654,6 @@ fn a_sealed_page_signed_by_a_since_retired_key_still_verifies() {
         std::slice::from_ref(&paged),
         "2026-08-09T13:00:00Z",
         None,
-        "k1",
         &K1_SEED,
     );
     let feed = serde_json::json!({
@@ -684,7 +663,7 @@ fn a_sealed_page_signed_by_a_since_retired_key_still_verifies() {
         "next": page_url(&r.host, 1),
     });
     let sk2 = wist_core::crypto::SigningKey::from_seed(&K2_SEED);
-    let env = wist_core::envelope::sign_envelope(&feed, "feed", "k2", &sk2).unwrap();
+    let env = wist_core::envelope::sign_envelope(&feed, "feed", &kid(&K2_SEED), &sk2).unwrap();
     std::fs::write(
         r.p.dir.path().join(".well-known/wist/feed.json"),
         serde_json::to_vec(&env).unwrap(),
@@ -728,9 +707,9 @@ fn fixed_recovery_bindings_survive_followers_reopen_migration_and_settlement() {
         let mut owner = before["publisher"].clone();
         owner["seq"] = 1.into();
         owner["prev_declaration"] = declaration_hash(&before).into();
-        owner["keys"] = serde_json::json!([key_entry("k1", &K2_SEED, "2026-08-09T13:00:00Z")]);
-        write_declaration(&r.p, &owner, "r1", &R1_SEED);
-        write_feed_signed(&r.p, &r.host, &[], "2026-08-09T13:00:00Z", "k1", &K2_SEED);
+        owner["keys"] = serde_json::json!([key_entry(&K2_SEED, "2026-08-09T13:00:00Z")]);
+        write_declaration(&r.p, &owner, &R1_SEED);
+        write_feed_signed(&r.p, &r.host, &[], "2026-08-09T13:00:00Z", &K2_SEED);
         ingest(&r, "2026-08-09T13:00:00Z");
         let owner = current_declaration(&r.p);
         if migration != "pending" {
@@ -740,11 +719,11 @@ fn fixed_recovery_bindings_survive_followers_reopen_migration_and_settlement() {
         follower["seq"] = 2.into();
         follower["prev_declaration"] = declaration_hash(&owner).into();
         follower["keys"] = serde_json::json!([
-            key_entry("k1", &K2_SEED, "2026-08-09T15:00:00Z"),
-            key_entry("k3", &X1_SEED, "2026-08-09T13:00:00Z")
+            key_entry(&K2_SEED, "2026-08-09T15:00:00Z"),
+            key_entry(&X1_SEED, "2026-08-09T13:00:00Z")
         ]);
-        write_declaration(&r.p, &follower, "k1", &K2_SEED);
-        write_feed_signed(&r.p, &r.host, &[], "2026-08-09T14:00:00Z", "k3", &X1_SEED);
+        write_declaration(&r.p, &follower, &K2_SEED);
+        write_feed_signed(&r.p, &r.host, &[], "2026-08-09T14:00:00Z", &X1_SEED);
         let report = ingest(&r, "2026-08-09T14:00:00Z");
         assert_ne!(
             report.noise,
@@ -774,39 +753,35 @@ fn fixed_recovery_bindings_survive_followers_reopen_migration_and_settlement() {
             );
         }
         let cases = [
-            ("prior", "k1", &K1_SEED, "2026-08-09T14:00:00Z", None),
-            ("owner", "k1", &K2_SEED, "2026-08-09T14:00:00Z", None),
+            ("prior", &K1_SEED, "2026-08-09T14:00:00Z", None),
+            ("owner", &K2_SEED, "2026-08-09T14:00:00Z", None),
             (
                 "follower",
-                "k3",
                 &X1_SEED,
                 "2026-08-09T14:00:00Z",
                 Some("WIST1-E02"),
             ),
-            (
-                "wrong",
-                "k1",
-                &X1_SEED,
-                "2026-08-09T14:00:00Z",
-                Some("WIST1-E01"),
-            ),
-            ("survivor", "k1", &K2_SEED, "2026-08-09T15:00:00Z", None),
+            ("wrong", &K2_SEED, "2026-08-09T14:00:00Z", Some("WIST1-E01")),
+            ("survivor", &K2_SEED, "2026-08-09T15:00:00Z", None),
         ];
         let ids: Vec<_> = cases
             .iter()
-            .map(|(name, key, seed, at, _)| {
-                add_delta_signed(
+            .map(|(name, seed, at, _)| {
+                // "wrong" names an authorized entry but is signed by another
+                // key, the one case that separates E01 from E02.
+                let signer = if *name == "wrong" { &X1_SEED } else { *seed };
+                add_delta_signed_as(
                     &r.p,
                     &format!("https://example.com/{name}"),
                     name,
                     None,
                     at,
-                    key,
+                    signer,
                     seed,
                 )
             })
             .collect();
-        write_feed_signed(&r.p, &r.host, &ids, "2026-08-09T15:00:00Z", "k3", &X1_SEED);
+        write_feed_signed(&r.p, &r.host, &ids, "2026-08-09T15:00:00Z", &X1_SEED);
         let report = ingest(&r, "2026-08-09T15:00:05Z");
         assert_eq!(
             report.queued,
@@ -821,7 +796,7 @@ fn fixed_recovery_bindings_survive_followers_reopen_migration_and_settlement() {
             ],
             "{migration}"
         );
-        write_feed_signed(&r.p, &r.host, &ids, "2026-08-09T15:00:00Z", "k1", &K1_SEED);
+        write_feed_signed(&r.p, &r.host, &ids, "2026-08-09T15:00:00Z", &K1_SEED);
         assert_eq!(ingest(&r, "2026-08-09T15:00:06Z").noise, Some("WIST2-E04"));
         if migration == "pending" {
             clave::seal::run(&r.db, r.data.path(), &r.sk, start + 10800).unwrap();
@@ -881,8 +856,8 @@ fn pending_owner_migration_rejects_missing_ambiguous_and_invalid_sources_atomica
             let mut owner = prior["publisher"].clone();
             owner["seq"] = 1.into();
             owner["prev_declaration"] = declaration_hash(&prior).into();
-            owner["keys"] = serde_json::json!([key_entry("k2", &K2_SEED, "2026-08-09T13:00:00Z")]);
-            write_declaration(&p, &owner, "r1", &R1_SEED);
+            owner["keys"] = serde_json::json!([key_entry(&K2_SEED, "2026-08-09T13:00:00Z")]);
+            write_declaration(&p, &owner, &R1_SEED);
             let owner = current_declaration(&p);
             db.open_recovery_window(
                 domain,
@@ -903,7 +878,7 @@ fn pending_owner_migration_rejects_missing_ambiguous_and_invalid_sources_atomica
                 if mutation == "ambiguous" {
                     competitor["seq"] = 2.into();
                 }
-                write_declaration(&p, &competitor, "r1", &R1_SEED);
+                write_declaration(&p, &competitor, &R1_SEED);
                 db.insert_pending_entry(
                     "publisher_declaration",
                     domain,
@@ -950,7 +925,7 @@ fn recovery_scope_sources_survive_reopen_and_gate_settlement() {
         .as_second();
     let mut prior = current_declaration(&r.p)["publisher"].clone();
     prior["subdomain_scope"] = serde_json::json!(["old.example", "shared.example"]);
-    write_declaration(&r.p, &prior, "k1", &K1_SEED);
+    write_declaration(&r.p, &prior, &K1_SEED);
     write_feed(&r.p, &r.host, &[], "2026-08-09T12:00:00Z");
     ingest(&r, "2026-08-09T12:00:00Z");
     clave::seal::run(&r.db, r.data.path(), &r.sk, start).unwrap();
@@ -958,10 +933,10 @@ fn recovery_scope_sources_survive_reopen_and_gate_settlement() {
     let mut owner = prior["publisher"].clone();
     owner["seq"] = 1.into();
     owner["prev_declaration"] = declaration_hash(&prior).into();
-    owner["keys"] = serde_json::json!([key_entry("k1", &K2_SEED, "2026-08-09T13:00:00Z")]);
+    owner["keys"] = serde_json::json!([key_entry(&K2_SEED, "2026-08-09T13:00:00Z")]);
     owner["subdomain_scope"] = serde_json::json!(["owner.example", "shared.example"]);
-    write_declaration(&r.p, &owner, "r1", &R1_SEED);
-    write_feed_signed(&r.p, &r.host, &[], "2026-08-09T13:00:00Z", "k1", &K2_SEED);
+    write_declaration(&r.p, &owner, &R1_SEED);
+    write_feed_signed(&r.p, &r.host, &[], "2026-08-09T13:00:00Z", &K2_SEED);
     ingest(&r, "2026-08-09T13:00:00Z");
     clave::seal::run(&r.db, r.data.path(), &r.sk, start + 3600).unwrap();
     let owner = current_declaration(&r.p);
@@ -969,8 +944,8 @@ fn recovery_scope_sources_survive_reopen_and_gate_settlement() {
     follower["seq"] = 2.into();
     follower["prev_declaration"] = declaration_hash(&owner).into();
     follower["subdomain_scope"] = serde_json::json!(["shared.example", "follower.example"]);
-    write_declaration(&r.p, &follower, "k1", &K2_SEED);
-    write_feed_signed(&r.p, &r.host, &[], "2026-08-09T14:00:00Z", "k1", &K2_SEED);
+    write_declaration(&r.p, &follower, &K2_SEED);
+    write_feed_signed(&r.p, &r.host, &[], "2026-08-09T14:00:00Z", &K2_SEED);
     ingest(&r, "2026-08-09T14:00:00Z");
     clave::seal::run(&r.db, r.data.path(), &r.sk, start + 7200).unwrap();
     r.db = clave::db::Db::open(&r.data.path().join("clave.sqlite")).unwrap();
@@ -993,11 +968,9 @@ fn recovery_scope_sources_survive_reopen_and_gate_settlement() {
     ];
     let ids: Vec<_> = cases
         .iter()
-        .map(|(url, key, _)| {
-            add_delta_signed(&r.p, url, "body", None, "2026-08-09T15:00:00Z", "k1", key)
-        })
+        .map(|(url, key, _)| add_delta_signed(&r.p, url, "body", None, "2026-08-09T15:00:00Z", key))
         .collect();
-    write_feed_signed(&r.p, &r.host, &ids, "2026-08-09T15:00:00Z", "k1", &K2_SEED);
+    write_feed_signed(&r.p, &r.host, &ids, "2026-08-09T15:00:00Z", &K2_SEED);
     let report = ingest(&r, "2026-08-09T15:00:00Z");
     assert_eq!(
         report.queued,
@@ -1076,7 +1049,7 @@ fn sealing_rechecks_scope_when_the_signing_key_is_retained() {
         .as_object_mut()
         .unwrap()
         .remove("subdomain_scope");
-    write_declaration(&r.p, &replacement, "k1", &K1_SEED);
+    write_declaration(&r.p, &replacement, &K1_SEED);
     write_feed(&r.p, &r.host, &[], "2026-08-09T13:00:00Z");
     ingest(&r, "2026-08-09T13:00:00Z");
     r.db = clave::db::Db::open(&r.data.path().join("clave.sqlite")).unwrap();
@@ -1153,9 +1126,9 @@ fn sealed_recovery() -> (Rig, i64, serde_json::Value) {
     let mut owner = prior["publisher"].clone();
     owner["seq"] = 1.into();
     owner["prev_declaration"] = declaration_hash(&prior).into();
-    owner["keys"] = serde_json::json!([key_entry("k2", &K2_SEED, "2026-08-09T13:00:00Z")]);
-    write_declaration(&r.p, &owner, "r1", &R1_SEED);
-    write_feed_signed(&r.p, &r.host, &[], "2026-08-09T13:00:00Z", "k2", &K2_SEED);
+    owner["keys"] = serde_json::json!([key_entry(&K2_SEED, "2026-08-09T13:00:00Z")]);
+    write_declaration(&r.p, &owner, &R1_SEED);
+    write_feed_signed(&r.p, &r.host, &[], "2026-08-09T13:00:00Z", &K2_SEED);
     ingest(&r, "2026-08-09T13:00:00Z");
     clave::seal::run(&r.db, r.data.path(), &r.sk, start + 3600).unwrap();
     (r, start, owner)
@@ -1186,7 +1159,6 @@ fn authenticated_sealing_separates_settlement_from_packed_authority() {
             "survivor",
             None,
             "2026-08-09T15:00:00Z",
-            "k2",
             &K2_SEED,
         );
         let rejected = add_delta_signed(
@@ -1195,7 +1167,6 @@ fn authenticated_sealing_separates_settlement_from_packed_authority() {
             "rejected",
             None,
             "2026-08-09T15:00:00Z",
-            "k1",
             &K1_SEED,
         );
         write_feed_signed(
@@ -1203,7 +1174,6 @@ fn authenticated_sealing_separates_settlement_from_packed_authority() {
             &r.host,
             &[survivor.clone(), rejected.clone()],
             "2026-08-09T15:00:00Z",
-            "k2",
             &K2_SEED,
         );
         assert_eq!(
@@ -1213,18 +1183,17 @@ fn authenticated_sealing_separates_settlement_from_packed_authority() {
         let mut replacement = owner.clone();
         replacement["seq"] = 2.into();
         replacement["prev_declaration"] = declaration_hash(&current_declaration(&r.p)).into();
-        let (signer, seed) = if case == "competitor" {
-            ("x1", &X1_SEED)
+        let seed = if case == "competitor" {
+            &X1_SEED
         } else {
-            ("k2", &K2_SEED)
+            &K2_SEED
         };
         if case == "competitor" {
-            replacement["keys"] =
-                serde_json::json!([key_entry("x1", &X1_SEED, "2026-08-09T13:00:00Z")]);
+            replacement["keys"] = serde_json::json!([key_entry(&X1_SEED, "2026-08-09T13:00:00Z")]);
         } else if case == "deadline_scope" {
             replacement["subdomain_scope"] = serde_json::json!([]);
         } else {
-            replacement["keys"][0]["valid_from"] = "2026-08-10T00:00:00Z".into();
+            replacement["keys"][0]["nbf"] = nbf("2026-08-10T00:00:00Z").into();
         }
         if case == "deferred_follower" {
             replacement["subdomain_scope"] =
@@ -1232,8 +1201,8 @@ fn authenticated_sealing_separates_settlement_from_packed_authority() {
                     .chain((0..70).map(|i| format!("explicit-host-{i}.example.com")))
                     .collect::<Vec<_>>());
         }
-        write_declaration(&r.p, &replacement, signer, seed);
-        write_feed_signed(&r.p, &r.host, &[], "2026-08-09T16:00:00Z", signer, seed);
+        write_declaration(&r.p, &replacement, seed);
+        write_feed_signed(&r.p, &r.host, &[], "2026-08-09T16:00:00Z", seed);
         ingest(&r, "2026-08-09T16:00:00Z");
         assert_eq!(
             r.db.count_pending_entries("publisher_declaration").unwrap(),
@@ -1314,7 +1283,6 @@ fn rejected_candidate_rolls_back_due_settlement_and_status() {
         "body",
         None,
         "2026-08-09T15:00:00Z",
-        "k1",
         &K1_SEED,
     );
     write_feed_signed(
@@ -1322,7 +1290,6 @@ fn rejected_candidate_rolls_back_due_settlement_and_status() {
         &r.host,
         std::slice::from_ref(&delta),
         "2026-08-09T15:00:00Z",
-        "k2",
         &K2_SEED,
     );
     assert_eq!(
@@ -1335,7 +1302,7 @@ fn rejected_candidate_rolls_back_due_settlement_and_status() {
     let invalid = wist_core::envelope::sign_envelope(
         &candidate,
         "publisher",
-        "k2",
+        &kid(&X1_SEED),
         &wist_core::crypto::SigningKey::from_seed(&X1_SEED),
     )
     .unwrap();
@@ -1384,7 +1351,6 @@ fn corrupt_pinned_history_cannot_settle_a_queue() {
         "body",
         None,
         "2026-08-09T15:00:00Z",
-        "k2",
         &K2_SEED,
     );
     write_feed_signed(
@@ -1392,7 +1358,6 @@ fn corrupt_pinned_history_cannot_settle_a_queue() {
         &r.host,
         std::slice::from_ref(&delta),
         "2026-08-09T15:00:00Z",
-        "k2",
         &K2_SEED,
     );
     assert_eq!(
@@ -1427,7 +1392,6 @@ fn sealed_recovery_sources_ignore_corrupt_summaries_and_local_window_lengths() {
         "body",
         None,
         "2026-08-09T15:00:00Z",
-        "k2",
         &K2_SEED,
     );
     write_feed_signed(
@@ -1435,7 +1399,6 @@ fn sealed_recovery_sources_ignore_corrupt_summaries_and_local_window_lengths() {
         &r.host,
         std::slice::from_ref(&delta),
         "2026-08-09T15:00:00Z",
-        "k2",
         &K2_SEED,
     );
     assert_eq!(
@@ -1519,21 +1482,20 @@ fn recovery_preserves_cross_queue_order_and_defers_every_capped_copy() {
         let mut owner = prior["publisher"].clone();
         owner["seq"] = 1.into();
         owner["prev_declaration"] = declaration_hash(&prior).into();
-        owner["keys"] = serde_json::json!([key_entry("k2", &K2_SEED, "2026-08-09T13:00:00Z")]);
+        owner["keys"] = serde_json::json!([key_entry(&K2_SEED, "2026-08-09T13:00:00Z")]);
         if retain_old_key {
             owner["keys"]
                 .as_array_mut()
                 .unwrap()
                 .push(prior["publisher"]["keys"][0].clone());
         }
-        write_declaration(&r.p, &owner, "r1", &R1_SEED);
+        write_declaration(&r.p, &owner, &R1_SEED);
         let newer = add_delta_signed(
             &r.p,
             "https://example.com/newer",
             "newer",
             None,
             "2026-08-09T13:00:00Z",
-            "k2",
             &K2_SEED,
         );
         write_feed_signed(
@@ -1541,7 +1503,6 @@ fn recovery_preserves_cross_queue_order_and_defers_every_capped_copy() {
             &r.host,
             std::slice::from_ref(&newer),
             "2026-08-09T13:00:00Z",
-            "k2",
             &K2_SEED,
         );
         assert_eq!(
@@ -1644,9 +1605,9 @@ fn settlement_rejects_dependent_copies_restores_tip_and_allows_reserving() {
     let mut owner = prior["publisher"].clone();
     owner["seq"] = 1.into();
     owner["prev_declaration"] = declaration_hash(&prior).into();
-    owner["keys"] = serde_json::json!([key_entry("k2", &K2_SEED, "2026-08-09T13:00:00Z")]);
-    write_declaration(&r.p, &owner, "r1", &R1_SEED);
-    write_feed_signed(&r.p, &r.host, &[], "2026-08-09T13:00:00Z", "k2", &K2_SEED);
+    owner["keys"] = serde_json::json!([key_entry(&K2_SEED, "2026-08-09T13:00:00Z")]);
+    write_declaration(&r.p, &owner, &R1_SEED);
+    write_feed_signed(&r.p, &r.host, &[], "2026-08-09T13:00:00Z", &K2_SEED);
     ingest(&r, "2026-08-09T13:00:00Z");
     clave::seal::run(&r.db, r.data.path(), &r.sk, start + 3600).unwrap();
     let root = add_delta_signed(
@@ -1655,7 +1616,6 @@ fn settlement_rejects_dependent_copies_restores_tip_and_allows_reserving() {
         "old authority",
         Some(&base),
         "2026-08-09T14:00:00Z",
-        "k1",
         &K1_SEED,
     );
     let child = add_delta_signed(
@@ -1664,7 +1624,6 @@ fn settlement_rejects_dependent_copies_restores_tip_and_allows_reserving() {
         "dependent",
         Some(&root),
         "2026-08-09T15:00:00Z",
-        "k2",
         &K2_SEED,
     );
     write_feed_signed(
@@ -1672,7 +1631,6 @@ fn settlement_rejects_dependent_copies_restores_tip_and_allows_reserving() {
         &r.host,
         &[root.clone(), child.clone()],
         "2026-08-09T15:00:00Z",
-        "k2",
         &K2_SEED,
     );
     assert_eq!(
@@ -1701,7 +1659,7 @@ fn settlement_rejects_dependent_copies_restores_tip_and_allows_reserving() {
         .as_array_mut()
         .unwrap()
         .push(prior["publisher"]["keys"][0].clone());
-    write_declaration(&r.p, &replacement, "k2", &K2_SEED);
+    write_declaration(&r.p, &replacement, &K2_SEED);
     let report = ingest(&r, "2026-08-16T14:00:00Z");
     assert_eq!(report.accepted, vec![root.clone(), child.clone()]);
     assert!(report.rejected.is_empty());
@@ -1724,7 +1682,6 @@ fn pending_copy_in_an_expired_window_receives_settlement_rejection() {
         "deferred",
         None,
         "2026-08-09T14:00:00Z",
-        "k1",
         &K1_SEED,
     );
     let body: serde_json::Value = serde_json::from_slice(
@@ -1762,16 +1719,16 @@ fn admission_uses_both_heads_without_joining_a_competing_branch() {
     competitor["seq"] = 4.into();
     competitor["prev_declaration"] = declaration_hash(&owner_envelope).into();
     competitor["keys"] = serde_json::json!([
-        key_entry("x1", &X1_SEED, "2026-08-09T13:00:00Z"),
-        key_entry("k2", &K2_SEED, "2026-08-09T13:00:00Z")
+        key_entry(&X1_SEED, "2026-08-09T13:00:00Z"),
+        key_entry(&K2_SEED, "2026-08-09T13:00:00Z")
     ]);
-    write_declaration(&r.p, &competitor, "x1", &X1_SEED);
-    write_feed_signed(&r.p, &r.host, &[], "2026-08-09T14:00:00Z", "x1", &X1_SEED);
+    write_declaration(&r.p, &competitor, &X1_SEED);
+    write_feed_signed(&r.p, &r.host, &[], "2026-08-09T14:00:00Z", &X1_SEED);
     ingest(&r, "2026-08-09T14:00:00Z");
     let mut branch = competitor.clone();
     branch["seq"] = 6.into();
     branch["prev_declaration"] = declaration_hash(&current_declaration(&r.p)).into();
-    write_declaration(&r.p, &branch, "k2", &K2_SEED);
+    write_declaration(&r.p, &branch, &K2_SEED);
     let branch_envelope = current_declaration(&r.p);
     ingest(&r, "2026-08-09T14:00:00Z");
     let recovery = r.db.get_recovery_window(&r.host).unwrap().unwrap();
@@ -1791,7 +1748,7 @@ fn admission_uses_both_heads_without_joining_a_competing_branch() {
     follower["prev_declaration"] = declaration_hash(&owner_envelope).into();
     for seq in [5, 6] {
         follower["seq"] = seq.into();
-        write_declaration(&r.p, &follower, "k2", &K2_SEED);
+        write_declaration(&r.p, &follower, &K2_SEED);
         ingest(&r, "2026-08-09T14:00:00Z");
         assert_eq!(
             r.db.highest_accepted_declaration_seq(&r.host).unwrap(),
@@ -1809,7 +1766,7 @@ fn admission_uses_both_heads_without_joining_a_competing_branch() {
             .count(),
         2
     );
-    write_declaration(&r.p, &owner, "r1", &R1_SEED);
+    write_declaration(&r.p, &owner, &R1_SEED);
     ingest(&r, "2026-08-09T14:00:00Z");
     assert_eq!(
         rejection_codes(&r)
@@ -1839,8 +1796,8 @@ fn admission_uses_both_heads_without_joining_a_competing_branch() {
         branch_envelope
     );
     follower["seq"] = 7.into();
-    write_declaration(&r.p, &follower, "k2", &K2_SEED);
-    write_feed_signed(&r.p, &r.host, &[], "2026-08-09T14:00:00Z", "k2", &K2_SEED);
+    write_declaration(&r.p, &follower, &K2_SEED);
+    write_feed_signed(&r.p, &r.host, &[], "2026-08-09T14:00:00Z", &K2_SEED);
     ingest(&r, "2026-08-09T14:00:00Z");
     assert_eq!(
         r.db.highest_accepted_declaration_seq(&r.host).unwrap(),
@@ -1874,9 +1831,9 @@ fn settled_admission_retains_the_floor_and_current_idempotence_after_migration()
         let mut competitor = owner.clone();
         competitor["seq"] = 9.into();
         competitor["prev_declaration"] = declaration_hash(&owner_envelope).into();
-        competitor["keys"] = serde_json::json!([key_entry("x1", &X1_SEED, "2026-08-09T13:00:00Z")]);
-        write_declaration(&r.p, &competitor, "x1", &X1_SEED);
-        write_feed_signed(&r.p, &r.host, &[], "2026-08-09T14:00:00Z", "x1", &X1_SEED);
+        competitor["keys"] = serde_json::json!([key_entry(&X1_SEED, "2026-08-09T13:00:00Z")]);
+        write_declaration(&r.p, &competitor, &X1_SEED);
+        write_feed_signed(&r.p, &r.host, &[], "2026-08-09T14:00:00Z", &X1_SEED);
         ingest(&r, "2026-08-09T14:00:00Z");
         clave::seal::run(&r.db, r.data.path(), &r.sk, start + 7200).unwrap();
         clave::seal::run(&r.db, r.data.path(), &r.sk, start + 3600 + 7 * DAY).unwrap();
@@ -1895,8 +1852,8 @@ fn settled_admission_retains_the_floor_and_current_idempotence_after_migration()
             r.db.highest_accepted_declaration_seq(&r.host).unwrap(),
             Some(9)
         );
-        write_declaration(&r.p, &owner, "r1", &R1_SEED);
-        write_feed_signed(&r.p, &r.host, &[], "2026-08-16T14:00:00Z", "k2", &K2_SEED);
+        write_declaration(&r.p, &owner, &R1_SEED);
+        write_feed_signed(&r.p, &r.host, &[], "2026-08-16T14:00:00Z", &K2_SEED);
         ingest(&r, "2026-08-16T14:00:00Z");
         assert_eq!(
             r.db.count_pending_entries("publisher_declaration").unwrap(),
@@ -1906,7 +1863,7 @@ fn settled_admission_retains_the_floor_and_current_idempotence_after_migration()
         let mut follower = owner.clone();
         follower["seq"] = 8.into();
         follower["prev_declaration"] = declaration_hash(&owner_envelope).into();
-        write_declaration(&r.p, &follower, "k2", &K2_SEED);
+        write_declaration(&r.p, &follower, &K2_SEED);
         ingest(&r, "2026-08-16T14:00:00Z");
         assert!(rejection_codes(&r).contains(&"WIST1-E08".into()));
         assert_eq!(
@@ -1914,7 +1871,7 @@ fn settled_admission_retains_the_floor_and_current_idempotence_after_migration()
             0
         );
         follower["seq"] = 10.into();
-        write_declaration(&r.p, &follower, "k2", &K2_SEED);
+        write_declaration(&r.p, &follower, &K2_SEED);
         ingest(&r, "2026-08-16T14:00:00Z");
         assert_eq!(
             r.db.highest_accepted_declaration_seq(&r.host).unwrap(),
@@ -1935,9 +1892,9 @@ fn capped_recovery_siblings_preserve_sequences_and_progress_after_restart() {
         let mut competitor = owner.clone();
         competitor["seq"] = 2.into();
         competitor["prev_declaration"] = declaration_hash(&owner_envelope).into();
-        competitor["keys"] = serde_json::json!([key_entry("x1", &X1_SEED, "2026-08-09T13:00:00Z")]);
-        write_declaration(&r.p, &competitor, "x1", &X1_SEED);
-        write_feed_signed(&r.p, &r.host, &[], "2026-08-09T14:00:00Z", "x1", &X1_SEED);
+        competitor["keys"] = serde_json::json!([key_entry(&X1_SEED, "2026-08-09T13:00:00Z")]);
+        write_declaration(&r.p, &competitor, &X1_SEED);
+        write_feed_signed(&r.p, &r.host, &[], "2026-08-09T14:00:00Z", &X1_SEED);
         ingest(&r, "2026-08-09T14:00:00Z");
         clave::seal::run(&r.db, r.data.path(), &r.sk, start + 7200).unwrap();
 
@@ -1946,15 +1903,15 @@ fn capped_recovery_siblings_preserve_sequences_and_progress_after_restart() {
         competitor["subdomain_scope"] = serde_json::json!((0..70)
             .map(|i| format!("explicit-host-{i}.example.com"))
             .collect::<Vec<_>>());
-        write_declaration(&r.p, &competitor, "x1", &X1_SEED);
+        write_declaration(&r.p, &competitor, &X1_SEED);
         let lower = current_declaration(&r.p);
         ingest(&r, "2026-08-09T14:00:00Z");
         let mut follower = owner;
         follower["seq"] = 4.into();
         follower["prev_declaration"] = declaration_hash(&owner_envelope).into();
-        write_declaration(&r.p, &follower, "k2", &K2_SEED);
+        write_declaration(&r.p, &follower, &K2_SEED);
         let higher = current_declaration(&r.p);
-        write_feed_signed(&r.p, &r.host, &[], "2026-08-09T15:00:00Z", "k2", &K2_SEED);
+        write_feed_signed(&r.p, &r.host, &[], "2026-08-09T15:00:00Z", &K2_SEED);
         ingest(&r, "2026-08-09T15:00:00Z");
         assert_eq!(
             r.db.highest_accepted_declaration_seq(&r.host).unwrap(),
@@ -1999,7 +1956,7 @@ fn capped_recovery_siblings_preserve_sequences_and_progress_after_restart() {
             let independent = wist_core::envelope::sign_envelope(
                 &independent,
                 "publisher",
-                "x1",
+                &kid(&X1_SEED),
                 &wist_core::crypto::SigningKey::from_seed(&X1_SEED),
             )
             .unwrap();
@@ -2007,10 +1964,8 @@ fn capped_recovery_siblings_preserve_sequences_and_progress_after_restart() {
             r.db.record_publisher_declaration(
                 "zz-independent.example",
                 &serde_json::to_vec(&independent).unwrap(),
-                "x1",
-                independent["publisher"]["keys"][0]["public_key"]
-                    .as_str()
-                    .unwrap(),
+                &kid(&X1_SEED),
+                independent["publisher"]["keys"][0]["x"].as_str().unwrap(),
                 &independent,
             )
             .unwrap();
@@ -2122,15 +2077,15 @@ fn pending_recovery_followers_remain_eligible_after_partial_sealing() {
     let mut follower = owner.clone();
     follower["seq"] = 2.into();
     follower["prev_declaration"] = declaration_hash(&current_declaration(&r.p)).into();
-    write_declaration(&r.p, &follower, "k2", &K2_SEED);
-    write_feed_signed(&r.p, &r.host, &[], "2026-08-09T14:00:00Z", "k2", &K2_SEED);
+    write_declaration(&r.p, &follower, &K2_SEED);
+    write_feed_signed(&r.p, &r.host, &[], "2026-08-09T14:00:00Z", &K2_SEED);
     ingest(&r, "2026-08-09T14:00:00Z");
     follower["seq"] = 3.into();
     follower["prev_declaration"] = declaration_hash(&current_declaration(&r.p)).into();
     follower["subdomain_scope"] = serde_json::json!((0..70)
         .map(|i| format!("long-explicit-host-{i}.example.com"))
         .collect::<Vec<_>>());
-    write_declaration(&r.p, &follower, "k2", &K2_SEED);
+    write_declaration(&r.p, &follower, &K2_SEED);
     let pending_follower = current_declaration(&r.p);
     ingest(&r, "2026-08-09T14:00:00Z");
     r.db.set_param("block_decompressed_cap_bytes", 1800)
@@ -2150,13 +2105,13 @@ fn pending_recovery_followers_remain_eligible_after_partial_sealing() {
     let mut competitor = follower.clone();
     competitor["seq"] = 4.into();
     competitor["prev_declaration"] = declaration_hash(&pending_follower).into();
-    competitor["keys"] = serde_json::json!([key_entry("x1", &X1_SEED, "2026-08-09T13:00:00Z")]);
-    write_declaration(&r.p, &competitor, "x1", &X1_SEED);
-    write_feed_signed(&r.p, &r.host, &[], "2026-08-09T15:00:00Z", "x1", &X1_SEED);
+    competitor["keys"] = serde_json::json!([key_entry(&X1_SEED, "2026-08-09T13:00:00Z")]);
+    write_declaration(&r.p, &competitor, &X1_SEED);
+    write_feed_signed(&r.p, &r.host, &[], "2026-08-09T15:00:00Z", &X1_SEED);
     ingest(&r, "2026-08-09T15:00:00Z");
     follower["seq"] = 5.into();
     follower["prev_declaration"] = declaration_hash(&pending_follower).into();
-    write_declaration(&r.p, &follower, "k2", &K2_SEED);
+    write_declaration(&r.p, &follower, &K2_SEED);
     ingest(&r, "2026-08-09T15:00:00Z");
     assert_eq!(
         r.db.highest_accepted_declaration_seq(&r.host).unwrap(),
@@ -2188,8 +2143,8 @@ fn floor_migration_authenticates_the_pinned_prefix_before_writing() {
     let mut follower = owner.clone();
     follower["seq"] = 12.into();
     follower["prev_declaration"] = declaration_hash(&owner_envelope).into();
-    write_declaration(&r.p, &follower, "k2", &K2_SEED);
-    write_feed_signed(&r.p, &r.host, &[], "2026-08-09T14:00:00Z", "k2", &K2_SEED);
+    write_declaration(&r.p, &follower, &K2_SEED);
+    write_feed_signed(&r.p, &r.host, &[], "2026-08-09T14:00:00Z", &K2_SEED);
     ingest(&r, "2026-08-09T14:00:00Z");
     let database = r.data.path().join("clave.sqlite");
     let conn = rusqlite::Connection::open(&database).unwrap();
@@ -2228,8 +2183,8 @@ fn failed_recovery_head_write_rolls_back_declaration_floor_and_pending_entry() {
     let mut follower = owner.clone();
     follower["seq"] = 2.into();
     follower["prev_declaration"] = declaration_hash(&owner_envelope).into();
-    write_declaration(&r.p, &follower, "k2", &K2_SEED);
-    write_feed_signed(&r.p, &r.host, &[], "2026-08-09T14:00:00Z", "k2", &K2_SEED);
+    write_declaration(&r.p, &follower, &K2_SEED);
+    write_feed_signed(&r.p, &r.host, &[], "2026-08-09T14:00:00Z", &K2_SEED);
     let path = r.data.path().join("clave.sqlite");
     let conn = rusqlite::Connection::open(&path).unwrap();
     conn.execute_batch("CREATE TRIGGER fail_changed_recovery_head AFTER UPDATE OF declaration_json ON recovery_windows WHEN NEW.declaration_json != OLD.declaration_json BEGIN SELECT RAISE(ABORT, 'injected head write failure'); END;").unwrap();
@@ -2283,7 +2238,6 @@ fn admission_deadline_preserves_pending_followers_and_later_replacements() {
             "old",
             None,
             "2026-08-09T14:00:00Z",
-            "k1",
             &K1_SEED,
         );
         write_feed_signed(
@@ -2291,7 +2245,6 @@ fn admission_deadline_preserves_pending_followers_and_later_replacements() {
             &r.host,
             std::slice::from_ref(&rejected),
             "2026-08-09T14:00:00Z",
-            "k2",
             &K2_SEED,
         );
         assert_eq!(
@@ -2301,22 +2254,22 @@ fn admission_deadline_preserves_pending_followers_and_later_replacements() {
         let mut competitor = owner.clone();
         competitor["seq"] = 2.into();
         competitor["prev_declaration"] = declaration_hash(&owner_envelope).into();
-        competitor["keys"] = serde_json::json!([key_entry("x1", &X1_SEED, "2026-08-09T13:00:00Z")]);
-        write_declaration(&r.p, &competitor, "x1", &X1_SEED);
-        write_feed_signed(&r.p, &r.host, &[], "2026-08-09T15:00:00Z", "x1", &X1_SEED);
+        competitor["keys"] = serde_json::json!([key_entry(&X1_SEED, "2026-08-09T13:00:00Z")]);
+        write_declaration(&r.p, &competitor, &X1_SEED);
+        write_feed_signed(&r.p, &r.host, &[], "2026-08-09T15:00:00Z", &X1_SEED);
         ingest(&r, "2026-08-09T15:00:00Z");
         let mut follower = owner;
         follower["seq"] = 3.into();
         follower["prev_declaration"] = declaration_hash(&owner_envelope).into();
-        follower["keys"] = serde_json::json!([key_entry("k1", &K1_SEED, "2026-08-09T13:00:00Z")]);
-        let (signer, seed) = if recovery_follower {
-            ("r1", &R1_SEED)
+        follower["keys"] = serde_json::json!([key_entry(&K1_SEED, "2026-08-09T13:00:00Z")]);
+        let seed = if recovery_follower {
+            &R1_SEED
         } else {
-            ("k2", &K2_SEED)
+            &K2_SEED
         };
-        write_declaration(&r.p, &follower, signer, seed);
+        write_declaration(&r.p, &follower, seed);
         let follower_envelope = current_declaration(&r.p);
-        write_feed_signed(&r.p, &r.host, &[], "2026-08-09T16:00:00Z", "k1", &K1_SEED);
+        write_feed_signed(&r.p, &r.host, &[], "2026-08-09T16:00:00Z", &K1_SEED);
         ingest(&r, "2026-08-09T16:00:00Z");
         let deadline = "2026-08-16T13:00:00Z";
         r.db = clave::db::Db::open(&r.data.path().join("clave.sqlite")).unwrap();
@@ -2345,7 +2298,10 @@ fn admission_deadline_preserves_pending_followers_and_later_replacements() {
             .is_none());
         competitor["seq"] = 4.into();
         competitor["prev_declaration"] = declaration_hash(&follower_envelope).into();
-        write_declaration(&r.p, &competitor, "x1", &X1_SEED);
+        // Signed by the restored head's own key, so the post-settlement
+        // replacement is an ordinary rotation and its key has authority at
+        // once (WIST-1 §5.2).
+        write_declaration(&r.p, &competitor, &K1_SEED);
         let replacement = current_declaration(&r.p);
         let accepted = add_delta_signed(
             &r.p,
@@ -2353,7 +2309,6 @@ fn admission_deadline_preserves_pending_followers_and_later_replacements() {
             "after",
             None,
             deadline,
-            "x1",
             &X1_SEED,
         );
         write_feed_signed(
@@ -2361,7 +2316,6 @@ fn admission_deadline_preserves_pending_followers_and_later_replacements() {
             &r.host,
             std::slice::from_ref(&accepted),
             deadline,
-            "x1",
             &X1_SEED,
         );
         assert_eq!(ingest(&r, deadline).accepted, vec![accepted.clone()]);
@@ -2414,7 +2368,6 @@ fn failed_admission_settlement_rolls_back_every_database_effect() {
         "old",
         None,
         "2026-08-09T14:00:00Z",
-        "k1",
         &K1_SEED,
     );
     write_feed_signed(
@@ -2422,7 +2375,6 @@ fn failed_admission_settlement_rolls_back_every_database_effect() {
         &r.host,
         std::slice::from_ref(&rejected),
         "2026-08-09T14:00:00Z",
-        "k2",
         &K2_SEED,
     );
     ingest(&r, "2026-08-09T14:00:00Z");
@@ -2475,10 +2427,10 @@ fn cadence_rounding_cannot_reopen_a_settled_admission_window() {
     let mut owner = prior["publisher"].clone();
     owner["seq"] = 1.into();
     owner["prev_declaration"] = declaration_hash(&prior).into();
-    owner["keys"] = serde_json::json!([key_entry("k2", &K2_SEED, "2026-08-09T13:00:00Z")]);
-    write_declaration(&r.p, &owner, "r1", &R1_SEED);
+    owner["keys"] = serde_json::json!([key_entry(&K2_SEED, "2026-08-09T13:00:00Z")]);
+    write_declaration(&r.p, &owner, &R1_SEED);
     let opened = (effective.div_euclid(3599) + 1) * 3599;
-    write_feed_signed(&r.p, &r.host, &[], &at(opened), "k2", &K2_SEED);
+    write_feed_signed(&r.p, &r.host, &[], &at(opened), &K2_SEED);
     ingest(&r, &at(opened));
     clave::seal::run(&r.db, r.data.path(), &r.sk, opened).unwrap();
     let survivor = add_delta_signed(
@@ -2487,7 +2439,6 @@ fn cadence_rounding_cannot_reopen_a_settled_admission_window() {
         "body",
         None,
         &at(opened),
-        "k2",
         &K2_SEED,
     );
     write_feed_signed(
@@ -2495,7 +2446,6 @@ fn cadence_rounding_cannot_reopen_a_settled_admission_window() {
         &r.host,
         std::slice::from_ref(&survivor),
         &at(opened),
-        "k2",
         &K2_SEED,
     );
     assert_eq!(ingest(&r, &at(opened)).queued, vec![survivor.clone()]);
@@ -2540,7 +2490,6 @@ fn pulls_crossing_the_deadline_refresh_authority_before_admission() {
             "body",
             None,
             "2026-08-16T12:59:59Z",
-            "k1",
             &K1_SEED,
         );
         write_feed_signed(
@@ -2548,7 +2497,6 @@ fn pulls_crossing_the_deadline_refresh_authority_before_admission() {
             &r.host,
             std::slice::from_ref(&delta),
             "2026-08-16T12:59:59Z",
-            "k2",
             &K2_SEED,
         );
         let calls = std::cell::Cell::new(0);
@@ -2589,21 +2537,12 @@ fn deadline_retries_seen_copies_and_retrieves_a_settled_predecessor() {
     for with_child in [false, true] {
         let (r, _, _) = sealed_recovery();
         let url = "https://example.com/retry";
-        let parent = add_delta_signed(
-            &r.p,
-            url,
-            "parent",
-            None,
-            "2026-08-09T14:00:00Z",
-            "k1",
-            &K1_SEED,
-        );
+        let parent = add_delta_signed(&r.p, url, "parent", None, "2026-08-09T14:00:00Z", &K1_SEED);
         write_feed_signed(
             &r.p,
             &r.host,
             std::slice::from_ref(&parent),
             "2026-08-09T14:00:00Z",
-            "k2",
             &K2_SEED,
         );
         assert_eq!(
@@ -2619,7 +2558,7 @@ fn deadline_retries_seen_copies_and_retrieves_a_settled_predecessor() {
         let replacement = wist_core::envelope::sign_envelope(
             &old["delta"],
             "delta",
-            "k2",
+            &kid(&K2_SEED),
             &wist_core::crypto::SigningKey::from_seed(&K2_SEED),
         )
         .unwrap();
@@ -2631,7 +2570,6 @@ fn deadline_retries_seen_copies_and_retrieves_a_settled_predecessor() {
                 "child",
                 Some(&parent),
                 "2026-08-16T12:59:59Z",
-                "k2",
                 &K2_SEED,
             )
         } else {
@@ -2642,7 +2580,6 @@ fn deadline_retries_seen_copies_and_retrieves_a_settled_predecessor() {
             &r.host,
             std::slice::from_ref(&requested),
             "2026-08-16T12:59:59Z",
-            "k2",
             &K2_SEED,
         );
         let calls = std::cell::Cell::new(0);

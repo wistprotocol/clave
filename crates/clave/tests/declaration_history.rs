@@ -51,6 +51,11 @@ fn field_rejection_preserves_the_complete_declaration_prefix() {
                     .unwrap()
                     .value_at("recovery_window_days", block.sealed_at_s())
                     .unwrap(),
+                reader
+                    .schedule()
+                    .unwrap()
+                    .value_at("declaration_activation_blocks", block.sealed_at_s())
+                    .unwrap(),
                 &block.block().entries,
             );
             assert_eq!(format!("{state:?}"), before);
@@ -406,6 +411,11 @@ fn probe(blocks: &[Value], probe: &Value) -> (Declarations, Result<Effects, Stri
             .unwrap()
             .value_at("recovery_window_days", candidate.sealed_at_s())
             .unwrap(),
+        history
+            .schedule()
+            .unwrap()
+            .value_at("declaration_activation_blocks", candidate.sealed_at_s())
+            .unwrap(),
         &candidate.block().entries,
     );
     assert_eq!(format!("{state:?}"), before);
@@ -544,9 +554,31 @@ fn recovery_heads_sequence_floors_and_named_predecessors_match_signed_vectors() 
     }
 }
 
+/// Applies one authenticated Block under the parameter map a vector
+/// declares, rather than the registry defaults its fixture Log carries.
+fn apply_under(
+    state: &mut Declarations,
+    block: &clave::history::VerifiedBlock,
+    days: i64,
+    activation_blocks: i64,
+) -> Result<clave::history::declarations::Effects, clave::Error> {
+    let header = &block.block().header;
+    Ok(state.apply_block(
+        header.block_number,
+        &header.prev_block_hash,
+        block.hash(),
+        &header.sealed_at,
+        days,
+        activation_blocks,
+        &block.block().entries,
+    )?)
+}
+
 #[test]
 fn conflicting_groups_and_failed_authors_reject_blocks_atomically() {
     let vector = vector("wist1/declaration-conflicts");
+    let days = vector["recovery_window_days"].as_i64().unwrap();
+    let activation_blocks = vector["declaration_activation_blocks"].as_i64().unwrap();
     for case in vector["cases"].as_array().unwrap() {
         let mut blocks = vector["prefixes"][case["prefix"].as_str().unwrap()]
             .as_array()
@@ -559,7 +591,7 @@ fn conflicting_groups_and_failed_authors_reject_blocks_atomically() {
         let mut windows = std::collections::BTreeMap::<String, u64>::new();
         while let Some(block) = history.next_block().unwrap() {
             let before = format!("{state:?}");
-            match state.apply(&block) {
+            match apply_under(&mut state, &block, days, activation_blocks) {
                 Ok(effects) => {
                     for installation in effects.installations {
                         let domain = installation.declaration.envelope()["publisher"]["domain"]
@@ -675,16 +707,20 @@ fn reconstruction_requires_complete_pinned_history_and_sequential_application() 
 fn recovery_declaration(previous: Option<&Value>) -> Value {
     let signing = SigningKey::from_seed(&[42; 32]);
     let recovery = SigningKey::from_seed(&[43; 32]);
-    let mut publisher = json!({"wist_version":"1.0.0","domain":"example.com","seq":previous.map_or(0,|p|p["publisher"]["seq"].as_u64().unwrap()+1),"keys":[{"key_id":"signing","alg":"Ed25519","public_key":signing.public().to_b64u(),"valid_from":"2026-01-01T00:00:00Z"}],"recovery_keys":[{"key_id":"recovery","alg":"Ed25519","public_key":recovery.public().to_b64u(),"valid_from":"2026-01-01T00:00:00Z"}]});
+    let signing_entry =
+        wist_core::objects::PublisherKey::new(&signing.public().to_b64u(), 1_767_225_600, None);
+    let recovery_entry =
+        wist_core::objects::PublisherKey::new(&recovery.public().to_b64u(), 1_767_225_600, None);
+    let mut publisher = json!({"wist_version":"1.0.0","domain":"example.com","seq":previous.map_or(0,|p|p["publisher"]["seq"].as_u64().unwrap()+1),"keys":[signing_entry],"recovery_keys":[recovery_entry]});
     if let Some(previous) = previous {
         publisher["prev_declaration"] = digest(&previous["publisher"]).into();
     }
-    let (key_id, key) = if previous.is_some() {
-        ("recovery", &recovery)
+    let (kid, key) = if previous.is_some() {
+        (&recovery_entry.kid, &recovery)
     } else {
-        ("signing", &signing)
+        (&signing_entry.kid, &signing)
     };
-    envelope::sign_envelope(&publisher, "publisher", key_id, key).unwrap()
+    envelope::sign_envelope(&publisher, "publisher", kid, key).unwrap()
 }
 
 #[test]
@@ -917,7 +953,7 @@ fn candidate_sources_keep_settlement_separate_from_deadline_replacements() {
             4
         );
         let deadline = i64::try_from(domain.window().unwrap().end_s()).unwrap();
-        let prior = state.project(&timestamp(deadline - 1), 7, &[]).unwrap();
+        let prior = state.project(&timestamp(deadline - 1), 7, 0, &[]).unwrap();
         assert!(prior.effects().settlements.is_empty());
         let domain = &prior.domains()["example.com"];
         assert!(domain.delta_sealing_source().is_none());
@@ -930,7 +966,7 @@ fn candidate_sources_keep_settlement_separate_from_deadline_replacements() {
             [1, 2]
         );
 
-        let empty = state.project(&timestamp(deadline), 7, &[]).unwrap();
+        let empty = state.project(&timestamp(deadline), 7, 0, &[]).unwrap();
         let restored = &empty.domains()["example.com"];
         assert_eq!(
             restored.delta_sealing_source().unwrap().envelope()["publisher"]["seq"],
@@ -953,6 +989,7 @@ fn candidate_sources_keep_settlement_separate_from_deadline_replacements() {
             .project(
                 blocks[169]["header"]["sealed_at"].as_str().unwrap(),
                 7,
+                0,
                 blocks[169]["entries"].as_array().unwrap(),
             )
             .unwrap();
@@ -987,13 +1024,16 @@ fn candidate_sources_keep_settlement_separate_from_deadline_replacements() {
         )
         .into();
         assert!(state
-            .project(&timestamp(deadline), 7, &corrupted)
+            .project(&timestamp(deadline), 7, 0, &corrupted)
             .unwrap_err()
             .to_string()
             .contains("WIST1-E01"));
         assert_eq!(format!("{state:?}"), before);
         assert_eq!(
-            format!("{:?}", state.project(&timestamp(deadline), 7, &[]).unwrap()),
+            format!(
+                "{:?}",
+                state.project(&timestamp(deadline), 7, 0, &[]).unwrap()
+            ),
             format!("{empty:?}")
         );
         assert_eq!(format!("{:?}", fixture.restore().unwrap()), before);
@@ -1013,6 +1053,7 @@ fn unsealed_candidate_followers_do_not_advance_recovery_authority() {
             .project(
                 blocks[3]["header"]["sealed_at"].as_str().unwrap(),
                 7,
+                0,
                 blocks[3]["entries"].as_array().unwrap(),
             )
             .unwrap();
@@ -1038,7 +1079,7 @@ fn unsealed_candidate_followers_do_not_advance_recovery_authority() {
         );
         assert_eq!(domain.highest_accepted_seq(), 3);
         let deadline = i64::try_from(domain.window().unwrap().end_s()).unwrap();
-        let settled = state.project(&timestamp(deadline), 7, &[]).unwrap();
+        let settled = state.project(&timestamp(deadline), 7, 0, &[]).unwrap();
         assert_eq!(
             settled.effects().settlements[0].restored.envelope()["publisher"]["seq"],
             2
@@ -1063,18 +1104,18 @@ fn candidate_projection_requires_valid_time_profile_and_entry_order() {
         "2026-08-04T02:00:00.0Z",
         "2026-08-04T02:00:00+00:00",
     ] {
-        assert!(state.project(invalid, 7, &[]).is_err());
+        assert!(state.project(invalid, 7, 0, &[]).is_err());
     }
-    assert!(state.project(at, 0, &[]).is_err());
-    assert!(state.project(at, i64::MAX, &[]).is_err());
+    assert!(state.project(at, 0, 0, &[]).is_err());
+    assert!(state.project(at, i64::MAX, 0, &[]).is_err());
     let malformed = json!({"type":"publisher_declaration","body":null});
-    assert!(state.project(at, 7, &[malformed]).is_err());
+    assert!(state.project(at, 7, 0, &[malformed]).is_err());
     let mut entries = vec![
         json!({"type":"label","body":{}}),
         blocks[2]["entries"][0].clone(),
     ];
-    assert!(state.project(at, 7, &entries).is_err());
+    assert!(state.project(at, 7, 0, &entries).is_err());
     entries.reverse();
-    assert!(state.project(at, 7, &entries).is_ok());
+    assert!(state.project(at, 7, 0, &entries).is_ok());
     assert_eq!(format!("{state:?}"), before);
 }

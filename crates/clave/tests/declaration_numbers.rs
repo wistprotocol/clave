@@ -37,10 +37,10 @@ impl Rig {
         self.db = clave::db::Db::open(&self.data.path().join("clave.sqlite")).unwrap();
     }
 
-    fn admit(&self, body: &Value, signer: &str, seed: &[u8; 32], at: &str) -> Value {
-        write_declaration(&self.publisher, body, signer, seed);
+    fn admit(&self, body: &Value, seed: &[u8; 32], at: &str) -> Value {
+        write_declaration(&self.publisher, body, seed);
         let declaration = current_declaration(&self.publisher);
-        write_feed_signed(&self.publisher, &self.host, &[], at, signer, seed);
+        write_feed_signed(&self.publisher, &self.host, &[], at, seed);
         clave::ingest::run(&self.db, &self.client, self.data.path(), &self.host, at).unwrap();
         assert_eq!(
             self.db
@@ -131,7 +131,7 @@ fn integral_declaration_sequences_preserve_admission_metadata_and_snapshot_heigh
         for (index, spelling) in spellings.into_iter().enumerate() {
             body["seq"] = serde_json::from_str(spelling).unwrap();
             let at = format!("2026-08-09T{:02}:00:00Z", 12 + index);
-            let declaration = rig.admit(&body, "k1", &K1_SEED, &at);
+            let declaration = rig.admit(&body, &K1_SEED, &at);
             let raw = serde_json::to_vec(&declaration).unwrap();
             rig.reopen();
             assert_eq!(
@@ -160,7 +160,7 @@ fn integral_declaration_sequences_preserve_admission_metadata_and_snapshot_heigh
             .get_publisher_declaration(&rig.host)
             .unwrap()
             .unwrap();
-        write_declaration(&rig.publisher, &equivalent, "k1", &K1_SEED);
+        write_declaration(&rig.publisher, &equivalent, &K1_SEED);
         write_feed(&rig.publisher, &rig.host, &[], at);
         clave::ingest::run(&rig.db, &rig.client, rig.data.path(), &rig.host, at).unwrap();
         assert_eq!(
@@ -186,33 +186,33 @@ fn integral_pending_recovery_sequences_settle_in_order_and_preserve_the_floor() 
     {
         let mut rig = Rig::new();
         let initial_body = current_declaration(&rig.publisher)["publisher"].clone();
-        let initial = rig.admit(&initial_body, "k1", &K1_SEED, "2026-08-09T12:00:00Z");
+        let initial = rig.admit(&initial_body, &K1_SEED, "2026-08-09T12:00:00Z");
         rig.seal("2026-08-09T12:00:00Z");
         let mut owner = initial_body;
         owner["seq"] = json!(1.0);
         owner["prev_declaration"] = declaration_hash(&initial).into();
-        owner["keys"] = json!([key_entry("k2", &K2_SEED, "2026-08-09T13:00:00Z")]);
-        let owner_envelope = rig.admit(&owner, "r1", &R1_SEED, "2026-08-09T13:00:00Z");
+        owner["keys"] = json!([key_entry(&K2_SEED, "2026-08-09T13:00:00Z")]);
+        let owner_envelope = rig.admit(&owner, &R1_SEED, "2026-08-09T13:00:00Z");
         rig.seal("2026-08-09T13:00:00Z");
         let mut follower = owner.clone();
         follower["seq"] = serde_json::from_str(spellings[0]).unwrap();
         follower["prev_declaration"] = declaration_hash(&owner_envelope).into();
-        let first = rig.admit(&follower, "k2", &K2_SEED, "2026-08-09T14:00:00Z");
+        let first = rig.admit(&follower, &K2_SEED, "2026-08-09T14:00:00Z");
         follower["seq"] = serde_json::from_str(spellings[1]).unwrap();
         follower["prev_declaration"] = declaration_hash(&first).into();
-        let retained = rig.admit(&follower, "k2", &K2_SEED, "2026-08-09T15:00:00Z");
+        let retained = rig.admit(&follower, &K2_SEED, "2026-08-09T15:00:00Z");
         let mut competitor = follower.clone();
         competitor["seq"] = serde_json::from_str(spellings[2]).unwrap();
         competitor["prev_declaration"] = declaration_hash(&retained).into();
-        competitor["keys"] = json!([key_entry("x1", &X1_SEED, "2026-08-09T13:00:00Z")]);
-        rig.admit(&competitor, "x1", &X1_SEED, "2026-08-09T16:00:00Z");
+        competitor["keys"] = json!([key_entry(&X1_SEED, "2026-08-09T13:00:00Z")]);
+        rig.admit(&competitor, &X1_SEED, "2026-08-09T16:00:00Z");
         rig.reopen();
         follower["seq"] = json!(5.0);
         follower["prev_declaration"] = declaration_hash(&retained).into();
-        let last = rig.admit(&follower, "k2", &K2_SEED, "2026-08-09T17:00:00Z");
+        let last = rig.admit(&follower, &K2_SEED, "2026-08-09T17:00:00Z");
         competitor["seq"] = json!(6.0);
         competitor["prev_declaration"] = declaration_hash(&last).into();
-        rig.admit(&competitor, "x1", &X1_SEED, "2026-08-09T18:00:00Z");
+        rig.admit(&competitor, &X1_SEED, "2026-08-09T18:00:00Z");
         rig.reopen();
         let deadline = "2026-08-16T13:00:00Z";
         if !sealing_settlement {
@@ -258,19 +258,19 @@ fn integral_pending_recovery_sequences_settle_in_order_and_preserve_the_floor() 
         let rejected = envelope::sign_envelope(
             &rejected,
             "publisher",
-            "k2",
+            &kid(&K2_SEED),
             &wist_core::crypto::SigningKey::from_seed(&K2_SEED),
         )
         .unwrap();
         assert_eq!(
-            clave::declaration::evaluate_with_heads(&last, None, 6, &rejected)
+            clave::declaration::evaluate_with_heads(&last, None, None, 6, &rejected)
                 .unwrap_err()
                 .0,
             "WIST1-E08"
         );
         follower["seq"] = json!(7.0);
         follower["prev_declaration"] = declaration_hash(&last).into();
-        let next = rig.admit(&follower, "k2", &K2_SEED, "2026-08-16T14:00:00Z");
+        let next = rig.admit(&follower, &K2_SEED, "2026-08-16T14:00:00Z");
         rig.reopen();
         let height = rig.seal("2026-08-16T14:00:00Z");
         rig.assert_sealed(&next, height, "2026-08-16T14:00:00Z");

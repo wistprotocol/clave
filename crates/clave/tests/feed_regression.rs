@@ -285,26 +285,35 @@ fn declaration_rotation_and_identity_reset_preserve_the_observation() {
         replacement["seq"] = 1.into();
         replacement["prev_declaration"] = declaration_hash(&original).into();
         let seed = [2u8; 32];
-        replacement["keys"][0]["public_key"] = wist_core::crypto::b64u_encode(
-            &ed25519_dalek::SigningKey::from_bytes(&seed)
-                .verifying_key()
-                .to_bytes(),
-        )
-        .into();
+        rekey(&mut replacement["keys"][0], &seed_public_b64u(&seed));
         write_declaration(
             &publisher,
             &replacement,
-            "k1",
             if identity_reset { &seed } else { &[1u8; 32] },
         );
         publisher.sk = wist_core::crypto::SigningKey::from_seed(&seed);
+        publisher.kid = kid(&seed);
         write_feed(&publisher, &host, &[], EARLIER);
         drop(db);
         let db = Db::open(&path).unwrap();
         let report = clave::ingest::run(&db, &client, data.path(), &host, NOW).unwrap();
-        assert!(report.noise.is_none(), "{identity_reset}");
         let accepted: Value =
             serde_json::from_slice(&db.get_publisher_declaration(&host).unwrap().unwrap()).unwrap();
+        if identity_reset {
+            // WIST-1 §5.2: the fresh identity is pending, so the Declaration
+            // in force is unchanged and a Feed signed under the pending key
+            // authenticates as nothing this domain has published.
+            assert_eq!(
+                accepted["publisher"], original["publisher"],
+                "{identity_reset}"
+            );
+            let pending: Value =
+                serde_json::from_slice(&db.get_pending_identity(&host).unwrap().unwrap()).unwrap();
+            assert_eq!(pending["publisher"], replacement);
+            assert_eq!(report.noise, Some("WIST2-E04"), "{identity_reset}");
+            continue;
+        }
+        assert!(report.noise.is_none(), "{identity_reset}");
         assert_eq!(accepted["publisher"], replacement);
         assert_eq!(
             db.list_rejections(&host).unwrap().first().unwrap().code,
@@ -334,27 +343,18 @@ fn recovery_settlement_preserves_a_superseded_identitys_feed_maximum() {
             let mut owner = initial["publisher"].clone();
             owner["seq"] = 1.into();
             owner["prev_declaration"] = declaration_hash(&initial).into();
-            owner["keys"] = serde_json::json!([key_entry("k2", &K2_SEED, "2026-08-09T13:00:00Z")]);
-            for (at, body, signer, seed, feed_signer, feed_seed) in [
+            owner["keys"] = serde_json::json!([key_entry(&K2_SEED, "2026-08-09T13:00:00Z")]);
+            for (at, body, seed, feed_seed) in [
                 (
                     "2026-08-09T12:00:00Z",
                     &initial["publisher"],
-                    "k1",
                     &K1_SEED,
-                    "k1",
                     &K1_SEED,
                 ),
-                (
-                    "2026-08-09T13:00:00Z",
-                    &owner,
-                    "r1",
-                    &R1_SEED,
-                    "k2",
-                    &K2_SEED,
-                ),
+                ("2026-08-09T13:00:00Z", &owner, &R1_SEED, &K2_SEED),
             ] {
-                write_declaration(&publisher, body, signer, seed);
-                write_feed_signed(&publisher, &host, &[], at, feed_signer, feed_seed);
+                write_declaration(&publisher, body, seed);
+                write_feed_signed(&publisher, &host, &[], at, feed_seed);
                 let report = clave::ingest::run(&db, &client, data.path(), &host, at).unwrap();
                 assert_eq!(report.noise, Some("WIST2-E02"));
                 clave::seal::run(
@@ -369,10 +369,9 @@ fn recovery_settlement_preserves_a_superseded_identitys_feed_maximum() {
             let mut competitor = owner.clone();
             competitor["seq"] = 2.into();
             competitor["prev_declaration"] = declaration_hash(&owner_envelope).into();
-            competitor["keys"] =
-                serde_json::json!([key_entry("x1", &X1_SEED, "2026-08-09T14:00:00Z")]);
-            write_declaration(&publisher, &competitor, "x1", &X1_SEED);
-            write_feed_signed(&publisher, &host, &[], MAXIMUM, "x1", &X1_SEED);
+            competitor["keys"] = serde_json::json!([key_entry(&X1_SEED, "2026-08-09T14:00:00Z")]);
+            write_declaration(&publisher, &competitor, &X1_SEED);
+            write_feed_signed(&publisher, &host, &[], MAXIMUM, &X1_SEED);
             let report = clave::ingest::run(&db, &client, data.path(), &host, NOW).unwrap();
             assert_eq!(report.noise, Some("WIST2-E02"));
             let accepted: Value =
@@ -401,14 +400,13 @@ fn recovery_settlement_preserves_a_superseded_identitys_feed_maximum() {
                 .unwrap();
                 db = Db::open(&path).unwrap();
             }
-            write_declaration(&publisher, &owner, "r1", &R1_SEED);
+            write_declaration(&publisher, &owner, &R1_SEED);
             let id = add_delta_signed(
                 &publisher,
                 "https://localhost/recovered",
                 "recovered content",
                 None,
                 DEADLINE,
-                "k2",
                 &K2_SEED,
             );
             write_feed_signed(
@@ -416,7 +414,6 @@ fn recovery_settlement_preserves_a_superseded_identitys_feed_maximum() {
                 &host,
                 std::slice::from_ref(&id),
                 DEADLINE,
-                "k2",
                 &K2_SEED,
             );
             let report = clave::ingest::run(&db, &client, data.path(), &host, DEADLINE).unwrap();
@@ -437,7 +434,6 @@ fn recovery_settlement_preserves_a_superseded_identitys_feed_maximum() {
                 &host,
                 std::slice::from_ref(&id),
                 MAXIMUM,
-                "k2",
                 &K2_SEED,
             );
             let report = clave::ingest::run(&db, &client, data.path(), &host, DEADLINE).unwrap();

@@ -19,6 +19,7 @@ pub struct VerifiedBlock {
     decompressed_bytes: u64,
     rejected_parameters: Vec<usize>,
     recovery_window_days: i64,
+    declaration_activation_blocks: i64,
     delta_size_caps: crate::declaration::delta::SizeCaps,
     clock_skew_seconds: i64,
 }
@@ -222,6 +223,9 @@ impl History {
         self.prior_at = Some(at);
         self.largest = largest;
         let recovery_window_days = schedule.value_at("recovery_window_days", at).unwrap();
+        let declaration_activation_blocks = schedule
+            .value_at("declaration_activation_blocks", at)
+            .unwrap();
         let delta_size_caps = crate::declaration::delta::SizeCaps::from_schedule(&schedule, at);
         self.schedule = Some(schedule);
         Ok(Some(VerifiedBlock {
@@ -231,6 +235,7 @@ impl History {
             decompressed_bytes: size,
             rejected_parameters,
             recovery_window_days,
+            declaration_activation_blocks,
             delta_size_caps,
             clock_skew_seconds: self
                 .schedule

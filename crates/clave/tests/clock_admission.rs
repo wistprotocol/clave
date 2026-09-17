@@ -54,15 +54,14 @@ fn excess_skew_cannot_enter_a_recovery_queue() {
     let mut recovery = previous["publisher"].clone();
     recovery["seq"] = json!(1);
     recovery["prev_declaration"] = json!(declaration_hash(&previous));
-    recovery["keys"] = json!([key_entry("k2", &K2_SEED, "2026-08-09T12:00:00Z")]);
-    write_declaration(&p, &recovery, "r1", &R1_SEED);
+    recovery["keys"] = json!([key_entry(&K2_SEED, "2026-08-09T12:00:00Z")]);
+    write_declaration(&p, &recovery, &R1_SEED);
     let accepted = add_delta_signed(
         &p,
         "https://localhost/a",
         "first",
         None,
         "2026-08-09T12:10:00Z",
-        "k2",
         &K2_SEED,
     );
     let rejected = add_delta_signed(
@@ -71,7 +70,6 @@ fn excess_skew_cannot_enter_a_recovery_queue() {
         "later",
         None,
         "2026-08-09T12:10:00.000000000001Z",
-        "k2",
         &K2_SEED,
     );
     write_feed_signed(
@@ -79,7 +77,6 @@ fn excess_skew_cannot_enter_a_recovery_queue() {
         &host,
         &[accepted.clone(), rejected.clone()],
         "2026-08-09T12:00:00Z",
-        "k2",
         &K2_SEED,
     );
     let report =
@@ -238,22 +235,13 @@ fn ingest_rechecks_rejected_ids_after_restart_without_advancing_the_chain() {
     let (listener, host, client) = reserve_addr();
     let p = make_publisher(&host);
     let url = "https://localhost/a";
-    let first = add_delta_signed(
-        &p,
-        url,
-        "first",
-        None,
-        "2026-08-09T12:10:00Z",
-        "k1",
-        &K1_SEED,
-    );
+    let first = add_delta_signed(&p, url, "first", None, "2026-08-09T12:10:00Z", &K1_SEED);
     let later = add_delta_signed(
         &p,
         url,
         "later",
         Some(&first),
         "2026-08-09T12:10:00.00000000000000000001Z",
-        "k1",
         &K1_SEED,
     );
     write_feed(
@@ -333,7 +321,6 @@ fn ingest_samples_each_delta_clock_and_uses_the_parameter_effective_then() {
                     path,
                     None,
                     "2026-08-16T12:00:00.5Z",
-                    "k1",
                     &K1_SEED,
                 )
             })

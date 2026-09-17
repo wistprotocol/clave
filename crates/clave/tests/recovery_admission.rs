@@ -16,8 +16,8 @@ fn store(db: &Db, doc: &Value) {
         db.record_publisher_declaration(
             DOMAIN,
             &raw,
-            key["key_id"].as_str().unwrap(),
-            key["public_key"].as_str().unwrap(),
+            key["kid"].as_str().unwrap(),
+            key["x"].as_str().unwrap(),
             doc,
         )
         .unwrap();
@@ -25,8 +25,8 @@ fn store(db: &Db, doc: &Value) {
         db.update_publisher_declaration(
             DOMAIN,
             &raw,
-            key["key_id"].as_str().unwrap(),
-            key["public_key"].as_str().unwrap(),
+            key["kid"].as_str().unwrap(),
+            key["x"].as_str().unwrap(),
             doc,
         )
         .unwrap();
@@ -171,6 +171,7 @@ fn signed_pending_declaration_settlement_vectors_survive_reopen_and_repeat() {
             let result = evaluate_with_heads(
                 &current(&db),
                 None,
+                None,
                 db.highest_accepted_declaration_seq(DOMAIN)
                     .unwrap()
                     .unwrap(),
@@ -213,7 +214,16 @@ fn signed_pending_declaration_settlement_vectors_survive_reopen_and_repeat() {
             .iter()
             .map(|entry| serde_json::from_value(entry.clone()).unwrap())
             .collect::<Vec<_>>();
-        let projection = history.project(deadline, 7, &entries).unwrap();
+        let projection = history
+            .project(
+                deadline,
+                7,
+                vector["declaration_activation_blocks"]
+                    .as_i64()
+                    .unwrap_or(24),
+                &entries,
+            )
+            .unwrap();
         let state = &projection.domains()[DOMAIN];
         assert_eq!(
             state.current().envelope(),

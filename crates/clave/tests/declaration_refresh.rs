@@ -54,17 +54,14 @@ fn serve_sequence(
     requests
 }
 
-fn replacement(p: &TestPub, key_id: &str, recovery: bool) -> Value {
+fn replacement(p: &TestPub, recovery: bool) -> Value {
     let previous = current_declaration(p);
     let mut next = previous["publisher"].clone();
     next["seq"] = json!(1);
     next["prev_declaration"] = json!(declaration_hash(&previous));
-    next["keys"] = json!([key_entry(key_id, &K2_SEED, "2026-08-09T00:00:00Z")]);
-    let (signer, seed) = if recovery {
-        ("r1", &R1_SEED)
-    } else {
-        ("k1", &K1_SEED)
-    };
+    next["keys"] = json!([key_entry(&K2_SEED, "2026-08-09T00:00:00Z")]);
+    let seed = if recovery { &R1_SEED } else { &K1_SEED };
+    let signer = &kid(seed);
     wist_core::envelope::sign_envelope(
         &next,
         "publisher",
@@ -85,8 +82,8 @@ fn install(db: &Db, doc: &Value) {
         db,
         "localhost",
         &serde_json::to_vec(doc).unwrap(),
-        key["key_id"].as_str().unwrap(),
-        key["public_key"].as_str().unwrap(),
+        key["kid"].as_str().unwrap(),
+        key["x"].as_str().unwrap(),
         doc,
     )
     .unwrap();
@@ -100,21 +97,13 @@ fn stored(db: &Db) -> Value {
 #[test]
 fn rotated_feed_retries_the_same_bytes_after_first_contact_or_cached_discovery() {
     for known in [false, true] {
-        for key_id in ["k1", "k2"] {
+        {
             let (listener, host, client) = reserve_addr();
             let p = make_publisher_with_recovery(&host);
             let previous = current_declaration(&p);
-            let next = replacement(&p, key_id, false);
-            let id = add_delta_signed(
-                &p,
-                "https://localhost/a",
-                "rotated",
-                None,
-                NOW,
-                key_id,
-                &K2_SEED,
-            );
-            write_feed_signed(&p, &host, std::slice::from_ref(&id), NOW, key_id, &K2_SEED);
+            let next = replacement(&p, false);
+            let id = add_delta_signed(&p, "https://localhost/a", "rotated", None, NOW, &K2_SEED);
+            write_feed_signed(&p, &host, std::slice::from_ref(&id), NOW, &K2_SEED);
             let requests = serve_sequence(
                 listener,
                 p.dir.path().into(),
@@ -131,7 +120,7 @@ fn rotated_feed_retries_the_same_bytes_after_first_contact_or_cached_discovery()
             assert_eq!(
                 report.accepted,
                 std::slice::from_ref(&id),
-                "{known}/{key_id}: {report:?}"
+                "{known}: {report:?}"
             );
             assert!(report.rejected.is_empty());
             assert_eq!(report.noise, None);
@@ -165,17 +154,9 @@ fn refresh_authenticates_recovery_and_queues_the_feed_deltas() {
     let (listener, host, client) = reserve_addr();
     let p = make_publisher_with_recovery(&host);
     let previous = current_declaration(&p);
-    let next = replacement(&p, "k2", true);
-    let id = add_delta_signed(
-        &p,
-        "https://localhost/a",
-        "recovered",
-        None,
-        NOW,
-        "k2",
-        &K2_SEED,
-    );
-    write_feed_signed(&p, &host, std::slice::from_ref(&id), NOW, "k2", &K2_SEED);
+    let next = replacement(&p, true);
+    let id = add_delta_signed(&p, "https://localhost/a", "recovered", None, NOW, &K2_SEED);
+    write_feed_signed(&p, &host, std::slice::from_ref(&id), NOW, &K2_SEED);
     serve_sequence(
         listener,
         p.dir.path().into(),
@@ -217,7 +198,7 @@ fn unsuccessful_refresh_counts_one_feed_failure_without_installing_invalid_autho
         let (listener, host, client) = reserve_addr();
         let p = make_publisher_with_recovery(&host);
         let previous = current_declaration(&p);
-        let mut next = replacement(&p, "k2", false);
+        let mut next = replacement(&p, false);
         let refresh = match failure {
             "unchanged" => response(&previous),
             "invalid_signature" => {
@@ -236,16 +217,8 @@ fn unsuccessful_refresh_counts_one_feed_failure_without_installing_invalid_autho
             "non_json" => (axum::http::StatusCode::OK, b"invalid json".to_vec()),
             _ => unreachable!(),
         };
-        let id = add_delta_signed(
-            &p,
-            "https://localhost/a",
-            "rotated",
-            None,
-            NOW,
-            "k2",
-            &K2_SEED,
-        );
-        write_feed_signed(&p, &host, std::slice::from_ref(&id), NOW, "k2", &K2_SEED);
+        let id = add_delta_signed(&p, "https://localhost/a", "rotated", None, NOW, &K2_SEED);
+        write_feed_signed(&p, &host, std::slice::from_ref(&id), NOW, &K2_SEED);
         let requests = serve_sequence(
             listener,
             p.dir.path().into(),
@@ -290,17 +263,9 @@ fn an_exhausted_content_budget_refuses_the_feed_at_its_bound_and_resumes_after_r
     let (listener, host, client) = reserve_addr();
     let p = make_publisher_with_recovery(&host);
     let previous = current_declaration(&p);
-    let next = replacement(&p, "k2", false);
-    let id = add_delta_signed(
-        &p,
-        "https://localhost/a",
-        "rotated",
-        None,
-        NOW,
-        "k2",
-        &K2_SEED,
-    );
-    write_feed_signed(&p, &host, std::slice::from_ref(&id), NOW, "k2", &K2_SEED);
+    let next = replacement(&p, false);
+    let id = add_delta_signed(&p, "https://localhost/a", "rotated", None, NOW, &K2_SEED);
+    write_feed_signed(&p, &host, std::slice::from_ref(&id), NOW, &K2_SEED);
     let requests = serve_sequence(
         listener,
         p.dir.path().into(),
@@ -348,8 +313,8 @@ fn valid_refresh_does_not_authenticate_a_tampered_feed() {
     let (listener, host, client) = reserve_addr();
     let p = make_publisher_with_recovery(&host);
     let previous = current_declaration(&p);
-    let next = replacement(&p, "k2", false);
-    write_feed_signed(&p, &host, &[], NOW, "k2", &K2_SEED);
+    let next = replacement(&p, false);
+    write_feed_signed(&p, &host, &[], NOW, &K2_SEED);
     let path = p.dir.path().join(".well-known/wist/feed.json");
     let mut feed: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     feed["feed"]["generated_at"] = json!("2026-08-09T14:00:01Z");
@@ -381,8 +346,8 @@ fn failed_refresh_persistence_rolls_back_authority_and_admission_state() {
     let (listener, host, client) = reserve_addr();
     let p = make_publisher_with_recovery(&host);
     let previous = current_declaration(&p);
-    let next = replacement(&p, "k2", true);
-    write_feed_signed(&p, &host, &[], NOW, "k2", &K2_SEED);
+    let next = replacement(&p, true);
+    write_feed_signed(&p, &host, &[], NOW, &K2_SEED);
     serve_sequence(
         listener,
         p.dir.path().into(),
@@ -415,26 +380,16 @@ fn page_retry_resets_after_restart_and_waits_for_declaration_inclusion() {
     let (listener, host, client) = reserve_addr();
     let p = make_publisher_with_recovery(&host);
     let previous = current_declaration(&p);
-    let next = replacement(&p, "k2", false);
+    let next = replacement(&p, false);
     let id = add_delta_signed(
         &p,
         "https://localhost/a",
         "rotated Page",
         None,
         NOW,
-        "k2",
         &K2_SEED,
     );
-    write_feed_page_signed(
-        &p,
-        &host,
-        0,
-        &[],
-        "2026-08-09T12:30:00Z",
-        None,
-        "k2",
-        &K2_SEED,
-    );
+    write_feed_page_signed(&p, &host, 0, &[], "2026-08-09T12:30:00Z", None, &K2_SEED);
     let page_path = p.dir.path().join(".well-known/wist/feed/0.json");
     let page = std::fs::read(&page_path).unwrap();
     let requests = serve_sequence(
@@ -460,13 +415,13 @@ fn page_retry_resets_after_restart_and_waits_for_declaration_inclusion() {
     .unwrap();
     drop(db);
 
-    for (attempt, (key, seed)) in [("k1", &K1_SEED), ("k2", &K2_SEED)].into_iter().enumerate() {
+    for (attempt, seed) in [&K1_SEED, &K2_SEED].into_iter().enumerate() {
         let feed = json!({"wist_version": "1.0.0", "domain": host, "generated_at": NOW,
             "deltas": [id], "next": page_url(&host, 0)});
         let envelope = wist_core::envelope::sign_envelope(
             &feed,
             "feed",
-            key,
+            &kid(seed),
             &wist_core::crypto::SigningKey::from_seed(seed),
         )
         .unwrap();
@@ -710,8 +665,8 @@ fn unsuccessful_delta_attempt_resets_after_restart_on_a_later_pull() {
     let (listener, host, client) = reserve_addr();
     let p = make_publisher_with_recovery(&host);
     let previous = current_declaration(&p);
-    let next = replacement(&p, "k2", false);
-    let id = add_delta_signed(&p, "https://localhost/a", "body", None, NOW, "k2", &K2_SEED);
+    let next = replacement(&p, false);
+    let id = add_delta_signed(&p, "https://localhost/a", "body", None, NOW, &K2_SEED);
     write_feed(&p, &host, std::slice::from_ref(&id), NOW);
     let requests = serve_sequence(
         listener,
@@ -753,27 +708,19 @@ fn delta_refresh_opens_recovery_but_a_follower_cannot_replace_frozen_sources() {
     let (listener, host, client) = reserve_addr();
     let p = make_publisher_with_recovery(&host);
     let previous = current_declaration(&p);
-    let owner = replacement(&p, "k2", true);
+    let owner = replacement(&p, true);
     let mut body = owner["publisher"].clone();
     body["seq"] = json!(2);
     body["prev_declaration"] = json!(declaration_hash(&owner));
-    body["keys"] = json!([key_entry("k3", &X1_SEED, "2026-08-09T00:00:00Z")]);
+    body["keys"] = json!([key_entry(&X1_SEED, "2026-08-09T00:00:00Z")]);
     let follower = wist_core::envelope::sign_envelope(
         &body,
         "publisher",
-        "k2",
+        &kid(&K2_SEED),
         &wist_core::crypto::SigningKey::from_seed(&K2_SEED),
     )
     .unwrap();
-    let first = add_delta_signed(
-        &p,
-        "https://localhost/a",
-        "owner",
-        None,
-        NOW,
-        "k2",
-        &K2_SEED,
-    );
+    let first = add_delta_signed(&p, "https://localhost/a", "owner", None, NOW, &K2_SEED);
     write_feed(&p, &host, std::slice::from_ref(&first), NOW);
     let requests = serve_sequence(
         listener,
@@ -797,23 +744,8 @@ fn delta_refresh_opens_recovery_but_a_follower_cannot_replace_frozen_sources() {
         serde_json::from_slice::<Value>(&window.owner_declaration_json).unwrap(),
         owner
     );
-    let second = add_delta_signed(
-        &p,
-        "https://localhost/b",
-        "follower",
-        None,
-        NOW,
-        "k3",
-        &X1_SEED,
-    );
-    write_feed_signed(
-        &p,
-        &host,
-        std::slice::from_ref(&second),
-        NOW,
-        "k2",
-        &K2_SEED,
-    );
+    let second = add_delta_signed(&p, "https://localhost/b", "follower", None, NOW, &X1_SEED);
+    write_feed_signed(&p, &host, std::slice::from_ref(&second), NOW, &K2_SEED);
     drop(db);
     let db = Db::open(&path).unwrap();
     let report = clave::ingest::run(&db, &client, data.path(), &host, NOW).unwrap();
@@ -845,18 +777,18 @@ fn settlement_after_payload_fetch_retries_before_final_delta_admission() {
         let (listener, host, client) = reserve_addr();
         let p = make_publisher_with_recovery(&host);
         let previous = current_declaration(&p);
-        let owner = replacement(&p, "k2", true);
+        let owner = replacement(&p, true);
         let mut body = owner["publisher"].clone();
         body["seq"] = json!(2);
         body["prev_declaration"] = json!(declaration_hash(&owner));
         body["keys"] = json!([
-            key_entry("k1", &K1_SEED, "2026-08-09T00:00:00Z"),
-            key_entry("k2", &K2_SEED, "2026-08-09T00:00:00Z"),
+            key_entry(&K1_SEED, "2026-08-09T00:00:00Z"),
+            key_entry(&K2_SEED, "2026-08-09T00:00:00Z"),
         ]);
         let restored = wist_core::envelope::sign_envelope(
             &body,
             "publisher",
-            "k2",
+            &kid(&K2_SEED),
             &wist_core::crypto::SigningKey::from_seed(&K2_SEED),
         )
         .unwrap();
@@ -876,11 +808,11 @@ fn settlement_after_payload_fetch_retries_before_final_delta_admission() {
         let db = Db::open(&path).unwrap();
         db.set_param("block_cadence_seconds", 1).unwrap();
         let key = clave::keys::load(&data.path().join("keys/seed")).unwrap();
-        for (at, key_id, seed) in [
-            ("2026-08-09T12:00:00Z", "k1", &K1_SEED),
-            ("2026-08-09T13:00:00Z", "k2", &K2_SEED),
+        for (at, seed) in [
+            ("2026-08-09T12:00:00Z", &K1_SEED),
+            ("2026-08-09T13:00:00Z", &K2_SEED),
         ] {
-            write_feed_signed(&p, &host, &[], at, key_id, seed);
+            write_feed_signed(&p, &host, &[], at, seed);
             clave::ingest::run(&db, &client, data.path(), &host, at).unwrap();
             clave::seal::run(
                 &db,
@@ -892,16 +824,8 @@ fn settlement_after_payload_fetch_retries_before_final_delta_admission() {
         }
         let before = "2026-08-16T12:59:59Z";
         let deadline = "2026-08-16T13:00:00Z";
-        let id = add_delta_signed(
-            &p,
-            "https://localhost/a",
-            "body",
-            None,
-            before,
-            "k1",
-            &K1_SEED,
-        );
-        write_feed_signed(&p, &host, std::slice::from_ref(&id), before, "k2", &K2_SEED);
+        let id = add_delta_signed(&p, "https://localhost/a", "body", None, before, &K1_SEED);
+        write_feed_signed(&p, &host, std::slice::from_ref(&id), before, &K2_SEED);
         let crossed = std::cell::Cell::new(false);
         let report =
             clave::ingest::run_with_clock(&db, &client, data.path(), &host, before, || {
@@ -966,17 +890,16 @@ fn delta_clock_stays_frozen_through_refresh_and_resets_after_restart() {
     let (listener, host, client) = reserve_addr();
     let p = make_publisher_with_recovery(&host);
     let previous = current_declaration(&p);
-    let next = replacement(&p, "k2", false);
+    let next = replacement(&p, false);
     let id = add_delta_signed(
         &p,
         "https://localhost/future",
         "future",
         None,
         "2026-08-09T14:10:00.00000000000000000001Z",
-        "k2",
         &K2_SEED,
     );
-    write_feed_signed(&p, &host, std::slice::from_ref(&id), NOW, "k1", &K1_SEED);
+    write_feed_signed(&p, &host, std::slice::from_ref(&id), NOW, &K1_SEED);
     let requests = serve_sequence(
         listener,
         p.dir.path().into(),
@@ -1019,7 +942,6 @@ fn delta_clock_stays_frozen_through_refresh_and_resets_after_restart() {
         &host,
         std::slice::from_ref(&id),
         "2026-08-09T14:00:01Z",
-        "k2",
         &K2_SEED,
     );
     let report =

@@ -16,8 +16,7 @@ fn signed_field_vectors_preserve_diagnostics_and_source_bytes() {
     .unwrap();
     let source: wist_core::objects::Publisher = serde_json::from_value(json!({
         "wist_version":"1.0.0", "domain":"example.com", "seq":0,
-        "keys":[{"key_id":"test-k1", "alg":"Ed25519", "public_key":vector["author_key"],
-        "valid_from":"2026-08-01T00:00:00Z"}]
+        "keys":[key_entry_public(vector["author_key"].as_str().unwrap(), "2026-08-01T00:00:00Z")]
     }))
     .unwrap();
     for case in vector["cases"].as_array().unwrap() {
@@ -159,7 +158,7 @@ fn field_and_static_rejections_leave_no_admission_state_across_restart() {
             }
             _ => unreachable!(),
         }
-        let mut doc = wist_core::envelope::sign_envelope(&inner, "delta", "k1", &p.sk).unwrap();
+        let mut doc = wist_core::envelope::sign_envelope(&inner, "delta", &p.kid, &p.sk).unwrap();
         if index == 1 {
             doc["sig"]["value"] = json!(wist_core::crypto::b64u_encode(&[0; 64]));
         }
@@ -265,7 +264,7 @@ fn versioned_delta(p: &TestPub, url: &str, version: &str) -> (String, Value) {
     .unwrap();
     let mut inner = doc["delta"].clone();
     inner["wist_version"] = json!(version);
-    let updated = wist_core::envelope::sign_envelope(&inner, "delta", "k1", &p.sk).unwrap();
+    let updated = wist_core::envelope::sign_envelope(&inner, "delta", &p.kid, &p.sk).unwrap();
     let id = store(p, &updated);
     std::fs::copy(
         source.join(format!("payloads/{}.json", &original[7..])),

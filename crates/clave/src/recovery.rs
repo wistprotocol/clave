@@ -49,8 +49,14 @@ pub(crate) fn settle_due(db: &Db, history: &Declarations, now: &str) -> Result<(
         pending.sort_by_key(|(seq, _)| *seq);
         for (seq, entry) in pending {
             if let Some(seq) = seq {
-                declaration::evaluate_with_heads(&current, Some(&head), floor, &entry.entry_json)
-                    .map_err(|(code, detail)| Error::History(format!("{code}: {detail}")))?;
+                declaration::evaluate_with_heads(
+                    &current,
+                    Some(&head),
+                    None,
+                    floor,
+                    &entry.entry_json,
+                )
+                .map_err(|(code, detail)| Error::History(format!("{code}: {detail}")))?;
                 floor = floor.max(seq);
                 current = entry.entry_json.clone();
                 if declaration::follows_chain_head(&head, &entry.entry_json) {
@@ -89,12 +95,7 @@ pub(crate) fn settle_due(db: &Db, history: &Declarations, now: &str) -> Result<(
         db.reject_delta_copies(domain, &rejected, now)?;
         let publisher = declaration::publisher_of(&head).map_err(Error::History)?;
         let key = &publisher.keys[0];
-        db.restore_publisher_declaration(
-            domain,
-            &serde_json::to_vec(&head)?,
-            &key.key_id,
-            &key.public_key,
-        )?;
+        db.restore_publisher_declaration(domain, &serde_json::to_vec(&head)?, &key.kid, &key.x)?;
         db.close_recovery_window(domain)?;
         db.mark_recovery_settled(domain, window.owner().hash())?;
     }

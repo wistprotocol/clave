@@ -119,7 +119,7 @@ fn publish(p: &TestPub, case: &Value, suffix: &str, prev: Option<&str>) -> Strin
         body["observed_at"] = "2026-08-09T12:00:01Z".into();
     }
     let id = delta::delta_id(&body).unwrap();
-    let signed = envelope::sign_envelope(&body, "delta", "k1", &p.sk).unwrap();
+    let signed = envelope::sign_envelope(&body, "delta", &p.kid, &p.sk).unwrap();
     let base = p.dir.path().join(".well-known/wist");
     std::fs::write(
         base.join(format!("deltas/{}.json", &id[7..])),

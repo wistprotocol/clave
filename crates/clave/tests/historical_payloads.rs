@@ -816,16 +816,16 @@ fn historical_sources_freeze_signed_authority_and_scope_at_inclusion() {
             declaration["publisher"]["subdomain_scope"] = json!([]);
         }
         if fault == "key_time" {
-            declaration["publisher"]["keys"][0]["valid_from"] = json!("9999-01-01T00:00:00Z");
+            declaration["publisher"]["keys"][0]["nbf"] = json!(nbf("9999-01-01T00:00:00Z"));
         }
         declaration =
-            envelope::sign_envelope(&declaration["publisher"], "publisher", "k1", &p.sk).unwrap();
+            envelope::sign_envelope(&declaration["publisher"], "publisher", &p.kid, &p.sk).unwrap();
         let mut target = delta.clone();
         if fault == "signature" {
             target = envelope::sign_envelope(
                 &target["delta"],
                 "delta",
-                "k1",
+                &kid(&[99; 32]),
                 &crypto::SigningKey::from_seed(&[99; 32]),
             )
             .unwrap();
@@ -843,11 +843,11 @@ fn historical_sources_freeze_signed_authority_and_scope_at_inclusion() {
         replacement["seq"] = json!(1);
         replacement["prev_declaration"] = json!(declaration_hash(&declaration));
         replacement["subdomain_scope"] = json!([]);
-        replacement["keys"] = json!([key_entry("k2", &K2_SEED, "2026-08-09T00:00:00Z")]);
+        replacement["keys"] = json!([key_entry(&K2_SEED, "2026-08-09T00:00:00Z")]);
         let replacement = envelope::sign_envelope(
             &replacement,
             "publisher",
-            "k2",
+            &kid(&K2_SEED),
             &crypto::SigningKey::from_seed(&K2_SEED),
         )
         .unwrap();
@@ -927,7 +927,7 @@ fn historical_sources_require_the_entire_pinned_prefix_before_returning() {
     attest["observed_at"] = json!("2026-08-09T12:00:01Z");
     attest["prev"] = json!(wist_core::delta::delta_id(&delta["delta"]).unwrap());
     attest.as_object_mut().unwrap().remove("payload");
-    let attest = envelope::sign_envelope(&attest, "delta", "k1", &p.sk).unwrap();
+    let attest = envelope::sign_envelope(&attest, "delta", &p.kid, &p.sk).unwrap();
     f.append(vec![
         entry("publisher_delta", &delta),
         entry("publisher_delta", &attest),
@@ -946,22 +946,22 @@ fn historical_sources_apply_recovery_windows_and_deadline_scope() {
     let (delta, payload) = content(&p);
     let mut initial = current_declaration(&p)["publisher"].clone();
     initial["subdomain_scope"] = json!(["shared.example"]);
-    let initial = envelope::sign_envelope(&initial, "publisher", "k1", &p.sk).unwrap();
+    let initial = envelope::sign_envelope(&initial, "publisher", &p.kid, &p.sk).unwrap();
     let mut recovery = initial["publisher"].clone();
     recovery["seq"] = json!(1);
     recovery["prev_declaration"] = json!(declaration_hash(&initial));
-    recovery["keys"] = json!([key_entry("k2", &K2_SEED, "2026-08-09T00:00:00Z")]);
+    recovery["keys"] = json!([key_entry(&K2_SEED, "2026-08-09T00:00:00Z")]);
     let recovery = envelope::sign_envelope(
         &recovery,
         "publisher",
-        "r1",
+        &kid(&R1_SEED),
         &crypto::SigningKey::from_seed(&R1_SEED),
     )
     .unwrap();
     let delta = envelope::sign_envelope(
         &delta["delta"],
         "delta",
-        "k2",
+        &kid(&K2_SEED),
         &crypto::SigningKey::from_seed(&K2_SEED),
     )
     .unwrap();
@@ -983,7 +983,7 @@ fn historical_sources_apply_recovery_windows_and_deadline_scope() {
             let replacement = envelope::sign_envelope(
                 &replacement,
                 "publisher",
-                "k2",
+                &kid(&K2_SEED),
                 &crypto::SigningKey::from_seed(&K2_SEED),
             )
             .unwrap();
@@ -1096,11 +1096,11 @@ fn historical_payloads_require_authenticated_ancestors_and_all_later_delta_chain
         }
         if matches!(fault, "scope" | "publisher" | "url") {
             predecessor =
-                envelope::sign_envelope(&predecessor["delta"], "delta", "k1", &p.sk).unwrap();
+                envelope::sign_envelope(&predecessor["delta"], "delta", &p.kid, &p.sk).unwrap();
         }
         let mut target = next.clone();
         target["delta"]["prev"] = json!(wist_core::delta::delta_id(&predecessor["delta"]).unwrap());
-        target = envelope::sign_envelope(&target["delta"], "delta", "k1", &p.sk).unwrap();
+        target = envelope::sign_envelope(&target["delta"], "delta", &p.kid, &p.sk).unwrap();
         let mut entries = vec![entry("publisher_declaration", &current_declaration(&p))];
         if fault != "missing" {
             entries.push(entry("publisher_delta", &predecessor));
@@ -1121,7 +1121,7 @@ fn historical_payloads_require_authenticated_ancestors_and_all_later_delta_chain
             if fault == "late_fields" {
                 later["meta"]["unknown"] = json!(true);
             }
-            let mut later = envelope::sign_envelope(&later, "delta", "k1", &p.sk).unwrap();
+            let mut later = envelope::sign_envelope(&later, "delta", &p.kid, &p.sk).unwrap();
             if fault == "late_signature" {
                 later["sig"]["value"] = json!(crypto::b64u_encode(&[0; 64]));
             }
@@ -1147,8 +1147,9 @@ fn historical_sources_preserve_chain_ownership_across_identity_resets() {
     let mut replacement = current_declaration(&a)["publisher"].clone();
     replacement["seq"] = json!(1);
     replacement["prev_declaration"] = json!(declaration_hash(&current_declaration(&a)));
-    replacement["keys"][0]["public_key"] = json!(reset_key.public().to_b64u());
-    let replacement = envelope::sign_envelope(&replacement, "publisher", "k1", &reset_key).unwrap();
+    rekey(&mut replacement["keys"][0], &reset_key.public().to_b64u());
+    let replacement =
+        envelope::sign_envelope(&replacement, "publisher", &kid(&[9; 32]), &reset_key).unwrap();
     for fault in ["none", "restart", "foreign", "equal", "decreasing"] {
         let mut f = Fixture::new();
         f.append(vec![
@@ -1167,19 +1168,30 @@ fn historical_sources_preserve_chain_ownership_across_identity_resets() {
             let predecessor = if fault == "foreign" { &root_b } else { &root_a };
             next["prev"] = json!(wist_core::delta::delta_id(&predecessor["delta"]).unwrap());
         }
-        let next = envelope::sign_envelope(&next, "delta", "k1", &reset_key).unwrap();
-        f.append(vec![
-            entry("publisher_declaration", &replacement),
-            entry("publisher_delta", &next),
-        ]);
+        let next = envelope::sign_envelope(&next, "delta", &kid(&[9; 32]), &reset_key).unwrap();
+        f.append(vec![entry("publisher_declaration", &replacement)]);
+        // WIST-1 §5.2: the fresh identity takes effect, and the domain's
+        // history restarts, at its activation height; nothing it signs
+        // verifies before then.
+        let activation = 1 + u64::try_from(
+            wist_core::parameters::spec("declaration_activation_blocks")
+                .unwrap()
+                .default
+                .unwrap(),
+        )
+        .unwrap();
+        while f.head.as_ref().unwrap().block_number + 1 < activation {
+            f.append(Vec::new());
+        }
+        f.append(vec![entry("publisher_delta", &next)]);
         for _ in 0..2 {
             if fault == "none" {
                 let source = f.source(&next).unwrap();
                 let delta = source.delta_source();
                 assert_eq!(delta.envelope(), &next);
                 assert_eq!(delta.declaration().envelope(), &replacement);
-                assert_eq!(delta.identity_start(), delta.declaration().position());
-                assert_eq!(delta.identity_start().block_number, 1);
+                assert_eq!(delta.declaration().position().block_number, 1);
+                assert_eq!(delta.identity_start().block_number, activation);
                 for (root, publisher) in [(&root_a, &a), (&root_b, &b)] {
                     let earlier = f.delta_source(root).unwrap();
                     assert_eq!(earlier.identity_start(), earlier.declaration().position());
@@ -1209,7 +1221,7 @@ fn historical_sources_resolve_contentless_deltas_and_recreation_in_chain_order()
         if kind != "new" {
             next.as_object_mut().unwrap().remove("payload");
         }
-        chain.push(envelope::sign_envelope(&next, "delta", "k1", &p.sk).unwrap());
+        chain.push(envelope::sign_envelope(&next, "delta", &p.kid, &p.sk).unwrap());
     }
     for same_block in [false, true] {
         let mut f = Fixture::new();

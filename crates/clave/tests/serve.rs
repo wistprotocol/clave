@@ -250,8 +250,8 @@ fn status_reports_real_quota_remaining() {
         db.record_publisher_declaration(
             "example.com",
             &serde_json::to_vec(&doc).unwrap(),
-            "k1",
-            doc["publisher"]["keys"][0]["public_key"].as_str().unwrap(),
+            &publisher.kid,
+            doc["publisher"]["keys"][0]["x"].as_str().unwrap(),
             &doc,
         )
         .unwrap();

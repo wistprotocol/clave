@@ -3,13 +3,29 @@ use clave::declaration::{evaluate, Decision};
 use serde_json::{json, Value};
 use wist_core::crypto::SigningKey;
 
-fn key_json(key_id: &str, seed: &[u8; 32], valid_from: &str) -> Value {
-    let public_key = wist_core::crypto::b64u_encode(
+fn public_of(seed: &[u8; 32]) -> String {
+    wist_core::crypto::b64u_encode(
         &ed25519_dalek::SigningKey::from_bytes(seed)
             .verifying_key()
             .to_bytes(),
-    );
-    json!({"key_id": key_id, "alg": "Ed25519", "public_key": public_key, "valid_from": valid_from})
+    )
+}
+
+fn kid(seed: &[u8; 32]) -> String {
+    wist_core::objects::publisher::thumbprint(&public_of(seed))
+}
+
+fn nbf(at: &str) -> u64 {
+    u64::try_from(wist_core::timestamp::log_seconds(at).unwrap()).unwrap()
+}
+
+fn key_json(seed: &[u8; 32], valid_from: &str) -> Value {
+    serde_json::to_value(wist_core::objects::PublisherKey::new(
+        &public_of(seed),
+        nbf(valid_from),
+        None,
+    ))
+    .unwrap()
 }
 
 fn declaration(
@@ -17,7 +33,7 @@ fn declaration(
     prev: Option<&str>,
     keys: Vec<Value>,
     recovery_keys: Option<Vec<Value>>,
-    signer: (&str, &[u8; 32]),
+    signer: &[u8; 32],
 ) -> Value {
     let mut publisher = json!({
         "wist_version": "1.0.0",
@@ -31,9 +47,9 @@ fn declaration(
     if let Some(r) = recovery_keys {
         publisher["recovery_keys"] = Value::Array(r);
     }
-    let sk = SigningKey::from_seed(signer.1);
+    let sk = SigningKey::from_seed(signer);
     serde_json::to_value(
-        wist_core::envelope::sign_envelope(&publisher, "publisher", signer.0, &sk).unwrap(),
+        wist_core::envelope::sign_envelope(&publisher, "publisher", &kid(signer), &sk).unwrap(),
     )
     .unwrap()
 }
@@ -56,9 +72,9 @@ fn base() -> Value {
     declaration(
         0,
         None,
-        vec![key_json("k1", &K1, "2026-08-01T00:00:00Z")],
-        Some(vec![key_json("r1", &R1, "2026-08-01T00:00:00Z")]),
-        ("k1", &K1),
+        vec![key_json(&K1, "2026-08-01T00:00:00Z")],
+        Some(vec![key_json(&R1, "2026-08-01T00:00:00Z")]),
+        &K1,
     )
 }
 
@@ -77,9 +93,9 @@ fn same_seq_different_content_is_rejected() {
     let mutated = declaration(
         0,
         None,
-        vec![key_json("k1", &K1, "2026-08-02T00:00:00Z")],
-        Some(vec![key_json("r1", &R1, "2026-08-01T00:00:00Z")]),
-        ("k1", &K1),
+        vec![key_json(&K1, "2026-08-02T00:00:00Z")],
+        Some(vec![key_json(&R1, "2026-08-01T00:00:00Z")]),
+        &K1,
     );
     assert!(evaluate(&stored, &mutated).is_err());
 }
@@ -89,16 +105,16 @@ fn lower_seq_is_rejected() {
     let stored = declaration(
         2,
         Some(&format!("sha256:{}", "a".repeat(64))),
-        vec![key_json("k1", &K1, "2026-08-01T00:00:00Z")],
+        vec![key_json(&K1, "2026-08-01T00:00:00Z")],
         None,
-        ("k1", &K1),
+        &K1,
     );
     let stale = declaration(
         1,
         Some("sha256:bb"),
-        vec![key_json("k1", &K1, "2026-08-01T00:00:00Z")],
+        vec![key_json(&K1, "2026-08-01T00:00:00Z")],
         None,
-        ("k1", &K1),
+        &K1,
     );
     assert!(evaluate(&stored, &stale).is_err());
 }
@@ -110,11 +126,11 @@ fn prev_declaration_mismatch_is_rejected() {
         1,
         Some("sha256:0000"),
         vec![
-            key_json("k1", &K1, "2026-08-01T00:00:00Z"),
-            key_json("k2", &K2, "2026-08-10T00:00:00Z"),
+            key_json(&K1, "2026-08-01T00:00:00Z"),
+            key_json(&K2, "2026-08-10T00:00:00Z"),
         ],
-        Some(vec![key_json("r1", &R1, "2026-08-01T00:00:00Z")]),
-        ("k1", &K1),
+        Some(vec![key_json(&R1, "2026-08-01T00:00:00Z")]),
+        &K1,
     );
     assert!(evaluate(&stored, &next).is_err());
 }
@@ -126,25 +142,26 @@ fn ordinary_rotation_signed_by_stored_key() {
         1,
         Some(&hash_of(&stored)),
         vec![
-            key_json("k1", &K1, "2026-08-01T00:00:00Z"),
-            key_json("k2", &K2, "2026-08-10T00:00:00Z"),
+            key_json(&K1, "2026-08-01T00:00:00Z"),
+            key_json(&K2, "2026-08-10T00:00:00Z"),
         ],
-        Some(vec![key_json("r1", &R1, "2026-08-01T00:00:00Z")]),
-        ("k1", &K1),
+        Some(vec![key_json(&R1, "2026-08-01T00:00:00Z")]),
+        &K1,
     );
     assert_eq!(evaluate(&stored, &next).unwrap(), Decision::Ordinary);
 }
 
 #[test]
-fn signature_not_matching_named_key_is_rejected() {
+fn signature_not_verifying_under_the_named_entry_is_rejected() {
     let stored = base();
-    let next = declaration(
+    let mut next = declaration(
         1,
         Some(&hash_of(&stored)),
-        vec![key_json("k2", &K2, "2026-08-10T00:00:00Z")],
-        Some(vec![key_json("r1", &R1, "2026-08-01T00:00:00Z")]),
-        ("k1", &K2),
+        vec![key_json(&K2, "2026-08-10T00:00:00Z")],
+        Some(vec![key_json(&R1, "2026-08-01T00:00:00Z")]),
+        &K2,
     );
+    next["sig"]["key_id"] = kid(&K1).into();
     assert!(evaluate(&stored, &next).is_err());
 }
 
@@ -154,9 +171,9 @@ fn recovery_rotation_signed_by_stored_recovery_key() {
     let next = declaration(
         1,
         Some(&hash_of(&stored)),
-        vec![key_json("k2", &K2, "2026-08-10T00:00:00Z")],
-        Some(vec![key_json("r1", &R1, "2026-08-01T00:00:00Z")]),
-        ("r1", &R1),
+        vec![key_json(&K2, "2026-08-10T00:00:00Z")],
+        Some(vec![key_json(&R1, "2026-08-01T00:00:00Z")]),
+        &R1,
     );
     assert_eq!(evaluate(&stored, &next).unwrap(), Decision::Recovery);
 }
@@ -167,9 +184,9 @@ fn recovery_signed_declaration_may_replace_recovery_keys() {
     let next = declaration(
         1,
         Some(&hash_of(&stored)),
-        vec![key_json("k2", &K2, "2026-08-10T00:00:00Z")],
-        Some(vec![key_json("r2", &X1, "2026-08-10T00:00:00Z")]),
-        ("r1", &R1),
+        vec![key_json(&K2, "2026-08-10T00:00:00Z")],
+        Some(vec![key_json(&X1, "2026-08-10T00:00:00Z")]),
+        &R1,
     );
     assert_eq!(evaluate(&stored, &next).unwrap(), Decision::Recovery);
 }
@@ -179,16 +196,16 @@ fn fresh_identity_signed_by_own_new_key() {
     let stored = declaration(
         0,
         None,
-        vec![key_json("k1", &K1, "2026-08-01T00:00:00Z")],
+        vec![key_json(&K1, "2026-08-01T00:00:00Z")],
         None,
-        ("k1", &K1),
+        &K1,
     );
     let next = declaration(
         1,
         Some(&hash_of(&stored)),
-        vec![key_json("kx", &X1, "2026-08-10T00:00:00Z")],
+        vec![key_json(&X1, "2026-08-10T00:00:00Z")],
         None,
-        ("kx", &X1),
+        &X1,
     );
     assert_eq!(evaluate(&stored, &next).unwrap(), Decision::FreshIdentity);
 }
@@ -199,9 +216,9 @@ fn unknown_signer_is_rejected() {
     let next = declaration(
         1,
         Some(&hash_of(&stored)),
-        vec![key_json("k2", &K2, "2026-08-10T00:00:00Z")],
-        Some(vec![key_json("r1", &R1, "2026-08-01T00:00:00Z")]),
-        ("nope", &X1),
+        vec![key_json(&K2, "2026-08-10T00:00:00Z")],
+        Some(vec![key_json(&R1, "2026-08-01T00:00:00Z")]),
+        &X1,
     );
     assert!(evaluate(&stored, &next).is_err());
 }
@@ -212,9 +229,9 @@ fn altering_recovery_keys_without_recovery_signature_is_rejected() {
     let next = declaration(
         1,
         Some(&hash_of(&stored)),
-        vec![key_json("k1", &K1, "2026-08-01T00:00:00Z")],
-        Some(vec![key_json("r2", &X1, "2026-08-10T00:00:00Z")]),
-        ("k1", &K1),
+        vec![key_json(&K1, "2026-08-01T00:00:00Z")],
+        Some(vec![key_json(&X1, "2026-08-10T00:00:00Z")]),
+        &K1,
     );
     assert!(evaluate(&stored, &next).is_err());
 }
@@ -225,9 +242,9 @@ fn dropping_recovery_keys_without_recovery_signature_is_rejected() {
     let next = declaration(
         1,
         Some(&hash_of(&stored)),
-        vec![key_json("k1", &K1, "2026-08-01T00:00:00Z")],
+        vec![key_json(&K1, "2026-08-01T00:00:00Z")],
         None,
-        ("k1", &K1),
+        &K1,
     );
     assert!(evaluate(&stored, &next).is_err());
 }
@@ -237,16 +254,16 @@ fn establishing_recovery_keys_with_ordinary_signature_is_allowed() {
     let stored = declaration(
         0,
         None,
-        vec![key_json("k1", &K1, "2026-08-01T00:00:00Z")],
+        vec![key_json(&K1, "2026-08-01T00:00:00Z")],
         None,
-        ("k1", &K1),
+        &K1,
     );
     let next = declaration(
         1,
         Some(&hash_of(&stored)),
-        vec![key_json("k1", &K1, "2026-08-01T00:00:00Z")],
-        Some(vec![key_json("r1", &R1, "2026-08-10T00:00:00Z")]),
-        ("k1", &K1),
+        vec![key_json(&K1, "2026-08-01T00:00:00Z")],
+        Some(vec![key_json(&R1, "2026-08-10T00:00:00Z")]),
+        &K1,
     );
     assert_eq!(evaluate(&stored, &next).unwrap(), Decision::Ordinary);
 }
@@ -257,9 +274,9 @@ fn fresh_identity_must_carry_recovery_keys_byte_identical() {
     let next = declaration(
         1,
         Some(&hash_of(&stored)),
-        vec![key_json("kx", &X1, "2026-08-10T00:00:00Z")],
+        vec![key_json(&X1, "2026-08-10T00:00:00Z")],
         None,
-        ("kx", &X1),
+        &X1,
     );
     assert!(evaluate(&stored, &next).is_err());
 }
@@ -269,16 +286,16 @@ fn fresh_identity_is_accepted_and_left_to_the_windows_settlement() {
     let stored = declaration(
         1,
         Some(&format!("sha256:{}", "a".repeat(64))),
-        vec![key_json("k2", &K2, "2026-08-10T00:00:00Z")],
-        Some(vec![key_json("r1", &R1, "2026-08-01T00:00:00Z")]),
-        ("r1", &R1),
+        vec![key_json(&K2, "2026-08-10T00:00:00Z")],
+        Some(vec![key_json(&R1, "2026-08-01T00:00:00Z")]),
+        &R1,
     );
     let thief = declaration(
         2,
         Some(&hash_of(&stored)),
-        vec![key_json("kx", &X1, "2026-08-11T00:00:00Z")],
-        Some(vec![key_json("r1", &R1, "2026-08-01T00:00:00Z")]),
-        ("kx", &X1),
+        vec![key_json(&X1, "2026-08-11T00:00:00Z")],
+        Some(vec![key_json(&R1, "2026-08-01T00:00:00Z")]),
+        &X1,
     );
     assert_eq!(
         evaluate(&stored, &thief).unwrap(),
@@ -296,7 +313,7 @@ fn domain_change_is_rejected() {
     publisher["prev_declaration"] = hash_of(&stored).into();
     let sk = SigningKey::from_seed(&K1);
     let next = serde_json::to_value(
-        wist_core::envelope::sign_envelope(&publisher, "publisher", "k1", &sk).unwrap(),
+        wist_core::envelope::sign_envelope(&publisher, "publisher", &kid(&K1), &sk).unwrap(),
     )
     .unwrap();
     assert!(evaluate(&stored, &next).is_err());
@@ -418,7 +435,7 @@ fn signed_objects_exclude_unusable_keys_before_signature_verification() {
                 let doc = wist_core::envelope::sign_envelope(
                     &json!({"wist_version":"1.0.0", "publisher":publisher.domain, "url":"https://example.com/a", "change_type":"delete", "prev":format!("sha256:{}", "0".repeat(64)), "meta":{"lang":"en"}, "observed_at":"2026-08-04T12:00:00Z"}),
                     "delta",
-                    &key.key_id,
+                    &key.kid,
                     &SigningKey::from_seed(&K1),
                 )
                 .unwrap();
@@ -447,10 +464,7 @@ fn every_key_and_signature_encoding_boundary_is_checked_before_authentication() 
     let baseline = &vector["cases"][0]["envelope"];
     for case in vector["fields"].as_array().unwrap() {
         let paths: &[&str] = match case["kind"].as_str().unwrap() {
-            "public_key" => &[
-                "/publisher/keys/0/public_key",
-                "/publisher/recovery_keys/0/public_key",
-            ],
+            "x" => &["/publisher/keys/0/x", "/publisher/recovery_keys/0/x"],
             "signature" => &["/sig/value"],
             "salt" => continue,
             other => panic!("unexpected encoding kind {other}"),
@@ -458,6 +472,14 @@ fn every_key_and_signature_encoding_boundary_is_checked_before_authentication() 
         for path in paths {
             let mut candidate = baseline.clone();
             *candidate.pointer_mut(path).unwrap() = case["encoded"].clone();
+            if let Some(entry) = candidate.pointer_mut(path.trim_end_matches("/x")) {
+                // `kid` is the thumbprint of `x` as written (WIST-1 §5.1), so
+                // it follows the substitution and leaves only the encoding
+                // under test.
+                if let Some(x) = entry["x"].as_str().map(str::to_owned) {
+                    entry["kid"] = wist_core::objects::publisher::thumbprint(&x).into();
+                }
+            }
             let result = clave::declaration::validate_fields(&candidate)
                 .map(|_| "well_formed")
                 .unwrap_or_else(|(code, _)| code);
@@ -505,45 +527,95 @@ fn recovery_chain_membership_uses_authenticated_public_key() {
 fn signed_delta_key_bound_orders_publisher_instants_exactly() {
     let sk = SigningKey::from_seed(&K1);
     let cases = [
-        ("2026-08-04T10:00:00Z", "2026-08-04T10:00:00.5Z", true),
-        ("2026-08-04T10:00:00.5Z", "2026-08-04T10:00:00Z", false),
-        ("2026-08-04T10:00:00Z", "2026-08-04T10:00:00.0000Z", true),
-        ("2026-08-04T10:00:00.10Z", "2026-08-04T10:00:00.1Z", true),
+        ("2026-08-04T10:00:00Z", None, "2026-08-04T10:00:00.5Z", true),
         (
-            "2026-08-04T10:00:00.0000000001Z",
-            "2026-08-04T10:00:00.0000000000Z",
+            "2026-08-04T10:00:00Z",
+            None,
+            "2026-08-04T09:59:59.999999999999999999999Z",
             false,
         ),
         (
-            "2026-08-04T10:00:00.0000000001Z",
-            "2026-08-04T10:00:00.0000000002Z",
+            "2026-08-04T10:00:00Z",
+            None,
+            "2026-08-04T10:00:00.0000Z",
             true,
         ),
         (
-            "2026-08-04T10:00:00.1000000000000000000000000001Z",
-            "2026-08-04T10:00:00.1Z",
+            "2026-08-04T10:00:00Z",
+            None,
+            "2026-08-04T11:00:00+01:00",
+            true,
+        ),
+        (
+            "2026-08-04T10:00:00Z",
+            None,
+            "2026-08-04T10:30:00+01:00",
             false,
         ),
-        ("2026-08-04T10:00:00Z", "2026-08-04T11:00:00+01:00", true),
-        ("2026-08-04T10:00:00Z", "2026-08-04T10:30:00+01:00", false),
-        ("2026-08-04T10:00:00Z", "2026-08-04T09:30:00-01:00", true),
-        ("2026-08-04T10:00:00Z", "2026-08-04t10:00:00z", true),
-        ("2026-08-04T10:00:00Z", "2026-08-04T10:00:00-00:00", true),
-        ("2026-08-04T10:00:00+00:00", "2026-08-04T10:00:00Z", true),
-        ("2026-08-04T00:00:00Z", "2026-08-03T23:59:59-00:01", true),
-        ("0000-02-28T23:59:59Z", "0000-02-29T00:00:00Z", true),
-        ("2000-02-29T23:59:59Z", "2000-03-01T00:00:00Z", true),
-        ("0000-01-01T00:00:00Z", "0000-01-01T00:00:00+23:59", false),
-        ("9999-12-31T23:59:59Z", "9999-12-31T23:59:59-23:59", true),
+        (
+            "2026-08-04T10:00:00Z",
+            None,
+            "2026-08-04T09:30:00-01:00",
+            true,
+        ),
+        ("2026-08-04T10:00:00Z", None, "2026-08-04t10:00:00z", true),
+        (
+            "2026-08-04T10:00:00Z",
+            None,
+            "2026-08-04T10:00:00-00:00",
+            true,
+        ),
+        (
+            "2026-08-04T00:00:00Z",
+            None,
+            "2026-08-03T23:59:59-00:01",
+            true,
+        ),
+        ("2000-02-29T23:59:59Z", None, "2000-03-01T00:00:00Z", true),
+        (
+            "1970-01-01T00:00:00Z",
+            None,
+            "0000-01-01T00:00:00+23:59",
+            false,
+        ),
+        ("1970-01-01T00:00:00Z", None, "1970-01-01T00:00:00Z", true),
+        (
+            "9999-12-31T23:59:59Z",
+            None,
+            "9999-12-31T23:59:59-23:59",
+            true,
+        ),
+        (
+            "2026-08-04T10:00:00Z",
+            Some("2026-08-04T11:00:00Z"),
+            "2026-08-04T10:59:59.999999999999999999999Z",
+            true,
+        ),
+        (
+            "2026-08-04T10:00:00Z",
+            Some("2026-08-04T11:00:00Z"),
+            "2026-08-04T11:00:00Z",
+            false,
+        ),
+        (
+            "2026-08-04T10:00:00Z",
+            Some("2026-08-04T11:00:00Z"),
+            "2026-08-04T12:00:00+01:00",
+            false,
+        ),
     ];
-    for (valid_from, observed_at, eligible) in cases {
-        let key = serde_json::from_value(key_json("k1", &K1, valid_from)).unwrap();
+    for (not_before, expires, observed_at, eligible) in cases {
+        let key = wist_core::objects::PublisherKey::new(
+            &public_of(&K1),
+            nbf(not_before),
+            expires.map(nbf),
+        );
         let delta = json!({"wist_version":"1.0.0", "publisher":"example.com", "url":"https://example.com/a", "change_type":"delete", "observed_at":observed_at, "prev":format!("sha256:{}", "0".repeat(64)), "meta":{"lang":"en"}});
-        let signed = wist_core::envelope::sign_envelope(&delta, "delta", "k1", &sk).unwrap();
+        let signed = wist_core::envelope::sign_envelope(&delta, "delta", &kid(&K1), &sk).unwrap();
         assert_eq!(
             clave::declaration::verify_signed(&[&key], &signed, "delta", Some(observed_at)),
             if eligible { Ok(()) } else { Err("WIST1-E02") },
-            "valid_from={valid_from}, observed_at={observed_at}"
+            "nbf={not_before}, exp={expires:?}, observed_at={observed_at}"
         );
         if eligible {
             let mut tampered = signed;
@@ -640,17 +712,15 @@ fn declaration_numeric_spellings_and_unicode_string_bounds_preserve_signed_bytes
     let original = declaration(
         0,
         None,
-        vec![key_json("k1", &K1, "2026-08-01T00:00:00Z")],
+        vec![key_json(&K1, "2026-08-01T00:00:00Z")],
         None,
-        ("k1", &K1),
+        &K1,
     );
     for literal in ["0", "0.0", "-0", "-0.0", "0e5"] {
         let mut inner = original["publisher"].clone();
         inner["seq"] = serde_json::from_str(literal).unwrap();
         inner["contact"] = "😀".repeat(256).into();
-        inner["keys"][0]["key_id"] = "😀".repeat(64).into();
-        let doc =
-            wist_core::envelope::sign_envelope(&inner, "publisher", &"😀".repeat(64), &sk).unwrap();
+        let doc = wist_core::envelope::sign_envelope(&inner, "publisher", &kid(&K1), &sk).unwrap();
         let before = doc.clone();
         assert_eq!(
             clave::declaration::evaluate_initial(&doc).unwrap().seq,
@@ -669,7 +739,7 @@ fn declaration_numeric_spellings_and_unicode_string_bounds_preserve_signed_bytes
     ] {
         let mut inner = original["publisher"].clone();
         inner["wist_version"] = version.into();
-        let doc = wist_core::envelope::sign_envelope(&inner, "publisher", "k1", &sk).unwrap();
+        let doc = wist_core::envelope::sign_envelope(&inner, "publisher", &kid(&K1), &sk).unwrap();
         assert_eq!(
             clave::declaration::evaluate_initial(&doc).unwrap_err().0,
             "WIST1-E14",

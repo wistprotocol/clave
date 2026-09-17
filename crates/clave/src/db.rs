@@ -428,6 +428,46 @@ impl Db {
         Ok(())
     }
 
+    /// WIST-1 §5.2: the pending head of a fresh identity accepted at
+    /// admission, held beside the current Declaration until the Log
+    /// activates or reverses it.
+    pub fn get_pending_identity(&self, domain: &str) -> Result<Option<Vec<u8>>> {
+        self.conn
+            .query_row(
+                "SELECT declaration_json FROM pending_identities WHERE domain = ?1",
+                [domain],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Error::Db)
+    }
+
+    /// Accepts a Declaration as the pending head: it is queued for
+    /// sealing and raises the sequence floor without replacing the
+    /// current Declaration.
+    pub fn record_pending_identity(
+        &self,
+        domain: &str,
+        declaration_json: &[u8],
+        entry_json: &Value,
+    ) -> Result<()> {
+        let tx = self.mutation()?;
+        tx.execute(
+            "INSERT INTO pending_identities(domain, declaration_json) VALUES (?1, ?2) ON CONFLICT(domain) DO UPDATE SET declaration_json = excluded.declaration_json",
+            (domain, declaration_json),
+        )?;
+        exec_insert_pending_entry(&tx, "publisher_declaration", domain, entry_json, 0)?;
+        exec_retain_declaration_seq(&tx, domain, accepted_declaration_seq(domain, entry_json)?)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn clear_pending_identity(&self, domain: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM pending_identities WHERE domain = ?1", [domain])?;
+        Ok(())
+    }
+
     pub(crate) fn restore_publisher_declaration(
         &self,
         domain: &str,
@@ -1697,17 +1737,18 @@ mod tests {
 
     fn test_declaration(seq: u64) -> Value {
         let key = wist_core::crypto::SigningKey::from_seed(&[1; 32]);
+        let entry =
+            wist_core::objects::PublisherKey::new(&key.public().to_b64u(), 1_767_225_600, None);
         let mut publisher = serde_json::json!({
             "wist_version": "1.0.0", "domain": "example.com", "seq": seq,
-            "keys": [{"key_id": "k1", "alg": "Ed25519",
-                "public_key": key.public().to_b64u(), "valid_from": "2026-01-01T00:00:00Z"}]
+            "keys": [entry]
         });
         if seq > 0 {
             publisher["prev_declaration"] = crate::declaration::inner_hash(&test_declaration(0))
                 .unwrap()
                 .into();
         }
-        wist_core::envelope::sign_envelope(&publisher, "publisher", "k1", &key).unwrap()
+        wist_core::envelope::sign_envelope(&publisher, "publisher", &entry.kid, &key).unwrap()
     }
 
     fn record_test_declaration(db: &Db) -> Result<()> {

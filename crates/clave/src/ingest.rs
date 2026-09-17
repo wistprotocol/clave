@@ -88,30 +88,63 @@ fn page_declarations(
     let mut state = crate::history::declarations::Declarations::default();
     let mut sources = Vec::new();
     let mut superseded = std::collections::BTreeSet::new();
+    // WIST-2 §3.2 resolves a Page against the Key Set WIST-1 §5.2 resolves
+    // at the sealing Block, which excludes a Declaration that is pending,
+    // that a reversal discarded, or that a recovery superseded. A pending
+    // head enters at the instant it activates, not the instant it sealed.
+    let mut pending = std::collections::BTreeSet::new();
+    let mut excluded = std::collections::BTreeSet::new();
     while let Some(block) = history.next_block()? {
         let effects = state.apply(&block)?;
-        for settlement in effects.settlements {
+        for settlement in &effects.settlements {
             if settlement.domain == host {
-                for source in settlement.superseded {
+                for source in &settlement.superseded {
                     superseded.insert(source.hash().to_string());
                 }
             }
+        }
+        for installation in &effects.installations {
+            if installation.declaration.envelope()["publisher"]["domain"] != host {
+                continue;
+            }
+            if installation.pending {
+                pending.insert(installation.declaration.hash().to_string());
+            }
+            if installation.reversed.is_some() {
+                excluded.append(&mut pending);
+            }
+        }
+        for activation in effects
+            .activations
+            .iter()
+            .filter(|activation| activation.domain == host)
+        {
+            pending.remove(activation.activated.hash());
+            let publisher = declaration::publisher_of(activation.activated.envelope())
+                .map_err(crate::error::Error::History)?;
+            sources.push((
+                activation.activated.hash().to_string(),
+                (block.sealed_at_s(), publisher.seq, publisher.keys),
+            ));
         }
         for entry in block.block().entries.iter().filter(|entry| {
             entry["type"] == "publisher_declaration" && entry["body"]["publisher"]["domain"] == host
         }) {
             let source = &entry["body"];
+            let hash = declaration::inner_hash(source).map_err(crate::error::Error::History)?;
+            if pending.contains(&hash) || excluded.contains(&hash) {
+                continue;
+            }
             let publisher =
                 declaration::publisher_of(source).map_err(crate::error::Error::History)?;
-            sources.push((
-                declaration::inner_hash(source).map_err(crate::error::Error::History)?,
-                (block.sealed_at_s(), publisher.seq, publisher.keys),
-            ));
+            sources.push((hash, (block.sealed_at_s(), publisher.seq, publisher.keys)));
         }
     }
     Ok(sources
         .into_iter()
-        .filter_map(|(hash, source)| (!superseded.contains(&hash)).then_some(source))
+        .filter_map(|(hash, source)| {
+            (!superseded.contains(&hash) && !excluded.contains(&hash)).then_some(source)
+        })
         .collect())
 }
 
@@ -263,35 +296,70 @@ fn admit_fetched_declaration(
     let floor = db.highest_accepted_declaration_seq(host)?.ok_or_else(|| {
         crate::error::Error::History("missing accepted Declaration sequence floor".into())
     })?;
-    match declaration::evaluate_with_heads(&current_doc, recovery_head.as_ref(), floor, &value) {
+    let pending_head = db
+        .get_pending_identity(host)?
+        .map(|raw| crate::json::parse(&raw))
+        .transpose()?;
+    match declaration::evaluate_with_heads(
+        &current_doc,
+        recovery_head.as_ref(),
+        pending_head.as_ref(),
+        floor,
+        &value,
+    ) {
         Ok(Decision::Unchanged) => {
             db.mark_declaration_fetched(host, now)?;
         }
         Ok(decision) => {
-            let (key_id, public_key) = value
-                .pointer("/publisher/keys/0")
-                .map(|k| {
-                    (
-                        k["key_id"].as_str().unwrap_or_default().to_string(),
-                        k["public_key"].as_str().unwrap_or_default().to_string(),
-                    )
-                })
-                .unwrap_or_default();
-            db.update_publisher_declaration(host, &raw, &key_id, &public_key, &value)?;
-            match &open_window {
-                None => {
-                    if decision == Decision::Recovery {
-                        db.open_recovery_window(host, &raw, &stored_raw)?;
+            let names_pending = pending_head.as_ref().is_some_and(|head| {
+                declaration::inner_hash(head).ok().as_deref()
+                    == value["publisher"]["prev_declaration"].as_str()
+            });
+            if names_pending {
+                db.record_pending_identity(host, &raw, &value)?;
+                db.mark_declaration_fetched(host, now)?;
+            } else if decision == Decision::FreshIdentity && open_window.is_none() {
+                if pending_head.is_some() {
+                    record_rejection(
+                        db,
+                        host,
+                        "WIST1-E08",
+                        now,
+                        None,
+                        "fresh identity names the current Declaration beside a pending head",
+                    )?;
+                } else {
+                    db.record_pending_identity(host, &raw, &value)?;
+                    db.mark_declaration_fetched(host, now)?;
+                }
+            } else {
+                let (kid, x) = value
+                    .pointer("/publisher/keys/0")
+                    .map(|k| {
+                        (
+                            k["kid"].as_str().unwrap_or_default().to_string(),
+                            k["x"].as_str().unwrap_or_default().to_string(),
+                        )
+                    })
+                    .unwrap_or_default();
+                db.update_publisher_declaration(host, &raw, &kid, &x, &value)?;
+                db.clear_pending_identity(host)?;
+                match &open_window {
+                    None => {
+                        if decision == Decision::Recovery {
+                            db.open_recovery_window(host, &raw, &stored_raw)?;
+                        }
+                    }
+                    Some(_) => {
+                        if declaration::follows_chain_head(recovery_head.as_ref().unwrap(), &value)
+                        {
+                            db.update_recovery_chain_head(host, &raw)?;
+                        }
                     }
                 }
-                Some(_) => {
-                    if declaration::follows_chain_head(recovery_head.as_ref().unwrap(), &value) {
-                        db.update_recovery_chain_head(host, &raw)?;
-                    }
-                }
+                current_doc = value;
+                db.mark_declaration_fetched(host, now)?;
             }
-            current_doc = value;
-            db.mark_declaration_fetched(host, now)?;
         }
         Err((code, detail)) => {
             record_rejection(db, host, code, now, None, &detail)?;
@@ -366,7 +434,7 @@ fn onboard_publisher(
         }
     };
 
-    db.record_publisher_declaration(host, &raw, &key.key_id, &key.public_key, &value)?;
+    db.record_publisher_declaration(host, &raw, &key.kid, &key.x, &value)?;
     db.mark_declaration_fetched(host, now)?;
 
     Ok(Some(()))
@@ -1404,16 +1472,15 @@ mod tests {
                         .iter()
                         .map(|key| {
                             let id = key.as_str().unwrap();
-                            wist_core::objects::PublisherKey {
-                                key_id: id.into(),
-                                alg: "Ed25519".into(),
-                                public_key: wist_core::crypto::b64u_encode(
+                            wist_core::objects::PublisherKey::new(
+                                &wist_core::crypto::b64u_encode(
                                     &ed25519_dalek::SigningKey::from_bytes(&seeds[id])
                                         .verifying_key()
                                         .to_bytes(),
                                 ),
-                                valid_from: "2099-01-01T00:00:00Z".into(),
-                            }
+                                4_070_908_800,
+                                None,
+                            )
                         })
                         .collect();
                     (
@@ -1438,8 +1505,9 @@ mod tests {
                     "generated_at": cut, "deltas": [], "next": null
                 });
                 let key = wist_core::crypto::SigningKey::from_seed(&seeds[signer]);
+                let kid = wist_core::objects::publisher::thumbprint(&key.public().to_b64u());
                 let mut doc =
-                    wist_core::envelope::sign_envelope(&body, "feed", signer, &key).unwrap();
+                    wist_core::envelope::sign_envelope(&body, "feed", &kid, &key).unwrap();
                 for _ in 0..2 {
                     assert_eq!(
                         verify_sealed_page(&declarations, &doc, &cut),

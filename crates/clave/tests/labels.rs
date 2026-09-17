@@ -8,7 +8,7 @@ const SEAL_START: i64 = 1_786_276_800;
 
 fn sign(p: &common::TestPub, inner_name: &str, inner: Value) -> (String, Value) {
     let id = wist_core::label::label_id(&inner).unwrap();
-    let envelope = wist_core::envelope::sign_envelope(&inner, inner_name, "k1", &p.sk).unwrap();
+    let envelope = wist_core::envelope::sign_envelope(&inner, inner_name, &p.kid, &p.sk).unwrap();
     (id, envelope)
 }
 
@@ -24,7 +24,7 @@ fn write_listed(p: &common::TestPub, host: &str, items: &[(String, Value)], gene
     }
     let ids: Vec<&str> = items.iter().map(|(id, _)| id.as_str()).collect();
     let feed = json!({"wist_version": "1.0.0", "domain": host, "generated_at": generated_at, "deltas": ids, "next": null});
-    let envelope = wist_core::envelope::sign_envelope(&feed, "feed", "k1", &p.sk).unwrap();
+    let envelope = wist_core::envelope::sign_envelope(&feed, "feed", &p.kid, &p.sk).unwrap();
     fs::write(
         p.dir.path().join(".well-known/wist/label-feed.json"),
         serde_json::to_vec(&envelope).unwrap(),

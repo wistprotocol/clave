@@ -115,7 +115,8 @@ fn delta(publisher: &TestPub, url: &str, text: &str, prev: Option<&str>) -> (Str
         .unwrap()
         .to_string());
     let body =
-        wist_core::envelope::sign_envelope(&body["delta"], "delta", "k1", &publisher.sk).unwrap();
+        wist_core::envelope::sign_envelope(&body["delta"], "delta", &publisher.kid, &publisher.sk)
+            .unwrap();
     (wist_core::delta::delta_id(&body["delta"]).unwrap(), body)
 }
 
@@ -394,7 +395,7 @@ fn supported_versions_restore_chains_across_sealed_and_both_unsealed_stores() {
             let envelope = wist_core::envelope::sign_envelope(
                 &envelope["delta"],
                 "delta",
-                "k1",
+                &publisher.kid,
                 &publisher.sk,
             )
             .unwrap();
@@ -475,7 +476,7 @@ fn retained_version_and_field_failures_preserve_indexes_and_precedence() {
             let envelope = wist_core::envelope::sign_envelope(
                 &envelope["delta"],
                 "delta",
-                "k1",
+                &publisher.kid,
                 &publisher.sk,
             )
             .unwrap();
@@ -635,9 +636,13 @@ fn retained_change_types_require_content_and_preserve_contentless_successors() {
             if !with_prev {
                 body["delta"].as_object_mut().unwrap().remove("prev");
             }
-            let body =
-                wist_core::envelope::sign_envelope(&body["delta"], "delta", "k1", &publisher.sk)
-                    .unwrap();
+            let body = wist_core::envelope::sign_envelope(
+                &body["delta"],
+                "delta",
+                &publisher.kid,
+                &publisher.sk,
+            )
+            .unwrap();
             let id = wist_core::delta::delta_id(&body["delta"]).unwrap();
             match store {
                 "sealed" => f.append(vec![entry(body)]),
@@ -799,9 +804,13 @@ fn observation_history_stays_with_its_publisher_through_identity_reset() {
         for (publisher, at) in [(&a, "2027-01-15T07:00:00Z"), (&b, "2027-01-15T07:00:01Z")] {
             let (_, mut body) = delta(publisher, url, "root", None);
             body["delta"]["observed_at"] = json!(at);
-            let body =
-                wist_core::envelope::sign_envelope(&body["delta"], "delta", "k1", &publisher.sk)
-                    .unwrap();
+            let body = wist_core::envelope::sign_envelope(
+                &body["delta"],
+                "delta",
+                &publisher.kid,
+                &publisher.sk,
+            )
+            .unwrap();
             let id = wist_core::delta::delta_id(&body["delta"]).unwrap();
             roots.push((id, body));
         }
@@ -816,17 +825,34 @@ fn observation_history_stays_with_its_publisher_through_identity_reset() {
         replacement["seq"] = json!(1);
         replacement["prev_declaration"] =
             json!(clave::declaration::inner_hash(&declaration(&a)["body"]).unwrap());
-        replacement["keys"][0]["public_key"] = json!(seed_public_b64u(&[2; 32]));
+        rekey(&mut replacement["keys"][0], &seed_public_b64u(&[2; 32]));
         let replacement =
-            wist_core::envelope::sign_envelope(&replacement, "publisher", "k1", &key).unwrap();
+            wist_core::envelope::sign_envelope(&replacement, "publisher", &kid(&[2; 32]), &key)
+                .unwrap();
         let (_, mut body) = delta(&a, url, "after reset", Some(&roots[0].0));
         body["delta"]["observed_at"] = json!(at);
-        let body = wist_core::envelope::sign_envelope(&body["delta"], "delta", "k1", &key).unwrap();
+        let body =
+            wist_core::envelope::sign_envelope(&body["delta"], "delta", &kid(&[2; 32]), &key)
+                .unwrap();
         let id = wist_core::delta::delta_id(&body["delta"]).unwrap();
         f.append(vec![
             json!({"type":"publisher_declaration", "body":replacement}),
-            entry(body),
         ]);
+        // WIST-1 §5.2: a fresh identity is pending and supplies no authority
+        // until `declaration_activation_blocks` Blocks after the one sealing
+        // it, so its first Delta seals at the activation height.
+        let activation_height = f.db.last_block().unwrap().unwrap().block_number
+            + u64::try_from(
+                wist_core::parameters::spec("declaration_activation_blocks")
+                    .unwrap()
+                    .default
+                    .unwrap(),
+            )
+            .unwrap();
+        while f.db.last_block().unwrap().unwrap().block_number < activation_height - 1 {
+            f.append(Vec::new());
+        }
+        f.append(vec![entry(body)]);
         f.legacy();
         if accepted {
             let db = f.reopen().unwrap();

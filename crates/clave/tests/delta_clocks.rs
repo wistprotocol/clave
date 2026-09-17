@@ -62,12 +62,11 @@ fn append(
 fn genesis(data: &std::path::Path, vector: &Value) -> BlockRow {
     clave::init::run("log.example.net", data).unwrap();
     let key = crypto::SigningKey::from_seed(&std::array::from_fn(|i| i as u8));
+    let entry = wist_core::objects::PublisherKey::new(&key.public().to_b64u(), 0, None);
     let declaration = envelope::sign_envelope(
-        &json!({"wist_version":"1.0.0", "domain":"example.com", "seq":0,
-            "keys":[{"key_id":"test-k1", "alg":"Ed25519", "public_key":key.public().to_b64u(),
-                "valid_from":"0000-01-01T00:00:00+23:59"}]}),
+        &json!({"wist_version":"1.0.0", "domain":"example.com", "seq":0, "keys":[entry]}),
         "publisher",
-        "test-k1",
+        &entry.kid,
         &key,
     )
     .unwrap();
@@ -151,10 +150,25 @@ fn historical_clock_rejections_survive_later_blocks_restart_and_repair() {
             probe["checked_at"].as_str().unwrap(),
             vec![],
         );
+        // A key entry's `nbf` is a NumericDate, so no binding reaches an
+        // instant before the epoch: such a Delta fails the WIST-1 §5.1 key
+        // check whatever the clock rule makes of it.
+        let before_epoch = wist_core::publisher_time::at_or_after(
+            delta["delta"]["observed_at"].as_str().unwrap(),
+            0,
+        ) == Some(false);
         for pinned in [&head, &later, &later] {
             let result = DeltaSource::reconstruct(data.path(), Some(pinned.clone()), &id);
-            if probe["expected"].is_null() {
-                let source = result.unwrap();
+            if before_epoch {
+                let error = result.err().unwrap().to_string();
+                let clock = probe["expected"].as_str().unwrap_or("WIST1-E02");
+                assert!(
+                    error.contains("WIST1-E02") || error.contains(clock),
+                    "{}: {error}",
+                    probe["name"]
+                );
+            } else if probe["expected"].is_null() {
+                let source = result.unwrap_or_else(|e| panic!("{}: {e}", probe["name"]));
                 assert_eq!(source.envelope(), delta);
                 assert_eq!(
                     json!(source.clock_skew_seconds()),
@@ -172,7 +186,7 @@ fn historical_clock_rejections_survive_later_blocks_restart_and_repair() {
                 assert!(error.contains("WIST1-E06"), "{}: {error}", probe["name"]);
             }
         }
-        if probe["expected"].is_null() {
+        if probe["expected"].is_null() && !before_epoch {
             let path = data.path().join("log/blocks/000000001.json.zst");
             let original = std::fs::read(&path).unwrap();
             std::fs::write(&path, b"corrupt").unwrap();
@@ -219,7 +233,6 @@ fn sealing_rechecks_clock_reductions_and_releases_rejected_chains_for_retry() {
         "root",
         None,
         "2026-08-16T12:05:00Z",
-        "k1",
         &[1; 32],
     );
     let child = add_delta_signed(
@@ -228,7 +241,6 @@ fn sealing_rechecks_clock_reductions_and_releases_rejected_chains_for_retry() {
         "child",
         Some(&root),
         "2026-08-16T12:05:01Z",
-        "k1",
         &[1; 32],
     );
     let boundary = add_delta_signed(
@@ -237,7 +249,6 @@ fn sealing_rechecks_clock_reductions_and_releases_rejected_chains_for_retry() {
         "boundary",
         None,
         "2026-08-16T12:01:00Z",
-        "k1",
         &[1; 32],
     );
     write_feed(
@@ -296,7 +307,6 @@ fn waiting_successors_keep_their_clock_while_predecessors_start_new_attempts() {
         "root",
         None,
         "2026-08-16T12:00:30Z",
-        "k1",
         &[1; 32],
     );
     let child = add_delta_signed(
@@ -305,7 +315,6 @@ fn waiting_successors_keep_their_clock_while_predecessors_start_new_attempts() {
         "child",
         Some(&root),
         "2026-08-16T12:05:00Z",
-        "k1",
         &[1; 32],
     );
     let crossed = serve_crossing(

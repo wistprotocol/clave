@@ -12,9 +12,10 @@ use wist_core::crypto::{hex_encode, SigningKey};
 use wist_core::envelope::sign_envelope;
 use wist_core::label::{self, LabelerRow, SealedLabelCount};
 use wist_core::objects::{
-    AggregatorKeyEntry, DeclarationEntry, DisputeEntry, LabelEntry, ParameterEntry, RecordEntry,
-    RecoveryWindowEntry, SnapshotFile, SnapshotIndex, SnapshotIndexEntry, SnapshotManifest,
-    SnapshotState, SnapshotStateFile, StateEntry, SuffixListEntry, WithdrawalEntry,
+    AggregatorKeyEntry, DeclarationEntry, DisputeEntry, LabelEntry, ParameterEntry,
+    PendingDeclarationEntry, RecordEntry, RecoveryWindowEntry, SnapshotFile, SnapshotIndex,
+    SnapshotIndexEntry, SnapshotManifest, SnapshotState, SnapshotStateFile, StateEntry,
+    SuffixListEntry, WithdrawalEntry,
 };
 use wist_core::snapshot::{content_digest, state_digest};
 
@@ -424,6 +425,17 @@ fn build_state(
             declaration: current.envelope().clone(),
             sealing_height: current.position().block_number,
             highest_accepted_seq: state.highest_accepted_seq(),
+        }));
+    }
+    for (domain, state) in domains {
+        let Some(pending) = state.pending() else {
+            continue;
+        };
+        entries.push(StateEntry::PendingDeclaration(PendingDeclarationEntry {
+            domain: domain.clone(),
+            head: pending.head().envelope().clone(),
+            sealing_height: pending.head().position().block_number,
+            activation_height: pending.activation_height(),
         }));
     }
     for (domain, state) in domains {

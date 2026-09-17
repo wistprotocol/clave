@@ -58,7 +58,7 @@ fn publish(p: &TestPub, url: &str, links: Value, prev: Option<&str>) -> String {
         body["prev"] = prev.into();
     }
     let id = delta::delta_id(&body).unwrap();
-    let signed = envelope::sign_envelope(&body, "delta", "k1", &p.sk).unwrap();
+    let signed = envelope::sign_envelope(&body, "delta", &p.kid, &p.sk).unwrap();
     let base = p.dir.path().join(".well-known/wist");
     std::fs::write(
         base.join(format!("deltas/{}.json", &id[7..])),

@@ -6,7 +6,7 @@ use std::fs;
 
 fn write_delta(p: &TestPub, delta: &Value) -> String {
     let id = wist_core::delta::delta_id(delta).unwrap();
-    let envelope = wist_core::envelope::sign_envelope(delta, "delta", "k1", &p.sk).unwrap();
+    let envelope = wist_core::envelope::sign_envelope(delta, "delta", &p.kid, &p.sk).unwrap();
     fs::write(
         p.dir
             .path()
@@ -181,13 +181,13 @@ fn sealing_rejects_a_shared_key_delta_assigned_to_another_domain() {
     .unwrap();
     let mut inner = original["delta"].clone();
     inner["publisher"] = json!("example.com");
-    let foreign = wist_core::envelope::sign_envelope(&inner, "delta", "k1", &p.sk).unwrap();
+    let foreign = wist_core::envelope::sign_envelope(&inner, "delta", &p.kid, &p.sk).unwrap();
     db.insert_pending_entry("publisher_delta", &host, &foreign, 0)
         .unwrap();
     let mut malformed_inner = inner.clone();
     malformed_inner["publisher"] = Value::Null;
     let malformed =
-        wist_core::envelope::sign_envelope(&malformed_inner, "delta", "k1", &p.sk).unwrap();
+        wist_core::envelope::sign_envelope(&malformed_inner, "delta", &p.kid, &p.sk).unwrap();
     db.insert_pending_entry("publisher_delta", &host, &malformed, 0)
         .unwrap();
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
@@ -236,9 +236,9 @@ fn recovery_settlement_preserves_publisher_field_errors_in_corrupted_queues() {
     let mut recovery = previous["publisher"].clone();
     recovery["seq"] = json!(1);
     recovery["prev_declaration"] = json!(declaration_hash(&previous));
-    recovery["keys"] = json!([key_entry("k2", &K2_SEED, "2026-08-09T12:00:00Z")]);
-    write_declaration(&p, &recovery, "r1", &R1_SEED);
-    write_feed_signed(&p, &host, &[], "2026-08-09T12:00:00Z", "k2", &K2_SEED);
+    recovery["keys"] = json!([key_entry(&K2_SEED, "2026-08-09T12:00:00Z")]);
+    write_declaration(&p, &recovery, &R1_SEED);
+    write_feed_signed(&p, &host, &[], "2026-08-09T12:00:00Z", &K2_SEED);
     clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
     clave::seal::run(&db, data.path(), &sk, at).unwrap();
     let signer = wist_core::crypto::SigningKey::from_seed(&K2_SEED);
@@ -249,7 +249,8 @@ fn recovery_settlement_preserves_publisher_field_errors_in_corrupted_queues() {
     ] {
         let inner = json!({"wist_version":"1.0.0", "publisher":publisher, "url":"https://example.com/a", "change_type":"delete", "observed_at":"2026-08-09T12:00:00Z", "prev":format!("sha256:{}", "0".repeat(64)), "meta":{"lang":"en"}});
         let id = wist_core::delta::delta_id(&inner).unwrap();
-        let envelope = wist_core::envelope::sign_envelope(&inner, "delta", "k2", &signer).unwrap();
+        let envelope =
+            wist_core::envelope::sign_envelope(&inner, "delta", &kid(&K2_SEED), &signer).unwrap();
         db.queue_delta(&host, &id, &envelope, "https://example.com/a", &id, 0)
             .unwrap();
         expected.push((id, code));

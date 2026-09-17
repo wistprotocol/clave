@@ -56,9 +56,10 @@ fn predecessor_ownership_and_current_field_checks_precede_time_comparison() {
         candidate["observed_at"] = json!("2026-08-09T12:00:01Z");
         candidate["prev"] = json!(wist_core::delta::delta_id(&predecessor).unwrap());
         let predecessor =
-            wist_core::envelope::sign_envelope(&predecessor, "delta", "k1", &key).unwrap();
+            wist_core::envelope::sign_envelope(&predecessor, "delta", &kid(&K1_SEED), &key)
+                .unwrap();
         let candidate =
-            wist_core::envelope::sign_envelope(&candidate, "delta", "k1", &key).unwrap();
+            wist_core::envelope::sign_envelope(&candidate, "delta", &kid(&K1_SEED), &key).unwrap();
         for doc in [&predecessor, &candidate] {
             wist_core::envelope::verify_envelope(doc, "delta", &public).unwrap();
         }
@@ -70,7 +71,8 @@ fn predecessor_ownership_and_current_field_checks_precede_time_comparison() {
             let mut malformed = candidate["delta"].clone();
             malformed["observed_at"] = invalid;
             let malformed =
-                wist_core::envelope::sign_envelope(&malformed, "delta", "k1", &key).unwrap();
+                wist_core::envelope::sign_envelope(&malformed, "delta", &kid(&K1_SEED), &key)
+                    .unwrap();
             assert_eq!(
                 verify_delta_predecessor(&malformed, &predecessor),
                 Err("WIST1-E14")
@@ -80,7 +82,7 @@ fn predecessor_ownership_and_current_field_checks_precede_time_comparison() {
 }
 
 fn add(p: &TestPub, prev: Option<&str>, at: &str) -> String {
-    add_delta_signed(p, URL, at, prev, at, "k1", &K1_SEED)
+    add_delta_signed(p, URL, at, prev, at, &K1_SEED)
 }
 
 fn assert_rejected(db: &Db, data: &std::path::Path, id: &str, tip: &str) {
@@ -114,7 +116,7 @@ fn pending_sealed_and_recovery_predecessors_survive_restart() {
             let mut owner = previous["publisher"].clone();
             owner["seq"] = json!(1);
             owner["prev_declaration"] = json!(declaration_hash(&previous));
-            write_declaration(&p, &owner, "r1", &R1_SEED);
+            write_declaration(&p, &owner, &R1_SEED);
         }
         let first = add(&p, None, "2026-08-09T12:00:00.00000000000000000002Z");
         write_feed(&p, &host, std::slice::from_ref(&first), NOW);
@@ -304,7 +306,7 @@ fn an_accepted_tip_without_its_envelope_stops_the_pull() {
 
 fn write_envelope(p: &TestPub, body: &Value) -> String {
     let id = wist_core::delta::delta_id(body).unwrap();
-    let envelope = wist_core::envelope::sign_envelope(body, "delta", "k1", &p.sk).unwrap();
+    let envelope = wist_core::envelope::sign_envelope(body, "delta", &p.kid, &p.sk).unwrap();
     std::fs::write(
         p.dir
             .path()
@@ -435,7 +437,6 @@ fn retrieved_delta_keeps_its_own_url_chain_when_the_requested_relationship_is_in
         "other",
         None,
         "2026-08-09T12:00:01Z",
-        "k1",
         &K1_SEED,
     );
     let invalid = add(&p, Some(&other), "2026-08-09T12:00:02Z");
@@ -614,7 +615,7 @@ fn sealed_predecessors_require_authored_connected_history_before_admission() {
                 }
                 _ => (),
             }
-            let mut doc = envelope::sign_envelope(&body, "delta", "k1", &p.sk).unwrap();
+            let mut doc = envelope::sign_envelope(&body, "delta", &p.kid, &p.sk).unwrap();
             if fault == "late_signature" {
                 doc["sig"]["value"] = json!(crypto::b64u_encode(&[0; 64]));
             }
@@ -681,9 +682,11 @@ fn sealed_predecessor_keeps_its_historical_authority_after_rotation_and_restart(
     let mut replacement = original["publisher"].clone();
     replacement["seq"] = json!(1);
     replacement["prev_declaration"] = json!(declaration_hash(&original));
-    replacement["keys"] = json!([key_entry("k2", &K2_SEED, "2026-08-09T00:00:00Z")]);
-    write_declaration(&p, &replacement, "k2", &K2_SEED);
-    write_feed_signed(&p, &host, &[], "2026-08-09T15:00:00Z", "k2", &K2_SEED);
+    replacement["keys"] = json!([key_entry(&K2_SEED, "2026-08-09T00:00:00Z")]);
+    // Signed by the key it replaces, so the rotation preserves the identity
+    // and the new key has authority at once (WIST-1 §5.2).
+    write_declaration(&p, &replacement, &K1_SEED);
+    write_feed_signed(&p, &host, &[], "2026-08-09T15:00:00Z", &K2_SEED);
     let report =
         clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T15:00:00Z").unwrap();
     assert!(report.rejected.is_empty());
@@ -695,7 +698,6 @@ fn sealed_predecessor_keeps_its_historical_authority_after_rotation_and_restart(
         "new key",
         Some(&first),
         "2026-08-09T15:00:01Z",
-        "k2",
         &K2_SEED,
     );
     write_feed_signed(
@@ -703,7 +705,6 @@ fn sealed_predecessor_keeps_its_historical_authority_after_rotation_and_restart(
         &host,
         std::slice::from_ref(&next),
         "2026-08-09T16:00:00Z",
-        "k2",
         &K2_SEED,
     );
     let db = Db::open(&path).unwrap();

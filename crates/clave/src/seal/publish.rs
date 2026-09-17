@@ -169,6 +169,27 @@ pub(super) fn block(
     )?;
     db.record_publication(block_number, &block_bytes, &checkpoint_bytes)?;
 
+    for activation in &projection.effects().activations {
+        let publisher = crate::declaration::publisher_of(activation.activated.envelope())
+            .map_err(Error::History)?;
+        let key = &publisher.keys[0];
+        db.restore_publisher_declaration(
+            &activation.domain,
+            &serde_json::to_vec(activation.activated.envelope())?,
+            &key.kid,
+            &key.x,
+        )?;
+        db.clear_pending_identity(&activation.domain)?;
+    }
+    for installation in &projection.effects().installations {
+        if installation.reversed.is_some() {
+            if let Some(domain) =
+                installation.declaration.envelope()["publisher"]["domain"].as_str()
+            {
+                db.clear_pending_identity(domain)?;
+            }
+        }
+    }
     for window in &windows {
         db.store_sealed_recovery_window(
             &window.domain,

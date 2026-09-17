@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS recovery_settlements(domain TEXT NOT NULL, owner_hash
 CREATE TABLE IF NOT EXISTS sealed_declarations(domain TEXT NOT NULL, seq INTEGER NOT NULL, block_number INTEGER NOT NULL, sealed_at TEXT NOT NULL, declaration_json BLOB NOT NULL, PRIMARY KEY(domain, seq));
 CREATE TABLE IF NOT EXISTS queued_deltas(rowid INTEGER PRIMARY KEY AUTOINCREMENT, domain TEXT NOT NULL, delta_id TEXT NOT NULL, entry_json BLOB NOT NULL, url TEXT NOT NULL, chain_pos INTEGER NOT NULL, acceptance_order INTEGER);
 CREATE TABLE IF NOT EXISTS publications(block_number INTEGER PRIMARY KEY, block_json BLOB NOT NULL, checkpoint_json BLOB NOT NULL, published INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS pending_identities(domain TEXT PRIMARY KEY, declaration_json BLOB NOT NULL);
 ";
 
 pub(super) fn add_missing_columns(conn: &Connection) -> Result<()> {
