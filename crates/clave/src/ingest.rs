@@ -389,8 +389,9 @@ impl Default for PullLimits {
 
 /// The kinds of content object a pull fetches under the byte budget, each
 /// bounded while it streams.
-#[derive(Debug, Clone, Copy)]
-enum Object {
+/// The kinds of object a pull fetches, each under its own WIST-2 §8 bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Object {
     Page,
     Delta,
     Payload,
@@ -399,13 +400,13 @@ enum Object {
 /// Per-object bounds: Feed pages by the shared object cap, a Delta file
 /// by its URL cap and fixed fields, a Payload by the content caps in
 /// force plus its salt and framing.
-struct ObjectCaps {
+pub struct ObjectCaps {
     delta: u64,
     payload: u64,
 }
 
 impl ObjectCaps {
-    fn from_schedule(schedule: &wist_core::parameters::Schedule, at: i64) -> Self {
+    pub fn from_schedule(schedule: &wist_core::parameters::Schedule, at: i64) -> Self {
         let caps = crate::declaration::delta::SizeCaps::from_schedule(schedule, at);
         ObjectCaps {
             delta: 16_384 + 2 * caps.url_cap_bytes as u64,
@@ -413,7 +414,7 @@ impl ObjectCaps {
         }
     }
 
-    fn of(&self, object: Object) -> u64 {
+    pub fn of(&self, object: Object) -> u64 {
         match object {
             Object::Page => crate::fetch::OBJECT_CAP_BYTES,
             Object::Delta => self.delta,

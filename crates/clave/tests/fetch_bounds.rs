@@ -217,3 +217,91 @@ fn a_host_that_rebinds_to_a_private_address_is_refused_on_its_next_fetch() {
         "{err}"
     );
 }
+
+fn spec_path(rel: &str) -> std::path::PathBuf {
+    std::env::var("WIST_SPEC_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../spec")
+                .canonicalize()
+                .expect("sibling spec checkout")
+        })
+        .join(rel)
+}
+
+/// WIST-2 §8 (ADR-0044) through the spec's fetch-bounds vector: every
+/// address class the fetcher refuses, the loopback opt-in, resolver
+/// answers refused whole, and the octets read of each object under two
+/// parameter maps.
+#[test]
+fn fetch_bounds_vector() {
+    let vector: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(spec_path("vectors/wist2/fetch-bounds.json")).unwrap(),
+    )
+    .unwrap();
+    for case in vector["destinations"].as_array().unwrap() {
+        let label = case["label"].as_str().unwrap();
+        let ip: IpAddr = case["address"].as_str().unwrap().parse().unwrap();
+        let outcome =
+            clave::fetch::destination_allowed(ip, case["loopback_opt_in"].as_bool().unwrap());
+        assert_eq!(
+            outcome.is_ok(),
+            case["allowed"].as_bool().unwrap(),
+            "{label}: {outcome:?}"
+        );
+        if let Some(class) = case["class"].as_str() {
+            assert!(
+                outcome
+                    .as_ref()
+                    .is_err_and(|e| e.to_string().contains(class)),
+                "{label}: {outcome:?}"
+            );
+        }
+    }
+    for case in vector["resolutions"].as_array().unwrap() {
+        let addresses = case["addresses"].as_array().unwrap();
+        let allowed = !addresses.is_empty()
+            && addresses.iter().all(|a| {
+                clave::fetch::destination_allowed(a.as_str().unwrap().parse().unwrap(), false)
+                    .is_ok()
+            });
+        assert_eq!(
+            allowed,
+            case["allowed"].as_bool().unwrap(),
+            "{}",
+            case["label"]
+        );
+    }
+    for case in vector["object_bounds"].as_array().unwrap() {
+        let label = case["label"].as_str().unwrap();
+        let params = &case["parameters"];
+        let mut schedule = wist_core::parameters::Schedule::new(0);
+        for (index, name) in [
+            "url_cap_bytes",
+            "extract_cap_bytes",
+            "links_cap_bytes",
+            "summary_cap_bytes",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            schedule.adopt(wist_core::parameters::Amendment {
+                parameter: name.into(),
+                value: params[name].as_i64().unwrap(),
+                block_number: 0,
+                entry_index: index as u64,
+                sealed_at_s: 0,
+                effective_at_s: 0,
+            });
+        }
+        let caps = clave::ingest::ObjectCaps::from_schedule(&schedule, 0);
+        let bound = match case["object"].as_str().unwrap() {
+            "declaration" | "feed" | "page" | "mirrors" => clave::fetch::OBJECT_CAP_BYTES,
+            "delta" => caps.of(clave::ingest::Object::Delta),
+            "payload" => caps.of(clave::ingest::Object::Payload),
+            other => panic!("{label}: unknown object {other}"),
+        };
+        assert_eq!(bound, case["bound"].as_u64().unwrap(), "{label}");
+    }
+}
