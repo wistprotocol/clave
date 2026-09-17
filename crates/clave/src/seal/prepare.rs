@@ -727,12 +727,17 @@ pub(super) fn enforce_governance(
                 }
             }
             Some("suffix_list_update") => {
-                use wist_core::suffix_list::Disposition;
+                use wist_core::suffix_list::{Disposition, HeldFile};
                 match suffix_replay.apply(
                     block_number,
                     &e.body,
                     |key_id| (key_id == GENESIS_KEY_ID).then(|| log_key.clone()),
-                    |identifier| db.suffix_list_bytes(identifier).ok().flatten(),
+                    |identifier| {
+                        db.suffix_list_bytes(identifier)
+                            .ok()
+                            .flatten()
+                            .map_or(HeldFile::Absent, HeldFile::Bytes)
+                    },
                 ) {
                     Disposition::Accepted {
                         identifier,
