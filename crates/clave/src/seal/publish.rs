@@ -31,6 +31,7 @@ pub(super) fn block(
         sealed_rowids,
         accepted_changes,
         withdrawals,
+        suffix_lists,
         dropped,
         late,
         entry_count,
@@ -115,6 +116,7 @@ pub(super) fn block(
         &records,
         &param_changes,
         &withdrawal_rows,
+        &suffix_lists,
         &declaration_rows,
         block_bytes.len() as u64,
     )?;

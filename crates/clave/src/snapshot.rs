@@ -13,7 +13,7 @@ use wist_core::envelope::sign_envelope;
 use wist_core::objects::{
     AggregatorKeyEntry, DeclarationEntry, ParameterEntry, RecordEntry, RecoveryWindowEntry,
     SnapshotFile, SnapshotIndex, SnapshotIndexEntry, SnapshotManifest, SnapshotState,
-    SnapshotStateFile, StateEntry, WithdrawalEntry,
+    SnapshotStateFile, StateEntry, SuffixListEntry, WithdrawalEntry,
 };
 use wist_core::snapshot::{content_digest, state_digest};
 
@@ -228,6 +228,12 @@ fn build_state(
             name,
             effective_at,
             value,
+        }));
+    }
+    if let Some((identifier, sealing_height)) = db.suffix_list_at_position(log_position)? {
+        entries.push(StateEntry::SuffixList(SuffixListEntry {
+            identifier,
+            sealing_height,
         }));
     }
     for (domain, state) in domains {
@@ -538,6 +544,7 @@ mod tests {
                 abstract_text: None,
                 lang: "en",
             }],
+            &[],
             &[],
             &[],
             &declarations,

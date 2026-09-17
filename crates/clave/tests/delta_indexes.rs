@@ -77,6 +77,7 @@ impl Fixture {
                 &[],
                 &[],
                 &[],
+                &[],
                 bytes.len() as u64,
             )
             .unwrap();

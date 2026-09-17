@@ -25,7 +25,7 @@ pub fn update_id(update: &Value) -> Result<String> {
     ))
 }
 
-fn enqueue(db: &Db, sk: &SigningKey, update: Value) -> Result<String> {
+pub(crate) fn enqueue(db: &Db, sk: &SigningKey, update: Value) -> Result<String> {
     let id = update_id(&update)?;
     let envelope = sign_envelope(&update, "update", GENESIS_KEY_ID, sk)?;
     db.insert_pending_entry("registry_update", "", &envelope, 0)?;

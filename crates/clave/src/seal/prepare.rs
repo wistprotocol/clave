@@ -26,6 +26,7 @@ pub(super) struct PreparedBlock {
     pub(super) sealed_rowids: Vec<i64>,
     pub(super) accepted_changes: Vec<AcceptedParamChange>,
     pub(super) withdrawals: Vec<OwnedWithdrawal>,
+    pub(super) suffix_lists: Vec<String>,
     pub(super) dropped: Vec<String>,
     pub(super) late: Vec<String>,
     pub(super) entry_count: u64,
@@ -237,6 +238,7 @@ pub(super) fn block(
         kept: seal_entries,
         param_changes: accepted_changes,
         withdrawals,
+        suffix_lists,
         dropped,
         dropped_rowids,
     } = outcome;
@@ -299,6 +301,7 @@ pub(super) fn block(
         sealed_rowids,
         accepted_changes,
         withdrawals,
+        suffix_lists,
         dropped,
         late,
         entry_count,
@@ -325,6 +328,7 @@ pub(super) struct GovernanceOutcome {
     pub(super) kept: Vec<SealEntry>,
     pub(super) param_changes: Vec<AcceptedParamChange>,
     pub(super) withdrawals: Vec<OwnedWithdrawal>,
+    pub(super) suffix_lists: Vec<String>,
     pub(super) dropped: Vec<String>,
     pub(super) dropped_rowids: Vec<i64>,
 }
@@ -413,10 +417,11 @@ pub(crate) fn validate_pending_parameter(
 /// One whose signing key a Declaration accepted since the pull has
 /// retired is WIST1-E02, reported and not sealed.
 /// WIST-3 §3.2: a Block MUST NOT carry more than
-/// `domain_block_entries_max` `publisher_delta` Entries for one domain.
-/// The surplus waits its turn in acceptance order, and WIST-4 §6.4's
-/// inclusion ceiling runs from the Block a Delta's turn arrives in — the
-/// first with room for it — which is recorded here.
+/// `domain_block_entries_max` `publisher_delta`, `label` and `dispute`
+/// Entries of one Registrable Domain under the snapshot in force at it
+/// (WIST-4 §3.1). The surplus waits its turn in acceptance order, and
+/// WIST-4 §6.4's inclusion ceiling runs from the Block an Entry's turn
+/// arrives in — the first with room for it — which is recorded here.
 pub(super) fn fit_to_domain_cap(
     db: &Db,
     peeked: Vec<PendingEntryRow>,
@@ -424,14 +429,19 @@ pub(super) fn fit_to_domain_cap(
     block_number: u64,
 ) -> Result<Vec<PendingEntryRow>> {
     let cap = cap.max(0) as usize;
+    let list = crate::suffix_list::in_force_at_block(db, block_number)?;
     let mut taken: HashMap<String, usize> = HashMap::new();
     let mut kept = Vec::with_capacity(peeked.len());
     for p in peeked {
-        if p.entry_type != "publisher_delta" {
+        if !matches!(
+            p.entry_type.as_str(),
+            "publisher_delta" | "label" | "dispute"
+        ) {
             kept.push(p);
             continue;
         }
-        let count = taken.entry(p.domain.clone()).or_insert(0);
+        let unit = wist_core::suffix_list::registrable_domain(&p.domain, list.as_deref()).domain;
+        let count = taken.entry(unit).or_insert(0);
         if *count >= cap {
             continue;
         }
@@ -649,6 +659,7 @@ pub(super) fn enforce_governance(
         kept: Vec::with_capacity(entries.len()),
         param_changes: Vec::new(),
         withdrawals: Vec::new(),
+        suffix_lists: Vec::new(),
         dropped: Vec::new(),
         dropped_rowids: Vec::new(),
     };
@@ -665,6 +676,10 @@ pub(super) fn enforce_governance(
     let mut replay = wist_core::withdrawal::WithdrawalReplay::new();
     for (delta_id, domain, height) in db.withdrawal_state()? {
         replay.adopt(&delta_id, &domain, height);
+    }
+    let mut suffix_replay = wist_core::suffix_list::SuffixListReplay::new();
+    for (height, identifier) in db.suffix_list_acts()? {
+        suffix_replay.adopt(&identifier, height);
     }
     for (index, e) in entries.into_iter().enumerate() {
         if e.entry_type != "registry_update" {
@@ -707,6 +722,32 @@ pub(super) fn enforce_governance(
                     Ok(None) => out.kept.push(e),
                     Err(reason) => {
                         out.dropped.push(reason);
+                        out.dropped_rowids.push(e.rowid);
+                    }
+                }
+            }
+            Some("suffix_list_update") => {
+                use wist_core::suffix_list::Disposition;
+                match suffix_replay.apply(
+                    block_number,
+                    &e.body,
+                    |key_id| (key_id == GENESIS_KEY_ID).then(|| log_key.clone()),
+                    |identifier| db.suffix_list_bytes(identifier).ok().flatten(),
+                ) {
+                    Disposition::Accepted {
+                        identifier,
+                        changed: true,
+                        ..
+                    } => {
+                        out.suffix_lists.push(identifier);
+                        out.kept.push(e);
+                    }
+                    Disposition::Accepted { .. } | Disposition::NotSuffixList => out.kept.push(e),
+                    Disposition::Rejected(code) => {
+                        out.dropped.push(format!(
+                            "{code} suffix_list_update {} is not accepted",
+                            update["subject"].as_str().unwrap_or("without a subject")
+                        ));
                         out.dropped_rowids.push(e.rowid);
                     }
                 }
@@ -968,6 +1009,39 @@ pub(super) fn resolve_record_updates(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn domain_cap_counts_per_registrable_domain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+        let list = b"com\ngithub.io\n";
+        let identifier = wist_core::suffix_list::identifier(list);
+        db.store_suffix_list(&identifier, list).unwrap();
+        db.commit_seal(
+            &[],
+            0,
+            "sha256:h0",
+            "2026-08-09T00:00:00Z",
+            &[],
+            &[],
+            &[],
+            std::slice::from_ref(&identifier),
+            &[],
+            0,
+        )
+        .unwrap();
+        for domain in ["a.example.com", "b.example.com", "alice.github.io"] {
+            db.insert_pending_entry("publisher_delta", domain, &serde_json::json!({}), 0)
+                .unwrap();
+        }
+        let peeked = db.peek_pending_entries().unwrap().0;
+        let under_none = fit_to_domain_cap(&db, peeked, 1, 0).unwrap();
+        assert_eq!(under_none.len(), 3);
+        let peeked = db.peek_pending_entries().unwrap().0;
+        let under_list = fit_to_domain_cap(&db, peeked, 1, 1).unwrap();
+        let kept: Vec<&str> = under_list.iter().map(|p| p.domain.as_str()).collect();
+        assert_eq!(kept, ["a.example.com", "alice.github.io"]);
+    }
+
     use super::*;
 
     #[test]

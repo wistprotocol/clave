@@ -1002,6 +1002,7 @@ impl Db {
         records: &[RecordUpsert],
         param_changes: &[ParamChangeRow],
         withdrawals: &[WithdrawalRow],
+        suffix_lists: &[String],
         declarations: &[SealedDeclarationRow],
         decompressed_bytes: u64,
     ) -> Result<()> {
@@ -1042,8 +1043,102 @@ impl Db {
                 (w.delta_id, w.domain, w.update_id, block_number as i64, sealed_at),
             )?;
         }
+        for identifier in suffix_lists {
+            tx.execute(
+                "INSERT INTO suffix_list_acts(block_number, sha256) VALUES (?1, ?2)",
+                (block_number as i64, identifier),
+            )?;
+        }
         tx.commit()?;
         Ok(())
+    }
+
+    pub fn store_suffix_list(&self, identifier: &str, octets: &[u8]) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO suffix_lists(sha256, octets) VALUES (?1, ?2)",
+            (identifier, octets),
+        )?;
+        Ok(())
+    }
+
+    pub fn suffix_list_octets(&self, identifier: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT octets FROM suffix_lists WHERE sha256 = ?1",
+                [identifier],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn suffix_list_bytes(&self, identifier: &str) -> Result<Option<u64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT length(octets) FROM suffix_lists WHERE sha256 = ?1",
+                [identifier],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .map(|n| n.max(0) as u64))
+    }
+
+    /// WIST-4 §3.1: every accepted `suffix_list_update` that changed the
+    /// snapshot in force, in Log order, with its sealing height.
+    pub fn suffix_list_acts(&self) -> Result<Vec<(u64, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT block_number, sha256 FROM suffix_list_acts ORDER BY rowid")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?.max(0) as u64, row.get(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    fn suffix_list_row(
+        &self,
+        sql: &str,
+        param: impl rusqlite::ToSql,
+    ) -> Result<Option<(String, u64)>> {
+        Ok(self
+            .conn
+            .query_row(sql, [param], |row| {
+                Ok((row.get(0)?, row.get::<_, i64>(1)?.max(0) as u64))
+            })
+            .optional()?)
+    }
+
+    /// The snapshot in force at the instant `at` with the height of the
+    /// act that put it there: the most recent act sealed at or before `at`.
+    pub fn suffix_list_in_force_at(&self, at: &str) -> Result<Option<(String, u64)>> {
+        self.suffix_list_row(
+            "SELECT a.sha256, a.block_number FROM suffix_list_acts a JOIN blocks b ON b.block_number = a.block_number WHERE b.sealed_at <= ?1 ORDER BY a.rowid DESC LIMIT 1",
+            at,
+        )
+    }
+
+    /// The snapshot in force at Block `block_number`: the most recent act
+    /// sealed below it.
+    pub fn suffix_list_in_force_at_block(
+        &self,
+        block_number: u64,
+    ) -> Result<Option<(String, u64)>> {
+        self.suffix_list_row(
+            "SELECT sha256, block_number FROM suffix_list_acts WHERE block_number < ?1 ORDER BY rowid DESC LIMIT 1",
+            block_number as i64,
+        )
+    }
+
+    /// WIST-3 §7: the `suffix_list` tuple at `log_position`, the most
+    /// recent act sealed at or below it.
+    pub fn suffix_list_at_position(&self, log_position: u64) -> Result<Option<(String, u64)>> {
+        self.suffix_list_row(
+            "SELECT sha256, block_number FROM suffix_list_acts WHERE block_number <= ?1 ORDER BY rowid DESC LIMIT 1",
+            log_position as i64,
+        )
     }
 
     /// WIST-3 §7 `withdrawal` tuples: every withdrawn Delta with its
@@ -1679,6 +1774,7 @@ mod tests {
             }],
             &[],
             &[],
+            &[],
             0,
         )
         .unwrap();
@@ -1704,6 +1800,7 @@ mod tests {
                 value: 800,
                 effective_at: "2026-01-20T00:00:00Z",
             }],
+            &[],
             &[],
             &[],
             0,
@@ -1907,6 +2004,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             0,
         )
         .unwrap();
@@ -1950,6 +2048,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             0,
         )
         .unwrap();
@@ -1972,6 +2071,7 @@ mod tests {
             0,
             "sha256:blockhash0-conflict",
             "2026-08-09T00:01:00Z",
+            &[],
             &[],
             &[],
             &[],

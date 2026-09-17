@@ -23,15 +23,26 @@ and reported by `seal`), `withdraw` (queue a `payload_withdrawal`, WIST-4
 withdrawal engine under the Log key, seals only beside or above the
 Delta it names, deletes the Payload, drops the record, stops serving
 snapshots that still contain it and leaves a `withdrawal` tuple in every
-later Snapshot state; a repeated withdrawal seals and changes nothing), `mirror`
-(maintain the signed `/log/mirrors.json`).
+later Snapshot state; a repeated withdrawal seals and changes nothing),
+`suffix-list` (pin a Public Suffix List file, WIST-4 §3.1: the octets are
+held in the store and served at `/log/suffix-lists/<hex>.dat` without
+expiry, and the queued `suffix_list_update` seals in the next Block and
+is in force from the Block after it; `init --suffix-list <file>` pins
+one for Block 0, and without a pinned snapshot every Canonical Host is
+its own accounting unit), `mirror` (maintain the signed
+`/log/mirrors.json`).
 
 `serve` additionally enforces the flat `quota_base` ping quota (429 +
-Retry-After; only WIST2-E02/E04 pings count as noise) and runs a baseline
-pass every minute that
+Retry-After; only WIST2-E02/E04 pings count as noise), accounted per
+Registrable Domain under the snapshot in force at the Ping and reported
+as the shared remainder at every host's status endpoint, and runs a
+baseline pass every minute that
 re-pulls stale or budget-suspended publishers without a Ping. Ingest
-follows feed pages (WIST-2 §3.2) under the per-domain daily byte budget,
-suspending and resuming across days. Ping admission and every fetch are
+follows feed pages (WIST-2 §3.2) under the daily byte budget of the
+host's Registrable Domain, suspending and resuming across days. The
+seal's per-domain Block capacity counts Entries per Registrable Domain
+under the snapshot in force at the Block, and the Snapshot state carries
+the `suffix_list` tuple (WIST-3 §7). Ping admission and every fetch are
 bounded as [Fetch bounds and destination policy](#fetch-bounds-and-destination-policy)
 describes.
 

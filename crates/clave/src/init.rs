@@ -36,7 +36,13 @@ pub fn run(log_id: &str, data_dir: &Path) -> Result<()> {
     let bytes = serde_json::to_vec(&envelope)?;
     std::fs::write(data_dir.join("anchor.json"), bytes)?;
 
-    for dir in ["log/blocks", "log/checkpoints", "payloads", "snapshots"] {
+    for dir in [
+        "log/blocks",
+        "log/checkpoints",
+        "log/suffix-lists",
+        "payloads",
+        "snapshots",
+    ] {
         std::fs::create_dir_all(data_dir.join(dir))?;
     }
 

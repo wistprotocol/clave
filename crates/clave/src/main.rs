@@ -20,6 +20,21 @@ enum Command {
         data: PathBuf,
         #[arg(long, default_value_t = 3600)]
         cadence: i64,
+        /// A Public Suffix List file to pin in Block 0, so quota, ingest
+        /// budget and Block capacity are keyed per Registrable Domain from
+        /// the first Block on; without one every Canonical Host is its own
+        /// unit until `suffix-list` pins a snapshot.
+        #[arg(long = "suffix-list")]
+        suffix_list: Option<PathBuf>,
+    },
+    /// Pins a Public Suffix List file as the snapshot in force from the
+    /// Block after the next one, and serves it at
+    /// /log/suffix-lists/<hex>.dat.
+    SuffixList {
+        #[arg(long)]
+        data: PathBuf,
+        #[arg(long)]
+        file: PathBuf,
     },
     Serve {
         #[arg(long)]
@@ -81,10 +96,45 @@ fn main() -> Result<(), clave::Error> {
             log_id,
             data,
             cadence,
+            suffix_list,
         } => {
             clave::init::run(&log_id, &data)?;
             let db = clave::db::Db::open(&data.join("clave.sqlite"))?;
             db.set_param("block_cadence_seconds", cadence)?;
+            match suffix_list {
+                Some(file) => {
+                    let sk = clave::keys::load(&data.join("keys/seed"))?;
+                    let report = clave::suffix_list::pin(
+                        &db,
+                        &data,
+                        &sk,
+                        &file,
+                        jiff::Timestamp::now().as_second(),
+                    )?;
+                    println!(
+                        "pinned suffix list {} ({} bytes) for Block 0",
+                        report.identifier, report.bytes
+                    );
+                }
+                None => eprintln!(
+                    "no suffix list pinned: every Canonical Host is its own accounting unit until `suffix-list` pins one"
+                ),
+            }
+        }
+        Command::SuffixList { data, file } => {
+            let db = clave::db::Db::open(&data.join("clave.sqlite"))?;
+            let sk = clave::keys::load(&data.join("keys/seed"))?;
+            let report = clave::suffix_list::pin(
+                &db,
+                &data,
+                &sk,
+                &file,
+                jiff::Timestamp::now().as_second(),
+            )?;
+            println!(
+                "queued suffix list {} ({} bytes) as {}",
+                report.identifier, report.bytes, report.update_id
+            );
         }
         Command::Serve {
             data,

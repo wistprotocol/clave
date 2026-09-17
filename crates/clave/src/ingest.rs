@@ -425,6 +425,8 @@ impl ObjectCaps {
 struct Meter<'a> {
     db: &'a Db,
     domain: &'a str,
+    /// The Registrable Domain the daily budget is metered on (WIST-2 §5).
+    unit: String,
     day: &'a str,
     budget: i64,
     caps: ObjectCaps,
@@ -453,7 +455,7 @@ impl Meter<'_> {
     /// the budget, in which case the bytes read up to the bound are
     /// debited. An object above its own cap is a failed fetch.
     fn get(&self, client: &Client, url: &str, object: Object) -> Result<Option<(Vec<u8>, Value)>> {
-        let spent = self.db.ingest_bytes(self.domain, self.day)?;
+        let spent = self.db.ingest_bytes(&self.unit, self.day)?;
         let (work_bytes, work_objects) = self.work.get();
         if spent >= self.budget || work_bytes == 0 || work_objects == 0 {
             return Ok(None);
@@ -463,14 +465,14 @@ impl Meter<'_> {
         match client.get_json_bounded(url, &self.scope()?, limit) {
             Ok((raw, value)) => {
                 self.db
-                    .add_ingest_bytes(self.domain, self.day, raw.len() as i64)?;
+                    .add_ingest_bytes(&self.unit, self.day, raw.len() as i64)?;
                 self.work
                     .set((work_bytes - raw.len() as u64, work_objects - 1));
                 Ok(Some((raw, value)))
             }
             Err(crate::error::Error::Oversized(_)) if limit < cap => {
                 self.db
-                    .add_ingest_bytes(self.domain, self.day, limit as i64)?;
+                    .add_ingest_bytes(&self.unit, self.day, limit as i64)?;
                 self.work.set((work_bytes - limit, work_objects));
                 Ok(None)
             }
@@ -586,6 +588,7 @@ pub fn run_bounded(
     let meter = Meter {
         db,
         domain: host,
+        unit: crate::suffix_list::unit_at(db, host, now)?,
         day,
         budget,
         caps: ObjectCaps::from_schedule(&db.parameter_schedule(now_epoch)?, now_epoch),

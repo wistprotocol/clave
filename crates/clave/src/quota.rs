@@ -3,15 +3,19 @@ use crate::error::Result;
 
 use crate::registry;
 
-/// WIST-4 §5 and WIST-2 §4: every domain's Ping quota for a UTC day is
-/// `quota_base` in force at the instant, the same for every domain.
+/// WIST-4 §5 and WIST-2 §4: every Registrable Domain's Ping quota for a
+/// UTC day is `quota_base` in force at the instant, the same for every
+/// Registrable Domain.
 pub fn quota_q(db: &Db, at: &str) -> Result<i64> {
     registry::effective(db, "quota_base", at)
 }
 
-pub fn quota_remaining(db: &Db, domain: &str, at: &str) -> Result<i64> {
+/// The quota left to the Registrable Domain of `host` under the snapshot
+/// in force at `at` (WIST-4 §3.1), shared by every host under it.
+pub fn quota_remaining(db: &Db, host: &str, at: &str) -> Result<i64> {
     let day = at.get(..10).unwrap_or(at);
-    let noise = db.noise_ping_count(domain, day)?;
+    let unit = crate::suffix_list::unit_at(db, host, at)?;
+    let noise = db.noise_ping_count(&unit, day)?;
     Ok((quota_q(db, at)? - noise).max(0))
 }
 

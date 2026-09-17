@@ -258,7 +258,9 @@ async fn ingest_handler(State(state): State<AppState>, body: Bytes) -> axum::res
             if let Ok(report) = report {
                 if report.noise.is_some() {
                     let day = now.get(..10).unwrap_or(&now);
-                    let _ = db.bump_noise_ping(&payload.host, day);
+                    if let Ok(unit) = crate::suffix_list::unit_at(&db, &payload.host, &now) {
+                        let _ = db.bump_noise_ping(&unit, day);
+                    }
                 }
             }
         })

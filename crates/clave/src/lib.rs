@@ -22,6 +22,7 @@ pub mod registry;
 pub mod seal;
 pub mod serve;
 pub mod snapshot;
+pub mod suffix_list;
 
 pub use error::Error;
 
