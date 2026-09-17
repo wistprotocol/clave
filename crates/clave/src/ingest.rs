@@ -19,7 +19,6 @@ pub struct IngestReport {
     pub rejected: Vec<(String, String)>,
     pub noise: Option<&'static str>,
     pub suspended: bool,
-    pub submissions: Vec<String>,
 }
 
 /// WIST-2 §4: `host` MUST be a bare authority (`host[:port]`) — no scheme,
@@ -393,14 +392,13 @@ impl Default for PullLimits {
 #[derive(Debug, Clone, Copy)]
 enum Object {
     Page,
-    Registry,
     Delta,
     Payload,
 }
 
-/// Per-object bounds: Feed pages and Registry files by the shared object
-/// cap, a Delta file by its URL cap and fixed fields, a Payload by the
-/// content caps in force plus its salt and framing.
+/// Per-object bounds: Feed pages by the shared object cap, a Delta file
+/// by its URL cap and fixed fields, a Payload by the content caps in
+/// force plus its salt and framing.
 struct ObjectCaps {
     delta: u64,
     payload: u64,
@@ -417,7 +415,7 @@ impl ObjectCaps {
 
     fn of(&self, object: Object) -> u64 {
         match object {
-            Object::Page | Object::Registry => crate::fetch::OBJECT_CAP_BYTES,
+            Object::Page => crate::fetch::OBJECT_CAP_BYTES,
             Object::Delta => self.delta,
             Object::Payload => self.payload,
         }
@@ -579,9 +577,6 @@ pub fn run_bounded(
     };
     let host = host.as_str();
     crate::recovery::settle(db, data_dir, now)?;
-    if crate::sanctions::sanction_level(db, host, now)? >= 3 {
-        return Ok(report);
-    }
     let scheme = crate::fetch::scheme_for_host(host, client.allow_http());
     let base = format!("{scheme}://{host}/.well-known/wist/");
 
@@ -776,14 +771,6 @@ pub fn run_bounded(
                 }
             },
             None => break,
-        }
-    }
-
-    if !suspended {
-        if let Ok(Some((_, served))) =
-            meter.get(client, &format!("{base}registry.json"), Object::Registry)
-        {
-            report.submissions = crate::submissions::queue_served(db, host, Some(&served))?.queued;
         }
     }
 
@@ -1081,10 +1068,6 @@ pub fn run_bounded(
             continue;
         }
         let admission = db.mutation()?;
-        if crate::sanctions::sanction_level(db, host, now)? >= 3 {
-            drop(admission);
-            return Ok(report);
-        }
         let (window_open, sources) = delta_admission_sources(db, host)?;
         let authority =
             declaration::verify_delta_authority(&sources.iter().collect::<Vec<_>>(), &delta_value);

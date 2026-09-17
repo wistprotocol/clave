@@ -1,8 +1,8 @@
 # clave
 
-The signed Delta format targets [WIST specification revision `3dd2e8e97847e77d09de6d9b529d0c03d3766098`](https://github.com/wistprotocol/spec/tree/3dd2e8e97847e77d09de6d9b529d0c03d3766098). Object version `1.0.0` alone does not identify a compatible draft.
+The signed Delta format targets [WIST specification revision `d75bd49abcfbbe6a672e4fb695e078b489f51ba7`](https://github.com/wistprotocol/spec/tree/d75bd49abcfbbe6a672e4fb695e078b489f51ba7). Object version `1.0.0` alone does not identify a compatible draft.
 
-Delta ingestion checks the signed canonical `publisher` against the logical Feed domain before source selection and duplicate suppression, including fetched predecessors. Chain tips use `(publisher, url)` and persist across reopen; legacy index restoration is described under [Delta index reconciliation](#delta-index-reconciliation). Sealing and recovery settlement reject mismatches between queue ownership and the signed author. Complete authenticated Delta eligibility and Audit Record derivation remain separate validation requirements.
+Delta ingestion checks the signed canonical `publisher` against the logical Feed domain before source selection and duplicate suppression, including fetched predecessors. Chain tips use `(publisher, url)` and persist across reopen; legacy index restoration is described under [Delta index reconciliation](#delta-index-reconciliation). Sealing and recovery settlement reject mismatches between queue ownership and the signed author. Complete authenticated Delta eligibility remains a separate validation requirement.
 
 WIST Protocol aggregator. Clave pulls signed Deltas from Publishers through
 ping + pull, validates them, and seals hourly hash-chained Blocks. It serves
@@ -14,22 +14,20 @@ pending entries and chain it at the wall clock floored to the accepted
 cadence grid, or at `--at <whole-second UTC instant>` for a test Log that
 advances Log time faster than the clock), `snapshot` (build a signed, verifiable
 point-in-time index for cold-start sync), `param-change` (queue a signed
-`parameter_change` Registry Update, WIST-4 §9: bounds and combination
+`parameter_change` Registry Update, WIST-4 §5: bounds and combination
 rules checked, `effective_at` held past the grace period, applied to the
 live parameter set once its Block seals and the effective instant passes;
 a change whose grace window lapses while queued is dropped from the Block
-and reported by `seal`), `sanction` / `rule` / `lift` (WIST-4 §7 ladder:
-a level 3/4 sanction seals its notice first; rulings and lifts close or
-clear the process; in-force state honors the lapsed-deadline void rules),
-`withdraw` (payload withdrawal: deletes the Payload, drops the record,
-stops serving snapshots that still contain it), `poll-appeals` (fetches
-every sanction notice's appeal path despite the 403, seals served appeals
-or an unappealed ruling once the window closes; also run by `serve`'s
-baseline pass), `mirror` (maintain the signed `/log/mirrors.json`).
+and reported by `seal`), `withdraw` (queue a `payload_withdrawal`, WIST-4
+§5.1 and WIST-3 §6.2: the act seals only beside or above the Delta it
+names, deletes the Payload, drops the record, stops serving snapshots that
+still contain it and leaves a `withdrawal` tuple in every later Snapshot
+state; a repeated withdrawal seals and changes nothing), `mirror`
+(maintain the signed `/log/mirrors.json`).
 
-`serve` additionally enforces the reputation-derived ping quota (429 +
-Retry-After; only WIST2-E02/E04 pings count as noise), rejects quarantined
-and delisted domains with 403, and runs a baseline pass every minute that
+`serve` additionally enforces the flat `quota_base` ping quota (429 +
+Retry-After; only WIST2-E02/E04 pings count as noise) and runs a baseline
+pass every minute that
 re-pulls stale or budget-suspended publishers without a Ping. Ingest
 follows feed pages (WIST-2 §3.2) under the per-domain daily byte budget,
 suspending and resuming across days. Ping admission and every fetch are
@@ -42,8 +40,7 @@ protection, signer classification into ordinary rotation, recovery
 rotation, or fresh identity — WIST1-E08 otherwise), and verifies every
 delta against the full declared key set (`sig.key_id` membership and
 `valid_from`; WIST1-E01/E02). A recovery rotation opens the WIST-1 §5.2
-recovery window at its sealing Block (a `notice` with `details.kind`
-`"recovery"` is queued for inclusion, and the open window appears in snapshot
+recovery window at its sealing Block (the open window appears in snapshot
 state): the domain's deltas queue instead of sealing, declarations signed
 by superseded keys are rejected, and the first Block at or past the
 window's end settles the queue — survivors become eligible for sealing,
@@ -108,7 +105,7 @@ Payload/predecessor timing, repeated rejected IDs, restart, dependent rejection,
 missing/corrupt Payload rollback and signed authority despite changed local
 summaries. Full-prefix reconstruction per attempt remains unbounded.
 [Historical Payload retrieval](#historical-payload-retrieval) preserves these
-profiles; Audit Record integration remains required.
+profiles.
 
 ## Payload link admission
 
@@ -123,7 +120,7 @@ and its content unstored. Fetched predecessors undergo the same checks.
 `payload::validate_links` requires typed links and an already validated
 Canonical Publisher host. It checks neither fields, commitments nor size
 caps. It preserves URL order and accepts an incomplete prefix even when
-more links could fit: only a page audit can verify the declared prefix.
+more links could fit: no party measures the page against the declared prefix.
 
 `payload-links.json` supplies 31 signed commitment-valid probes. Live tests
 cover their pull dispositions, restart, accepted-byte preservation through
@@ -136,7 +133,7 @@ historical validation remains outstanding.
 Every fetch reads its response while it streams and refuses it at a bound
 before buffering or parsing: a declared length above the bound is refused
 before the body is read, and a body that crosses it is refused where it
-crosses. A Declaration, Feed page, Registry file, appeal or Mirror list is
+crosses. A Declaration, Feed page or Mirror list is
 bounded at 1 MiB; a Delta file at 16 KiB plus twice `url_cap_bytes`; a
 Payload at `extract_cap_bytes + links_cap_bytes + summary_cap_bytes` plus
 4 KiB, each read from the schedule in force at the pull. Content fetches
@@ -170,8 +167,7 @@ at most 64 accepted Pings wait for a slot. A Ping for a host with a pull
 running or waiting is accepted (202) without new work; a Ping beyond the
 waiting bound is refused with 503 and `Retry-After: 30`, is not queued,
 and counts as neither noise nor a pull, so the Publisher retries later
-under its own backoff. Quota (429) and quarantine (403) are answered
-before admission.
+under its own backoff. Quota (429) is answered before admission.
 
 ## Sealing publication and recovery
 
@@ -190,8 +186,7 @@ have served. A missing, torn or re-encoded head Block file is repaired
 from the record; a head file holding a different Block is refused, since
 the store and the disk then disagree beyond a torn write. Lower Blocks
 are checked by `verify-history` and reopening, not at every start.
-Snapshot files and the derived-state refresh follow the same seal
-outside that record.
+Snapshot files follow the same seal outside that record.
 
 ## Concurrency
 
@@ -202,10 +197,9 @@ answers and background passes proceed; SQLite serializes the writes.
 One pull runs per host at a time across Pings and the baseline pass.
 Fetching and state-independent verification happen outside any write
 transaction; each Delta's persistence is one immediate write transaction
-that first re-reads the sanction level, the admission Declarations and
-the URL's chain tip, stopping the pull if the domain became quarantined
-meanwhile and re-verifying the Delta if its authority or predecessor
-changed, so a concurrent seal or admission cannot be bypassed. Every
+that first re-reads the admission Declarations and the URL's chain tip,
+re-verifying the Delta if its authority or predecessor changed, so a
+concurrent seal or admission cannot be bypassed. Every
 top-level write transaction begins immediately, taking the write lock
 before its reads. Durable publication and partitioned ingestion remain
 separate requirements.
@@ -249,8 +243,7 @@ restart, fetched predecessors, same-ID retry after version rejection,
 record materialization and original-byte preservation through sealing.
 Field vectors supply cap contexts; [Delta size-cap profiles](#delta-size-cap-profiles)
 covers authenticated profile timing. Historical copies use
-[Historical Payload retrieval](#historical-payload-retrieval); full Audit Record
-eligibility remains incomplete.
+[Historical Payload retrieval](#historical-payload-retrieval).
 
 ## Retained Payload validation
 
@@ -332,9 +325,7 @@ not implement Consumer ignored-Entry dispositions.
 
 The source retains its Delta ID, original Envelope, canonical Entry position,
 Block sealing time, authenticating Declaration, identity's first-installation
-or latest reset position, committing
-size caps, [audit extraction profile](#historical-audit-extraction-profiles)
-and [verdict thresholds](#historical-verdict-thresholds).
+or latest reset position and committing size caps.
 Later history cannot change those bindings. Contentless `attest`
 and `delete` Deltas are supported. Sealed-predecessor admission uses this source;
 index reconciliation shares its sealed Delta checks. Their unsealed-state
@@ -343,723 +334,13 @@ and [Delta index reconciliation](#delta-index-reconciliation).
 
 Reconstruction changes no retained state and exposes no partial result. It scans
 the full prefix, retaining Declaration state, every seen ID and each Publisher/URL
-tip; bounded lookup remains required. It does not check Payload bodies,
-sanctions, materialization or Audit Record eligibility, and does
-not replace live admission or `verify-history`.
+tip; bounded lookup remains required. It does not check Payload bodies or
+materialization, and does not replace live admission or `verify-history`.
 
 Signed tests cover exact predecessor vectors in same-Block and cross-Block chains,
 invalid ancestors and later unrelated Deltas, independent Publishers sharing a
 URL, identity resets, contentless successors, recreation after deletion, restart
 and repair/retry.
-
-## Historical audit extraction profiles
-
-`DeltaSource::audit_profile()` exposes core's `ScoringProfile`, derived from the
-accepted signed parameter schedule at that Delta's sealing Block under WIST-4
-§§5/9. It retains `shingle_size`, `min_observed_words`, `similarity_consistent`
-and `similarity_variance_floor`; `VerifiedBlock::audit_profile()` supplies the
-same binding for streaming callers subject to [Authenticated history](#authenticated-history).
-
-Use the audited Delta's source when producing or recomputing extract similarity
-and hard hits. A reference Payload retains its own committing size caps under
-[Historical Payload validation](#historical-payload-validation); its Delta's
-extraction profile does not replace the audited Delta's. These APIs do not
-establish reference selection, Record eligibility or complete verdicts.
-Link thresholds follow [Historical verdict thresholds](#historical-verdict-thresholds).
-
-Eight `canary.json` scoring-profile cases run through signed Block, amendment,
-Declaration and Delta histories, reproducing extraction scores and hard-hit
-outcomes before and at amendment effectiveness. Tests cover later reference
-Payloads, subsequent parameter resets, reconstruction after restart, corrupt
-later Blocks with repair/retry, and rejected signature, value and grace-period
-amendments.
-
-## Historical verdict thresholds
-
-`DeltaSource::verdict_thresholds()` exposes core's `verdict::Thresholds` from
-that Delta's accepted sealing-Block schedule under WIST-4 §§5/9. It combines
-the [extraction profile](#historical-audit-extraction-profiles)'s similarity
-thresholds and mass guard with `link_agreement_consistent` and
-`link_variance_floor`. `VerifiedBlock::verdict_thresholds()` provides the same
-binding for streaming callers under [Authenticated history](#authenticated-history).
-
-Use `AuditChain::audited().verdict_thresholds()` for verdict derivation; a
-resolved reference's thresholds cannot replace the audited Delta's. Core's
-`verdict::resolve` separately takes the reference change type, availability
-and observation; these APIs do not establish those inputs or Record eligibility.
-Hard-hit scoring retains its extract-only rules.
-
-Signed histories consume eight `link-agreement.json` amendment contexts with
-increases, decreases, inclusive activation, link boundaries, all reference
-change types and extract-band precedence. Later references, parameter resets,
-reconstruction after restart and corrupt-prefix repair preserve the audited
-profile. Rejected signatures, values and grace periods supply no thresholds;
-`canary.json` histories also check shared extraction bindings. Full Record
-replay, automatic source selection and availability/withdrawal enforcement
-remain required.
-
-## Historical sampling inputs
-
-`DeltaSource::sampling_constants()` retains `sampling_floor`, `sampling_ceiling`
-and `sampling_slope` from the accepted parameter schedule at the Delta's sealing
-Block under WIST-4 §§4/9. Amendments apply at their exact effective instant;
-later Blocks and audit references cannot replace that profile.
-`VerifiedBlock::sampling_constants()` supplies the same values for streaming
-callers under [Authenticated history](#authenticated-history).
-
-`DeltaSource::block_hash()` retains the authenticated committing Block Hash.
-Pass it to core's `sampling::alpha_from_block_hash` for the VRF input, then use
-the full `DeltaSource::id()` for the draw. Reconstruction validates the complete
-pinned prefix before returning either binding, including for Block 0.
-
-These inputs do not establish Auditor standing or selection. VRF draws,
-selection domains and self-audit bars follow
-[Historical selection sets](#historical-selection-sets); the extension path
-and escalation state follow
-[Historical extension path](#historical-extension-path), which also derives
-the reputation and sanction state a draw reads at the preceding height.
-
-Signed-history tests cover increases and decreases of each constant before,
-at and after effectiveness, negative slopes and zero, later references and resets,
-reconstruction, VRF proof binding to the original Block, corrupt-prefix repair
-and rejected signature/value/grace amendments. Default profiles reproduce
-`sampling.json`'s rate cases, including sanction and escalation overrides.
-
-## Historical selection sets
-
-`history::selection::SelectionDomain::reconstruct(directory, pinned_head, block_hash)`
-authenticates the complete pinned prefix, replays Declarations and sealed
-Delta chains, and lists the named Block's `publisher_delta` Entries in
-canonical order with each Delta's ID, signed Publisher, URL host and the
-height of that host's own `seq`-0 Declaration Entry when one is sealed at or
-below the Block. Under WIST-4 §4 and WIST-3 §7 a Delta is outside the Block's
-selection domain when its signed Publisher differs from its URL host and that
-host's own `seq`-0 Declaration is sealed at or below the Block, whatever the
-label relationship between the two Publishers; a host's own Deltas are never
-excluded. The domain retains the Block's accepted `sampling_floor`,
-`sampling_ceiling` and `sampling_slope`, its Log Anchor fingerprint and its
-canonical `BlockRow`.
-
-`selection_set(&roster, auditor_id, vrf_proof, state)` derives one Auditor's
-draw for that Block. The proof must verify under the key the Auditor held at
-the Block's `sealed_at` per
-[Historical roster and Record signing bindings](#historical-roster-and-record-signing-bindings),
-using RFC 9381 verification with key validation over the Block Hash octets;
-an Auditor holding no key at that instant reports `NoKeyAtBlock`, and a proof
-under another key, another Block, an unusable admitted point or tampered
-bytes reports `ProofDoesNotVerify`. For each Delta the result records the
-disposition: outside the domain, barred by §3's self-audit test against the
-signed Publisher, not drawn, or selected. Outside-domain precedes self-audit;
-neither consults the draw. Drawn candidates carry `D` and `p_1e7`, computed
-with core's integer test from the caller-supplied `SamplingState` for the
-Delta's Publisher (`reputation_u`, level-1 sanction and escalated sampling as
-of the preceding height) and the Block's own constants. The roster must
-share the domain's Log Anchor and carry the Block's hash; otherwise
-reconstruction fails rather than binding across sources.
-`IncludedRecord::vrf_proof()` decodes a sealed Record's proof for this check.
-
-The result establishes the VRF path only. It supplies no reputation,
-sanction or escalation state, no coverage duty, discharge or attestation,
-and no Record disposition; extension-rule membership, contradiction and
-escalation derivation follow
-[Historical extension path](#historical-extension-path). Reconstruction validates every sealed Delta of the
-prefix, retains the domain in memory without a work bound, exposes nothing
-after a prefix failure and rereads repaired files on retry.
-
-Signed histories replay every `selection-domain.json` domain case, including
-own-host, pre-Declaration, same-height, later, subdomain-own and mixed
-Blocks, and every self-audit case through admitted Auditors and declared
-Publishers. Draw tests compare derived sets with independent proofs over
-the same Blocks at Provisional, established, sanctioned and escalated rates,
-show an accepted `sampling_slope` amendment changing later Blocks only,
-follow same-Block key rotation, removal for cause, foreign and cross-Block
-proofs, small-order and non-canonical admitted keys, pinned-prefix
-exclusion, corrupt-file repair, roster mismatches and sealed Records whose
-proofs select, miss, fall outside the domain or fail verification.
-
-## Historical extension path
-
-`history::extension::ExtensionHistory::reconstruct(directory, pinned_head)`
-authenticates the complete pinned prefix and replays every `audit_record`
-Entry in Log order under WIST-4 §§3/4, §6, §7 and §10.1. A draw over Block B
-reads `prior_state(publisher, B − 1)`: the Publisher's derived `reputation_u`
-and first-rung sanction state at the preceding height, with escalated
-sampling derived by the same replay; Block 0 reads the empty Log.
-
-Each result's `standing` is the proof path alone. `Selected`: the proof
-verifies over the audited Delta's Block under the key held at that Block's
-`sealed_at` and the draw selects the Delta with that Block's constants and the
-derived escalation state. `Extension { trigger_height }`: the proof instead
-verifies over a Block B₁ at which the extension rule named the Delta for that
-Auditor, under the key held at B₁. Otherwise `Void` with its reason: malformed
-non-evidence fields, an audited Delta the prefix does not seal, outside the
-selection domain, self-audit, no key at any candidate Block, or a proof that
-verifies nowhere; outside-domain and self-audit precede both paths. `duty` is
-`Active` when the Record is signed under the key its Auditor holds at its own
-Block, `RemovedAfterAnchor` when it is signed under the duty anchor Block's key
-after that key's removal (WIST-4 §3's carve-out), and `Absent` without
-standing. `diagnostic` and `discharges_coverage` apply
-[Audit Record fields and dispositions](#audit-record-fields-and-dispositions)
-with those predicates plus a `fetched_at` inside the closed interval from the
-proof's Block to the Record's Block, a `reference_delta` in the audited Delta's
-authenticated Publisher/URL chain, not preceding it and sealed at or before the
-fetch, and verdict scores under the audited Block's thresholds. A Record with
-no diagnostic is evidence; under WIST-4 §4 (**Only evidence counts**) only
-evidence triggers, suppresses a later trigger, spends ration, excludes a
-peer as a filer or joins either contradiction quorum.
-
-An evidence `inconsistent` or `link_inconsistent` Record triggers when no
-earlier such evidence Record for the Delta is sealed inside the confirmation
-window in force at its Block, read over the strict prefix including earlier
-Entries of the same Block. A trigger summons while its Auditor has fewer than
-`extension_triggers_max` (in force at B₁) summoning triggers in the 30 whole
-days ending at B₁'s `sealed_at`; a rationed trigger stays evidence and summons
-nobody. The summoned set is every Auditor admitted at B₁'s `sealed_at` that is
-independent of the signed Publisher and of every Auditor whose such evidence
-Record for the Delta is already sealed, the trigger included. `triggers()`
-lists each trigger with its summons, summoned Auditors, deadline
-(`confirm_window_hours / 2` after B₁) and profile; `duties()` and
-`named(auditor_id, trigger_height)` list the resulting extension duties.
-
-At the first Block sealed more than the fixed window after B₁, the trigger's
-`outcome` records core's contradiction test over the Delta's evidence Records:
-whether a quorum of the trigger's verdict including the trigger formed,
-whether `confirm_auditors` pairwise independent `consistent` Records sealed
-inside the window, and the establishing Block when a summoning trigger is
-contradicted. `escalations()` lists contradictions by Publisher and
-establishing height; `escalated_sampling(publisher, height)` reads the state
-at that height, in force from the establishing height for 30 whole days. A
-draw reads the preceding height, so an escalation established at height N
-displaces the formula from Block N + 1 on.
-
-The same replay accounts for WIST-4 §4 coverage duties. Every Auditor admitted
-at a Block's `sealed_at` holds a `CoverageDuty` for that Block, read through
-`coverage_duty(auditor_id, height)` and `coverage_duties()`, with the deadline
-and `record_seal_blocks` in force at that Block. Its `beta` is the first VRF
-output that verifies over the Block under the key admitted there, taken from
-any of the Auditor's sealed Records or coverage attestations; `selection` is
-then the draw over the Block's in-domain, non-self-audit Deltas with the
-derived prior state, and `named` lists the Deltas the extension rule
-added at that Block. A Record whose `discharges_coverage` holds and whose
-standing is anchored at the Block discharges its Delta at its own height. A
-`coverage_attestation` is accepted when its fields, version and signature
-under the key the subject holds at its Block (or the duty Block's key after
-removal) verify and its proof verifies over the named Block; it completes an
-empty duty set and otherwise only reveals the draw. A `pull_attestation` must
-be signed by the Log key, name an earlier sealed Block and a subject with a
-duty there; the earliest sealed one fixes the pair's attested height. Checks
-run in WIST-4 §4's order: Envelope and contract fields, then authenticity,
-then the named Block and duty, then the proof. Field, version and signature
-failures are reported as `WIST4-E11`, malformed details, unknown Blocks and
-pairs without a duty as `WIST4-E04`, and a coverage attestation whose proof
-does not verify as `WIST4-E01` (`rejected_acts()`). Every sealed Record and Registry Update ID counts as
-sealed for the exemption test below, whatever its validity; only a Record
-with valid non-evidence fields and an authentic signature is the Auditor's
-publication for that test.
-
-`complete_at` is the height at which the whole duty set is discharged, or the
-attestation height for an empty set; `unattested_height` is the
-`record_seal_blocks`-th Block sealed strictly after the deadline; the
-establishing height is the earlier of the pull attestation and that fallback.
-`counting_failures(auditor_id, height)` lists the duty Blocks that count at a
-height: established at or below it, inside the 30 whole days ending at its
-`sealed_at`, not complete at or below it, and not exempt — an attested pair
-is exempt while an authentic later publication of the same Auditor, sealed
-between the attestation and the height read, names a `prev_record` the
-attestation lists in `found` that the prefix through that height lacks.
-`in_coverage_failure(auditor_id, height)` applies `coverage_failures_max` to
-that list. Records of a Block are classified in two passes: discharges and
-attestations of the Block settle its coverage state, then each Record's
-`coverage_failure` at its own Block rejects it as WIST4-E01 (after field and
-version diagnostics, still discharging) before evidence, triggers and quorums
-are read in Entry order.
-
-`reputation(publisher, height)` derives WIST-4 §6 at a height from the same
-evidence: `A` from the Publisher's first accepted Delta at or above its most
-recent identity reset (Declarations replay supplies resets), `C` from
-distinct URLs with an evidence `consistent` Record whose reference is a
-`new` or `update` Delta, and `penalty_n` from `findings()`: a Confirmed
-Inconsistency or Confirmed Link Inconsistency is established at the first
-evidence `inconsistent` or `link_inconsistent` Record for a Delta at which
-the quorum and window in force at that Record's Block are met, with the
-§7 severity of the closed confirming set (fixed at 1 for a link finding);
-`decay_horizon_days` is read at the height. `sanction_level(publisher,
-height)` and `level1_sanction` read core's derived ladder, fed per Block with identity resets,
-Log-signed `sanction_lift` acts (rejected as WIST4-E11/E04 like other acts)
-and the Block's new findings in confirming-Record order; a finding whose
-Delta is sealed below the identity's reset arms nothing.
-
-The same replay feeds core's WIST-4 §7 process replay per Publisher once the
-prefix is complete. A `notice`, `appeal`, `appeal_ruling` or `sanction`
-passes §9.1's Envelope gate (WIST4-E11 for Envelope, version and
-signature-field failures, WIST4-E04 for details, evidence or subject shape),
-then its signing rule: notices, rulings and sanctions under the Log key
-(WIST4-E11); an appeal under the notice-era Key Set frozen from the
-Declarations replay at the notice's Block (the current or recovery-head
-Declaration's `keys`), where a notice the appeal cannot name, a mismatched
-subject or an absent identifier is WIST4-E05 and a failing signature
-WIST1-E01. Recovery notices open no process. Core then applies, per Block,
-identity resets, accepted lifts, the Block's findings with their closed
-confirming sets, the Record IDs sealed in the Block as available evidence,
-notice candidates and process acts under the appeal window and sealing
-allowance in force at the notice's Block and the ruling deadline in force
-at the appeal's Block. `processes(publisher)` returns the accepted notices
-with their appeal, merits and unappealed positions, void and retention
-instants, the notices and acts core rejected (WIST4-E04/E05), the derived
-level and rung activations per height, and each `sanction` act's evidence
-verdict: its `finding` must be a first confirming Record of the subject
-sealed at or below the act, `severity` the finding's, and `evidence` must
-resolve to sealed Records and establish the finding's quorum at that Record
-(WIST4-E05 otherwise); `noticed` records whether an accepted notice of the
-act's level precedes it. `sanction_level(publisher, height)` reads the full
-ladder with notice-scoped voids; `enforceable_level` additionally requires,
-for rungs 3 and 4, an accepted unvoided notice of that level for the active
-activation at or below the height, which is the Aggregator's own
-notice-before-enforcement bound. Live ingestion, serving, quota and
-Snapshot state read this derived state through
-[Derived state](#derived-state), which also queues the `auditor_remove` a
-coverage failure requires; Mirror evidence retention through
-`retention_end_at_s`, live pulls and attestation sealing are not
-implemented.
-Observers hold no coverage duty. Reconstruction retains every Block
-profile, Delta binding, Record, duty, publication, audit, finding, notice
-and act in memory without a work bound, exposes nothing after a prefix
-failure and rereads repaired files on retry.
-
-Signed histories cover extension-proof semantics across a key rotation between
-B₁ and the Record (proof under the key held at B₁, signature under the key
-held at the Record's Block) against proofs over the audited Block, an
-unrelated Block and the rotated key; `extension.json` order, ration and
-independence semantics with same-Block triggers, a same-Delta
-`link_inconsistent` inside the window, ration exhaustion and reset,
-per-Auditor rations and multi-filer exclusion; every `extension.json`
-contradiction case with VRF or extension standing per Record, closing and
-establishing heights and escalation probes; the escalation displacing the
-floor for later Blocks of the escalated domain only; void, unauthentic,
-malformed, mis-scored, early-fetch, unknown-Delta, outside-domain, self-audit
-and removed-key Records; corrupt-file repair and pinned-prefix exclusion.
-`extension.json` evidence cases are consumed twice: the signed Records are
-parsed and dispositioned directly under their supplied contexts, and each
-case is rebuilt as an authenticated history whose replay must derive the
-same rejections, triggers, summoned sets and outcomes; the coverage-failure
-case is exercised through the derived state below instead of a supplied
-flag. Coverage tests replay `coverage.json` late-discharge and attribution
-cases as signed histories, and cover silent Auditors failing at the fallback
-and crossing `coverage_failures_max`, attestation discharge of empty and
-extension-named duty sets, partial completion, attested-versus-fallback
-establishing heights, and rejected attestations. Reputation tests derive
-`A`, `C`, penalties with decay, the Provisional cap, extract and link
-findings, the first rung raising later draws to the ceiling, a Log-signed
-lift restoring the formula rate, a rejected lift, and a fresh identity
-clearing rungs and penalties, including a pre-reset Delta confirmed after
-the reset. `coverage.json` attestation cases and `sanctions.json` lift cases
-are transplanted onto fixture keys and Blocks and replayed as signed
-histories; the exemption-after-fallback, forged-successor and same-Block
-discharge readings have dedicated histories. Process tests cover a
-severity-3 finding arming level 3, its notice, a Publisher-signed appeal
-and an overturning ruling voiding the rung, rejected appeals (stranger key,
-absent identifier), a ruling for an unknown notice, a level-4 notice with
-no activation, valid and invalid sanction acts, the enforceable level before
-and after the notice, and the sealing deadline voiding state unless an
-unappealed ruling sealed after the window closed discharges it. The
-`sanctions.json` process, notice-target and notice-evidence cases are
-consumed by core.
-
-Payload withdrawals replay under WIST-4 §9.1 and ADR-0036: a
-`payload_withdrawal` is accepted only under the Log key (WIST4-E11 otherwise)
-and only when `details.delta_id` names a Delta sealed at or below its Block
-whose signed publisher is the subject, with non-empty `legal_basis` and
-`jurisdiction` (WIST4-E04 otherwise); the earliest accepted withdrawal's
-Block is the height read for repeats, exposed by `withdrawn_at`. From that
-Block, a Record sealed in a higher Block whose `reference_delta` is the
-withdrawn Delta is evidence only as `not_auditable` with `unmeasured`
-`reference`; any other verdict is WIST4-E02, discharging its duty. Records
-sealed at or below the withdrawal's Block stand. The `withdraw` command
-refuses a Delta the database has not seen for the subject; replay remains the
-authority. A signed history covers same-Block, later measured, later
-`not_auditable` on either side, another reference, foreign-subject,
-unsealed-Delta, Auditor-signed and repeated withdrawals; `withdrawal.json`
-fixes the act and Record dispositions.
-
-## Derived state
-
-`derived::refresh(directory, database)` runs after every sealed Block: it
-reconstructs [Historical extension path](#historical-extension-path) through
-the new head and records, for the head Block, each Publisher's derived
-`reputation_u`, ladder level, enforceable level, the highest active rung at
-or below 2 (the fallback a notice-scoped void leaves), the instant the level
-took effect, the Audit Record IDs of the active rungs' activations and the
-appeal, sealing and ruling deadlines still open, plus each admitted
-Auditor's coverage-failure state. The rows feed the WIST-3 §7
-`sanction_state` tuple, which carries the derived level and the activations'
-Audit Record IDs whether or not a notice has sealed, and the Aggregator's own
-enforcement bound, which is the enforceable level.
-
-The same refresh records, for the head Block, each domain's reputation
-inputs (the first accepted Delta's `sealed_at` under the current identity,
-the reset height, `C`, the counted-URL digest set — the first 16 octets of
-SHA-256 over JCS(domain) followed by JCS(URL), lowercase hex, ascending —
-and the confirmed findings' `[sealed_at, severity]` pairs in Log order),
-the latest establishing instant of any escalation inside WIST-4 §4's
-30-day window, and every failed duty Block still counting for each admitted
-Auditor. The Snapshot state carries them as `reputation_inputs`,
-`escalation` and `coverage_failure` tuples (WIST-3 §7); a domain with no
-accepted Delta under its current identity has no `reputation_inputs`
-tuple. The same refresh derives WIST-4 §5's unauditable URLs from evidence
-Records: a `robots_excluded` or observed-side `not_auditable` Record blocks,
-two blocking Records by independent Auditors inside the Block's
-`unauditable_horizon_days` window exclude the URL until an independent
-Auditor's measured Record seals after the later of them or the pair ages
-out, and the `exclusion` tuple dates the current unbroken run (WIST-3 §7).
-Snapshot building drops an excluded URL's records before the one-URL
-preference. The governance scenario checks the reputation tuple after two
-Confirmed Inconsistencies, a signed history arms, holds and clears an
-exclusion, and a unit test reproduces the counted-URL digests of the
-specification's state example.
-
-`sanctions::sanction_state(database, domain, at)` reads the row of the
-highest Block sealed at or before `at`. Its level is the enforceable level;
-where an open appeal-sealing or ruling deadline in that row is at or before
-`at`, the level-3 or level-4 state is void from that instant and the level
-falls to the fallback, so a lapse between Blocks is enforced before the next
-seal records it. Ingestion refuses a level-3 domain's pulls and Pings, status
-reports quarantine or delisting, and Snapshots reduce level-2 weights and
-exclude level-4 Deltas from that state. After those exclusions a Snapshot
-carries one record per URL under WIST-3 §7 and ADR-0039: the self-declared
-host's own record when the host's Declaration has sealed, else the nearest
-ancestor Publisher's, else the least non-ancestor domain in ascending octet
-order; a unit test fixes the five outcomes, including a label-boundary host
-and a self-declared host whose only record is a parent's. `quota::quota_q(database, domain,
-at)` reads `reputation_u` at the highest Block sealed strictly before the
-UTC day of `at` (WIST-4 §6.4), the new-domain value where none exists.
-
-`governance::sanction` records a ladder action the derived state already
-shows: the named `finding` must be a first confirming Record of the domain
-with the severity its closed confirming set fixes, `evidence` must include
-it, the requested level must not exceed the derived ladder, and a level-3 or
-level-4 action seals a `notice` whose `activation` is the active rung's
-confirming Record. Sanction acts, not findings, remain operator-issued.
-
-The refresh also queues the `auditor_remove` WIST-4 §4 requires for every
-Auditor in coverage failure at the head that still holds a key: a Log-signed
-removal of that key whose `evidence` lists the Block Hashes of the failed
-duty Blocks counting at the head, queued once and sealed by the next Block.
-The removal carries evidence, so it is for cause and bars readmission of
-the `auditor_id`; the derived state, not the act, is what excludes the
-Auditor's Records.
-
-Each refresh replays the complete history without a work bound, so sealing
-cost grows with the Log; incremental derivation is deferred to the durable
-ingestion work. Database rows written by local parameter overrides do not
-change the authenticated schedule the replay reads. Tests drive the whole
-path through sealed Records: findings that reach levels 1 to 4, the notice
-before enforcement, lapsed and discharged sealing deadlines, a lift, the
-quota read from a Block sealed before the day, and a silent Auditor removed
-for cause at the twenty-fifth established failure.
-
-## Historical coverage clocks
-
-`history::coverage::CoverageClock::reconstruct(directory, pinned_head, duty_hash)`
-authenticates the complete pinned prefix and freezes `coverage_deadline_hours`
-and `record_seal_blocks` at the named Block's sealing instant (WIST-4 §§4/9).
-The caller selects the audited Block for ordinary selection or B₁ for an
-extension pair. `VerifiedBlock::coverage_profile()` exposes the same accepted
-parameters; an amendment effective exactly at the anchor is included.
-
-`deadline_s()` returns the exact deadline in epoch seconds as `i128`.
-`unattested_height()` identifies the retained seal count's actual successor
-Block strictly after that deadline, or returns `None` when the pinned prefix
-has too few successors. A Block at the deadline does not count; later parameter
-and cadence changes neither move the deadline nor replace the frozen count.
-The result retains its duty Block, query head and Log Anchor fingerprint.
-
-Missing duties or invalid history fail without exposing a partial clock,
-including corruption after the allowance has elapsed. Reconstruction rereads
-repaired files and writes no state. It scans the prefix once, retains one clock
-and otherwise inherits [Authenticated history](#authenticated-history)'s limits.
-
-The clock establishes no Auditor duty, discharge, pull-attestation eligibility
-or coverage failure. Complete roster, selection, Record and attestation replay
-must establish those predicates before using this timing input.
-
-Tests embed the coverage clock and unattested establishing-height vectors in
-signed histories. They cover exact activation, increases and reductions,
-cadence changes, irregular Block gaps, rejected amendments, shorter pinned
-prefixes, restart and corrupt/missing-file repair.
-
-## Historical Record inclusion and confirmation profiles
-
-`history::records::IncludedRecord::reconstruct_all(directory, pinned_head)`
-returns every `audit_record` Entry in canonical Log order after the complete
-pinned Block prefix passes [Authenticated history](#authenticated-history).
-Each result preserves the original Envelope, Entry position, Block Hash, Anchor
-fingerprint and sealing time; reconstruction fails without returning a partial
-set if any Block is missing or invalid. A fresh attempt rereads repaired files.
-
-`confirmation_profile()` retains `confirm_auditors` and `confirm_window_hours`
-from the accepted schedule at that Record's sealing instant, including amendments
-effective exactly then. `VerifiedBlock::confirmation_profile()` exposes the same
-binding. WIST-4 §§5/9 evaluate each candidate using its own profile and preserve
-the earliest established confirmation; later profiles cannot re-evaluate earlier
-candidates. These bindings are independent of database parameter summaries.
-
-Inclusion establishes no Record authorship, field validity, standing, reference
-eligibility or finding. Malformed and incorrectly signed Record Envelopes remain
-in the returned sequence for subsequent eligibility classification. The API
-does not derive identity-scoped confirming sets, reputation or sanctions, and
-retains all included Record Envelopes in memory without a work/cache bound.
-
-Tests embed the four `parameter-combinations.json` confirmation-clock cases in
-signed histories with accepted prerequisite amendments. They cover quorum and
-window changes, activation boundaries, preservation through later amendments
-and restart, rejected signature/value/grace amendments, original Entries and
-positions, pinned-prefix exclusion, corrupt-history failure and repair/retry.
-The supplied candidate sets exercise profile timing without establishing Record
-eligibility or complete finding replay.
-
-## Included Record references
-
-`IncludedRecord::resolve_reference(directory)` binds the Record's signed
-`audited_delta`, `reference_delta` and `fetched_at` to
-[Historical audit references](#historical-audit-references). Reconstruction pins
-the prefix to the Record's own Block hash and sealing time and requires the
-same authenticated Anchor fingerprint (WIST-3 §3.4). Equal Block hashes under
-another Anchor cannot substitute a Log; identical authenticated files may be
-read from another directory. Later Blocks neither supply references nor prevent
-resolution of an already-included Record. Constructing that `IncludedRecord`
-still requires its complete requested prefix to pass
-[Historical Record inclusion and confirmation profiles](#historical-record-inclusion-and-confirmation-profiles).
-
-Resolution rejects `fetched_at` after the Record's sealing instant with
-WIST4-E02 and applies the named reference relation under WIST-4 §3. Fetch
-timestamps use the strict whole-second Log profile. Missing/non-string inputs,
-unavailable audited Deltas and history failures return errors without a partial
-binding or state mutation; a new attempt rereads repaired files.
-
-The returned `RecordReference` retains `record()`, `audited()`, `reference()`
-and `payload_source()`, preserving the original Envelope, identity, confirmation
-profile and each Delta's committing parameters. Retrieve content through
-[Included Record Payload retrieval](#included-record-payload-retrieval), or
-validate supplied bytes through [Historical Payload validation](#historical-payload-validation).
-
-This relation establishes no Record signature, complete field eligibility,
-Auditor standing, verdict or finding. Extension standing must additionally
-enforce the B₁ fetch lower bound; sanctions, availability and durable source
-retention remain separate requirements, and withdrawn references are
-dispositioned under [Historical extension path](#historical-extension-path). Work and memory bounds follow
-[Historical audit references](#historical-audit-references).
-
-Signed histories exercise all ten `superseded-audit.json` reference cases and
-eight `link-agreement.json` amendment contexts. Regressions cover inclusive fetch
-endpoints, same-Block references, contentless anchors, malformed fields/times,
-forged Record signature preservation, identical hashes under different Anchors,
-alternate directories, later invalid history, restart and file repair.
-
-## Included Record Payload retrieval
-
-`RecordReference::retrieve_payload(client, directory, independent_origins,
-mirror_list_origins)` discovers and retrieves the named reference's anchor
-through [Historical Payload source discovery](#historical-payload-source-discovery)
-and [Historical Payload retrieval](#historical-payload-retrieval). The directory
-selects local copies and hints; it cannot replace the authenticated history or
-the Payload's committing parameters. Remote hint discovery completes before
-Payload attempts, including when a valid local copy exists.
-
-The returned `RecordPayloadRetrieval` retains `reference()`, discovered
-`locations()` and `result()`. Successful results preserve original Payload bytes,
-the selected location and earlier fetch failures. Exhaustion retains every
-attempt; discovery failures remain separately available on either outcome.
-No anchor returns `None` before discovery. Each call rereads sources, allowing
-repair and retry without caching failures or writing content or history.
-
-Retrieval establishes content integrity only. It assigns no verdict, serving
-fault, coverage discharge or finding, and does not validate the Record's
-signature or remaining eligibility. Callers must enforce withdrawal and
-availability policy before use; automatic admission/replay integration and
-durable evidence retention remain unimplemented. Resource limits follow the
-linked discovery and retrieval contracts.
-
-Signed histories exercise the `superseded-audit.json` reference cases through
-independent origins and remote Mirror hints, including contentless references
-and reconstruction after restart. Regressions cover malformed lists, corrupt
-copies, Publisher fallback, exhaustion, repair, unchanged Record/Block bytes
-and Payload caps predating a reduction at Record inclusion.
-
-## Audit Record fields and dispositions
-
-`record::RecordEnvelope::parse()` rejects ineligible raw JSON as WIST1-E05,
-including duplicate decoded names at any depth, trailing input and non-JCS
-values. It preserves the parsed signed object and its numeric values without
-typed deserialization or version rewriting. `fields()` applies WIST-4 §10.1:
-non-evidence defects return WIST4-E09 before evidence defects return WIST4-E02.
-`FieldValidation::supported_major()` checks the Record's own version spelling
-and major independently of the evidence result; all minor/patch components of
-major 1 are supported without machine-integer limits.
-
-`disposition()` returns a diagnostic and a separate conditional coverage result.
-It verifies the signature over the original Record against the supplied
-`SigningBinding`, including exact Auditor identity and key ID. Non-evidence
-failure, unsupported major, failed authentication or `Duty::Absent` prevents
-discharge even when an evidence-field error takes diagnostic precedence.
-`Duty::RemovedAfterAnchor` and coverage failure preserve WIST-4 §3's discharge
-carve-outs while rejecting the Record for reputation, confirmation and extension
-triggers. After field checks, this implementation reports unsupported major
-before standing/authenticity and semantic evidence errors; §10.1 permits any
-applicable semantic diagnostic.
-
-`ReplayContext` supplies predicates that callers must establish from the same
-authenticated Log prefix: the admitted signing binding
-([Historical roster and Record signing bindings](#historical-roster-and-record-signing-bindings)),
-ordinary or extension duty, removal relative to its anchor, coverage failure
-at sealing and semantic evidence failures. `Duty::Active` requires every duty premise, including valid
-selection/extension proof, selection-domain membership and absence of self-audit;
-`RemovedAfterAnchor` requires those premises and removal only after that duty's
-anchor. A missing duty premise requires `Absent`. The field validator
-reconstructs none of these facts; admission and process replay must derive them
-before consuming its conditional results.
-
-`IncludedRecord::field_validation()` and `disposition()` apply the same checks
-to Envelopes retained in authenticated Blocks. Rejection leaves the Record and
-Block available for separate evidence/coverage handling. These APIs do not
-drive pulling, sealing, reputation, coverage transitions or accepted findings.
-
-The implementation independently consumes `vectors/wist4/record-fields.json`
-for raw parsing, signatures, complete fields, versions and conditional discharge.
-Signed Block tests exercise its object Envelopes through history reconstruction,
-preserve retained bytes and repeat after reopening, using supplied contexts
-within the limits above.
-
-## Historical roster and Record signing bindings
-
-`history::roster::RosterHistory::reconstruct(directory, pinned_head)` replays
-every roster act in the authenticated pinned prefix under WIST-4 §§3, 3.1, 4
-and 9.1. `auditor_admit` and `auditor_remove` must verify under the Log key,
-an `observer_register` under the key it registers with `sig.key_id` naming it,
-and an `observer_checkpoint` under the key registered for its subject at its
-Block. Malformed details, evidence, a subject with fewer than two labels and a
-missing, forbidden or stale `track_record` reject the act as WIST4-E04; core's
-batch rules reject roster conflicts as WIST4-E07; unknown members, malformed
-`wist_version`, `effective_at` or signature fields, an unsupported major and a
-signature failing under the key WIST-4 §9.1 names reject the act as WIST4-E11,
-with E11 before E04 and both before authenticity and roster rules. Rejection
-leaves the roster unchanged and the Block valid, and a rejected act is no
-batch candidate. Removals apply before the Block's admissions and
-registrations; checkpoints read the roster after the Block's roster acts; an
-admission reads Observer history and citable checkpoints below its Block. A Registry Update whose ID an accepted act already carries — at a lower Block or earlier in the same Block — is idempotent for roster acts, checkpoints, attestations, lifts and withdrawals alike (WIST-4 §9.1, ADR-0036): it applies nothing and rejects nothing, and the roster-acts vector's repeated checkpoint and admission replay as such.
-
-`admitted_key_at`, `registered_key_at`, `admitted_at`, `registered_at` and
-`tenure` read key custody from Block `sealed_at` instants: a key is held from
-the admitting Block's instant to the removing Block's instant, the latter
-excluded. `signing_binding(auditor_id, sealed_at_s)` supplies the
-`record::SigningBinding` for the key held at that instant.
-`IncludedRecord::signing_binding(&roster)` binds an included Record to the key
-its `auditor_id` held at the Record's own Block after checking that the roster
-carries the same Log Anchor and the Record's Block hash. A Record under an
-Observer key, an unknown Auditor, another Auditor's key or a removed key binds
-to nothing or to another key ID, and `disposition()` reports WIST4-E01. The
-carve-out for a Record signed under a duty Block's key after that key's
-removal takes the anchor instant's binding with `Duty::RemovedAfterAnchor`;
-deriving the duty anchor remains the caller's.
-
-A lexically valid admitted `public_key` that is not a canonical Ed25519 point
-or is of small order is admitted as a roster string; no Record or proof
-verifies under it (WIST4-E01). A checkpoint `head` is checked for ID shape,
-not for a sealed Record or attestation. Live sealing evaluates queued roster acts
-against this authenticated roster before recording them, so admission, restart
-and replay derive one roster. The Auditor Declaration check WIST-4 §3 requires
-before sealing an `auditor_admit`, Observer discovery and checkpoint pulling
-are not implemented. Reconstruction retains every Block hash and the roster in
-memory without a work/cache bound, exposes no state until the complete pinned
-prefix passes, and rereads repaired files on retry.
-
-Signed histories embed every `roster.json` roster, batch and admission case,
-substituting real keys for vector labels and cited checkpoints for seeded
-Observers, plus regressions for foreign signatures, non-canonical keys,
-missing algorithms, one-label subjects, unsupported versions, unknown members,
-leap-second instants, mis-signed registrations, unregistered checkpoints,
-empty removal evidence, same-Block rotation, Record bindings across rotation,
-pinned-prefix exclusion and corrupt-file repair. Every `roster-acts.json`
-history replays with its Aggregator acts re-signed under the fixture Log key,
-reproducing each Entry's diagnostic, the roster and checkpoint set after the
-last Block and the small-order Record probe; its duplicate-member Envelopes
-invalidate the containing Block file under WIST-3 §3. Live tests seal Observer
-registration, a checkpoint and a promotion citing it, and drop malformed and
-foreign-signed admissions.
-
-## Included Record evidence fields
-
-`IncludedRecord::evidence_fields_valid()` reports only WIST-4 §10.1's evidence
-field validity, including reference-ID spelling and actual whole-second UTC
-fetch instants. It assigns no diagnostic, reputation weight or coverage discharge;
-complete validation follows [Audit Record fields and dispositions](#audit-record-fields-and-dispositions).
-Reference-dependent checks follow [Included Record verdict scores](#included-record-verdict-scores).
-
-Signed-history tests additionally cover every verdict, commitment and score
-boundaries, conditional evidence markers and unauditable fetch-vector fields.
-Those fields establish no fetch outcome or unauditable horizon.
-
-## Included Record verdict scores
-
-`RecordReference::validate_verdict_scores()` applies WIST-4 §§3/5's
-Log-decidable score/verdict checks through core's `verdict::record_scores_valid`.
-The authenticated reference Delta supplies the change type; the audited Delta
-supplies its sealing-Block thresholds. Later references, Record inclusion and
-parameter resets cannot replace that profile.
-
-Unknown verdicts, missing measured similarity, malformed or out-of-range scores,
-explicit nulls, forbidden link readings and scores outside the claimed verdict's
-bands return WIST4-E02. Deletion mirrors similarity using the reference change
-type. Optional link omission preserves the extract verdict; link verdicts require
-a score, and link scores are forbidden for deletion and unmeasured verdicts.
-
-This check reads no Payloads or network state and writes nothing. Passing it
-establishes neither measurement truth, complete field/signature eligibility,
-Auditor standing, coverage nor a finding. Unmeasured verdicts with absent scores
-pass this relation without proving their cause. The Record and its authenticated
-bindings remain available after a score rejection for separate coverage handling
-under WIST-4 §3. History prerequisites and resource limits follow
-[Included Record references](#included-record-references).
-
-Signed histories exercise link-band amendment vectors before and at activation,
-later references and resets, all reference change types, score boundaries,
-malformed JSON values, neutral dimensions and reconstruction after restart.
-Forged Record signatures remain subject to the separate authorship check.
-
-## Historical audit references
-
-`history::references::AuditChain::reconstruct(directory, pinned_head, audited_id)`
-authenticates the audited Delta and its complete Publisher/URL chain under
-[Historical Delta sources](#historical-delta-sources). Predecessor links order
-Deltas within each Block; rotations and identity resets preserve chain ownership.
-The result retains each Delta's original authority, sealing time and parameter
-profiles. Reconstruction exposes no state until the complete pinned prefix passes,
-including unrelated or later Delta checks.
-
-`newest_at(fetched_at)` selects WIST-4 §5's newest Delta sealed at or before that
-instant, or returns none if no chain member qualifies. `resolve(reference_id,
-fetched_at)` checks the named reference under §3: another chain, a predecessor of
-the audited Delta or a Delta sealed after the fetch rejects with WIST4-E02.
-An older eligible reference remains valid evidence under that relation. Both
-methods require the strict whole-second Log timestamp profile. Callers must
-separately establish the Record's fetch interval, standing, authorship and remaining
-eligibility; these methods do not validate an Audit Record.
-
-The resolved `Reference` exposes its named `delta()` and `payload_source()`:
-the reference's own Payload for `new`/`update`, otherwise the last content-bearing
-predecessor's. The Payload source validates supplied bytes with its original
-commitment, Publisher and committing caps under
-[Historical Payload validation](#historical-payload-validation). Extraction keeps
-the audited Delta's [profile](#historical-audit-extraction-profiles), available
-through `audited()`. [Historical Payload retrieval](#historical-payload-retrieval)
-checks configured disk and HTTP candidates. Availability, withdrawal,
-sanctions and verdict derivation remain separate requirements.
-
-Reconstruction scans the pinned prefix twice and retains the selected chain's
-Envelopes and bindings, in addition to the underlying replay state; bounded work
-and caches remain unimplemented. Tests embed all ten `superseded-audit.json`
-reference cases in signed histories and cover same-Block chain order, historical
-caps and extraction profiles, shared-host Publishers, identity resets, malformed
-fetch timestamps, invalid ancestors/later Entries, restart and repair/retry.
 
 ## Historical Payload validation
 
@@ -1070,10 +351,10 @@ commitment. `delta_source()` exposes its authenticated bindings.
 `PayloadSource::validate(raw)` applies the complete
 [Payload validator](#retained-payload-validation) to supplied bytes with the retained
 commitment, signed Publisher and caps. Reconstructing after restart selects the
-same profile; an Audit Record's or another Delta's profile cannot replace it.
+same profile; another Delta's profile cannot replace it.
 Invalid bytes return a Payload error without mutating the source or stored state,
 allowing another copy to be checked. Retrieval follows the contract below;
-availability, withdrawal and Audit Record eligibility remain separate requirements.
+availability and withdrawal remain separate requirements.
 
 Signed tests cover 103 default-profile Payload field cases, original-byte and
 numeric-value preservation, historical cap references and invalid cap Blocks,
@@ -1095,18 +376,17 @@ does not preserve the original representation.
 
 Invalid bytes return `Error::Payload` with the WIST-1 diagnostic. Disk and
 transport failures retain their respective errors; no failure establishes a
-withdrawal, a serving fault or a `not_auditable` verdict. Reads and fetches
+withdrawal or a serving fault. Reads and fetches
 write no files or history state and retain no failure cache, so callers can
-retry another copy. A resolved audit reference uses its `payload_source()`;
-an `attest` or `delete` reference has no own Payload to retrieve.
+retry another copy. An `attest` or `delete` Delta has no own Payload to
+retrieve.
 
 `retrieve(client, candidates)` tries `PayloadLocation` file paths or URLs in
 caller-supplied order, stopping at the first verified copy. `retained_location`
 derives the local path; `distribution_location` appends the WIST-3 §6.1 path
 to a configured HTTP(S) origin, preserving its port; `publisher_location`
 derives the WIST-2 §3.1 path from the Delta's signed Publisher. Each uses the
-Payload source's Delta ID, including when a contentless audit reference resolves
-to an earlier anchor. Parsed distribution origins must be bare, without
+Payload source's Delta ID. Parsed distribution origins must be bare, without
 credentials, query strings or fragments; the client enforces transport eligibility
 when fetching.
 
@@ -1169,8 +449,7 @@ available. List retrieval does not fetch Payloads.
 another call observes repairs or configuration changes. Remote list reads share
 the [retrieval limits](#historical-payload-retrieval); neither signing-key time
 authentication nor durable selected-source provenance is implemented. Service
-admission/replay integration remains unimplemented; the Record-bound API is
-described under [Included Record Payload retrieval](#included-record-payload-retrieval).
+admission/replay integration remains unimplemented.
 Signed-history tests cover
 independent/Mirror/Publisher fallback, malformed and duplicate-member lists,
 origin and request deduplication, explicit-only discovery, corruption, repair,
@@ -1369,7 +648,7 @@ one under WIST1-E08 (WIST-1 §5.2); window ends up to that instant are spelled
 by `registry::instant`, which covers the whole four-digit-year range, so every
 published window end is a Log timestamp.
 Correct sealing source selection does not establish complete recovery admission,
-Delta chains, schema validation, Audit Record eligibility or sanctions.
+Delta chains or schema validation.
 
 Opening an older store restores missing owner Envelopes atomically. An opened
 window requires complete authenticated Declaration history through the
@@ -1388,8 +667,8 @@ signed pending-Declaration cases through SQLite reopen, exact deadline
 settlement, repeated calls and candidate projection. Live tests cover new
 post-deadline admissions, retained followers opening another window, injected
 transaction failure and cadence rounding after admission closure.
-Full authenticated Delta chains, signature-failure Declaration re-fetches, sealed
-Feed key provenance and notice-era appeal authority remain incomplete.
+Full authenticated Delta chains, signature-failure Declaration re-fetches and
+sealed Feed key provenance remain incomplete.
 
 Delta key-time checks compare `observed_at` and `valid_from` as instants,
 including numeric UTC offsets and decimal fractions of arbitrary precision.
@@ -1444,59 +723,6 @@ request counts. Page field regressions stop before Delta/Payload admission.
 The schema gate does not establish exact Page cardinality, publication/history
 partitioning, supported-major policy or durable selected-source provenance;
 target validation is described under [Feed next targets](#feed-next-targets).
-
-## Canary act replay
-
-Extension history replays `canary_commitment` and `canary_reveal` acts under
-WIST-4 §§5.1/9.1: field failures are WIST4-E11 or WIST4-E04 (two-label
-subject, digest root, leaf count from 1, reveal leaf shapes), authentication
-reads the subject's Key Set at the sealing Block from the Declaration replay
-(WIST4-E11), and §5.1's rules are WIST4-E08: a leaf count above
-`canary_leaves_max`, a planter suffix past `canary_commitments_max` in its
-budgeting epoch (`epoch_blocks` walked from genesis), a reveal naming an
-unsealed or revealed commitment, an index out of range or repeated, a Delta of
-another domain, sealed at or above the reveal, inside `canary_lead_blocks` of
-the commitment, bound twice or reserved by an earlier reveal, an inclusion
-proof that fails under the commitment's root and leaf count, a reveal before
-the numeric minimum (reveal minimum plus the checkpoint-budget rotation for
-the suffixes registered at the newest bound Delta's Block) or after the
-lifetime, or one leaving no actual sealing opportunity under §5.1's
-coverage-deadline and budgeting-epoch test. Reveals settle per Block as a
-batch: identical IDs count once, invalid candidates block nobody, and
-candidates sharing a commitment or Delta reject each other. An accepted
-reveal reserves its Deltas Log-wide. Derived-state refresh records the
-commitments live at the head, unrevealed and inside their lifetime, and
-Snapshot state emits them as `canary_commitment` tuples, and the
-registrations holding at the head as `observer` tuples (observer, key
-identifier, public key, registration height, no end); scoreboards and
-`track_record` derivation from reveals are not implemented. A signed history exercises the epoch ration, an early reveal,
-a failing proof beside a valid reveal in one Block, a second reveal of a
-revealed commitment and a reserved Delta, and every `canary-acts.json` case
-replays as a signed history: the vector's acts are re-signed under fixture
-Declarations carrying the vector's key identifiers, its Deltas are sealed at
-the vector's heights, and a revealed or reserved context is sealed one Block
-before the case.
-
-## Submissions path pulls
-
-Every Feed pull also fetches the domain's
-`/.well-known/wist/registry.json` (WIST-4 §9.1): a JSON array of the
-Registry Updates the domain signs for itself. `submissions::pull` queues each
-`observer_register`, `observer_checkpoint`, `canary_commitment` or
-`canary_reveal` whose `subject` is the serving domain and that authenticates
-under §9.1's signing rule — the key it registers, which the domain's stored
-Declaration must carry (WIST-4 §3.1's verification before sealing), the key
-registered for the Observer, or the domain's stored Declaration Key Set — unless the pending
-queue or a sealed Block already carries its Registry Update ID; seals record
-every sealed Registry Update ID for that check. An absent or malformed path
-queues nothing and is no fault; subject shape, contract and §5.1 rules are
-decided at sealing and replay. `poll-submissions` (`submissions::poll_epoch`)
-pulls, once the head Block closes a budgeting epoch, the submissions path of
-every Observer that epoch budgets — the registrations at the epoch's first
-Block grouped by two-label suffix and walked by `observer_checkpoint_budget`
-per WIST-4 §3.1 — once per epoch. Live tests cover queueing, foreign
-subjects, forged signatures, Aggregator-signed items, repeats and sealed
-items; a signed history checks the closed-epoch targets.
 
 ## Feed next targets
 
@@ -1685,11 +911,11 @@ and both queue orders.
 Parameter admission checks the accepted schedule and queued amendments in
 canonical Entry order. Sealing repeats validation at the actual Block
 instant: delayed or conflicting amendments are dropped with WIST4-E03.
-Every prospective map is checked, including grace changes and cadence
-transitions that could outlive an older extension window. A
+Every prospective map is checked, including grace changes and the
+links, retention and Block-size combination rules. A
 `recovery_window_days` amendment whose window from its own `effective_at`
 would end after 9999-12-31T23:59:59Z is rejected at acceptance (WIST4-E03,
-WIST-4 §9); the signed-history test replays the rejected amendment, the
+WIST-4 §5); the signed-history test replays the rejected amendment, the
 largest representable window and an unsealable opening near the range end.
 
 Caps cover the largest complete JCS Block through each amendment's own
@@ -1749,8 +975,7 @@ opening the reader are outside its pinned prefix.
 Supported histories use object version `1.0.0` and the genesis signing key.
 Log key transitions and successor Anchors stop the reader as unsupported.
 Authentication establishes Block inclusion; it does not establish an
-Entry's author, Audit Record eligibility, or correct derived reputation and
-sanctions. Parameter Envelopes receive their own signature and admission
+Entry's author or eligibility. Parameter Envelopes receive their own signature and admission
 checks. Other Entry validation and service state reconstruction remain
 separate from this command; successful history verification is not full
 protocol conformance.
@@ -1780,7 +1005,7 @@ parameter schedule and exact 128-bit arithmetic, surviving later amendments
 and recovery followers. Settlement restores the recovery head without lowering
 the sequence floor or resetting identity. Returned installation and settlement
 effects identify resets, window openings and superseded competitors. They do
-not apply database, queue or sanction changes.
+not apply database or queue changes.
 
 `Declarations::project(sealed_at, recovery_window_days, entries)` evaluates
 one proposed next Block without changing the accepted prefix. Pass its complete
@@ -1826,13 +1051,8 @@ after packing and filtering. Live admission still requires integration with
 durable queue, status and chain-tip updates, including preservation of
 acceptance order across queues.
 
-`Domain::appeal_declaration()` selects the signing-key source after the current
-Block’s Declaration stage. Callers must separately establish notice eligibility
-and freeze that notice’s complete key bindings; this accessor does not validate
-notices, appeals or appeal processes.
-
 This API validates Declaration fields, sequencing and author authentication.
-Deltas, Audit Records and non-parameter Registry Updates receive no eligibility checks here.
+Deltas and non-parameter Registry Updates receive no eligibility checks here.
 SQLite uses this state to restore missing owners of legacy opened recovery
 windows. Live sealing reconstructs and projects this state for source selection;
 general admission and database reconstruction still use separate state.
@@ -1844,7 +1064,7 @@ Replay retains all domains’ current state and open-window competitors in memor
 atomic application stages a copy of the domain map while sharing immutable
 Declaration Envelopes. It does not provide bounded-cache or Snapshot resume
 behavior. Tests consume signed recovery ownership, predecessor, conflict,
-identity, settlement and appeal-key histories, including corrupted or missing
+identity and settlement histories, including corrupted or missing
 history and signed recovery-parameter transitions.
 
 ## Build & test

@@ -2,7 +2,6 @@ use crate::db::Db;
 use crate::error::Result;
 use crate::fetch::Client;
 use std::path::Path;
-use wist_core::crypto::SigningKey;
 
 /// WIST-2 §5: known feeds are polled at `baseline_poll_seconds`
 /// regardless of Pings, and a budget-suspended walk resumes on a later
@@ -28,14 +27,8 @@ pub fn due_domains(db: &Db, now_epoch: i64) -> Result<Vec<String>> {
     Ok(due)
 }
 
-pub fn run_pass(
-    db: &Db,
-    client: &Client,
-    sk: &SigningKey,
-    data_dir: &Path,
-    now_epoch: i64,
-) -> Result<Vec<String>> {
-    run_pass_inner(db, client, sk, data_dir, now_epoch, None)
+pub fn run_pass(db: &Db, client: &Client, data_dir: &Path, now_epoch: i64) -> Result<Vec<String>> {
+    run_pass_inner(db, client, data_dir, now_epoch, None)
 }
 
 /// A pass that leaves alone every domain the gate already has a pull
@@ -43,18 +36,16 @@ pub fn run_pass(
 pub fn run_pass_gated(
     db: &Db,
     client: &Client,
-    sk: &SigningKey,
     data_dir: &Path,
     now_epoch: i64,
     gate: &std::sync::Arc<crate::serve::IngestGate>,
 ) -> Result<Vec<String>> {
-    run_pass_inner(db, client, sk, data_dir, now_epoch, Some(gate))
+    run_pass_inner(db, client, data_dir, now_epoch, Some(gate))
 }
 
 fn run_pass_inner(
     db: &Db,
     client: &Client,
-    sk: &SigningKey,
     data_dir: &Path,
     now_epoch: i64,
     gate: Option<&std::sync::Arc<crate::serve::IngestGate>>,
@@ -74,7 +65,6 @@ fn run_pass_inner(
         let _ =
             crate::ingest::run_with_clock(db, client, data_dir, domain, &now, jiff::Timestamp::now);
     }
-    crate::appeals::poll(db, client, sk, now_epoch)?;
     Ok(due)
 }
 

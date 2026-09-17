@@ -1,7 +1,7 @@
 use super::prepare::PreparedBlock;
 use super::{SealReport, GENESIS_KEY_ID};
 use crate::db::Mutation;
-use crate::db::{Db, GovernanceRow, ParamChangeRow, RecordUpsert, SealedDeclarationRow};
+use crate::db::{Db, ParamChangeRow, RecordUpsert, SealedDeclarationRow, WithdrawalRow};
 use crate::error::{Error, Result};
 use crate::WIST_VERSION;
 use std::path::Path;
@@ -11,9 +11,9 @@ use wist_core::jcs;
 use wist_core::objects::Checkpoint;
 
 /// Publishes a prepared Block: writes the Block and Checkpoint files,
-/// commits the seal with its acceptance, schedule, governance and
-/// Declaration rows, records sealed windows and recovery notices,
-/// refreshes derived state, applies withdrawals and rebuilds the Snapshot.
+/// commits the seal with its acceptance, schedule, withdrawal and
+/// Declaration rows, records sealed windows, applies withdrawals and
+/// rebuilds the Snapshot.
 pub(super) fn block(
     db: &Db,
     data_dir: &Path,
@@ -30,7 +30,6 @@ pub(super) fn block(
         seal_entries,
         sealed_rowids,
         accepted_changes,
-        governance,
         withdrawals,
         dropped,
         late,
@@ -63,7 +62,6 @@ pub(super) fn block(
             publisher: &r.publisher,
             delta_id: &r.delta_id,
             observed_at: &r.observed_at,
-            weight: "full",
             title: &r.title,
             abstract_text: r.abstract_text.as_deref(),
             lang: &r.lang,
@@ -81,16 +79,12 @@ pub(super) fn block(
             effective_at: &c.effective_at,
         })
         .collect();
-    let governance_rows: Vec<GovernanceRow> = governance
+    let withdrawal_rows: Vec<WithdrawalRow> = withdrawals
         .iter()
-        .map(|g| GovernanceRow {
-            update_id: &g.update_id,
-            action: &g.action,
-            domain: &g.domain,
-            level: g.level,
-            notice_id: g.notice_id.as_deref(),
-            outcome: g.outcome.as_deref(),
-            kind: g.kind.as_deref(),
+        .map(|w| WithdrawalRow {
+            update_id: &w.update_id,
+            delta_id: &w.delta_id,
+            domain: &w.domain,
         })
         .collect();
     let sealed_declarations: Vec<(String, u64, Vec<u8>)> = seal_entries
@@ -120,7 +114,7 @@ pub(super) fn block(
         &sealed_at,
         &records,
         &param_changes,
-        &governance_rows,
+        &withdrawal_rows,
         &declaration_rows,
         block_bytes.len() as u64,
     )?;
@@ -136,35 +130,12 @@ pub(super) fn block(
             &window.window_end,
         )?;
     }
-    for installation in &projection.effects().installations {
-        if !installation.opens_window {
-            continue;
-        }
-        let domain = &installation.declaration.envelope()["publisher"]["domain"];
-        let update = serde_json::json!({
-            "wist_version": WIST_VERSION,
-            "action": "notice",
-            "subject": domain,
-            "details": {"kind": "recovery"},
-            "effective_at": sealed_at,
-        });
-        let envelope = sign_envelope(&update, "update", GENESIS_KEY_ID, sk)?;
-        db.insert_pending_entry("registry_update", "", &envelope, 0)?;
-    }
-
     mutation.commit()?;
     crate::publication::publish(data_dir, block_number, &block_bytes, &checkpoint_bytes)?;
     db.mark_published(block_number)?;
-    let sealed_update_ids: Vec<String> = seal_entries
-        .iter()
-        .filter(|e| e.entry_type == "registry_update")
-        .filter_map(|e| crate::governance::update_id(&e.body["update"]).ok())
-        .collect();
-    db.record_sealed_updates(block_number, &sealed_update_ids)?;
-    crate::derived::refresh(db, data_dir, sk)?;
 
     if !withdrawals.is_empty() {
-        for delta_id in &withdrawals {
+        for delta_id in withdrawals.iter().map(|w| &w.delta_id) {
             let hex = delta_id.strip_prefix("sha256:").unwrap_or(delta_id);
             let _ = std::fs::remove_file(data_dir.join("payloads").join(format!("{hex}.json")));
             db.delete_record_by_delta(delta_id)?;
@@ -190,7 +161,6 @@ pub(super) fn block(
         block_number,
         &block_hash,
         &snapshot_date,
-        &sealed_at,
         projection.domains(),
     )?;
 

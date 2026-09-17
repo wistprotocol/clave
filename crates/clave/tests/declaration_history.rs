@@ -278,7 +278,7 @@ fn signed_block(prefix: &[Value], at: &str, mut entries: Vec<Value>) -> Value {
             "publisher_declaration" => 0,
             "registry_update" => 1,
             "publisher_delta" => 2,
-            "audit_record" => 3,
+            "label" => 3,
             _ => unreachable!(),
         };
         (rank, merkle::leaf_hash(&jcs::canonicalize(entry).unwrap()))
@@ -606,37 +606,6 @@ fn conflicting_groups_and_failed_authors_reject_blocks_atomically() {
 }
 
 #[test]
-fn recovery_competitors_preserve_identity_and_settlement_has_no_reset() {
-    for case in vector("wist4/recovery-identity")["cases"]
-        .as_array()
-        .unwrap()
-    {
-        let blocks = case["blocks"].as_array().unwrap();
-        let fixture = Fixture::new(blocks);
-        let mut reader = fixture.reader();
-        let mut state = Declarations::default();
-        let mut resets = Vec::new();
-        while let Some(block) = reader.next_block().unwrap() {
-            for installation in state.apply(&block).unwrap().installations {
-                if installation.resets_identity {
-                    resets.push(installation.declaration.position().block_number);
-                }
-            }
-        }
-        assert_eq!(json!(resets), case["expected_resets"]);
-        for candidate in case["probes"].as_array().unwrap() {
-            let (state, _, _) = probe(blocks, candidate);
-            assert_eq!(
-                json!(state.domains()["example.com"]
-                    .reset()
-                    .map(|p| p.block_number)),
-                candidate["expected_reset"]
-            );
-        }
-    }
-}
-
-#[test]
 fn settlement_restores_authenticated_chain_and_reports_competitors() {
     for case in vector("wist1/recovery-settlement")["cases"]
         .as_array()
@@ -671,31 +640,6 @@ fn settlement_restores_authenticated_chain_and_reports_competitors() {
             )
             .into();
             assert!(probe(blocks, &candidate).1.is_err());
-        }
-    }
-}
-
-#[test]
-fn appeal_key_source_tracks_recovery_heads() {
-    for case in vector("wist4/recovery-appeals")["cases"]
-        .as_array()
-        .unwrap()
-    {
-        let fixture = Fixture::new(case["blocks"].as_array().unwrap());
-        let mut reader = fixture.reader();
-        let mut state = Declarations::default();
-        while let Some(block) = reader.next_block().unwrap() {
-            state.apply(&block).unwrap();
-            for expected in case["expected_authority"].as_array().unwrap() {
-                if expected["height"] == block.block().header.block_number {
-                    let declaration = state.domains()["example.com"].appeal_declaration();
-                    assert_eq!(declaration.hash(), expected["declaration"]);
-                    assert_eq!(
-                        declaration.envelope()["publisher"]["keys"],
-                        expected["keys"]
-                    );
-                }
-            }
         }
     }
 }
@@ -1123,7 +1067,7 @@ fn candidate_projection_requires_valid_time_profile_and_entry_order() {
     let malformed = json!({"type":"publisher_declaration","body":null});
     assert!(state.project(at, 7, &[malformed]).is_err());
     let mut entries = vec![
-        json!({"type":"audit_record","body":{}}),
+        json!({"type":"label","body":{}}),
         blocks[2]["entries"][0].clone(),
     ];
     assert!(state.project(at, 7, &entries).is_err());

@@ -376,7 +376,7 @@ fn recovery_flow_queues_settles_and_rejects_superseded_deltas() {
         .to_string();
     assert_eq!(w.window_end.as_deref(), Some(expected_end.as_str()));
     let _ = sealed_at;
-    assert_eq!(r.db.count_pending_entries("registry_update").unwrap(), 1);
+    assert_eq!(r.db.count_pending_entries("registry_update").unwrap(), 0);
 
     let sealed_at_b1 = jiff::Timestamp::from_second(T0 + 7200).unwrap().to_string();
     let state_raw = std::fs::read(
@@ -536,66 +536,6 @@ fn declaration_outside_the_recovery_chain_is_superseded_at_the_windows_end() {
             .is_none(),
         "a Delta signed by the superseded key never seals"
     );
-}
-
-#[test]
-fn recovery_notice_is_sealed_with_kind_recovery() {
-    let r = rig(make_publisher_with_recovery);
-    write_feed(&r.p, &r.host, &[], "2026-08-09T12:00:00Z");
-    ingest(&r, "2026-08-09T12:00:05Z");
-
-    let stored = current_declaration(&r.p);
-    let recovery = serde_json::json!({
-        "wist_version": "1.0.0", "domain": r.host,
-        "subdomain_scope": ["example.com"],
-        "keys": [key_entry("k2", &K2_SEED, "2026-08-09T13:00:00Z")],
-        "recovery_keys": [key_entry("r1", &R1_SEED, "2026-08-01T00:00:00Z")],
-        "seq": 1,
-        "prev_declaration": declaration_hash(&stored),
-    });
-    write_declaration(&r.p, &recovery, "r1", &R1_SEED);
-    ingest(&r, "2026-08-09T14:00:05Z");
-    clave::seal::run(&r.db, r.data.path(), &r.sk, T0).unwrap();
-    clave::seal::run(&r.db, r.data.path(), &r.sk, T0 + 7200).unwrap();
-
-    let raw = std::fs::read(r.data.path().join("log/blocks/000000001.json.zst")).unwrap();
-    let block: serde_json::Value =
-        serde_json::from_slice(&zstd::decode_all(&raw[..]).unwrap()).unwrap();
-    let entries = block["entries"].as_array().unwrap();
-    let notice = entries
-        .iter()
-        .find(|e| e["type"] == "registry_update" && e["body"]["update"]["action"] == "notice")
-        .expect("recovery notice sealed");
-    assert_eq!(notice["body"]["update"]["details"]["kind"], "recovery");
-    assert_eq!(
-        notice["body"]["update"]["subject"],
-        serde_json::json!(r.host)
-    );
-}
-
-#[test]
-fn a_recovery_notice_is_never_polled_for_an_appeal() {
-    let r = rig(make_publisher_with_recovery);
-    write_feed(&r.p, &r.host, &[], "2026-08-09T12:00:00Z");
-    ingest(&r, "2026-08-09T12:00:05Z");
-
-    let stored = current_declaration(&r.p);
-    let recovery = serde_json::json!({
-        "wist_version": "1.0.0", "domain": r.host,
-        "subdomain_scope": ["example.com"],
-        "keys": [key_entry("k2", &K2_SEED, "2026-08-09T13:00:00Z")],
-        "recovery_keys": [key_entry("r1", &R1_SEED, "2026-08-01T00:00:00Z")],
-        "seq": 1,
-        "prev_declaration": declaration_hash(&stored),
-    });
-    write_declaration(&r.p, &recovery, "r1", &R1_SEED);
-    ingest(&r, "2026-08-09T14:00:05Z");
-    clave::seal::run(&r.db, r.data.path(), &r.sk, T0).unwrap();
-    clave::seal::run(&r.db, r.data.path(), &r.sk, T0 + 7200).unwrap();
-
-    let client = clave::fetch::Client::new(true);
-    let actions = clave::appeals::poll(&r.db, &client, &r.sk, T0 + 100 * 86400).unwrap();
-    assert!(actions.is_empty(), "actions {actions:?}");
 }
 
 #[test]

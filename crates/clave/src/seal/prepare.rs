@@ -1,9 +1,8 @@
-use super::{DAY_SECONDS, ENTRY_TYPE_ORDER, GENESIS_KEY_ID, GOVERNANCE_ACTIONS};
+use super::{ENTRY_TYPE_ORDER, GENESIS_KEY_ID};
 use crate::db::{Db, PendingEntryRow};
 use crate::error::{Error, Result};
 use crate::history::declarations::DeclarationsReplay;
 use crate::history::declarations::{Declarations, Projection};
-use crate::history::roster::{Outcome, RosterHistory};
 use crate::history::History;
 use crate::registry;
 use crate::WIST_VERSION;
@@ -26,8 +25,7 @@ pub(super) struct PreparedBlock {
     pub(super) seal_entries: Vec<SealEntry>,
     pub(super) sealed_rowids: Vec<i64>,
     pub(super) accepted_changes: Vec<AcceptedParamChange>,
-    pub(super) governance: Vec<OwnedGovernanceRow>,
-    pub(super) withdrawals: Vec<String>,
+    pub(super) withdrawals: Vec<OwnedWithdrawal>,
     pub(super) dropped: Vec<String>,
     pub(super) late: Vec<String>,
     pub(super) entry_count: u64,
@@ -50,8 +48,8 @@ pub(super) struct SealedWindow {
 /// Prepares the next Block at the cadence slot `now_epoch` falls in:
 /// replays the history, settles and diverts recovery, orders and bounds
 /// the pending Entries, revalidates them and applies governance, then
-/// signs the Block. Writes only the diversions, settlements, restated
-/// deadlines and retirements the preparation itself decides.
+/// signs the Block. Writes only the diversions, settlements and
+/// retirements the preparation itself decides.
 pub(super) fn block(
     db: &Db,
     data_dir: &Path,
@@ -88,10 +86,8 @@ pub(super) fn block(
 
     let mut history = History::open(data_dir, db.last_block()?)?;
     let mut declarations = Declarations::default();
-    let mut roster = RosterHistory::start(&history);
     while let Some(block) = history.next_block()? {
         declarations.apply(&block)?;
-        roster.apply(&block, history.log_key_id(), history.log_key())?;
     }
     for (domain, state) in declarations.domains() {
         if let Some(window) = state.window() {
@@ -130,7 +126,6 @@ pub(super) fn block(
     let settlement = declarations.project(&sealed_at, recovery_days, &[])?;
 
     let (peeked, _up_to_rowid) = db.peek_pending_entries()?;
-    let peeked = restate_appeal_deadlines(db, sk, peeked, &sealed_at, sealed_epoch)?;
     let domain_cap = registry::effective(db, "domain_block_entries_max", &sealed_at)?;
     let peeked = fit_to_domain_cap(db, peeked, domain_cap, block_number)?;
     let seal_entries = storage_order(peeked)?;
@@ -217,15 +212,6 @@ pub(super) fn block(
         &sealed_at,
         &projection,
     )?;
-    let (seal_entries, roster_rowids, roster_dropped) = check_roster_acts(
-        db,
-        seal_entries,
-        &sealed_at,
-        sealed_epoch,
-        block_number,
-        &roster,
-        &sk.public(),
-    )?;
     let ceiling = registry::effective(db, "max_inclusion_blocks", &sealed_at)?;
     let late = late_inclusions(&seal_entries, block_number, ceiling);
     let candidate = encoded_block(
@@ -246,12 +232,9 @@ pub(super) fn block(
     )?;
     outcome.dropped.extend(retired);
     outcome.dropped_rowids.extend(retired_rowids);
-    outcome.dropped.extend(roster_dropped);
-    outcome.dropped_rowids.extend(roster_rowids);
     let GovernanceOutcome {
         kept: seal_entries,
         param_changes: accepted_changes,
-        governance,
         withdrawals,
         dropped,
         dropped_rowids,
@@ -314,7 +297,6 @@ pub(super) fn block(
         seal_entries,
         sealed_rowids,
         accepted_changes,
-        governance,
         withdrawals,
         dropped,
         late,
@@ -332,21 +314,16 @@ pub(super) struct AcceptedParamChange {
     pub(super) effective_at: String,
 }
 
-pub(super) struct OwnedGovernanceRow {
+pub(super) struct OwnedWithdrawal {
     pub(super) update_id: String,
-    pub(super) action: String,
+    pub(super) delta_id: String,
     pub(super) domain: String,
-    pub(super) level: Option<i64>,
-    pub(super) notice_id: Option<String>,
-    pub(super) outcome: Option<String>,
-    pub(super) kind: Option<String>,
 }
 
 pub(super) struct GovernanceOutcome {
     pub(super) kept: Vec<SealEntry>,
     pub(super) param_changes: Vec<AcceptedParamChange>,
-    pub(super) governance: Vec<OwnedGovernanceRow>,
-    pub(super) withdrawals: Vec<String>,
+    pub(super) withdrawals: Vec<OwnedWithdrawal>,
     pub(super) dropped: Vec<String>,
     pub(super) dropped_rowids: Vec<i64>,
 }
@@ -428,40 +405,6 @@ pub(crate) fn validate_pending_parameter(
     ))
 }
 
-/// WIST-4 §7: an "unappealed" ruling discharges T only when its Block's
-/// `sealed_at` is at or after the close of the appeal window.
-pub(super) fn check_unappealed_ruling(
-    db: &Db,
-    update: &Value,
-    sealed_epoch: i64,
-) -> std::result::Result<(), String> {
-    let domain = update["subject"].as_str().ok_or("missing subject")?;
-    let notice_id = update["details"]["notice"]
-        .as_str()
-        .ok_or("missing details.notice")?;
-    let entries = db
-        .governance_for_domain(domain)
-        .map_err(|e| e.to_string())?;
-    let notice = entries
-        .iter()
-        .find(|e| e.update_id == notice_id)
-        .ok_or_else(|| format!("unappealed ruling names unsealed notice {notice_id}"))?;
-    let notice_epoch = notice
-        .sealed_at
-        .parse::<jiff::Timestamp>()
-        .map_err(|_| "unparseable notice sealed_at".to_string())?
-        .as_second();
-    let window_days = registry::effective(db, "appeal_window_days", &notice.sealed_at)
-        .map_err(|e| e.to_string())?;
-    let window_close = notice_epoch + window_days * 86400;
-    if sealed_epoch < window_close {
-        return Err(format!(
-            "unappealed ruling for {notice_id} sealed before the appeal window closes"
-        ));
-    }
-    Ok(())
-}
-
 /// WIST-2 §5 step 4: a queued Delta is sealed only where it verifies
 /// under the Key Set WIST-1 §5.2 resolves at the sealing Block — the
 /// highest-`seq` Declaration sealed at a height at or below it, this
@@ -530,62 +473,6 @@ pub(super) fn divert_recovery_deltas(db: &Db, domains: &HashSet<&str>) -> Result
         db.requeue_pending_delta(&entry)?;
     }
     Ok(())
-}
-
-pub(super) fn check_roster_acts(
-    db: &Db,
-    entries: Vec<SealEntry>,
-    sealed_at: &str,
-    sealed_epoch: i64,
-    block_number: u64,
-    roster: &RosterHistory,
-    log_key: &wist_core::crypto::PublicKey,
-) -> Result<(Vec<SealEntry>, Vec<i64>, Vec<String>)> {
-    if !entries.iter().any(|e| e.entry_type == "registry_update") {
-        return Ok((entries, Vec::new(), Vec::new()));
-    }
-    let wrapped: Vec<Value> = entries.iter().map(|e| e.wrapped.clone()).collect();
-    let outcomes = roster.clone().apply_entries(
-        block_number,
-        sealed_epoch,
-        &wrapped,
-        GENESIS_KEY_ID,
-        log_key,
-    )?;
-    let mut dropped = Vec::new();
-    let mut dropped_rowids = Vec::new();
-    let mut accepted = Vec::new();
-    let mut rejected_entries = HashSet::new();
-    for (index, outcome) in outcomes.into_iter().enumerate() {
-        match outcome {
-            Outcome::NotRoster => {}
-            Outcome::Rejected(rejection) => {
-                dropped.push(format!("{}: {}", rejection.subject, rejection.reason));
-                dropped_rowids.push(entries[index].rowid);
-                rejected_entries.insert(index);
-            }
-            Outcome::Accepted(act) if act.action != "observer_checkpoint" => {
-                accepted.push(crate::db::RosterActRow {
-                    block_number,
-                    sealed_at: sealed_at.to_string(),
-                    action: act.action,
-                    auditor_id: act.subject,
-                    key_id: act.key_id,
-                    public_key: act.public_key,
-                    for_cause: act.for_cause,
-                });
-            }
-            Outcome::Accepted(_) | Outcome::Idempotent => {}
-        }
-    }
-    db.record_roster_acts(&accepted)?;
-    let kept = entries
-        .into_iter()
-        .enumerate()
-        .filter(|(i, _)| !rejected_entries.contains(i))
-        .map(|(_, e)| e)
-        .collect();
-    Ok((kept, dropped_rowids, dropped))
 }
 
 pub(super) fn revalidate_queued_deltas(
@@ -691,6 +578,40 @@ pub(super) fn revalidate_queued_deltas(
     Ok((kept, dropped_rowids, dropped))
 }
 
+/// WIST-4 §5.1: a `payload_withdrawal` names a Delta sealed at or below
+/// its Block whose signed publisher is the act's subject; an act failing
+/// that contract is WIST4-E04 and is not sealed. A later withdrawal of an
+/// already withdrawn Delta seals and changes nothing.
+fn check_withdrawal(
+    db: &Db,
+    update: &Value,
+    block_deltas: &HashSet<(String, String)>,
+) -> std::result::Result<OwnedWithdrawal, String> {
+    let parsed: wist_core::objects::RegistryUpdate =
+        serde_json::from_value(update.clone()).map_err(|e| format!("WIST4-E11 {e}"))?;
+    let details = match parsed.typed_details().map_err(|e| e.to_string())? {
+        wist_core::objects::RegistryDetails::PayloadWithdrawal(details) => details,
+        _ => return Err("WIST4-E04 action is not a payload_withdrawal".into()),
+    };
+    let domain = parsed.subject;
+    let in_block = block_deltas.contains(&(domain.clone(), details.delta_id.clone()));
+    if !in_block
+        && !db
+            .is_delta_sealed_for(&details.delta_id, &domain)
+            .map_err(|e| e.to_string())?
+    {
+        return Err(format!(
+            "WIST4-E04 {} is not a sealed Delta of {domain}",
+            details.delta_id
+        ));
+    }
+    Ok(OwnedWithdrawal {
+        update_id: crate::governance::update_id(update).map_err(|e| e.to_string())?,
+        delta_id: details.delta_id,
+        domain,
+    })
+}
+
 pub(super) fn enforce_governance(
     db: &Db,
     entries: Vec<SealEntry>,
@@ -703,20 +624,28 @@ pub(super) fn enforce_governance(
     let mut out = GovernanceOutcome {
         kept: Vec::with_capacity(entries.len()),
         param_changes: Vec::new(),
-        governance: Vec::new(),
         withdrawals: Vec::new(),
         dropped: Vec::new(),
         dropped_rowids: Vec::new(),
     };
+    let block_deltas: HashSet<(String, String)> = entries
+        .iter()
+        .filter(|e| e.entry_type == "publisher_delta")
+        .map(|e| {
+            Ok((
+                e.domain.clone(),
+                wist_core::delta::delta_id(&e.body["delta"])?,
+            ))
+        })
+        .collect::<Result<_>>()?;
     for (index, e) in entries.into_iter().enumerate() {
         if e.entry_type != "registry_update" {
             out.kept.push(e);
             continue;
         }
         let update = e.body["update"].clone();
-        let action = update["action"].as_str().unwrap_or_default().to_string();
-        if action == "parameter_change" {
-            match check_param_change(
+        match update["action"].as_str() {
+            Some("parameter_change") => match check_param_change(
                 &mut schedule,
                 &update,
                 sealed_epoch,
@@ -733,62 +662,18 @@ pub(super) fn enforce_governance(
                     out.dropped.push(reason);
                     out.dropped_rowids.push(e.rowid);
                 }
-            }
-            continue;
-        }
-        if !GOVERNANCE_ACTIONS.contains(&action.as_str()) {
-            out.kept.push(e);
-            continue;
-        }
-        if action == "appeal_ruling" && update["details"]["outcome"] == "unappealed" {
-            if let Err(reason) = check_unappealed_ruling(db, &update, sealed_epoch) {
-                out.dropped.push(reason);
-                out.dropped_rowids.push(e.rowid);
-                continue;
-            }
-        }
-        let row = OwnedGovernanceRow {
-            update_id: crate::governance::update_id(&update)?,
-            action: action.clone(),
-            domain: update["subject"].as_str().unwrap_or_default().to_string(),
-            level: update["details"]["level"].as_i64(),
-            notice_id: update["details"]["notice"].as_str().map(str::to_string),
-            outcome: update["details"]["outcome"].as_str().map(str::to_string),
-            kind: update["details"]["kind"].as_str().map(str::to_string),
-        };
-        if action == "payload_withdrawal" {
-            if let Some(delta_id) = update["details"]["delta_id"].as_str() {
-                out.withdrawals.push(delta_id.to_string());
-            }
-        }
-        out.governance.push(row);
-        out.kept.push(e);
-    }
-
-    let batch_notices: Vec<(String, String)> = out
-        .governance
-        .iter()
-        .filter(|r| r.action == "notice")
-        .map(|r| (r.domain.clone(), r.update_id.clone()))
-        .collect();
-    for row in &mut out.governance {
-        if row.action == "sanction" && row.level.unwrap_or(0) >= 3 && row.notice_id.is_none() {
-            row.notice_id = batch_notices
-                .iter()
-                .rev()
-                .find(|(d, _)| *d == row.domain)
-                .map(|(_, id)| id.clone())
-                .or_else(|| {
-                    db.governance_for_domain(&row.domain)
-                        .ok()
-                        .and_then(|entries| {
-                            entries
-                                .iter()
-                                .rev()
-                                .find(|e| e.action == "notice")
-                                .map(|e| e.update_id.clone())
-                        })
-                });
+            },
+            Some("payload_withdrawal") => match check_withdrawal(db, &update, &block_deltas) {
+                Ok(withdrawal) => {
+                    out.withdrawals.push(withdrawal);
+                    out.kept.push(e);
+                }
+                Err(reason) => {
+                    out.dropped.push(reason);
+                    out.dropped_rowids.push(e.rowid);
+                }
+            },
+            _ => out.kept.push(e),
         }
     }
     Ok(out)
@@ -936,48 +821,6 @@ pub(super) fn entry_type_rank(entry_type: &str) -> usize {
         .iter()
         .position(|t| *t == entry_type)
         .unwrap_or(ENTRY_TYPE_ORDER.len())
-}
-
-/// WIST-4 §9.1: a sanction notice's `appeal_deadline` restates the
-/// `sealed_at` of the Block sealing it plus `appeal_window_days`, which
-/// is not knowable when the notice is enqueued. The value is restated
-/// here and the update re-signed, so the notice a Consumer reads and
-/// §7's own derivation agree.
-pub(super) fn restate_appeal_deadlines(
-    db: &Db,
-    sk: &SigningKey,
-    peeked: Vec<PendingEntryRow>,
-    sealed_at: &str,
-    sealed_epoch: i64,
-) -> Result<Vec<PendingEntryRow>> {
-    let mut window_days = None;
-    peeked
-        .into_iter()
-        .map(|mut p| {
-            let update = &p.entry_json["update"];
-            if p.entry_type != "registry_update"
-                || update["action"] != "notice"
-                || update["details"]["kind"] != "sanction"
-            {
-                return Ok(p);
-            }
-            let days = match window_days {
-                Some(days) => days,
-                None => {
-                    let days = registry::effective(db, "appeal_window_days", sealed_at)?;
-                    window_days = Some(days);
-                    days
-                }
-            };
-            let deadline = jiff::Timestamp::from_second(sealed_epoch + days * DAY_SECONDS)
-                .map_err(|_| Error::Seal("appeal_deadline out of range".into()))?
-                .to_string();
-            let mut update = update.clone();
-            update["details"]["appeal_deadline"] = deadline.into();
-            p.entry_json = sign_envelope(&update, "update", GENESIS_KEY_ID, sk)?;
-            Ok(p)
-        })
-        .collect()
 }
 
 pub(super) fn storage_order(peeked: Vec<PendingEntryRow>) -> Result<Vec<SealEntry>> {

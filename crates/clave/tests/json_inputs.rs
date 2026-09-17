@@ -163,7 +163,7 @@ fn retained_duplicates_reject_without_draining_pending_or_recovery_entries() {
             "publisher_declaration" => (current_declaration(&p), "domain"),
             "registry_update" => (
                 wist_core::envelope::sign_envelope(
-                    &json!({"action":"auditor_admit", "subject":"audit.example"}),
+                    &json!({"action":"parameter_change", "subject":"quota_base"}),
                     "update",
                     "k1",
                     &p.sk,

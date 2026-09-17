@@ -171,7 +171,7 @@ fn status_reports_last_pull_and_quota_after_ingest() {
     }
     assert_eq!(body["wist_version"], "1.0.0");
     assert_eq!(body["domain"], host);
-    assert_eq!(body["quota_remaining"], 1100);
+    assert_eq!(body["quota_remaining"], 1000);
     assert_eq!(body["state"], "active");
     assert_eq!(body["rejections"].as_array().unwrap().len(), 0);
 }
@@ -183,7 +183,6 @@ fn ingest_ping_over_quota_gets_429_with_retry_after() {
     {
         let db = clave::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
         db.set_param("quota_base", 0).unwrap();
-        db.set_param("quota_slope", 0).unwrap();
     }
     let addr = spawn_server(tmp.path());
     let c = reqwest::blocking::Client::new();
@@ -257,7 +256,6 @@ fn status_reports_real_quota_remaining() {
         )
         .unwrap();
         db.set_param("quota_base", 50).unwrap();
-        db.set_param("quota_slope", 0).unwrap();
         let day = &jiff::Timestamp::now().to_string()[..10];
         db.bump_noise_ping("example.com", day).unwrap();
         db.bump_noise_ping("example.com", day).unwrap();
@@ -285,60 +283,6 @@ fn ingest_rejects_host_with_no_canonicalization() {
         .send()
         .unwrap();
     assert_eq!(r.status(), 400);
-}
-
-#[test]
-fn sanctioned_domain_ping_gets_403_and_status_shows_state() {
-    let tmp = tempfile::tempdir().unwrap();
-    clave::init::run("127.0.0.1:0", tmp.path()).unwrap();
-    {
-        let db = clave::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
-        let publisher = common::make_publisher("example.com");
-        let doc = common::current_declaration(&publisher);
-        db.record_publisher_declaration(
-            "example.com",
-            &serde_json::to_vec(&doc).unwrap(),
-            "k1",
-            doc["publisher"]["keys"][0]["public_key"].as_str().unwrap(),
-            &doc,
-        )
-        .unwrap();
-        let now = jiff::Timestamp::now().as_second();
-        let sealed = jiff::Timestamp::from_second(now - 3600)
-            .unwrap()
-            .to_string();
-        db.record_derived_state(
-            0,
-            &sealed,
-            &[clave::db::DerivedPublisherRow {
-                domain: "example.com",
-                reputation_u: 100_000,
-                level: 3,
-                enforceable_level: 3,
-                fallback_level: 0,
-                level_since: &sealed,
-                evidence: &[],
-                deadlines: &[],
-            }],
-            &[],
-        )
-        .unwrap();
-    }
-    let addr = spawn_server(tmp.path());
-    let c = reqwest::blocking::Client::new();
-    let r = c
-        .post(format!("{addr}/ingest"))
-        .json(&serde_json::json!({"host": "example.com"}))
-        .send()
-        .unwrap();
-    assert_eq!(r.status(), 403);
-    let body: serde_json::Value = c
-        .get(format!("{addr}/status/example.com"))
-        .send()
-        .unwrap()
-        .json()
-        .unwrap();
-    assert_eq!(body["state"], "sanctioned_quarantine");
 }
 
 #[test]

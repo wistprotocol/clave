@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS publishers(domain TEXT PRIMARY KEY, declaration_json 
 CREATE TABLE IF NOT EXISTS declaration_floors(domain TEXT PRIMARY KEY, seq INTEGER NOT NULL CHECK(typeof(seq) = 'integer' AND seq BETWEEN 0 AND 9007199254740991));
 CREATE TABLE IF NOT EXISTS seen_deltas(delta_id TEXT PRIMARY KEY, domain TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS pending_entries(rowid INTEGER PRIMARY KEY AUTOINCREMENT, entry_type TEXT NOT NULL, domain TEXT NOT NULL, entry_json BLOB NOT NULL, chain_pos INTEGER NOT NULL, turn_block INTEGER, acceptance_order INTEGER);
-CREATE TABLE IF NOT EXISTS records(url TEXT NOT NULL, publisher TEXT NOT NULL, delta_id TEXT NOT NULL, observed_at TEXT NOT NULL, weight TEXT NOT NULL, title TEXT NOT NULL, abstract TEXT, lang TEXT NOT NULL, sealed_at TEXT NOT NULL DEFAULT '', PRIMARY KEY(url, publisher));
+CREATE TABLE IF NOT EXISTS records(url TEXT NOT NULL, publisher TEXT NOT NULL, delta_id TEXT NOT NULL, observed_at TEXT NOT NULL, title TEXT NOT NULL, abstract TEXT, lang TEXT NOT NULL, sealed_at TEXT NOT NULL DEFAULT '', PRIMARY KEY(url, publisher));
 CREATE TABLE IF NOT EXISTS blocks(block_number INTEGER PRIMARY KEY, block_hash TEXT NOT NULL, sealed_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS rejections(domain TEXT NOT NULL, code TEXT NOT NULL, at TEXT NOT NULL, delta_id TEXT, detail TEXT);
 CREATE TABLE IF NOT EXISTS params(name TEXT PRIMARY KEY, value INTEGER NOT NULL);
@@ -41,28 +41,16 @@ CREATE TABLE IF NOT EXISTS noise_pings(domain TEXT NOT NULL, day TEXT NOT NULL, 
 CREATE TABLE IF NOT EXISTS ingest_meter(domain TEXT NOT NULL, day TEXT NOT NULL, bytes INTEGER NOT NULL, PRIMARY KEY(domain, day));
 CREATE TABLE IF NOT EXISTS walk_state(domain TEXT PRIMARY KEY, suspended INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS feed_observations(domain TEXT PRIMARY KEY, generated_at_s INTEGER NOT NULL CHECK(typeof(generated_at_s) = 'integer' AND generated_at_s BETWEEN -62167219200 AND 253402300799));
-CREATE TABLE IF NOT EXISTS governance(update_id TEXT PRIMARY KEY, action TEXT NOT NULL, domain TEXT NOT NULL, level INTEGER, notice_id TEXT, outcome TEXT, sealed_at TEXT NOT NULL, block_number INTEGER NOT NULL, kind TEXT);
+CREATE TABLE IF NOT EXISTS withdrawals(delta_id TEXT PRIMARY KEY, domain TEXT NOT NULL, update_id TEXT NOT NULL, block_number INTEGER NOT NULL, sealed_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS recovery_windows(domain TEXT PRIMARY KEY, declaration_json BLOB NOT NULL, prior_declaration_json BLOB NOT NULL, owner_declaration_json BLOB NOT NULL, opened_block INTEGER, window_end TEXT);
 CREATE TABLE IF NOT EXISTS recovery_settlements(domain TEXT NOT NULL, owner_hash TEXT NOT NULL, PRIMARY KEY(domain, owner_hash));
 CREATE TABLE IF NOT EXISTS sealed_declarations(domain TEXT NOT NULL, seq INTEGER NOT NULL, block_number INTEGER NOT NULL, sealed_at TEXT NOT NULL, declaration_json BLOB NOT NULL, PRIMARY KEY(domain, seq));
-CREATE TABLE IF NOT EXISTS roster_acts(block_number INTEGER NOT NULL, act_index INTEGER NOT NULL, sealed_at TEXT NOT NULL, action TEXT NOT NULL, auditor_id TEXT NOT NULL, key_id TEXT NOT NULL, public_key TEXT NOT NULL, for_cause INTEGER NOT NULL, PRIMARY KEY(block_number, act_index));
 CREATE TABLE IF NOT EXISTS queued_deltas(rowid INTEGER PRIMARY KEY AUTOINCREMENT, domain TEXT NOT NULL, delta_id TEXT NOT NULL, entry_json BLOB NOT NULL, url TEXT NOT NULL, chain_pos INTEGER NOT NULL, acceptance_order INTEGER);
-CREATE TABLE IF NOT EXISTS derived_publisher_state(domain TEXT NOT NULL, block_number INTEGER NOT NULL, sealed_at TEXT NOT NULL, reputation_u INTEGER NOT NULL, level INTEGER NOT NULL, enforceable_level INTEGER NOT NULL, fallback_level INTEGER NOT NULL, level_since TEXT NOT NULL, evidence_json TEXT NOT NULL, deadlines_json TEXT NOT NULL, PRIMARY KEY(domain, block_number));
-CREATE TABLE IF NOT EXISTS derived_reputation_inputs(domain TEXT NOT NULL, block_number INTEGER NOT NULL, first_accepted_at TEXT NOT NULL, reset_height INTEGER, counted_total INTEGER NOT NULL, counted_json TEXT NOT NULL, penalties_json TEXT NOT NULL, PRIMARY KEY(domain, block_number));
-CREATE TABLE IF NOT EXISTS derived_escalations(domain TEXT NOT NULL, block_number INTEGER NOT NULL, establishing_at TEXT NOT NULL, PRIMARY KEY(domain, block_number));
-CREATE TABLE IF NOT EXISTS derived_coverage_failures(auditor_id TEXT NOT NULL, block_number INTEGER NOT NULL, duty_block INTEGER NOT NULL, PRIMARY KEY(auditor_id, block_number, duty_block));
-CREATE TABLE IF NOT EXISTS sealed_updates(update_id TEXT PRIMARY KEY, block_number INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS derived_canary_commitments(update_id TEXT NOT NULL, block_number INTEGER NOT NULL, planter TEXT NOT NULL, root TEXT NOT NULL, leaves INTEGER NOT NULL, sealing_height INTEGER NOT NULL, PRIMARY KEY(update_id, block_number));
-CREATE TABLE IF NOT EXISTS epoch_pulls(epoch_number INTEGER PRIMARY KEY, block_number INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS derived_observers(observer_id TEXT NOT NULL, block_number INTEGER NOT NULL, key_id TEXT NOT NULL, public_key TEXT NOT NULL, registered_height INTEGER NOT NULL, PRIMARY KEY(observer_id, block_number));
-CREATE TABLE IF NOT EXISTS derived_exclusions(publisher TEXT NOT NULL, url TEXT NOT NULL, block_number INTEGER NOT NULL, since_height INTEGER NOT NULL, PRIMARY KEY(publisher, url, block_number));
-CREATE TABLE IF NOT EXISTS derived_auditor_state(auditor_id TEXT NOT NULL, block_number INTEGER NOT NULL, sealed_at TEXT NOT NULL, coverage_failure INTEGER NOT NULL, PRIMARY KEY(auditor_id, block_number));
 CREATE TABLE IF NOT EXISTS publications(block_number INTEGER PRIMARY KEY, block_json BLOB NOT NULL, checkpoint_json BLOB NOT NULL, published INTEGER NOT NULL DEFAULT 0);
 ";
 
 pub(super) fn add_missing_columns(conn: &Connection) -> Result<()> {
     for statement in [
-        "ALTER TABLE governance ADD COLUMN kind TEXT",
         "ALTER TABLE records ADD COLUMN sealed_at TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE publishers ADD COLUMN declaration_fetched_at TEXT",
         "ALTER TABLE pending_entries ADD COLUMN turn_block INTEGER",

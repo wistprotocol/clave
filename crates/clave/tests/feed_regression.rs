@@ -79,18 +79,9 @@ fn signed_observation_sequences_survive_restart() {
             );
             assert!(rejections.iter().all(|r| r.delta_id.is_none()));
             let paths = requests.lock().unwrap().clone();
-            let submissions = paths
-                .iter()
-                .filter(|path| path.ends_with("/registry.json"))
-                .count();
-            assert_eq!(
-                submissions,
-                usize::from(event["code"].is_null()),
-                "{name}: the submissions path is pulled with an accepted Feed only"
-            );
             assert_eq!(
                 paths.len(),
-                2 + submissions + event["declaration_retries"].as_u64().unwrap() as usize,
+                2 + event["declaration_retries"].as_u64().unwrap() as usize,
                 "{name}"
             );
             drop(db);

@@ -16,7 +16,6 @@ fn record_projection(r: &clave::db::RecordRow) -> serde_json::Value {
         "publisher": r.publisher,
         "delta_id": r.delta_id,
         "observed_at": r.observed_at,
-        "weight": r.weight,
     })
 }
 
@@ -151,7 +150,6 @@ fn snapshot_build_produces_verifiable_tier0_state_and_signed_artifacts() {
     let mut saw_key = false;
     let mut saw_declaration = false;
     let mut saw_record = false;
-    let mut saw_inputs = false;
     for e in &state.entries {
         match e {
             StateEntry::AggregatorKey(k) => {
@@ -174,21 +172,13 @@ fn snapshot_build_produces_verifiable_tier0_state_and_signed_artifacts() {
                 assert_eq!(r.url, "https://example.com/alpha");
                 assert_eq!(r.delta_id, id1);
             }
-            StateEntry::ReputationInputs(inputs) => {
-                saw_inputs = true;
-                assert_eq!(inputs.domain, host);
-                assert_eq!(inputs.first_accepted_sealed_at, "2026-08-09T12:00:00Z");
-                assert_eq!(inputs.reset_height, None);
-                assert_eq!(inputs.counted_total, 0);
-                assert!(inputs.counted_url_digests.is_empty() && inputs.penalties.is_empty());
-            }
             other => panic!("unexpected state entry in this slice: {other:?}"),
         }
     }
-    assert!(saw_key && saw_declaration && saw_record && saw_inputs);
+    assert!(saw_key && saw_declaration && saw_record);
     assert_eq!(
         state.entries.len(),
-        4,
+        3,
         "no parameter is amended here, and WIST-3 §7 does not restate Registry defaults"
     );
 }
@@ -380,44 +370,17 @@ fn the_state_artifact_carries_every_kind_with_live_instances() {
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
     clave::seal::run(&db, data.path(), &sk, SEAL_START).unwrap();
 
-    let admit = serde_json::json!({
-        "wist_version": "1.0.0",
-        "action": "auditor_admit",
-        "subject": "audit.example.org",
-        "details": {
-            "key_id": "a1",
-            "alg": "Ed25519",
-            "public_key": wist_core::crypto::SigningKey::from_seed(&[21; 32]).public().to_b64u(),
-        },
-        "effective_at": "2026-08-09T12:00:00Z",
-    });
-    let envelope = wist_core::envelope::sign_envelope(&admit, "update", "log1", &sk).unwrap();
-    db.insert_pending_entry("registry_update", "", &envelope, 0)
-        .unwrap();
-    db.record_derived_state(
-        0,
-        &jiff::Timestamp::from_second(SEAL_START)
-            .unwrap()
-            .to_string(),
-        &[clave::db::DerivedPublisherRow {
-            domain: "example.com",
-            reputation_u: 100_000,
-            level: 2,
-            enforceable_level: 2,
-            fallback_level: 0,
-            level_since: &jiff::Timestamp::from_second(SEAL_START)
-                .unwrap()
-                .to_string(),
-            evidence: &[format!("sha256:{}", "1".repeat(64))],
-            deadlines: &[],
-        }],
-        &[],
+    clave::governance::withdraw(
+        &db,
+        &sk,
+        &host,
+        &doomed,
+        "court order",
+        "DE",
+        SEAL_START + 1,
     )
     .unwrap();
     clave::seal::run(&db, data.path(), &sk, SEAL_START + 3600).unwrap();
-
-    // The record for the deleted URL is gone, but its chain tip is not.
-    db.delete_record_by_delta(&doomed).unwrap();
 
     clave::seal::run(&db, data.path(), &sk, SEAL_START + 7200).unwrap();
     let date = &jiff::Timestamp::from_second(SEAL_START + 7200)
@@ -431,18 +394,10 @@ fn the_state_artifact_carries_every_kind_with_live_instances() {
         serde_json::from_value(state_env["state"].clone()).unwrap();
 
     assert!(
-        state
-            .entries
-            .iter()
-            .any(|e| matches!(e, StateEntry::Auditor(a) if a.auditor_id == "audit.example.org")),
-        "no auditor tuple"
-    );
-    assert!(
-        state
-            .entries
-            .iter()
-            .any(|e| matches!(e, StateEntry::SanctionState(s) if s.domain == "example.com")),
-        "no sanction_state tuple"
+        state.entries.iter().any(
+            |e| matches!(e, StateEntry::Withdrawal(w) if w.delta_id == doomed && w.publisher == host && w.sealing_height == 1)
+        ),
+        "no withdrawal tuple"
     );
     assert!(
         state.entries.iter().any(
@@ -461,6 +416,10 @@ fn the_state_artifact_carries_every_kind_with_live_instances() {
         .collect();
     assert!(
         tips.contains(&"https://example.com/gone"),
-        "a deleted URL keeps its chain tip; tips {tips:?}"
+        "a withdrawn URL keeps its chain tip; tips {tips:?}"
     );
+    assert!(db
+        .get_record("https://example.com/gone", &host)
+        .unwrap()
+        .is_none());
 }

@@ -97,7 +97,6 @@ pub struct RecordRow {
     pub publisher: String,
     pub delta_id: String,
     pub observed_at: String,
-    pub weight: String,
     pub title: String,
     pub abstract_text: Option<String>,
     pub lang: String,
@@ -115,7 +114,7 @@ pub struct PendingEntryRow {
     pub entry_type: String,
     pub domain: String,
     pub entry_json: Value,
-    /// WIST-4 §6.4: the Block at which this Delta's turn arrived — the
+    /// WIST-4 §5: the Block at which this Delta's turn arrived — the
     /// first with room for it under WIST-3 §3.2's per-domain capacity.
     /// The inclusion ceiling runs from here.
     pub turn_block: Option<u64>,
@@ -128,111 +127,15 @@ pub struct ParamChangeRow<'a> {
     pub effective_at: &'a str,
 }
 
-pub struct GovernanceRow<'a> {
+pub struct WithdrawalRow<'a> {
     pub update_id: &'a str,
-    pub action: &'a str,
+    pub delta_id: &'a str,
     pub domain: &'a str,
-    pub level: Option<i64>,
-    pub notice_id: Option<&'a str>,
-    pub outcome: Option<&'a str>,
-    pub kind: Option<&'a str>,
 }
 
-pub struct DerivedPublisherRow<'a> {
-    pub domain: &'a str,
-    pub reputation_u: u64,
-    pub level: u8,
-    pub enforceable_level: u8,
-    pub fallback_level: u8,
-    pub level_since: &'a str,
-    pub evidence: &'a [String],
-    pub deadlines: &'a [(wist_core::objects::SanctionDeadlineLabel, String)],
-}
-
-pub struct DerivedAuditorRow<'a> {
-    pub auditor_id: &'a str,
-    pub coverage_failure: bool,
-}
-
-/// A live canary commitment at a derived height: Registry Update ID,
-/// planter, root, leaf count and sealing height.
-pub type DerivedCanaryCommitment = (String, String, String, u64, u64);
-
-pub struct DerivedReputationInputsRow<'a> {
-    pub domain: &'a str,
-    pub first_accepted_at: &'a str,
-    pub reset_height: Option<u64>,
-    pub counted_total: u64,
-    pub counted_url_digests: &'a [String],
-    pub penalties: &'a [(String, u64)],
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DerivedReputationInputs {
-    pub domain: String,
-    pub first_accepted_at: String,
-    pub reset_height: Option<u64>,
-    pub counted_total: u64,
-    pub counted_url_digests: Vec<String>,
-    pub penalties: Vec<(String, u64)>,
-}
-
-#[derive(Debug, Clone)]
-pub struct DerivedPublisherState {
-    pub block_number: u64,
-    pub sealed_at: String,
-    pub reputation_u: u64,
-    pub level: u8,
-    pub enforceable_level: u8,
-    pub fallback_level: u8,
-    pub level_since: String,
-    pub evidence: Vec<String>,
-    pub deadlines: Vec<(wist_core::objects::SanctionDeadlineLabel, String)>,
-}
-
-type DerivedStateRow = (i64, String, i64, i64, i64, i64, String, String, String);
-
-fn deadline_label_name(label: &wist_core::objects::SanctionDeadlineLabel) -> &'static str {
-    match label {
-        wist_core::objects::SanctionDeadlineLabel::Appeal => "appeal",
-        wist_core::objects::SanctionDeadlineLabel::AppealSealing => "appeal_sealing",
-        wist_core::objects::SanctionDeadlineLabel::Ruling => "ruling",
-    }
-}
-
-fn deadline_label(name: &str) -> Option<wist_core::objects::SanctionDeadlineLabel> {
-    match name {
-        "appeal" => Some(wist_core::objects::SanctionDeadlineLabel::Appeal),
-        "appeal_sealing" => Some(wist_core::objects::SanctionDeadlineLabel::AppealSealing),
-        "ruling" => Some(wist_core::objects::SanctionDeadlineLabel::Ruling),
-        _ => None,
-    }
-}
-
-pub struct GovernanceEntry {
-    pub update_id: String,
-    pub action: String,
-    pub domain: String,
-    pub level: Option<i64>,
-    pub notice_id: Option<String>,
-    pub outcome: Option<String>,
-    pub sealed_at: String,
-    pub block_number: u64,
-    pub kind: Option<String>,
-}
-
-/// `(auditor_id, key_id, public_key, admitted height, removed height)`
-pub type RosterTenure = (String, String, String, u64, Option<u64>);
-
-pub struct RosterActRow {
-    pub block_number: u64,
-    pub sealed_at: String,
-    pub action: String,
-    pub auditor_id: String,
-    pub key_id: String,
-    pub public_key: String,
-    pub for_cause: bool,
-}
+/// `(delta_id, publisher domain, sealing height)` of an accepted
+/// withdrawal, the WIST-3 §7 `withdrawal` tuple.
+pub type WithdrawalState = (String, String, u64);
 
 pub struct SealedDeclarationRow<'a> {
     pub domain: &'a str,
@@ -268,7 +171,6 @@ pub struct RecordUpsert<'a> {
     pub publisher: &'a str,
     pub delta_id: &'a str,
     pub observed_at: &'a str,
-    pub weight: &'a str,
     pub title: &'a str,
     pub abstract_text: Option<&'a str>,
     pub lang: &'a str,
@@ -339,14 +241,13 @@ fn exec_set_url_tip(conn: &Connection, url: &str, domain: &str, tip: &str) -> Re
 
 fn exec_upsert_record(conn: &Connection, r: &RecordUpsert, sealed_at: &str) -> Result<()> {
     conn.execute(
-        "INSERT INTO records(url, publisher, delta_id, observed_at, weight, title, abstract, lang, sealed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-         ON CONFLICT(url, publisher) DO UPDATE SET delta_id = excluded.delta_id, observed_at = excluded.observed_at, weight = excluded.weight, title = excluded.title, abstract = excluded.abstract, lang = excluded.lang, sealed_at = excluded.sealed_at",
+        "INSERT INTO records(url, publisher, delta_id, observed_at, title, abstract, lang, sealed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(url, publisher) DO UPDATE SET delta_id = excluded.delta_id, observed_at = excluded.observed_at, title = excluded.title, abstract = excluded.abstract, lang = excluded.lang, sealed_at = excluded.sealed_at",
         (
             r.url,
             r.publisher,
             r.delta_id,
             r.observed_at,
-            r.weight,
             r.title,
             r.abstract_text,
             r.lang,
@@ -584,51 +485,6 @@ impl Db {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
-    }
-
-    /// Every roster act the Log has accepted, in Log order, so the
-    /// WIST-4 §4 roster can be replayed before the next Block's acts are
-    /// checked against it.
-    pub fn accepted_roster_acts(&self) -> Result<Vec<RosterActRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT block_number, sealed_at, action, auditor_id, key_id, public_key, for_cause FROM roster_acts ORDER BY block_number ASC, act_index ASC",
-        )?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok(RosterActRow {
-                    block_number: row.get::<_, i64>(0)? as u64,
-                    sealed_at: row.get(1)?,
-                    action: row.get(2)?,
-                    auditor_id: row.get(3)?,
-                    key_id: row.get(4)?,
-                    public_key: row.get(5)?,
-                    for_cause: row.get::<_, i64>(6)? != 0,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
-    }
-
-    pub fn record_roster_acts(&self, acts: &[RosterActRow]) -> Result<()> {
-        let tx = self.mutation()?;
-        for (i, a) in acts.iter().enumerate() {
-            tx.execute(
-                "INSERT INTO roster_acts(block_number, act_index, sealed_at, action, auditor_id, key_id, public_key, for_cause) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-                 ON CONFLICT(block_number, act_index) DO NOTHING",
-                (
-                    a.block_number as i64,
-                    i as i64,
-                    &a.sealed_at,
-                    &a.action,
-                    &a.auditor_id,
-                    &a.key_id,
-                    &a.public_key,
-                    i64::from(a.for_cause),
-                ),
-            )?;
-        }
-        tx.commit()?;
-        Ok(())
     }
 
     pub fn set_turn_block(&self, rowid: i64, block_number: u64) -> Result<()> {
@@ -1145,7 +1001,7 @@ impl Db {
         sealed_at: &str,
         records: &[RecordUpsert],
         param_changes: &[ParamChangeRow],
-        governance: &[GovernanceRow],
+        withdrawals: &[WithdrawalRow],
         declarations: &[SealedDeclarationRow],
         decompressed_bytes: u64,
     ) -> Result<()> {
@@ -1180,405 +1036,61 @@ impl Db {
                 (c.parameter, c.value, c.effective_at, block_number as i64, c.entry_index),
             )?;
         }
-        for g in governance {
+        for w in withdrawals {
             tx.execute(
-                "INSERT INTO governance(update_id, action, domain, level, notice_id, outcome, sealed_at, block_number, kind) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                (
-                    g.update_id,
-                    g.action,
-                    g.domain,
-                    g.level,
-                    g.notice_id,
-                    g.outcome,
-                    sealed_at,
-                    block_number as i64,
-                    g.kind,
-                ),
+                "INSERT OR IGNORE INTO withdrawals(delta_id, domain, update_id, block_number, sealed_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                (w.delta_id, w.domain, w.update_id, block_number as i64, sealed_at),
             )?;
         }
         tx.commit()?;
         Ok(())
     }
 
-    pub fn record_derived_state(
-        &self,
-        block_number: u64,
-        sealed_at: &str,
-        publishers: &[DerivedPublisherRow],
-        auditors: &[DerivedAuditorRow],
-    ) -> Result<()> {
-        let tx = self.mutation()?;
-        for row in publishers {
-            let deadlines: Vec<(&str, &str)> = row
-                .deadlines
-                .iter()
-                .map(|(label, at)| (deadline_label_name(label), at.as_str()))
-                .collect();
-            tx.execute(
-                "INSERT OR REPLACE INTO derived_publisher_state(domain, block_number, sealed_at, reputation_u, level, enforceable_level, fallback_level, level_since, evidence_json, deadlines_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                (
-                    row.domain,
-                    block_number as i64,
-                    sealed_at,
-                    row.reputation_u as i64,
-                    i64::from(row.level),
-                    i64::from(row.enforceable_level),
-                    i64::from(row.fallback_level),
-                    row.level_since,
-                    serde_json::to_string(row.evidence)?,
-                    serde_json::to_string(&deadlines)?,
-                ),
-            )?;
-        }
-        for row in auditors {
-            tx.execute(
-                "INSERT OR REPLACE INTO derived_auditor_state(auditor_id, block_number, sealed_at, coverage_failure) VALUES (?1, ?2, ?3, ?4)",
-                (
-                    row.auditor_id,
-                    block_number as i64,
-                    sealed_at,
-                    i64::from(row.coverage_failure),
-                ),
-            )?;
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    pub fn record_derived_snapshot_inputs(
-        &self,
-        block_number: u64,
-        reputation: &[DerivedReputationInputsRow],
-        escalations: &[(String, String)],
-        failures: &[(String, u64)],
-    ) -> Result<()> {
-        let tx = self.mutation()?;
-        for row in reputation {
-            tx.execute(
-                "INSERT OR REPLACE INTO derived_reputation_inputs(domain, block_number, first_accepted_at, reset_height, counted_total, counted_json, penalties_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                (
-                    row.domain,
-                    block_number as i64,
-                    row.first_accepted_at,
-                    row.reset_height.map(|h| h as i64),
-                    row.counted_total as i64,
-                    serde_json::to_string(row.counted_url_digests)?,
-                    serde_json::to_string(row.penalties)?,
-                ),
-            )?;
-        }
-        for (domain, establishing_at) in escalations {
-            tx.execute(
-                "INSERT OR REPLACE INTO derived_escalations(domain, block_number, establishing_at) VALUES (?1, ?2, ?3)",
-                (domain, block_number as i64, establishing_at),
-            )?;
-        }
-        for (auditor_id, duty_block) in failures {
-            tx.execute(
-                "INSERT OR REPLACE INTO derived_coverage_failures(auditor_id, block_number, duty_block) VALUES (?1, ?2, ?3)",
-                (auditor_id, block_number as i64, *duty_block as i64),
-            )?;
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    pub fn record_sealed_updates(&self, block_number: u64, update_ids: &[String]) -> Result<()> {
-        let tx = self.mutation()?;
-        for id in update_ids {
-            tx.execute(
-                "INSERT OR IGNORE INTO sealed_updates(update_id, block_number) VALUES (?1, ?2)",
-                (id, block_number as i64),
-            )?;
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    pub fn registry_update_sealed(&self, update_id: &str) -> Result<bool> {
-        Ok(self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sealed_updates WHERE update_id = ?1)",
-            [update_id],
-            |row| row.get(0),
-        )?)
-    }
-
-    pub fn record_derived_canary_commitments(
-        &self,
-        block_number: u64,
-        commitments: &[DerivedCanaryCommitment],
-    ) -> Result<()> {
-        let tx = self.mutation()?;
-        for (update_id, planter, root, leaves, sealing_height) in commitments {
-            tx.execute(
-                "INSERT OR REPLACE INTO derived_canary_commitments(update_id, block_number, planter, root, leaves, sealing_height) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                (
-                    update_id,
-                    block_number as i64,
-                    planter,
-                    root,
-                    *leaves as i64,
-                    *sealing_height as i64,
-                ),
-            )?;
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    pub fn derived_canary_commitments_at(
-        &self,
-        block_number: u64,
-    ) -> Result<Vec<DerivedCanaryCommitment>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT update_id, planter, root, leaves, sealing_height FROM derived_canary_commitments WHERE block_number = ?1 ORDER BY update_id",
-        )?;
-        let rows = stmt.query_map([block_number as i64], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, i64>(3)? as u64,
-                r.get::<_, i64>(4)? as u64,
-            ))
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Error::Db)
-    }
-
-    pub fn epoch_pulled(&self, epoch_number: u64) -> Result<bool> {
-        Ok(self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM epoch_pulls WHERE epoch_number = ?1)",
-            [epoch_number as i64],
-            |row| row.get(0),
-        )?)
-    }
-
-    pub fn record_epoch_pull(&self, epoch_number: u64, block_number: u64) -> Result<()> {
-        self.conn.execute(
-            "INSERT OR IGNORE INTO epoch_pulls(epoch_number, block_number) VALUES (?1, ?2)",
-            (epoch_number as i64, block_number as i64),
-        )?;
-        Ok(())
-    }
-
-    pub fn record_derived_observers(
-        &self,
-        block_number: u64,
-        observers: &[(String, String, String, u64)],
-    ) -> Result<()> {
-        let tx = self.mutation()?;
-        for (observer_id, key_id, public_key, registered_height) in observers {
-            tx.execute(
-                "INSERT OR REPLACE INTO derived_observers(observer_id, block_number, key_id, public_key, registered_height) VALUES (?1, ?2, ?3, ?4, ?5)",
-                (
-                    observer_id,
-                    block_number as i64,
-                    key_id,
-                    public_key,
-                    *registered_height as i64,
-                ),
-            )?;
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    pub fn derived_observers_at(
-        &self,
-        block_number: u64,
-    ) -> Result<Vec<(String, String, String, u64)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT observer_id, key_id, public_key, registered_height FROM derived_observers WHERE block_number = ?1 ORDER BY observer_id",
-        )?;
-        let rows = stmt.query_map([block_number as i64], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, i64>(3)? as u64,
-            ))
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Error::Db)
-    }
-
-    pub fn record_derived_exclusions(
-        &self,
-        block_number: u64,
-        exclusions: &[(String, String, u64)],
-    ) -> Result<()> {
-        let tx = self.mutation()?;
-        for (publisher, url, since) in exclusions {
-            tx.execute(
-                "INSERT OR REPLACE INTO derived_exclusions(publisher, url, block_number, since_height) VALUES (?1, ?2, ?3, ?4)",
-                (publisher, url, block_number as i64, *since as i64),
-            )?;
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    pub fn derived_exclusions_at(&self, block_number: u64) -> Result<Vec<(String, String, u64)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT publisher, url, since_height FROM derived_exclusions WHERE block_number = ?1 ORDER BY publisher, url",
-        )?;
-        let rows = stmt.query_map([block_number as i64], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, i64>(2)? as u64,
-            ))
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Error::Db)
-    }
-
-    pub fn derived_reputation_inputs_at(
-        &self,
-        block_number: u64,
-    ) -> Result<Vec<DerivedReputationInputs>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT domain, first_accepted_at, reset_height, counted_total, counted_json, penalties_json FROM derived_reputation_inputs WHERE block_number = ?1 ORDER BY domain",
-        )?;
+    /// WIST-3 §7 `withdrawal` tuples: every withdrawn Delta with its
+    /// Publisher and the earliest Block that sealed a withdrawal of it.
+    pub fn withdrawal_state(&self) -> Result<Vec<WithdrawalState>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT delta_id, domain, block_number FROM withdrawals ORDER BY delta_id")?;
         let rows = stmt
-            .query_map([block_number as i64], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, Option<i64>>(2)?,
-                    r.get::<_, i64>(3)?,
-                    r.get::<_, String>(4)?,
-                    r.get::<_, String>(5)?,
-                ))
-            })?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        rows.into_iter()
-            .map(|(domain, first, reset, total, counted, penalties)| {
-                Ok(DerivedReputationInputs {
-                    domain,
-                    first_accepted_at: first,
-                    reset_height: reset.map(|h| h as u64),
-                    counted_total: total as u64,
-                    counted_url_digests: serde_json::from_str(&counted)?,
-                    penalties: serde_json::from_str(&penalties)?,
-                })
-            })
-            .collect()
+        Ok(rows)
     }
 
-    pub fn derived_escalations_at(&self, block_number: u64) -> Result<Vec<(String, String)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT domain, establishing_at FROM derived_escalations WHERE block_number = ?1 ORDER BY domain",
+    pub fn is_withdrawn(&self, delta_id: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM withdrawals WHERE delta_id = ?1)",
+            [delta_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Whether `delta_id` is an accepted Delta of `domain` that a sealed
+    /// Block already carries: accepted, and neither pending nor queued.
+    pub fn is_delta_sealed_for(&self, delta_id: &str, domain: &str) -> Result<bool> {
+        if !self.is_delta_seen_for(delta_id, domain)? {
+            return Ok(false);
+        }
+        let queued: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM queued_deltas WHERE delta_id = ?1 AND domain = ?2)",
+            (delta_id, domain),
+            |row| row.get(0),
         )?;
-        let rows = stmt.query_map([block_number as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Error::Db)
-    }
-
-    pub fn derived_coverage_failures_at(&self, block_number: u64) -> Result<Vec<(String, u64)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT auditor_id, duty_block FROM derived_coverage_failures WHERE block_number = ?1 ORDER BY auditor_id, duty_block",
+        if queued {
+            return Ok(false);
+        }
+        let mut statement = self.conn.prepare(
+            "SELECT entry_json FROM pending_entries WHERE entry_type = 'publisher_delta' AND domain = ?1",
         )?;
-        let rows = stmt.query_map([block_number as i64], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Error::Db)
-    }
-
-    fn derived_publisher_state_where(
-        &self,
-        domain: &str,
-        instant: &str,
-        comparison: &str,
-    ) -> Result<Option<DerivedPublisherState>> {
-        let sql = format!(
-            "SELECT block_number, sealed_at, reputation_u, level, enforceable_level, fallback_level, level_since, evidence_json, deadlines_json FROM derived_publisher_state WHERE domain = ?1 AND sealed_at {comparison} ?2 ORDER BY block_number DESC LIMIT 1"
-        );
-        let row: Option<DerivedStateRow> = self
-            .conn
-            .query_row(&sql, (domain, instant), |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                    r.get(5)?,
-                    r.get(6)?,
-                    r.get(7)?,
-                    r.get(8)?,
-                ))
-            })
-            .optional()?;
-        let Some((
-            block_number,
-            sealed_at,
-            reputation_u,
-            level,
-            enforceable,
-            fallback,
-            since,
-            evidence,
-            deadlines,
-        )) = row
-        else {
-            return Ok(None);
-        };
-        let evidence: Vec<String> = serde_json::from_str(&evidence)?;
-        let deadlines: Vec<(String, String)> = serde_json::from_str(&deadlines)?;
-        Ok(Some(DerivedPublisherState {
-            block_number: block_number as u64,
-            sealed_at,
-            reputation_u: reputation_u as u64,
-            level: level as u8,
-            enforceable_level: enforceable as u8,
-            fallback_level: fallback as u8,
-            level_since: since,
-            evidence,
-            deadlines: deadlines
-                .into_iter()
-                .filter_map(|(label, at)| deadline_label(&label).map(|label| (label, at)))
-                .collect(),
-        }))
-    }
-
-    pub fn derived_publisher_state_at(
-        &self,
-        domain: &str,
-        at: &str,
-    ) -> Result<Option<DerivedPublisherState>> {
-        self.derived_publisher_state_where(domain, at, "<=")
-    }
-
-    pub fn derived_publisher_state_before(
-        &self,
-        domain: &str,
-        instant: &str,
-    ) -> Result<Option<DerivedPublisherState>> {
-        self.derived_publisher_state_where(domain, instant, "<")
-    }
-
-    pub fn derived_sanctioned_domains(&self, at: &str) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT d.domain FROM derived_publisher_state d WHERE d.sealed_at <= ?1 AND d.block_number = (SELECT MAX(block_number) FROM derived_publisher_state WHERE domain = d.domain AND sealed_at <= ?1) AND d.level > 0 ORDER BY d.domain",
-        )?;
-        let rows = stmt.query_map([at], |r| r.get::<_, String>(0))?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(Into::into)
-    }
-
-    pub fn auditor_in_coverage_failure(&self, auditor_id: &str, at: &str) -> Result<bool> {
-        let row: Option<i64> = self
-            .conn
-            .query_row(
-                "SELECT coverage_failure FROM derived_auditor_state WHERE auditor_id = ?1 AND sealed_at <= ?2 ORDER BY block_number DESC LIMIT 1",
-                (auditor_id, at),
-                |r| r.get(0),
-            )
-            .optional()?;
-        Ok(row.is_some_and(|value| value != 0))
+        let mut rows = statement.query([domain])?;
+        while let Some(row) = rows.next()? {
+            let doc: Value = crate::json::parse(&row.get::<_, Vec<u8>>(0)?)?;
+            if wist_core::delta::delta_id(&doc["delta"])? == delta_id {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     pub fn bump_noise_ping(&self, domain: &str, day: &str) -> Result<()> {
@@ -1655,50 +1167,6 @@ impl Db {
         self.conn
             .execute("DELETE FROM records WHERE delta_id = ?1", [delta_id])?;
         Ok(())
-    }
-
-    pub fn governance_by_action(&self, action: &str) -> Result<Vec<GovernanceEntry>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT update_id, action, domain, level, notice_id, outcome, sealed_at, block_number, kind FROM governance WHERE action = ?1 ORDER BY sealed_at ASC, block_number ASC",
-        )?;
-        let rows = stmt
-            .query_map([action], |row| {
-                Ok(GovernanceEntry {
-                    update_id: row.get(0)?,
-                    action: row.get(1)?,
-                    domain: row.get(2)?,
-                    level: row.get(3)?,
-                    notice_id: row.get(4)?,
-                    outcome: row.get(5)?,
-                    sealed_at: row.get(6)?,
-                    block_number: row.get::<_, i64>(7)? as u64,
-                    kind: row.get(8)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
-    }
-
-    pub fn governance_for_domain(&self, domain: &str) -> Result<Vec<GovernanceEntry>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT update_id, action, domain, level, notice_id, outcome, sealed_at, block_number, kind FROM governance WHERE domain = ?1 ORDER BY sealed_at ASC, block_number ASC",
-        )?;
-        let rows = stmt
-            .query_map([domain], |row| {
-                Ok(GovernanceEntry {
-                    update_id: row.get(0)?,
-                    action: row.get(1)?,
-                    domain: row.get(2)?,
-                    level: row.get(3)?,
-                    notice_id: row.get(4)?,
-                    outcome: row.get(5)?,
-                    sealed_at: row.get(6)?,
-                    block_number: row.get::<_, i64>(7)? as u64,
-                    kind: row.get(8)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
     }
 
     pub fn largest_block_bytes(&self) -> Result<u64> {
@@ -1815,7 +1283,7 @@ impl Db {
     pub fn get_record(&self, url: &str, publisher: &str) -> Result<Option<RecordRow>> {
         self.conn
             .query_row(
-                "SELECT url, publisher, delta_id, observed_at, weight, title, abstract, lang, sealed_at FROM records WHERE url = ?1 AND publisher = ?2",
+                "SELECT url, publisher, delta_id, observed_at, title, abstract, lang, sealed_at FROM records WHERE url = ?1 AND publisher = ?2",
                 (url, publisher),
                 |row| {
                     Ok(RecordRow {
@@ -1823,11 +1291,10 @@ impl Db {
                         publisher: row.get(1)?,
                         delta_id: row.get(2)?,
                         observed_at: row.get(3)?,
-                        weight: row.get(4)?,
-                        title: row.get(5)?,
-                        abstract_text: row.get(6)?,
-                        lang: row.get(7)?,
-                        sealed_at: row.get(8)?,
+                        title: row.get(4)?,
+                        abstract_text: row.get(5)?,
+                        lang: row.get(6)?,
+                        sealed_at: row.get(7)?,
                     })
                 },
             )
@@ -1837,7 +1304,7 @@ impl Db {
 
     pub fn list_records(&self) -> Result<Vec<RecordRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT url, publisher, delta_id, observed_at, weight, title, abstract, lang, sealed_at FROM records ORDER BY publisher, url",
+            "SELECT url, publisher, delta_id, observed_at, title, abstract, lang, sealed_at FROM records ORDER BY publisher, url",
         )?;
         let rows = stmt
             .query_map([], |row| {
@@ -1846,11 +1313,10 @@ impl Db {
                     publisher: row.get(1)?,
                     delta_id: row.get(2)?,
                     observed_at: row.get(3)?,
-                    weight: row.get(4)?,
-                    title: row.get(5)?,
-                    abstract_text: row.get(6)?,
-                    lang: row.get(7)?,
-                    sealed_at: row.get(8)?,
+                    title: row.get(4)?,
+                    abstract_text: row.get(5)?,
+                    lang: row.get(6)?,
+                    sealed_at: row.get(7)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1872,18 +1338,6 @@ impl Db {
         Ok(rows)
     }
 
-    /// Every domain the Log carries a `sanction` for, so §7's derived
-    /// state can be read for each.
-    pub fn sanctioned_domains(&self) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT domain FROM governance WHERE action = 'sanction' ORDER BY domain",
-        )?;
-        let rows = stmt
-            .query_map([], |row| row.get(0))?
-            .collect::<rusqlite::Result<Vec<String>>>()?;
-        Ok(rows)
-    }
-
     pub fn list_url_tips(&self) -> Result<Vec<(String, String, String)>> {
         let mut stmt = self
             .conn
@@ -1892,33 +1346,6 @@ impl Db {
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
-    }
-
-    /// WIST-3 §7 `auditor` tuples: each admitted key with the height that
-    /// admitted it and the height that removed it, if any.
-    pub fn roster_state(&self) -> Result<Vec<RosterTenure>> {
-        let mut admitted: Vec<RosterTenure> = Vec::new();
-        for act in self.accepted_roster_acts()? {
-            match act.action.as_str() {
-                "auditor_admit" => admitted.push((
-                    act.auditor_id,
-                    act.key_id,
-                    act.public_key,
-                    act.block_number,
-                    None,
-                )),
-                "auditor_remove" => {
-                    if let Some(row) = admitted
-                        .iter_mut()
-                        .find(|(a, k, ..)| *a == act.auditor_id && *k == act.key_id)
-                    {
-                        row.4 = Some(act.block_number);
-                    }
-                }
-                _ => {}
-            }
-        }
-        Ok(admitted)
     }
 
     pub fn url_tip(&self, domain: &str, url: &str) -> Result<Option<String>> {
@@ -2473,7 +1900,6 @@ mod tests {
                 publisher: "example.com",
                 delta_id: "sha256:a",
                 observed_at: "2026-08-09T00:00:00Z",
-                weight: "full",
                 title: "t",
                 abstract_text: None,
                 lang: "en",

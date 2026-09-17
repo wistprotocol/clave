@@ -87,15 +87,6 @@ fn signed_cap_profiles_follow_authenticated_prefixes_and_survive_later_amendment
         let result = delta.and_then(|()| caps.validate_payload_sizes(&object["payload"]));
         assert_eq!(json!(result.err()), probe["expected"], "{}", probe["name"]);
     }
-    for probe in vector["reference_probes"].as_array().unwrap() {
-        let object = &vector["objects"][probe["reference"].as_str().unwrap()];
-        let caps = &profiles[object["sealed_height"].as_u64().unwrap() as usize];
-        assert_eq!(json!(caps), probe["expected_profile"]);
-        assert_eq!(
-            json!(caps.validate_payload_sizes(&object["payload"]).err()),
-            probe["expected"]
-        );
-    }
     for case in vector["invalid_blocks"].as_array().unwrap() {
         let doc = &case["block"];
         let height = doc["header"]["block_number"].as_u64().unwrap() as usize;
@@ -133,8 +124,13 @@ fn historical_payload_sources_keep_the_committing_profile_after_restart() {
             .unwrap(),
     )
     .unwrap();
-    for probe in vector["reference_probes"].as_array().unwrap() {
-        let object = &vector["objects"][probe["reference"].as_str().unwrap()];
+    for probe in vector["probes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|probe| probe["stage"] == "historical" && probe["expected_delta"].is_null())
+    {
+        let object = &vector["objects"][probe["object"].as_str().unwrap()];
         let id = wist_core::delta::delta_id(&object["envelope"]["delta"]).unwrap();
         let raw = serde_json::to_vec(&object["payload"]).unwrap();
         let name = format!("payloads/{}.json", &id[7..]);
@@ -188,17 +184,6 @@ fn historical_payload_sources_keep_the_committing_profile_after_restart() {
                 };
                 assert_eq!(json!(code), probe["expected"]);
             }
-            let chain = clave::history::references::AuditChain::reconstruct(
-                data.path(),
-                Some(head.clone()),
-                &id,
-            )
-            .unwrap();
-            let reference = chain.resolve(&id, &head.sealed_at).unwrap();
-            let anchor = reference.payload_source().unwrap();
-            assert_eq!(anchor.envelope(), &object["envelope"]);
-            assert_eq!(json!(anchor.size_caps()), probe["expected_profile"]);
-            assert_eq!(json!(anchor.validate(&raw).err()), probe["expected"]);
         }
     }
     for case in vector["invalid_blocks"].as_array().unwrap() {

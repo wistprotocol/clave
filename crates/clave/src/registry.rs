@@ -119,67 +119,17 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_sampling_ceiling_below_floor() {
-        assert!(validate("sampling_ceiling", 100_000, defaults).is_err());
-    }
-
-    #[test]
-    fn validate_rejects_similarity_consistent_at_variance_floor() {
-        assert!(validate("similarity_consistent", 300_000, defaults).is_err());
-    }
-
-    #[test]
-    fn validate_rejects_half_confirm_window_longer_than_coverage_deadline() {
-        assert!(validate("confirm_window_hours", 200, defaults).is_err());
-        assert!(validate("coverage_deadline_hours", 35, defaults).is_err());
-        assert!(validate("coverage_deadline_hours", 36, defaults).is_ok());
-    }
-
-    #[test]
-    fn validate_rejects_c_cap_below_provisional_audits() {
-        assert!(validate("c_cap", 9, defaults).is_err());
-    }
-
-    #[test]
-    fn validate_rejects_confirm_window_shorter_than_cadence() {
-        assert!(validate("block_cadence_seconds", 86400, |n| match n {
-            "confirm_window_hours" => 12,
-            other => defaults(other),
-        })
-        .is_err());
-    }
-
-    #[test]
-    fn validate_rejects_half_confirm_window_shorter_than_cadence() {
-        assert!(validate("confirm_window_hours", 3, |n| match n {
-            "block_cadence_seconds" => 7200,
-            other => defaults(other),
-        })
-        .is_err());
-    }
-
-    #[test]
-    fn validate_rejects_mirror_retention_below_appeal_span_sum() {
-        assert!(validate("ruling_deadline_days", 80, defaults).is_err());
-    }
-
-    #[test]
     fn validate_rejects_links_cap_below_link_url_cap_plus_21() {
         assert!(validate("links_cap_bytes", 2000, defaults).is_err());
     }
 
     #[test]
-    fn validate_rejects_link_variance_floor_at_agreement_consistent() {
-        assert!(validate("link_variance_floor", 600_000, defaults).is_err());
-    }
-
-    #[test]
     fn validate_rejects_retired_identifiers() {
         for name in [
-            "contradictions_max",
-            "escalation_l2",
-            "escalation_l3",
-            "escalation_l4",
+            "sampling_floor",
+            "similarity_consistent",
+            "shingle_size",
+            "quota_slope",
         ] {
             assert!(matches!(
                 validate(name, 1, defaults),
@@ -189,18 +139,12 @@ mod tests {
     }
 
     #[test]
-    fn validate_checks_every_canary_combination_participant_at_its_boundary() {
+    fn validate_checks_every_combination_participant_at_its_boundary() {
         for (name, accepted, rejected) in [
-            ("block_cadence_seconds", 2700, 2699),
-            ("block_cadence_seconds", 5400, 5401),
-            ("confirm_window_hours", 47, 46),
-            ("record_seal_blocks", 36, 37),
-            ("coverage_deadline_hours", 96, 97),
-            ("epoch_blocks", 36, 37),
-            ("canary_reveal_min_blocks", 144, 143),
-            ("canary_reveal_min_blocks", 1415, 1416),
-            ("canary_lead_blocks", 1271, 1272),
-            ("canary_lifetime_blocks", 193, 192),
+            ("links_cap_bytes", 2069, 2068),
+            ("link_url_cap_bytes", 4075, 4076),
+            ("payload_window_days", 540, 541),
+            ("mirror_retention_days", 30, 29),
         ] {
             validate(name, accepted, defaults).unwrap();
             assert!(
@@ -211,71 +155,18 @@ mod tests {
                 "{name}"
             );
         }
-        let lookup = |name: &str| match name {
-            "confirm_window_hours" => 96,
-            other => defaults(other),
-        };
-        validate("record_seal_blocks", 48, lookup).unwrap();
-        assert!(validate("record_seal_blocks", 49, lookup).is_err());
     }
 
     #[test]
     fn validate_preserves_wire_bounds_and_exact_intermediate_arithmetic() {
         let max = wist_core::parameters::WIRE_INTEGER_MAX;
-        validate("canary_leaves_max", max, defaults).unwrap();
-        assert!(validate("canary_leaves_max", max + 1, defaults).is_err());
+        validate("links_cap_bytes", max, defaults).unwrap();
+        assert!(validate("links_cap_bytes", max + 1, defaults).is_err());
         validate("clock_skew_seconds", -max, defaults).unwrap();
         assert!(validate("clock_skew_seconds", -max - 1, defaults).is_err());
-        for name in [
-            "epoch_blocks",
-            "canary_reveal_min_blocks",
-            "record_seal_blocks",
-        ] {
+        for name in ["link_url_cap_bytes", "payload_window_days"] {
             assert!(validate(name, max, defaults).is_err(), "{name}");
         }
-    }
-
-    #[test]
-    fn observer_and_canary_defaults_match_vectors_and_work_without_database_rows() {
-        let dir = std::env::var("WIST_SPEC_DIR").unwrap_or_else(|_| "../../../spec".into());
-        let vector: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(std::path::Path::new(&dir).join("vectors/wist4/canary.json")).unwrap(),
-        )
-        .unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        let db = crate::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
-        for name in [
-            "epoch_blocks",
-            "observer_checkpoint_budget",
-            "canary_lead_blocks",
-            "canary_leaves_max",
-            "canary_commitments_max",
-            "canary_reveal_min_blocks",
-            "canary_lifetime_blocks",
-        ] {
-            let expected = vector["parameters"][name].as_i64().unwrap();
-            assert_eq!(defaults(name), expected, "{name}");
-            assert_eq!(
-                effective(&db, name, "2026-01-01T00:00:00Z").unwrap(),
-                expected,
-                "{name}"
-            );
-            validate(name, expected, defaults).unwrap();
-            assert!(
-                validate(name, spec(name).unwrap().min.unwrap() - 1, defaults).is_err(),
-                "{name}"
-            );
-        }
-    }
-
-    #[test]
-    fn validate_rejects_audit_budget_below_single_audit_cost() {
-        assert!(validate("audit_domain_budget_bytes_day", 8_000_000, defaults).is_err());
-    }
-
-    #[test]
-    fn validate_accepts_combination_rule_at_exact_boundary() {
-        validate("mirror_retention_days", 51, defaults).unwrap();
     }
 
     #[test]

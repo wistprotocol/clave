@@ -171,17 +171,12 @@ fn load_status(db: &Db, domain: &str) -> Result<Option<Status>> {
     let rejections = db.list_rejections(domain)?;
     let now = now_utc();
     let quota_remaining = crate::quota::quota_remaining(db, domain, &now)?.max(0) as u64;
-    let state = match crate::sanctions::sanction_level(db, domain, &now)? {
-        4 => wist_core::objects::PublisherState::Delisted,
-        3 => wist_core::objects::PublisherState::SanctionedQuarantine,
-        _ => row.state,
-    };
     Ok(Some(Status {
         wist_version: WIST_VERSION.to_string(),
         domain: domain.to_string(),
         last_pull_at: row.last_pull_at,
         quota_remaining,
-        state,
+        state: row.state,
         rejections,
     }))
 }
@@ -210,16 +205,12 @@ async fn ingest_handler(State(state): State<AppState>, body: Bytes) -> axum::res
         let at = now.clone();
         tokio::task::spawn_blocking(move || {
             let db = Db::connect(&db_path)?;
-            let level = crate::sanctions::sanction_level(&db, &host, &at)?;
-            crate::quota::quota_remaining(&db, &host, &at).map(|q| (level, q))
+            crate::quota::quota_remaining(&db, &host, &at)
         })
         .await
     };
     match quota {
-        Ok(Ok((level, _))) if level >= 3 => {
-            return StatusCode::FORBIDDEN.into_response();
-        }
-        Ok(Ok((_, remaining))) if remaining <= 0 => {
+        Ok(Ok(remaining)) if remaining <= 0 => {
             let retry_after = seconds_to_next_utc_day(&now);
             return (
                 StatusCode::TOO_MANY_REQUESTS,
@@ -329,36 +320,28 @@ pub fn run_with_options(
         .route_service("/anchor.json", ServeFile::new(data_dir.join("anchor.json")))
         .with_state(state);
 
-    let baseline_sk = crate::keys::load(&data_dir.join("keys/seed"))
-        .ok()
-        .map(Arc::new);
     let bg_data = data_dir.clone();
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
-        if let Some(sk) = baseline_sk {
-            tokio::spawn(async move {
-                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
-                loop {
-                    ticker.tick().await;
-                    let db_path = bg_state.db_path.clone();
-                    let client = bg_state.client.clone();
-                    let data = bg_data.clone();
-                    let sk = sk.clone();
-                    let gate = bg_state.gate.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        let Ok(db) = Db::connect(&db_path) else {
-                            return;
-                        };
-                        let now_epoch = jiff::Timestamp::now().as_second();
-                        let _ = crate::baseline::run_pass_gated(
-                            &db, &client, &sk, &data, now_epoch, &gate,
-                        );
-                    })
-                    .await;
-                }
-            });
-        }
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                ticker.tick().await;
+                let db_path = bg_state.db_path.clone();
+                let client = bg_state.client.clone();
+                let data = bg_data.clone();
+                let gate = bg_state.gate.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let Ok(db) = Db::connect(&db_path) else {
+                        return;
+                    };
+                    let now_epoch = jiff::Timestamp::now().as_second();
+                    let _ = crate::baseline::run_pass_gated(&db, &client, &data, now_epoch, &gate);
+                })
+                .await;
+            }
+        });
         let listener = tokio::net::TcpListener::bind(bind).await?;
         let local_addr = listener.local_addr()?;
         println!("listening on http://{local_addr}");

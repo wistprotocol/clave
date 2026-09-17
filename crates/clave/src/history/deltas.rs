@@ -12,7 +12,6 @@ use std::path::Path;
 
 #[derive(Clone)]
 pub struct DeltaSource {
-    anchor_hash: [u8; 32],
     id: String,
     envelope: Value,
     position: Position,
@@ -21,9 +20,6 @@ pub struct DeltaSource {
     declaration: Declaration,
     identity_start: Position,
     caps: SizeCaps,
-    audit_profile: wist_core::canary::ScoringProfile,
-    verdict_thresholds: wist_core::verdict::Thresholds,
-    sampling_constants: wist_core::sampling::SamplingConstants,
     clock_skew_seconds: i64,
 }
 
@@ -58,7 +54,6 @@ impl DeltaSource {
                 let domain =
                     &declarations.domains()[envelope["delta"]["publisher"].as_str().unwrap()];
                 found.push(Self {
-                    anchor_hash: history.anchor_hash,
                     id,
                     envelope: envelope.clone(),
                     position: Position {
@@ -70,9 +65,6 @@ impl DeltaSource {
                     declaration: domain.delta_sealing_source().unwrap().clone(),
                     identity_start: domain.reset().unwrap_or(domain.first()),
                     caps: block.delta_size_caps().clone(),
-                    audit_profile: *block.audit_profile(),
-                    verdict_thresholds: *block.verdict_thresholds(),
-                    sampling_constants: *block.sampling_constants(),
                     clock_skew_seconds: block.clock_skew_seconds(),
                 });
             }
@@ -84,20 +76,12 @@ impl DeltaSource {
         &self.id
     }
 
-    pub(crate) fn anchor_hash(&self) -> [u8; 32] {
-        self.anchor_hash
-    }
-
     pub fn sealed_at_s(&self) -> i64 {
         self.sealed_at_s
     }
 
     pub fn block_hash(&self) -> &str {
         &self.block_hash
-    }
-
-    pub fn sampling_constants(&self) -> &wist_core::sampling::SamplingConstants {
-        &self.sampling_constants
     }
 
     pub fn clock_skew_seconds(&self) -> i64 {
@@ -122,14 +106,6 @@ impl DeltaSource {
 
     pub fn size_caps(&self) -> &SizeCaps {
         &self.caps
-    }
-
-    pub fn verdict_thresholds(&self) -> &wist_core::verdict::Thresholds {
-        &self.verdict_thresholds
-    }
-
-    pub fn audit_profile(&self) -> &wist_core::canary::ScoringProfile {
-        &self.audit_profile
     }
 }
 

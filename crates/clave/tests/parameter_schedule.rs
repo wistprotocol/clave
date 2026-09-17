@@ -221,8 +221,8 @@ fn prospective_vectors_filter_rejected_history_and_preserve_every_future_map() {
 fn queued_conflicts_use_canonical_entry_order_for_admission_and_sealing() {
     let (data, db, sk) = setup();
     let mut candidates = [
-        envelope(&sk, "sampling_floor", 4_000_000, NOW + 10 * DAY),
-        envelope(&sk, "sampling_ceiling", 3_000_000, NOW + 10 * DAY),
+        envelope(&sk, "link_url_cap_bytes", 4000, NOW + 10 * DAY),
+        envelope(&sk, "links_cap_bytes", 4000, NOW + 10 * DAY),
     ];
     candidates.sort_by_key(|body| {
         wist_core::merkle::leaf_hash(
@@ -288,55 +288,6 @@ fn grace_changes_are_read_from_the_accepted_sealing_prefix() {
     assert_eq!(
         clave::registry::effective(&db, "feed_window", &ts(NOW + 8 * DAY)).unwrap(),
         600
-    );
-}
-
-#[test]
-fn cadence_admission_preserves_historical_extension_windows() {
-    let (data, db, sk) = setup();
-    queue(
-        &db,
-        &envelope(&sk, "confirm_window_hours", 96, NOW + 10 * DAY),
-    );
-    clave::seal::run(&db, data.path(), &sk, NOW).unwrap();
-    assert!(clave::param_change::run(
-        &db,
-        &sk,
-        "block_cadence_seconds",
-        7200,
-        Some(&ts(NOW + 13 * DAY - 1)),
-        NOW + DAY
-    )
-    .err()
-    .unwrap()
-    .to_string()
-    .contains("cadence transition"));
-    queue(
-        &db,
-        &envelope(&sk, "block_cadence_seconds", 7200, NOW + 13 * DAY - 1),
-    );
-    let report = clave::seal::run(&db, data.path(), &sk, NOW + DAY).unwrap();
-    assert_eq!(report.entry_count, 0);
-    assert!(report.dropped[0].contains("cadence transition"));
-    clave::param_change::run(
-        &db,
-        &sk,
-        "block_cadence_seconds",
-        7200,
-        Some(&ts(NOW + 13 * DAY)),
-        NOW + 2 * DAY,
-    )
-    .unwrap();
-    clave::seal::run(&db, data.path(), &sk, NOW + 2 * DAY).unwrap();
-    drop(db);
-    let db = Db::open(&data.path().join("clave.sqlite")).unwrap();
-    assert_eq!(
-        clave::registry::effective(&db, "block_cadence_seconds", &ts(NOW + 13 * DAY - 1)).unwrap(),
-        3600
-    );
-    assert_eq!(
-        clave::registry::effective(&db, "block_cadence_seconds", &ts(NOW + 13 * DAY)).unwrap(),
-        7200
     );
 }
 

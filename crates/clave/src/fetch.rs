@@ -11,9 +11,9 @@ const REQUEST_TIMEOUT_SECS: u64 = 30;
 /// URL it has already fetched.
 const MAX_REDIRECTS: usize = 5;
 
-/// The bound on one fetched Declaration, Feed page, Registry file, appeal
-/// or Mirror list: no protocol object of those kinds approaches it, and a
-/// response above it is refused while it streams.
+/// The bound on one fetched Declaration, Feed page or Mirror list: no
+/// protocol object of those kinds approaches it, and a response above it
+/// is refused while it streams.
 pub const OBJECT_CAP_BYTES: u64 = 1 << 20;
 
 const READ_CHUNK_BYTES: usize = 16 * 1024;

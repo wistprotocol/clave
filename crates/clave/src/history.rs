@@ -1,18 +1,11 @@
-pub mod coverage;
 pub mod declarations;
 pub mod deltas;
-pub mod extension;
 pub mod payloads;
-pub mod records;
-pub mod references;
-pub mod roster;
-pub mod selection;
 
 use crate::db::BlockRow;
 use crate::error::{Error, Result};
 use crate::registry;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use wist_core::crypto::PublicKey;
 use wist_core::objects::{Block, LogAnchorEnvelope, RegistryUpdateEnvelope};
@@ -27,45 +20,10 @@ pub struct VerifiedBlock {
     rejected_parameters: Vec<usize>,
     recovery_window_days: i64,
     delta_size_caps: crate::declaration::delta::SizeCaps,
-    audit_profile: wist_core::canary::ScoringProfile,
-    verdict_thresholds: wist_core::verdict::Thresholds,
-    sampling_constants: wist_core::sampling::SamplingConstants,
-    confirmation_profile: records::ConfirmationProfile,
-    coverage_profile: coverage::CoverageProfile,
-    extension_triggers_max: u64,
     clock_skew_seconds: i64,
-    decay_horizon_days: u64,
-    unauditable_horizon_days: u64,
-    process_profile: ProcessProfile,
-    canary_profile: CanaryProfile,
-}
-
-pub use wist_core::canary_replay::CanaryProfile;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ProcessProfile {
-    pub appeal_window_days: u64,
-    pub appeal_seal_days: u64,
-    pub ruling_deadline_days: u64,
 }
 
 impl VerifiedBlock {
-    pub fn decay_horizon_days(&self) -> u64 {
-        self.decay_horizon_days
-    }
-
-    pub fn unauditable_horizon_days(&self) -> u64 {
-        self.unauditable_horizon_days
-    }
-
-    pub fn process_profile(&self) -> &ProcessProfile {
-        &self.process_profile
-    }
-
-    pub fn canary_profile(&self) -> &CanaryProfile {
-        &self.canary_profile
-    }
-
     pub fn block(&self) -> &Block {
         &self.block
     }
@@ -86,30 +44,6 @@ impl VerifiedBlock {
         &self.delta_size_caps
     }
 
-    pub fn audit_profile(&self) -> &wist_core::canary::ScoringProfile {
-        &self.audit_profile
-    }
-
-    pub fn verdict_thresholds(&self) -> &wist_core::verdict::Thresholds {
-        &self.verdict_thresholds
-    }
-
-    pub fn sampling_constants(&self) -> &wist_core::sampling::SamplingConstants {
-        &self.sampling_constants
-    }
-
-    pub fn confirmation_profile(&self) -> &records::ConfirmationProfile {
-        &self.confirmation_profile
-    }
-
-    pub fn coverage_profile(&self) -> &coverage::CoverageProfile {
-        &self.coverage_profile
-    }
-
-    pub fn extension_triggers_max(&self) -> u64 {
-        self.extension_triggers_max
-    }
-
     pub fn clock_skew_seconds(&self) -> i64 {
         self.clock_skew_seconds
     }
@@ -120,7 +54,6 @@ impl VerifiedBlock {
 }
 
 pub struct History {
-    anchor_hash: [u8; 32],
     directory: PathBuf,
     head: Option<BlockRow>,
     log_id: String,
@@ -156,7 +89,6 @@ impl History {
         let key = PublicKey::from_b64u(&genesis.public_key)?;
         wist_core::envelope::verify_envelope(&doc, "anchor", &key)?;
         Ok(Self {
-            anchor_hash: Sha256::digest(wist_core::jcs::canonicalize(&doc["anchor"])?).into(),
             directory: directory.into(),
             head,
             log_id: anchor.anchor.log_id.clone(),
@@ -291,32 +223,6 @@ impl History {
         self.largest = largest;
         let recovery_window_days = schedule.value_at("recovery_window_days", at).unwrap();
         let delta_size_caps = crate::declaration::delta::SizeCaps::from_schedule(&schedule, at);
-        let audit_profile = wist_core::canary::ScoringProfile::at_audited_delta(at, |name, at| {
-            schedule.value_at(name, at).unwrap() as u64
-        });
-        let verdict_thresholds = wist_core::verdict::Thresholds {
-            similarity_consistent: audit_profile.similarity_consistent,
-            similarity_variance_floor: audit_profile.similarity_variance_floor,
-            min_observed_words: audit_profile.min_observed_words,
-            link_agreement_consistent: schedule.value_at("link_agreement_consistent", at).unwrap()
-                as u64,
-            link_variance_floor: schedule.value_at("link_variance_floor", at).unwrap() as u64,
-        };
-        let sampling_constants = wist_core::sampling::SamplingConstants {
-            floor_1e7: schedule.value_at("sampling_floor", at).unwrap() as u64,
-            ceiling_1e7: schedule.value_at("sampling_ceiling", at).unwrap() as u64,
-            slope_per_micro: schedule.value_at("sampling_slope", at).unwrap(),
-        };
-        let confirmation_profile = records::ConfirmationProfile {
-            auditors: schedule.value_at("confirm_auditors", at).unwrap() as u64,
-            window_hours: schedule.value_at("confirm_window_hours", at).unwrap() as u64,
-        };
-        let coverage_profile = coverage::CoverageProfile {
-            deadline_hours: schedule.value_at("coverage_deadline_hours", at).unwrap() as u64,
-            seal_blocks: schedule.value_at("record_seal_blocks", at).unwrap() as u64,
-        };
-        let extension_triggers_max =
-            schedule.value_at("extension_triggers_max", at).unwrap() as u64;
         self.schedule = Some(schedule);
         Ok(Some(VerifiedBlock {
             block,
@@ -326,52 +232,12 @@ impl History {
             rejected_parameters,
             recovery_window_days,
             delta_size_caps,
-            audit_profile,
-            verdict_thresholds,
-            sampling_constants,
-            confirmation_profile,
-            coverage_profile,
-            extension_triggers_max,
             clock_skew_seconds: self
                 .schedule
                 .as_ref()
                 .unwrap()
                 .value_at("clock_skew_seconds", at)
                 .unwrap(),
-            decay_horizon_days: self
-                .schedule
-                .as_ref()
-                .unwrap()
-                .value_at("decay_horizon_days", at)
-                .unwrap() as u64,
-            unauditable_horizon_days: self
-                .schedule
-                .as_ref()
-                .unwrap()
-                .value_at("unauditable_horizon_days", at)
-                .unwrap() as u64,
-            process_profile: {
-                let schedule = self.schedule.as_ref().unwrap();
-                ProcessProfile {
-                    appeal_window_days: schedule.value_at("appeal_window_days", at).unwrap() as u64,
-                    appeal_seal_days: schedule.value_at("appeal_seal_days", at).unwrap() as u64,
-                    ruling_deadline_days: schedule.value_at("ruling_deadline_days", at).unwrap()
-                        as u64,
-                }
-            },
-            canary_profile: {
-                let schedule = self.schedule.as_ref().unwrap();
-                let read = |name: &str| schedule.value_at(name, at).unwrap() as u64;
-                CanaryProfile {
-                    lead_blocks: read("canary_lead_blocks"),
-                    leaves_max: read("canary_leaves_max"),
-                    commitments_max: read("canary_commitments_max"),
-                    reveal_min_blocks: read("canary_reveal_min_blocks"),
-                    lifetime_blocks: read("canary_lifetime_blocks"),
-                    epoch_blocks: read("epoch_blocks"),
-                    checkpoint_budget: read("observer_checkpoint_budget"),
-                }
-            },
         }))
     }
 
@@ -390,11 +256,6 @@ impl History {
         };
         if parsed.update.wist_version != crate::WIST_VERSION
             || parsed.update.subject.chars().count() > 256
-            || parsed
-                .update
-                .evidence
-                .as_ref()
-                .is_some_and(|ids| ids.iter().any(|id| id.chars().count() > 256))
             || body["sig"]["alg"] != "Ed25519"
             || body["sig"]["key_id"] != self.key_id
             || wist_core::envelope::verify_envelope(body, "update", &self.key).is_err()

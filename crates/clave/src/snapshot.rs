@@ -11,10 +11,9 @@ use std::path::Path;
 use wist_core::crypto::{hex_encode, SigningKey};
 use wist_core::envelope::sign_envelope;
 use wist_core::objects::{
-    AggregatorKeyEntry, AuditorEntry, CanaryCommitmentEntry, CoverageFailureEntry,
-    DeclarationEntry, EscalationEntry, ExclusionEntry, ObserverEntry, ParameterEntry, RecordEntry,
-    RecoveryWindowEntry, ReputationInputsEntry, SanctionStateEntry, SnapshotFile, SnapshotIndex,
-    SnapshotIndexEntry, SnapshotManifest, SnapshotState, SnapshotStateFile, StateEntry,
+    AggregatorKeyEntry, DeclarationEntry, ParameterEntry, RecordEntry, RecoveryWindowEntry,
+    SnapshotFile, SnapshotIndex, SnapshotIndexEntry, SnapshotManifest, SnapshotState,
+    SnapshotStateFile, StateEntry, WithdrawalEntry,
 };
 use wist_core::snapshot::{content_digest, state_digest};
 
@@ -175,7 +174,6 @@ fn record_projection(r: &RecordRow) -> Value {
         "publisher": r.publisher,
         "delta_id": r.delta_id,
         "observed_at": r.observed_at,
-        "weight": r.weight,
     })
 }
 
@@ -187,13 +185,13 @@ fn build_tier0(dir: &Path, records: &[RecordRow]) -> Result<Vec<u8>> {
     }
     let conn = Connection::open(&sqlite_path)?;
     conn.execute_batch(
-        "CREATE TABLE records(url TEXT, publisher TEXT, delta_id TEXT, observed_at TEXT, weight TEXT, title TEXT, abstract TEXT, lang TEXT);
+        "CREATE TABLE records(url TEXT, publisher TEXT, delta_id TEXT, observed_at TEXT, title TEXT, abstract TEXT, lang TEXT);
          CREATE VIRTUAL TABLE records_fts USING fts5(title, abstract, content=records, content_rowid=rowid);",
     )?;
     for r in records {
         conn.execute(
-            "INSERT INTO records(url, publisher, delta_id, observed_at, weight, title, abstract, lang) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            (&r.url, &r.publisher, &r.delta_id, &r.observed_at, &r.weight, &r.title, &r.abstract_text, &r.lang),
+            "INSERT INTO records(url, publisher, delta_id, observed_at, title, abstract, lang) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            (&r.url, &r.publisher, &r.delta_id, &r.observed_at, &r.title, &r.abstract_text, &r.lang),
         )?;
     }
     conn.execute("INSERT INTO records_fts(records_fts) VALUES('rebuild')", [])?;
@@ -241,27 +239,6 @@ fn build_state(
             highest_accepted_seq: state.highest_accepted_seq(),
         }));
     }
-    for (auditor_id, key_id, public_key, admitted_height, removed_height) in db.roster_state()? {
-        entries.push(StateEntry::Auditor(AuditorEntry {
-            auditor_id,
-            key_id,
-            public_key,
-            admitted_height,
-            removed_height,
-        }));
-    }
-    for domain in db.derived_sanctioned_domains(&head_sealed_at)? {
-        let state = crate::sanctions::sanction_state(db, &domain, &head_sealed_at)?;
-        if state.derived_level == 0 {
-            continue;
-        }
-        entries.push(StateEntry::SanctionState(SanctionStateEntry {
-            domain,
-            level: state.derived_level as u64,
-            evidence: state.evidence,
-            deadlines: state.deadlines,
-        }));
-    }
     for (domain, state) in domains {
         let Some(window) = state.window() else {
             continue;
@@ -278,55 +255,11 @@ fn build_state(
             head_height: window.head().position().block_number,
         }));
     }
-    for row in db.derived_reputation_inputs_at(log_position)? {
-        entries.push(StateEntry::ReputationInputs(ReputationInputsEntry {
-            domain: row.domain,
-            first_accepted_sealed_at: row.first_accepted_at,
-            reset_height: row.reset_height,
-            counted_total: row.counted_total,
-            counted_url_digests: row.counted_url_digests,
-            penalties: row.penalties,
-        }));
-    }
-    for (domain, establishing_sealed_at) in db.derived_escalations_at(log_position)? {
-        entries.push(StateEntry::Escalation(EscalationEntry {
-            domain,
-            establishing_sealed_at,
-        }));
-    }
-    for (observer_id, key_id, public_key, registered_height) in
-        db.derived_observers_at(log_position)?
-    {
-        entries.push(StateEntry::Observer(ObserverEntry {
-            observer_id,
-            key_id,
-            public_key,
-            registered_height,
-            ended_height: None,
-        }));
-    }
-    for (update_id, planter, root, leaves, sealing_height) in
-        db.derived_canary_commitments_at(log_position)?
-    {
-        entries.push(StateEntry::CanaryCommitment(CanaryCommitmentEntry {
-            update_id,
-            planter,
-            root,
-            leaves,
-            sealing_height,
-        }));
-    }
-    for (publisher, url, excluded_since_height) in db.derived_exclusions_at(log_position)? {
-        entries.push(StateEntry::Exclusion(ExclusionEntry {
+    for (delta_id, publisher, sealing_height) in db.withdrawal_state()? {
+        entries.push(StateEntry::Withdrawal(WithdrawalEntry {
+            delta_id,
             publisher,
-            url,
-            excluded_since_height,
-        }));
-    }
-    for (auditor_id, block_number) in db.derived_coverage_failures_at(log_position)? {
-        entries.push(StateEntry::CoverageFailure(CoverageFailureEntry {
-            auditor_id,
-            block_number,
+            sealing_height,
         }));
     }
     // WIST-3 §7: a `record` tuple exists for every key the chain-tip
@@ -403,49 +336,6 @@ fn update_index(
     Ok(())
 }
 
-/// WIST-3 §7: level 2 marks the domain's records reduced-weight, level 3
-/// stops its later Deltas from being materialized at all from the height
-/// it takes effect, and level 4 removes its records entirely.
-fn apply_sanctions(db: &Db, records: Vec<RecordRow>, at: &str) -> Result<Vec<RecordRow>> {
-    let mut states: std::collections::HashMap<String, (u8, Option<String>)> =
-        std::collections::HashMap::new();
-    let mut kept = Vec::with_capacity(records.len());
-    for mut r in records {
-        let state = match states.get(&r.publisher) {
-            Some(state) => state.clone(),
-            None => {
-                let s = crate::sanctions::sanction_state(db, &r.publisher, at)?;
-                let state = (s.level, s.effective_at);
-                states.insert(r.publisher.clone(), state.clone());
-                state
-            }
-        };
-        match state {
-            (4, _) => continue,
-            (3, Some(effective_at)) if r.sealed_at >= effective_at => continue,
-            (2, _) => r.weight = "reduced".to_string(),
-            _ => {}
-        }
-        kept.push(r);
-    }
-    Ok(kept)
-}
-
-/// WIST-4 §5 and WIST-3 §7: a URL unauditable at the Snapshot's
-/// `log_position` materializes nothing until an independent measurement
-/// clears it or its blocking pair ages out.
-fn apply_exclusions(db: &Db, records: Vec<RecordRow>, log_position: u64) -> Result<Vec<RecordRow>> {
-    let excluded: std::collections::HashSet<(String, String)> = db
-        .derived_exclusions_at(log_position)?
-        .into_iter()
-        .map(|(publisher, url, _)| (publisher, url))
-        .collect();
-    Ok(records
-        .into_iter()
-        .filter(|record| !excluded.contains(&(record.publisher.clone(), record.url.clone())))
-        .collect())
-}
-
 /// WIST-3 §7, one URL, one Publisher: a self-declared host's own record,
 /// else the nearest ancestor Publisher's, else the least non-ancestor
 /// domain in ascending octet order; the other records are excluded.
@@ -518,11 +408,9 @@ pub fn build(
     log_position: u64,
     anchor_block_hash: &str,
     snapshot_date: &str,
-    sealed_at: &str,
     domains: &BTreeMap<String, Domain>,
 ) -> Result<()> {
-    let records = apply_sanctions(db, db.list_records()?, sealed_at)?;
-    let records = prefer_one_publisher(db, apply_exclusions(db, records, log_position)?)?;
+    let records = prefer_one_publisher(db, db.list_records()?)?;
     let snapshot_dir = data_dir.join("snapshots").join(snapshot_date);
 
     let shard_count = db.param("snapshot_shard_count").unwrap_or(1).max(1) as u64;
@@ -614,15 +502,10 @@ mod tests {
     use super::*;
     use crate::db::RecordUpsert;
 
-    const DAY: i64 = 86400;
     const T0: i64 = 1_800_000_000;
 
     fn ts(epoch: i64) -> String {
         jiff::Timestamp::from_second(epoch).unwrap().to_string()
-    }
-
-    fn seal_record(db: &Db, block: u64, sealed_epoch: i64, url: &str) {
-        seal_record_as(db, block, sealed_epoch, url, "example.com", &[]);
     }
 
     fn seal_record_as(
@@ -651,7 +534,6 @@ mod tests {
                 publisher,
                 delta_id: &format!("sha256:{:064x}", block),
                 observed_at: &ts(sealed_epoch),
-                weight: "full",
                 title: "t",
                 abstract_text: None,
                 lang: "en",
@@ -662,28 +544,6 @@ mod tests {
             0,
         )
         .unwrap();
-    }
-
-    #[test]
-    fn unauditable_urls_leave_materialization_at_the_snapshot_height() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
-        seal_record(&db, 0, T0, "https://example.com/open");
-        seal_record(&db, 1, T0 + DAY, "https://example.com/shut");
-        db.record_derived_exclusions(
-            1,
-            &[("example.com".into(), "https://example.com/shut".into(), 1)],
-        )
-        .unwrap();
-        let kept = apply_exclusions(&db, db.list_records().unwrap(), 1).unwrap();
-        let urls: Vec<&str> = kept.iter().map(|r| r.url.as_str()).collect();
-        assert_eq!(urls, ["https://example.com/open"]);
-        assert_eq!(
-            apply_exclusions(&db, db.list_records().unwrap(), 0)
-                .unwrap()
-                .len(),
-            2
-        );
     }
 
     #[test]
@@ -733,34 +593,5 @@ mod tests {
                 ("https://e.example.com/x", "alpha.example"),
             ]
         );
-    }
-
-    #[test]
-    fn level_three_stops_materialization_from_its_effective_height() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
-        seal_record(&db, 0, T0, "https://example.com/before");
-        seal_record(&db, 1, T0 + DAY, "https://example.com/at");
-        db.record_derived_state(
-            1,
-            &ts(T0 + DAY),
-            &[crate::db::DerivedPublisherRow {
-                domain: "example.com",
-                reputation_u: 100_000,
-                level: 3,
-                enforceable_level: 3,
-                fallback_level: 1,
-                level_since: &ts(T0 + DAY),
-                evidence: &[],
-                deadlines: &[],
-            }],
-            &[],
-        )
-        .unwrap();
-        seal_record(&db, 2, T0 + 2 * DAY, "https://example.com/after");
-
-        let kept = apply_sanctions(&db, db.list_records().unwrap(), &ts(T0 + 3 * DAY)).unwrap();
-        let urls: Vec<&str> = kept.iter().map(|r| r.url.as_str()).collect();
-        assert_eq!(urls, ["https://example.com/before"]);
     }
 }
