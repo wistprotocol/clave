@@ -2,7 +2,7 @@ use clave::history::declarations::Declarations;
 use clave::history::declarations::DeclarationsReplay;
 use serde_json::{json, Value};
 use wist_core::crypto::SigningKey;
-use wist_core::{block, envelope, jcs, merkle};
+use wist_core::{envelope, epoch, jcs, merkle};
 
 /// The octets an Entry carrying `declaration` occupies in an entry
 /// bundle: its JCS serialization behind a two-octet length prefix.
@@ -110,8 +110,7 @@ fn check_capped_chain(oversized_predecessor: bool, spellings: [&str; 2]) {
     } else {
         cap
     };
-    db.set_param("block_decompressed_cap_bytes", initial_cap as i64)
-        .unwrap();
+    db.set_param("epoch_cap_bytes", initial_cap as i64).unwrap();
     for declaration in [&predecessor, &successor] {
         db.update_publisher_declaration(
             "example.com",
@@ -128,16 +127,15 @@ fn check_capped_chain(oversized_predecessor: bool, spellings: [&str; 2]) {
         let db = clave::db::Db::open(&database).unwrap();
         let report = clave::seal::run(&db, data.path(), &log_key, start + 3600).unwrap();
         assert_eq!(report.entry_count, 0);
-        assert!(db.block_entries(1).unwrap().is_empty());
+        assert!(db.epoch_entries(1).unwrap().is_empty());
         assert_eq!(db.peek_pending_entries().unwrap().0.len(), 2);
         let reconstructed =
-            Declarations::reconstruct(&db, data.path(), db.last_block().unwrap()).unwrap();
+            Declarations::reconstruct(&db, data.path(), db.last_epoch().unwrap()).unwrap();
         assert_eq!(
             reconstructed.domains()["example.com"].current().envelope(),
             &initial
         );
-        db.set_param("block_decompressed_cap_bytes", cap as i64)
-            .unwrap();
+        db.set_param("epoch_cap_bytes", cap as i64).unwrap();
         2
     } else {
         1
@@ -147,13 +145,13 @@ fn check_capped_chain(oversized_predecessor: bool, spellings: [&str; 2]) {
         let report =
             clave::seal::run(&db, data.path(), &log_key, start + height as i64 * 3600).unwrap();
         assert_eq!(report.entry_count, 1);
-        let sealed = db.block_entries(height).unwrap();
+        let sealed = db.epoch_entries(height).unwrap();
         let canonical_expected: Value =
             serde_json::from_slice(&jcs::canonicalize(expected).unwrap()).unwrap();
         assert_eq!(sealed, vec![entry(&canonical_expected)]);
-        assert!(block::block_octets(&sealed).unwrap() <= cap);
+        assert!(epoch::epoch_octets(&sealed).unwrap() <= cap);
         let reconstructed =
-            Declarations::reconstruct(&db, data.path(), db.last_block().unwrap()).unwrap();
+            Declarations::reconstruct(&db, data.path(), db.last_epoch().unwrap()).unwrap();
         assert_eq!(
             reconstructed.domains()["example.com"].current().envelope(),
             &canonical_expected

@@ -84,18 +84,18 @@ fn page_declarations(
     data_dir: &Path,
     host: &str,
 ) -> Result<Vec<(i64, u64, Vec<wist_core::objects::PublisherKey>)>> {
-    let mut history = crate::history::History::open(db, data_dir, db.last_block()?)?;
+    let mut history = crate::history::History::open(db, data_dir, db.last_epoch()?)?;
     let mut state = crate::history::declarations::Declarations::default();
     let mut sources = Vec::new();
     let mut superseded = std::collections::BTreeSet::new();
     // WIST-2 §3.2 resolves a Page against the Key Set WIST-1 §5.2 resolves
-    // at the sealing Block, which excludes a Declaration that is pending,
+    // at the sealing Epoch, which excludes a Declaration that is pending,
     // that a reversal discarded, or that a recovery superseded. A pending
     // head enters at the instant it activates, not the instant it sealed.
     let mut pending = std::collections::BTreeSet::new();
     let mut excluded = std::collections::BTreeSet::new();
-    while let Some(block) = history.next_block()? {
-        let effects = state.apply(&block)?;
+    while let Some(epoch) = history.next_epoch()? {
+        let effects = state.apply(&epoch)?;
         for settlement in &effects.settlements {
             if settlement.domain == host {
                 for source in &settlement.superseded {
@@ -124,10 +124,10 @@ fn page_declarations(
                 .map_err(crate::error::Error::History)?;
             sources.push((
                 activation.activated.hash().to_string(),
-                (block.sealed_at_s(), publisher.seq, publisher.keys),
+                (epoch.sealed_at_s(), publisher.seq, publisher.keys),
             ));
         }
-        for entry in block.entries().iter().filter(|entry| {
+        for entry in epoch.entries().iter().filter(|entry| {
             entry["type"] == "publisher_declaration" && entry["body"]["publisher"]["domain"] == host
         }) {
             let source = &entry["body"];
@@ -137,7 +137,7 @@ fn page_declarations(
             }
             let publisher =
                 declaration::publisher_of(source).map_err(crate::error::Error::History)?;
-            sources.push((hash, (block.sealed_at_s(), publisher.seq, publisher.keys)));
+            sources.push((hash, (epoch.sealed_at_s(), publisher.seq, publisher.keys)));
         }
     }
     Ok(sources
@@ -153,7 +153,7 @@ fn verify_sealed_page(
     doc: &Value,
     generated_at: &str,
 ) -> bool {
-    let Ok(cut) = registry::epoch(generated_at) else {
+    let Ok(cut) = registry::unix(generated_at) else {
         return false;
     };
     let current = declarations
@@ -189,11 +189,11 @@ fn accepted_recovery_head(
     host: &str,
     window: &crate::db::RecoveryWindowRow,
 ) -> Result<Value> {
-    let mut head = if window.opened_block.is_some() {
+    let mut head = if window.opened_epoch.is_some() {
         let state = crate::history::declarations::Declarations::reconstruct(
             db,
             data_dir,
-            db.last_block()?,
+            db.last_epoch()?,
         )?;
         state
             .domains()
@@ -245,7 +245,7 @@ fn settle_before_admission(
 ) -> Result<()> {
     if db
         .get_recovery_window(host)?
-        .is_some_and(|window| window.opened_block.is_some())
+        .is_some_and(|window| window.opened_epoch.is_some())
     {
         crate::recovery::settle(db, data_dir, &clock().to_string())?;
     }
@@ -660,14 +660,14 @@ pub fn run_bounded(
 
     let day = now.get(..10).unwrap_or(now);
     let budget = crate::registry::effective(db, "ingest_budget_bytes_day", now)?;
-    let now_epoch = crate::registry::epoch(now)?;
+    let now_unix = crate::registry::unix(now)?;
     let meter = Meter {
         db,
         domain: host,
         unit: crate::suffix_list::unit_at(db, host, now)?,
         day,
         budget,
-        caps: ObjectCaps::from_schedule(&db.parameter_schedule(now_epoch)?, now_epoch),
+        caps: ObjectCaps::from_schedule(&db.parameter_schedule(now_unix)?, now_unix),
         work: std::cell::Cell::new((limits.work_bytes, limits.work_objects)),
     };
 
@@ -1176,8 +1176,8 @@ pub fn run_bounded(
 
     if !suspended {
         let sizes = declaration::delta::SizeCaps::from_schedule(
-            &db.parameter_schedule(now_epoch)?,
-            now_epoch,
+            &db.parameter_schedule(now_unix)?,
+            now_unix,
         );
         suspended = pull_labels(
             db,

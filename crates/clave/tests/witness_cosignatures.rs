@@ -126,7 +126,7 @@ fn sealed_log() -> Log {
     let data = tempfile::tempdir().unwrap();
     clave::init::run(&host, data.path()).unwrap();
     let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
-    db.set_param("block_cadence_seconds", 1).unwrap();
+    db.set_param("epoch_cadence_seconds", 1).unwrap();
     clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
     Log {
@@ -243,7 +243,7 @@ fn a_witness_that_cannot_be_reached_does_not_fail_the_seal() {
     let report =
         clave::seal::run_with_client(&log.db, log.data.path(), &log.sk, &log.client, SEAL_START)
             .unwrap();
-    assert_eq!(report.block_number, 0);
+    assert_eq!(report.epoch_number, 0);
 
     let note = head_note(log.data.path());
     assert!(cosigners(&note, &log.host, &log.sk).is_empty());

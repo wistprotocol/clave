@@ -1,6 +1,6 @@
 mod common;
 
-use clave::db::BlockRow;
+use clave::db::EpochRow;
 use clave::history::{
     deltas::DeltaSource,
     payloads::{PayloadLocation, PayloadSource},
@@ -12,7 +12,7 @@ use wist_core::{crypto, envelope, jcs};
 struct Fixture {
     data: tempfile::TempDir,
     db: clave::db::Db,
-    head: Option<BlockRow>,
+    head: Option<EpochRow>,
 }
 
 impl Fixture {
@@ -31,7 +31,7 @@ impl Fixture {
         rusqlite::Connection::open(self.data.path().join("clave.sqlite")).unwrap()
     }
 
-    /// The leaf data of the first Entry of Block `height`, which a fault
+    /// The leaf data of the first Entry of Epoch `height`, which a fault
     /// injection replaces to corrupt the retained history.
     fn first_leaf(&self, height: u64) -> (u64, Vec<u8>) {
         let index = self.db.size_before(height).unwrap();
@@ -67,23 +67,23 @@ impl Fixture {
     fn restore_leaf(&self, index: u64, bytes: &[u8]) {
         self.connection()
             .execute(
-                "INSERT OR REPLACE INTO log_entries(leaf_index, block_number, entry_json) VALUES (?1, 0, ?2)",
+                "INSERT OR REPLACE INTO log_entries(leaf_index, epoch_number, entry_json) VALUES (?1, 0, ?2)",
                 rusqlite::params![index as i64, bytes],
             )
             .unwrap();
     }
 
     fn append(&mut self, entries: Vec<Value>) {
-        let height = self.head.as_ref().map_or(0, |head| head.block_number + 1);
+        let height = self.head.as_ref().map_or(0, |head| head.epoch_number + 1);
         self.append_at(entries, height as i64 * 3600);
     }
 
     fn append_at(&mut self, entries: Vec<Value>, offset_s: i64) {
-        let height = self.head.as_ref().map_or(0, |head| head.block_number + 1);
+        let height = self.head.as_ref().map_or(0, |head| head.epoch_number + 1);
         let at = jiff::Timestamp::from_second(1_800_000_000 + offset_s)
             .unwrap()
             .to_string();
-        self.head = Some(seal_fixture_block(
+        self.head = Some(seal_fixture_epoch(
             &self.db,
             self.data.path(),
             height,
@@ -213,7 +213,7 @@ fn historical_payload_retrieval_retries_independent_copies_without_rewriting_sta
         entry("publisher_declaration", &current_declaration(&p)),
         entry("publisher_delta", &delta),
     ]);
-    let block_entries = f.db.block_entries(0).unwrap();
+    let epoch_entries = f.db.epoch_entries(0).unwrap();
     let copies = tempfile::tempdir().unwrap();
     let (listener, host, client) = reserve_addr();
     serve_static(listener, copies.path().to_owned());
@@ -266,7 +266,7 @@ fn historical_payload_retrieval_retries_independent_copies_without_rewriting_sta
         );
         std::fs::remove_file(copies.path().join("copy.json")).unwrap();
         assert_eq!(copy.raw(), original);
-        assert_eq!(f.db.block_entries(0).unwrap(), block_entries);
+        assert_eq!(f.db.epoch_entries(0).unwrap(), epoch_entries);
     }
 }
 
@@ -279,7 +279,7 @@ fn historical_payload_fallback_preserves_failures_and_the_signed_publisher_locat
         entry("publisher_declaration", &current_declaration(&p)),
         entry("publisher_delta", &delta),
     ]);
-    let block_entries = f.db.block_entries(0).unwrap();
+    let epoch_entries = f.db.epoch_entries(0).unwrap();
     let (listener, host, client) = reserve_addr();
     serve_static(listener, p.dir.path().to_owned());
     let relative = format!(
@@ -346,7 +346,7 @@ fn historical_payload_fallback_preserves_failures_and_the_signed_publisher_locat
         assert_eq!(copy.source().envelope(), &delta);
         assert_eq!(std::fs::read(&retained_path).unwrap(), b"not JSON");
         assert_eq!(std::fs::read(&distributed_path).unwrap(), wrong);
-        assert_eq!(f.db.block_entries(0).unwrap(), block_entries);
+        assert_eq!(f.db.epoch_entries(0).unwrap(), epoch_entries);
         std::fs::write(&retained_path, &original).unwrap();
         let candidates = std::iter::once(locations[0].clone()).chain(std::iter::once_with(|| {
             panic!("a verified retained copy must stop fallback")
@@ -378,7 +378,7 @@ fn historical_payload_discovery_uses_independent_origins_mirror_hints_and_signed
         entry("publisher_declaration", &current_declaration(&p)),
         entry("publisher_delta", &delta),
     ]);
-    let block_entries = f.db.block_entries(0).unwrap();
+    let epoch_entries = f.db.epoch_entries(0).unwrap();
     let (listener, _, client) = reserve_addr();
     serve_static(listener, p.dir.path().to_owned());
     let mirror = tempfile::tempdir().unwrap();
@@ -468,7 +468,7 @@ fn historical_payload_discovery_uses_independent_origins_mirror_hints_and_signed
         assert_eq!(copy.raw(), raw);
         assert!(!retained.exists());
         assert_eq!(std::fs::read(&mirror_file).unwrap(), hint_bytes);
-        assert_eq!(f.db.block_entries(0).unwrap(), block_entries);
+        assert_eq!(f.db.epoch_entries(0).unwrap(), epoch_entries);
     }
 }
 
@@ -538,7 +538,7 @@ fn remote_mirror_hints_preserve_payload_authentication_fallback_and_restart() {
         entry("publisher_declaration", &current_declaration(&p)),
         entry("publisher_delta", &delta),
     ]);
-    let block_entries = f.db.block_entries(0).unwrap();
+    let epoch_entries = f.db.epoch_entries(0).unwrap();
     let (listener, _, client) = reserve_addr();
     serve_static(listener, p.dir.path().to_owned());
     let mirror = tempfile::tempdir().unwrap();
@@ -618,7 +618,7 @@ fn remote_mirror_hints_preserve_payload_authentication_fallback_and_restart() {
             assert_eq!(copy.source().envelope(), &delta);
         }
         assert_eq!(std::fs::read(&list).unwrap(), hints);
-        assert_eq!(f.db.block_entries(0).unwrap(), block_entries);
+        assert_eq!(f.db.epoch_entries(0).unwrap(), epoch_entries);
         assert!(!f.data.path().join(&relative).exists());
     }
     std::fs::write(&list, r#"{"mirrors":{"mirror_urls":[]}}"#).unwrap();
@@ -874,7 +874,7 @@ fn historical_sources_freeze_signed_authority_and_scope_at_inclusion() {
         f.append(vec![entry("publisher_declaration", &replacement)]);
         for _ in 0..2 {
             let source = f.source(&target).unwrap();
-            assert_eq!(source.block_number(), 0);
+            assert_eq!(source.epoch_number(), 0);
             assert_eq!(source.envelope(), &target);
             source.validate(&payload).unwrap();
             let mut corrupt: Value = serde_json::from_slice(&payload).unwrap();
@@ -1043,13 +1043,13 @@ fn historical_delta_sources_check_exact_predecessor_vectors_in_chain_order() {
             continue;
         }
         count += 1;
-        for same_block in [false, true] {
+        for same_epoch in [false, true] {
             let mut f = Fixture::new();
             let mut entries = vec![
                 entry("publisher_declaration", &vector["stored"]),
                 entry("publisher_delta", &case["predecessor"]),
             ];
-            if !same_block {
+            if !same_epoch {
                 f.append(entries);
                 entries = vec![];
             }
@@ -1061,7 +1061,7 @@ fn historical_delta_sources_check_exact_predecessor_vectors_in_chain_order() {
                         assert_eq!(case["expected"], "relation_satisfied", "{}", case["name"]);
                         assert_eq!(source.envelope(), &case["envelope"]);
                         assert_eq!(source.declaration().envelope(), &vector["stored"]);
-                        assert_eq!(source.position().block_number, u64::from(!same_block));
+                        assert_eq!(source.position().epoch_number, u64::from(!same_epoch));
                     }
                     Err(error) => assert!(
                         error
@@ -1193,13 +1193,13 @@ fn historical_sources_preserve_chain_ownership_across_identity_resets() {
         // history restarts, at its activation height; nothing it signs
         // verifies before then.
         let activation = 1 + u64::try_from(
-            wist_core::parameters::spec("declaration_activation_blocks")
+            wist_core::parameters::spec("declaration_activation_epochs")
                 .unwrap()
                 .default
                 .unwrap(),
         )
         .unwrap();
-        while f.head.as_ref().unwrap().block_number + 1 < activation {
+        while f.head.as_ref().unwrap().epoch_number + 1 < activation {
             f.append(Vec::new());
         }
         f.append(vec![entry("publisher_delta", &next)]);
@@ -1209,12 +1209,12 @@ fn historical_sources_preserve_chain_ownership_across_identity_resets() {
                 let delta = source.delta_source();
                 assert_eq!(delta.envelope(), &next);
                 assert_eq!(delta.declaration().envelope(), &replacement);
-                assert_eq!(delta.declaration().position().block_number, 1);
-                assert_eq!(delta.identity_start().block_number, activation);
+                assert_eq!(delta.declaration().position().epoch_number, 1);
+                assert_eq!(delta.identity_start().epoch_number, activation);
                 for (root, publisher) in [(&root_a, &a), (&root_b, &b)] {
                     let earlier = f.delta_source(root).unwrap();
                     assert_eq!(earlier.identity_start(), earlier.declaration().position());
-                    assert_eq!(earlier.identity_start().block_number, 0);
+                    assert_eq!(earlier.identity_start().epoch_number, 0);
                     assert_eq!(
                         earlier.declaration().envelope(),
                         &current_declaration(publisher)
@@ -1242,25 +1242,25 @@ fn historical_sources_resolve_contentless_deltas_and_recreation_in_chain_order()
         }
         chain.push(envelope::sign_envelope(&next, "delta", &p.kid, &p.sk).unwrap());
     }
-    for same_block in [false, true] {
+    for same_epoch in [false, true] {
         let mut f = Fixture::new();
         let mut entries = vec![entry("publisher_declaration", &current_declaration(&p))];
         for delta in &chain {
             entries.push(entry("publisher_delta", delta));
-            if !same_block {
+            if !same_epoch {
                 f.append(entries);
                 entries = vec![];
             }
         }
-        if same_block {
+        if same_epoch {
             f.append(entries);
         }
         for (i, delta) in chain.iter().enumerate() {
             let source = f.delta_source(delta).unwrap();
             assert_eq!(source.envelope(), delta);
             assert_eq!(
-                source.position().block_number,
-                if same_block { 0 } else { i as u64 }
+                source.position().epoch_number,
+                if same_epoch { 0 } else { i as u64 }
             );
             if i == 0 || i == 3 {
                 f.source(delta).unwrap().validate(&payload).unwrap();

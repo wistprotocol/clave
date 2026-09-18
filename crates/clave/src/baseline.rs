@@ -6,8 +6,8 @@ use std::path::Path;
 /// WIST-2 §5: known feeds are polled at `baseline_poll_seconds`
 /// regardless of Pings, and a budget-suspended walk resumes on a later
 /// run rather than being treated as complete.
-pub fn due_domains(db: &Db, now_epoch: i64) -> Result<Vec<String>> {
-    let now = jiff::Timestamp::from_second(now_epoch)
+pub fn due_domains(db: &Db, now_unix: i64) -> Result<Vec<String>> {
+    let now = jiff::Timestamp::from_second(now_unix)
         .map_err(|_| crate::error::Error::Governance("timestamp out of range".into()))?
         .to_string();
     let interval = crate::registry::effective(db, "baseline_poll_seconds", &now)?;
@@ -17,7 +17,7 @@ pub fn due_domains(db: &Db, now_epoch: i64) -> Result<Vec<String>> {
             None => true,
             Some(t) => t
                 .parse::<jiff::Timestamp>()
-                .map(|ts| now_epoch - ts.as_second() >= interval)
+                .map(|ts| now_unix - ts.as_second() >= interval)
                 .unwrap_or(true),
         };
         if stale || db.walk_suspended(&domain)? {
@@ -27,8 +27,8 @@ pub fn due_domains(db: &Db, now_epoch: i64) -> Result<Vec<String>> {
     Ok(due)
 }
 
-pub fn run_pass(db: &Db, client: &Client, data_dir: &Path, now_epoch: i64) -> Result<Vec<String>> {
-    run_pass_inner(db, client, data_dir, now_epoch, None)
+pub fn run_pass(db: &Db, client: &Client, data_dir: &Path, now_unix: i64) -> Result<Vec<String>> {
+    run_pass_inner(db, client, data_dir, now_unix, None)
 }
 
 /// A pass that leaves alone every domain the gate already has a pull
@@ -37,23 +37,23 @@ pub fn run_pass_gated(
     db: &Db,
     client: &Client,
     data_dir: &Path,
-    now_epoch: i64,
+    now_unix: i64,
     gate: &std::sync::Arc<crate::serve::IngestGate>,
 ) -> Result<Vec<String>> {
-    run_pass_inner(db, client, data_dir, now_epoch, Some(gate))
+    run_pass_inner(db, client, data_dir, now_unix, Some(gate))
 }
 
 fn run_pass_inner(
     db: &Db,
     client: &Client,
     data_dir: &Path,
-    now_epoch: i64,
+    now_unix: i64,
     gate: Option<&std::sync::Arc<crate::serve::IngestGate>>,
 ) -> Result<Vec<String>> {
-    let now = jiff::Timestamp::from_second(now_epoch)
+    let now = jiff::Timestamp::from_second(now_unix)
         .map_err(|_| crate::error::Error::Governance("timestamp out of range".into()))?
         .to_string();
-    let due = due_domains(db, now_epoch)?;
+    let due = due_domains(db, now_unix)?;
     for domain in &due {
         let _guard = match gate {
             Some(gate) => match gate.begin_background(domain) {
@@ -74,8 +74,8 @@ mod tests {
 
     const NOW: i64 = 1_800_000_000;
 
-    fn ts(epoch: i64) -> String {
-        jiff::Timestamp::from_second(epoch).unwrap().to_string()
+    fn ts(unix: i64) -> String {
+        jiff::Timestamp::from_second(unix).unwrap().to_string()
     }
 
     fn open_db() -> (tempfile::TempDir, Db) {

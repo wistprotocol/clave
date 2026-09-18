@@ -4,8 +4,8 @@ const SEAL_START: i64 = 1_786_276_800;
 const FIRST: &str = "// ===BEGIN ICANN DOMAINS===\ncom\nnet\n// ===END ICANN DOMAINS===\n// ===BEGIN PRIVATE DOMAINS===\ngithub.io\n// ===END PRIVATE DOMAINS===\n";
 const SECOND: &str = "// ===BEGIN ICANN DOMAINS===\ncom\nnet\n// ===END ICANN DOMAINS===\n// ===BEGIN PRIVATE DOMAINS===\ngithub.io\nhosts.sample.net\n// ===END PRIVATE DOMAINS===\n";
 
-fn instant(epoch: i64) -> String {
-    jiff::Timestamp::from_second(epoch).unwrap().to_string()
+fn instant(unix: i64) -> String {
+    jiff::Timestamp::from_second(unix).unwrap().to_string()
 }
 
 fn state_entries(data: &std::path::Path) -> Vec<serde_json::Value> {
@@ -31,11 +31,11 @@ fn state_entries(data: &std::path::Path) -> Vec<serde_json::Value> {
 }
 
 #[test]
-fn a_pinned_snapshot_governs_from_the_block_after_its_seal() {
+fn a_pinned_snapshot_governs_from_the_epoch_after_its_seal() {
     let data = tempfile::tempdir().unwrap();
     clave::init::run("log.example", data.path()).unwrap();
     let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
-    db.set_param("block_cadence_seconds", 1).unwrap();
+    db.set_param("epoch_cadence_seconds", 1).unwrap();
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
     let file = data.path().join("first.dat");
     std::fs::write(&file, FIRST).unwrap();
@@ -55,15 +55,15 @@ fn a_pinned_snapshot_governs_from_the_block_after_its_seal() {
     );
 
     let r0 = clave::seal::run(&db, data.path(), &sk, SEAL_START).unwrap();
-    assert_eq!((r0.block_number, r0.entry_count), (0, 1));
+    assert_eq!((r0.epoch_number, r0.entry_count), (0, 1));
     assert!(r0.dropped.is_empty(), "{:?}", r0.dropped);
     assert_eq!(
         db.suffix_list_acts().unwrap(),
         vec![(0, first.identifier.clone())]
     );
-    assert_eq!(db.suffix_list_in_force_at_block(0).unwrap(), None);
+    assert_eq!(db.suffix_list_in_force_at_epoch(0).unwrap(), None);
     assert_eq!(
-        db.suffix_list_in_force_at_block(1).unwrap(),
+        db.suffix_list_in_force_at_epoch(1).unwrap(),
         Some((first.identifier.clone(), 0))
     );
     assert_eq!(
@@ -94,13 +94,13 @@ fn a_pinned_snapshot_governs_from_the_block_after_its_seal() {
     std::fs::write(&file, SECOND).unwrap();
     let second = clave::suffix_list::pin(&db, data.path(), &sk, &file, SEAL_START).unwrap();
     let r1 = clave::seal::run(&db, data.path(), &sk, SEAL_START + 7200).unwrap();
-    assert_eq!((r1.block_number, r1.entry_count), (1, 1));
+    assert_eq!((r1.epoch_number, r1.entry_count), (1, 1));
     assert_eq!(
-        db.suffix_list_in_force_at_block(1).unwrap(),
+        db.suffix_list_in_force_at_epoch(1).unwrap(),
         Some((first.identifier.clone(), 0))
     );
     assert_eq!(
-        db.suffix_list_in_force_at_block(2).unwrap(),
+        db.suffix_list_in_force_at_epoch(2).unwrap(),
         Some((second.identifier.clone(), 1))
     );
     let later = instant(SEAL_START + 10800);
@@ -120,11 +120,11 @@ fn a_pinned_snapshot_governs_from_the_block_after_its_seal() {
 
     clave::suffix_list::pin(&db, data.path(), &sk, &file, SEAL_START + 10800).unwrap();
     let r2 = clave::seal::run(&db, data.path(), &sk, SEAL_START + 14400).unwrap();
-    assert_eq!((r2.block_number, r2.entry_count), (2, 1));
+    assert_eq!((r2.epoch_number, r2.entry_count), (2, 1));
     assert!(r2.dropped.is_empty(), "{:?}", r2.dropped);
     assert_eq!(db.suffix_list_acts().unwrap().len(), 2);
     assert_eq!(
-        db.suffix_list_in_force_at_block(3).unwrap(),
+        db.suffix_list_in_force_at_epoch(3).unwrap(),
         Some((second.identifier.clone(), 1))
     );
 
@@ -139,7 +139,7 @@ fn a_pinned_snapshot_governs_from_the_block_after_its_seal() {
     db.insert_pending_entry("registry_update", "", &envelope, 0)
         .unwrap();
     let r3 = clave::seal::run(&db, data.path(), &sk, SEAL_START + 18000).unwrap();
-    assert_eq!((r3.block_number, r3.entry_count), (3, 0));
+    assert_eq!((r3.epoch_number, r3.entry_count), (3, 0));
     assert!(
         r3.dropped.iter().any(|d| d.starts_with("WIST4-E04")),
         "{:?}",

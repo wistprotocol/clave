@@ -13,14 +13,14 @@ use wist_core::envelope::sign_envelope;
 use wist_core::objects::ChangeType;
 use wist_core::{jcs, merkle, tiles};
 
-/// One Block prepared for publication: its Checkpoint, the leaves it
+/// One Epoch prepared for publication: its Checkpoint, the leaves it
 /// appends to the tree, the rows its commit writes and the effects its
 /// publication applies.
-pub(super) struct PreparedBlock {
+pub(super) struct PreparedEpoch {
     pub(super) log_id: String,
     pub(super) entries: Vec<Value>,
     pub(super) octets: u64,
-    pub(super) block_number: u64,
+    pub(super) epoch_number: u64,
     pub(super) sealed_at: String,
     pub(super) seal_entries: Vec<SealEntry>,
     pub(super) sealed_rowids: Vec<i64>,
@@ -35,64 +35,64 @@ pub(super) struct PreparedBlock {
     pub(super) record_updates: Vec<OwnedRecordUpsert>,
 }
 
-/// A recovery window open after this Block, as the sealed-window row
+/// A recovery window open after this Epoch, as the sealed-window row
 /// records it (WIST-1 §5.2).
 pub(super) struct SealedWindow {
     pub(super) domain: String,
     pub(super) head: Vec<u8>,
     pub(super) before: Vec<u8>,
     pub(super) owner: Vec<u8>,
-    pub(super) opened_block: u64,
+    pub(super) opened_epoch: u64,
     pub(super) window_end: String,
 }
 
-/// Prepares the next Block at the cadence slot `now_epoch` falls in:
+/// Prepares the next Epoch at the cadence slot `now_unix` falls in:
 /// replays the history, settles and diverts recovery, orders and bounds
 /// the pending Entries, revalidates them and applies governance, then
-/// signs the Block. Writes only the diversions, settlements and
+/// signs the Epoch. Writes only the diversions, settlements and
 /// retirements the preparation itself decides.
-pub(super) fn block(
+pub(super) fn epoch(
     db: &Db,
     data_dir: &Path,
     sk: &SigningKey,
-    now_epoch: i64,
-) -> Result<PreparedBlock> {
-    let now_at = jiff::Timestamp::from_second(now_epoch)
+    now_unix: i64,
+) -> Result<PreparedEpoch> {
+    let now_at = jiff::Timestamp::from_second(now_unix)
         .map_err(|_| Error::Seal("now out of range".into()))?
         .to_string();
-    let prev = db.last_block()?;
+    let prev = db.last_epoch()?;
     let cadence = registry::effective(
         db,
-        "block_cadence_seconds",
+        "epoch_cadence_seconds",
         prev.as_ref()
             .map_or(now_at.as_str(), |p| p.sealed_at.as_str()),
     )?;
     if cadence <= 0 {
-        return Err(Error::Seal("block_cadence_seconds must be positive".into()));
+        return Err(Error::Seal("epoch_cadence_seconds must be positive".into()));
     }
-    let sealed_epoch = now_epoch.div_euclid(cadence) * cadence;
-    let sealed_at = jiff::Timestamp::from_second(sealed_epoch)
+    let sealed_unix = now_unix.div_euclid(cadence) * cadence;
+    let sealed_at = jiff::Timestamp::from_second(sealed_unix)
         .map_err(|_| Error::Seal("sealed_at out of range".into()))?
         .to_string();
 
-    let block_number = match &prev {
+    let epoch_number = match &prev {
         Some(p) => {
             if sealed_at.as_str() <= p.sealed_at.as_str() {
                 return Err(Error::Seal("cadence slot already sealed".into()));
             }
-            p.block_number + 1
+            p.epoch_number + 1
         }
         None => 0,
     };
 
-    let mut history = History::open(db, data_dir, db.last_block()?)?;
+    let mut history = History::open(db, data_dir, db.last_epoch()?)?;
     let mut declarations = Declarations::default();
-    while let Some(block) = history.next_block()? {
-        declarations.apply(&block)?;
+    while let Some(epoch) = history.next_epoch()? {
+        declarations.apply(&epoch)?;
     }
     for (domain, state) in declarations.domains() {
         if let Some(window) = state.window() {
-            if window.end_s() > i128::from(sealed_epoch)
+            if window.end_s() > i128::from(sealed_unix)
                 && db.recovery_settled(domain, window.owner().hash())?
             {
                 return Err(Error::Seal(
@@ -103,18 +103,18 @@ pub(super) fn block(
     }
     let recovery_days = history
         .schedule()
-        .and_then(|schedule| schedule.value_at("recovery_window_days", sealed_epoch))
+        .and_then(|schedule| schedule.value_at("recovery_window_days", sealed_unix))
         .unwrap_or_else(|| {
             registry::spec("recovery_window_days")
                 .unwrap()
                 .default
                 .unwrap()
         });
-    let activation_blocks = history
+    let activation_epochs = history
         .schedule()
-        .and_then(|schedule| schedule.value_at("declaration_activation_blocks", sealed_epoch))
+        .and_then(|schedule| schedule.value_at("declaration_activation_epochs", sealed_unix))
         .unwrap_or_else(|| {
-            registry::spec("declaration_activation_blocks")
+            registry::spec("declaration_activation_epochs")
                 .unwrap()
                 .default
                 .unwrap()
@@ -128,26 +128,26 @@ pub(super) fn block(
             .filter(|(_, state)| {
                 state
                     .window()
-                    .is_some_and(|window| window.end_s() > i128::from(sealed_epoch))
+                    .is_some_and(|window| window.end_s() > i128::from(sealed_unix))
             })
             .map(|(domain, _)| domain.as_str())
             .collect(),
     )?;
-    let settlement = declarations.project(&sealed_at, recovery_days, activation_blocks, &[])?;
+    let settlement = declarations.project(&sealed_at, recovery_days, activation_epochs, &[])?;
 
     let (peeked, _up_to_rowid) = db.peek_pending_entries()?;
-    let domain_cap = registry::effective(db, "domain_block_entries_max", &sealed_at)?;
-    let labeler_cap = registry::effective(db, "labeler_block_entries_max", &sealed_at)?;
-    let peeked = fit_to_domain_cap(db, peeked, domain_cap, labeler_cap, block_number)?;
+    let domain_cap = registry::effective(db, "domain_epoch_entries_max", &sealed_at)?;
+    let labeler_cap = registry::effective(db, "labeler_epoch_entries_max", &sealed_at)?;
+    let peeked = fit_to_domain_cap(db, peeked, domain_cap, labeler_cap, epoch_number)?;
     let (seal_entries, oversized) = hold_out_oversize_entries(storage_order(peeked)?);
-    let schedule = db.parameter_schedule(sealed_epoch)?;
-    let mut cap = registry::block_cap(&schedule, sealed_epoch).min(registry::effective(
+    let schedule = db.parameter_schedule(sealed_unix)?;
+    let mut cap = registry::epoch_cap(&schedule, sealed_unix).min(registry::effective(
         db,
-        "block_decompressed_cap_bytes",
+        "epoch_cap_bytes",
         &sealed_at,
     )?);
     let mut tentative = schedule.clone();
-    let largest = db.largest_block_bytes()?;
+    let largest = db.largest_epoch_bytes()?;
     for (index, entry) in seal_entries.iter().enumerate() {
         let update = &entry.body["update"];
         if entry.entry_type == "registry_update"
@@ -155,14 +155,14 @@ pub(super) fn block(
             && check_param_change(
                 &mut tentative,
                 update,
-                sealed_epoch,
-                block_number,
+                sealed_unix,
+                epoch_number,
                 index as u64,
                 largest,
             )
             .is_ok()
         {
-            cap = cap.min(registry::block_cap(&tentative, sealed_epoch));
+            cap = cap.min(registry::epoch_cap(&tentative, sealed_unix));
         }
     }
     let installed = settlement
@@ -180,7 +180,7 @@ pub(super) fn block(
     let projection = declarations.project(
         &sealed_at,
         recovery_days,
-        activation_blocks,
+        activation_epochs,
         &seal_entries
             .iter()
             .map(|entry| entry.wrapped.clone())
@@ -199,12 +199,12 @@ pub(super) fn block(
             entry.entry_type != "publisher_delta" || !recovering.contains(entry.domain.as_str())
         })
         .collect();
-    let default_schedule = wist_core::parameters::Schedule::new(sealed_epoch);
+    let default_schedule = wist_core::parameters::Schedule::new(sealed_unix);
     let sealing_schedule = history.schedule().unwrap_or(&default_schedule);
     let size_caps =
-        crate::declaration::delta::SizeCaps::from_schedule(sealing_schedule, sealed_epoch);
+        crate::declaration::delta::SizeCaps::from_schedule(sealing_schedule, sealed_unix);
     let clock_skew_seconds = sealing_schedule
-        .value_at("clock_skew_seconds", sealed_epoch)
+        .value_at("clock_skew_seconds", sealed_unix)
         .unwrap();
     let (seal_entries, retired_rowids, retired) = revalidate_queued_deltas(
         db,
@@ -215,16 +215,16 @@ pub(super) fn block(
         &sealed_at,
         &projection,
     )?;
-    let ceiling = registry::effective(db, "max_inclusion_blocks", &sealed_at)?;
-    let late = late_inclusions(&seal_entries, block_number, ceiling);
+    let ceiling = registry::effective(db, "max_inclusion_epochs", &sealed_at)?;
+    let late = late_inclusions(&seal_entries, epoch_number, ceiling);
     let candidate_octets = seal_entries.iter().map(SealEntry::octets).sum();
     let mut outcome = enforce_governance(
         db,
         &sk.public(),
         history.log_id(),
         seal_entries,
-        sealed_epoch,
-        block_number,
+        sealed_unix,
+        epoch_number,
         candidate_octets,
     )?;
     outcome.dropped.extend(retired);
@@ -256,11 +256,11 @@ pub(super) fn block(
     let entry_count = entries.len() as u64;
     if octets > cap.max(0) as u64 {
         return Err(Error::Seal(
-            "the Block's entry-bundle octets exceed the decompressed cap".into(),
+            "the Epoch's entry-bundle octets exceed epoch_cap_bytes".into(),
         ));
     }
     let projection =
-        declarations.project(&sealed_at, recovery_days, activation_blocks, &entries)?;
+        declarations.project(&sealed_at, recovery_days, activation_epochs, &entries)?;
     let windows = projection
         .domains()
         .iter()
@@ -277,7 +277,7 @@ pub(super) fn block(
                     head: serde_json::to_vec(window.head().envelope())?,
                     before: serde_json::to_vec(window.before().envelope())?,
                     owner: serde_json::to_vec(window.owner().envelope())?,
-                    opened_block: window.owner().position().block_number,
+                    opened_epoch: window.owner().position().epoch_number,
                     window_end,
                 })
             })
@@ -285,11 +285,11 @@ pub(super) fn block(
         .collect::<Result<Vec<_>>>()?;
     let record_updates = resolve_record_updates(data_dir, &size_caps, &seal_entries)?;
 
-    Ok(PreparedBlock {
+    Ok(PreparedEpoch {
         log_id: history.log_id().to_owned(),
         entries,
         octets,
-        block_number,
+        epoch_number,
         sealed_at,
         seal_entries,
         sealed_rowids,
@@ -330,10 +330,10 @@ pub(super) struct GovernanceOutcome {
 pub(super) fn check_param_change(
     schedule: &mut wist_core::parameters::Schedule,
     update: &Value,
-    sealed_epoch: i64,
-    block_number: u64,
+    sealed_unix: i64,
+    epoch_number: u64,
     entry_index: u64,
-    largest_block: u64,
+    largest_epoch: u64,
 ) -> std::result::Result<AcceptedParamChange, String> {
     let parameter = update["details"]["parameter"]
         .as_str()
@@ -347,12 +347,12 @@ pub(super) fn check_param_change(
     let amendment = wist_core::parameters::Amendment {
         parameter: parameter.into(),
         value,
-        block_number,
+        epoch_number,
         entry_index,
-        sealed_at_s: sealed_epoch,
-        effective_at_s: registry::epoch(effective_at).map_err(|e| e.to_string())?,
+        sealed_at_s: sealed_unix,
+        effective_at_s: registry::unix(effective_at).map_err(|e| e.to_string())?,
     };
-    registry::accept(schedule, amendment, largest_block)
+    registry::accept(schedule, amendment, largest_epoch)
         .map_err(|e| format!("{parameter}: {e}"))?;
     Ok(AcceptedParamChange {
         rowid: 0,
@@ -369,8 +369,8 @@ pub(crate) fn validate_pending_parameter(
     at: i64,
 ) -> Result<()> {
     let mut schedule = db.parameter_schedule(at)?;
-    let height = db.last_block()?.map_or(0, |b| b.block_number + 1);
-    let largest = db.largest_block_bytes()?;
+    let height = db.last_epoch()?.map_or(0, |b| b.epoch_number + 1);
+    let largest = db.largest_epoch_bytes()?;
     let (mut pending, _) = db.peek_pending_entries()?;
     let rowid = pending.iter().map(|p| p.rowid).max().unwrap_or(0) + 1;
     pending.push(PendingEntryRow {
@@ -378,7 +378,7 @@ pub(crate) fn validate_pending_parameter(
         entry_type: "registry_update".into(),
         domain: String::new(),
         entry_json: sign_envelope(update, "update", GENESIS_KEY_ID, sk)?,
-        turn_block: None,
+        turn_epoch: None,
     });
     for (index, entry) in storage_order(pending)?.iter().enumerate() {
         if entry.entry_type != "registry_update"
@@ -405,17 +405,17 @@ pub(crate) fn validate_pending_parameter(
 }
 
 /// WIST-2 §5 step 4: a queued Delta is sealed only where it verifies
-/// under the Key Set WIST-1 §5.2 resolves at the sealing Block — the
+/// under the Key Set WIST-1 §5.2 resolves at the sealing Epoch — the
 /// highest-`seq` Declaration sealed at a height at or below it, this
-/// Block's own Declarations included (WIST-3 §3.2 applies them first).
+/// Epoch's own Declarations included (WIST-3 §3.2 applies them first).
 /// One whose signing key a Declaration accepted since the pull has
 /// retired is WIST1-E02, reported and not sealed.
-/// WIST-3 §3.2: a Block MUST NOT carry more than
-/// `domain_block_entries_max` `publisher_delta`, `label` and `dispute`
+/// WIST-3 §3.2: an Epoch MUST NOT carry more than
+/// `domain_epoch_entries_max` `publisher_delta`, `label` and `dispute`
 /// Entries of one Registrable Domain under the snapshot in force at it
-/// (WIST-4 §3.1), nor more than `labeler_block_entries_max` `label` and
+/// (WIST-4 §3.1), nor more than `labeler_epoch_entries_max` `label` and
 /// `dispute` Entries of one. The surplus waits its turn in acceptance
-/// order, and WIST-4 §6.4's inclusion ceiling runs from the Block an
+/// order, and WIST-4 §6.4's inclusion ceiling runs from the Epoch an
 /// Entry's turn arrives in — the first with room for it — which is
 /// recorded here.
 pub(super) fn fit_to_domain_cap(
@@ -423,11 +423,11 @@ pub(super) fn fit_to_domain_cap(
     peeked: Vec<PendingEntryRow>,
     cap: i64,
     labeler_cap: i64,
-    block_number: u64,
+    epoch_number: u64,
 ) -> Result<Vec<PendingEntryRow>> {
     let cap = cap.max(0) as usize;
     let labeler_cap = labeler_cap.max(0) as usize;
-    let list = crate::suffix_list::in_force_at_block(db, block_number)?;
+    let list = crate::suffix_list::in_force_at_epoch(db, epoch_number)?;
     let mut taken: HashMap<String, usize> = HashMap::new();
     let mut labeled: HashMap<String, usize> = HashMap::new();
     let mut kept = Vec::with_capacity(peeked.len());
@@ -452,17 +452,17 @@ pub(super) fn fit_to_domain_cap(
             *opinions += 1;
         }
         *count += 1;
-        db.set_turn_block(p.rowid, block_number)?;
+        db.set_turn_epoch(p.rowid, epoch_number)?;
         kept.push(p);
     }
     Ok(kept)
 }
 
 /// WIST-4 §6.4: an accepted Delta MUST be sealed no later than
-/// `max_inclusion_blocks` Blocks after the Block its turn arrived in.
+/// `max_inclusion_epochs` Epochs after the Epoch its turn arrived in.
 pub(super) fn late_inclusions(
     entries: &[SealEntry],
-    block_number: u64,
+    epoch_number: u64,
     ceiling: i64,
 ) -> Vec<String> {
     let ceiling = ceiling.max(0) as u64;
@@ -475,12 +475,12 @@ pub(super) fn late_inclusions(
             )
         })
         .filter_map(|e| {
-            let turn = e.turn_block?;
-            (block_number > turn + ceiling).then(|| {
+            let turn = e.turn_epoch?;
+            (epoch_number > turn + ceiling).then(|| {
                 format!(
-                    "{}: sealed at Block {block_number}, {} Blocks after its turn at {turn}",
+                    "{}: sealed at Epoch {epoch_number}, {} Epochs after its turn at {turn}",
                     e.domain,
-                    block_number - turn
+                    epoch_number - turn
                 )
             })
         })
@@ -601,8 +601,8 @@ pub(super) fn revalidate_queued_deltas(
 }
 
 /// WIST-4 §5.1 through core's withdrawal replay: the act must verify under
-/// the Log key and name a Delta sealed at or below this Block — one this
-/// Block seals or one the store already holds — whose signed publisher is
+/// the Log key and name a Delta sealed at or below this Epoch — one this
+/// Epoch seals or one the store already holds — whose signed publisher is
 /// the subject; a failing act is dropped with its code, and a repeated
 /// withdrawal seals and changes nothing.
 fn check_withdrawal(
@@ -610,29 +610,29 @@ fn check_withdrawal(
     replay: &mut wist_core::withdrawal::WithdrawalReplay,
     log_key: &wist_core::crypto::PublicKey,
     body: &Value,
-    block_number: u64,
-    block_deltas: &HashMap<String, String>,
+    epoch_number: u64,
+    epoch_deltas: &HashMap<String, String>,
 ) -> std::result::Result<Option<OwnedWithdrawal>, String> {
     use wist_core::withdrawal::{Disposition, SealedDelta};
     let subject = body["update"]["subject"]
         .as_str()
         .unwrap_or_default()
         .to_string();
-    let lookup = |delta_id: &str| match block_deltas.get(delta_id) {
+    let lookup = |delta_id: &str| match epoch_deltas.get(delta_id) {
         Some(publisher) => SealedDelta::Known {
             publisher: publisher.clone(),
-            height: block_number,
+            height: epoch_number,
         },
         None => match db.is_delta_sealed_for(delta_id, &subject) {
             Ok(true) => SealedDelta::Known {
                 publisher: subject.clone(),
-                height: block_number,
+                height: epoch_number,
             },
             _ => SealedDelta::Absent,
         },
     };
     match replay.apply(
-        block_number,
+        epoch_number,
         body,
         |key_id| (key_id == GENESIS_KEY_ID).then(|| log_key.clone()),
         lookup,
@@ -691,12 +691,12 @@ pub(super) fn enforce_governance(
     log_key: &wist_core::crypto::PublicKey,
     log_id: &str,
     entries: Vec<SealEntry>,
-    sealed_epoch: i64,
-    block_number: u64,
-    block_bytes: u64,
+    sealed_unix: i64,
+    epoch_number: u64,
+    epoch_bytes: u64,
 ) -> Result<GovernanceOutcome> {
-    let mut schedule = db.parameter_schedule(sealed_epoch)?;
-    let largest = db.largest_block_bytes()?.max(block_bytes);
+    let mut schedule = db.parameter_schedule(sealed_unix)?;
+    let largest = db.largest_epoch_bytes()?.max(epoch_bytes);
     let mut admitted = db.admitted_note_key_ids()?;
     if admitted.is_empty() {
         admitted.push(hex_encode(&wist_core::checkpoint::aggregator_key_id(
@@ -711,7 +711,7 @@ pub(super) fn enforce_governance(
         dropped: Vec::new(),
         dropped_rowids: Vec::new(),
     };
-    let block_deltas: HashMap<String, String> = entries
+    let epoch_deltas: HashMap<String, String> = entries
         .iter()
         .filter(|e| e.entry_type == "publisher_delta")
         .map(|e| {
@@ -739,8 +739,8 @@ pub(super) fn enforce_governance(
             Some("parameter_change") => match check_param_change(
                 &mut schedule,
                 &update,
-                sealed_epoch,
-                block_number,
+                sealed_unix,
+                epoch_number,
                 index as u64,
                 largest,
             ) {
@@ -760,8 +760,8 @@ pub(super) fn enforce_governance(
                     &mut replay,
                     log_key,
                     &e.body,
-                    block_number,
-                    &block_deltas,
+                    epoch_number,
+                    &epoch_deltas,
                 ) {
                     Ok(Some(withdrawal)) => {
                         out.withdrawals.push(withdrawal);
@@ -777,7 +777,7 @@ pub(super) fn enforce_governance(
             Some("suffix_list_update") => {
                 use wist_core::suffix_list::{Disposition, HeldFile};
                 match suffix_replay.apply(
-                    block_number,
+                    epoch_number,
                     &e.body,
                     |key_id| (key_id == GENESIS_KEY_ID).then(|| log_key.clone()),
                     |identifier| {
@@ -816,15 +816,15 @@ pub(super) fn enforce_governance(
     Ok(out)
 }
 
-/// WIST-3 §6: a Block's size is the octets its Entries occupy in entry
+/// WIST-3 §6: an Epoch's size is the octets its Entries occupy in entry
 /// bundles — each Entry's JCS serialization plus two — and it must not
-/// exceed the `block_decompressed_cap_bytes` in force.
+/// exceed the `epoch_cap_bytes` in force.
 pub(super) fn fit_to_cap(
     entries: Vec<SealEntry>,
     cap: i64,
     installed: &HashSet<String>,
 ) -> Result<(Vec<SealEntry>, usize)> {
-    let cap = u64::try_from(cap).map_err(|_| Error::Seal("invalid Block cap".into()))?;
+    let cap = u64::try_from(cap).map_err(|_| Error::Seal("invalid Epoch cap".into()))?;
     let pending_declarations: HashSet<_> = entries
         .iter()
         .filter(|entry| entry.entry_type == "publisher_declaration")
@@ -902,7 +902,7 @@ pub(super) struct SealEntry {
     pub(super) wrapped: Value,
     pub(super) canonical: Vec<u8>,
     pub(super) leaf: [u8; 32],
-    pub(super) turn_block: Option<u64>,
+    pub(super) turn_epoch: Option<u64>,
 }
 
 impl SealEntry {
@@ -915,8 +915,8 @@ impl SealEntry {
 
 /// WIST-3 §3.3: an Entry whose JCS serialization exceeds 65 535 octets
 /// does not fit a leaf of an entry bundle and is never sealed. It is
-/// held out of the Block here, the last point at which the Aggregator
-/// still decides membership, and reported with the Block's drops.
+/// held out of the Epoch here, the last point at which the Aggregator
+/// still decides membership, and reported with the Epoch's drops.
 pub(super) fn hold_out_oversize_entries(
     entries: Vec<SealEntry>,
 ) -> (Vec<SealEntry>, Vec<SealEntry>) {
@@ -963,7 +963,7 @@ pub(super) fn storage_order(peeked: Vec<PendingEntryRow>) -> Result<Vec<SealEntr
                 wrapped,
                 canonical,
                 leaf,
-                turn_block: p.turn_block,
+                turn_epoch: p.turn_epoch,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1115,7 +1115,7 @@ mod tests {
                             domain: String::new(),
                             entry_json: sign_envelope(&update, "update", GENESIS_KEY_ID, &sk)
                                 .unwrap(),
-                            turn_block: None,
+                            turn_epoch: None,
                         }
                     })
                     .collect(),

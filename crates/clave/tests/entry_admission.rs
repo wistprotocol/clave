@@ -51,7 +51,7 @@ fn an_entry_over_65_535_octets_is_never_sealed_and_is_reported() {
         report.dropped
     );
 
-    let sealed = db.block_entries(0).unwrap();
+    let sealed = db.epoch_entries(0).unwrap();
     assert_eq!(sealed.len(), 1);
     assert_eq!(sealed[0]["body"], fitting);
     for leaf in db.entry_range(0, db.tree_size().unwrap()).unwrap() {
@@ -83,7 +83,7 @@ fn an_aggregator_key_add_that_collides_with_an_admitted_note_key_id_is_refused()
         "{:?}",
         report.dropped
     );
-    assert!(db.block_entries(0).unwrap().is_empty());
+    assert!(db.epoch_entries(0).unwrap().is_empty());
     assert_eq!(
         db.admitted_note_key_ids().unwrap(),
         vec![wist_core::crypto::hex_encode(

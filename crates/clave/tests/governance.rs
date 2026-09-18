@@ -5,8 +5,8 @@ use common::{add_delta, make_publisher_with_scope, reserve_addr, serve_static, w
 const NOW: i64 = 1_800_000_000;
 const DAY: i64 = 86400;
 
-fn ts(epoch: i64) -> String {
-    jiff::Timestamp::from_second(epoch).unwrap().to_string()
+fn ts(unix: i64) -> String {
+    jiff::Timestamp::from_second(unix).unwrap().to_string()
 }
 
 struct Rig {
@@ -30,7 +30,7 @@ fn rig(urls: &[&str]) -> Rig {
     let data = tempfile::tempdir().unwrap();
     clave::init::run(&host, data.path()).unwrap();
     let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
-    db.set_param("block_cadence_seconds", 1).unwrap();
+    db.set_param("epoch_cadence_seconds", 1).unwrap();
     clave::ingest::run(&db, &client, data.path(), &host, &ts(NOW)).unwrap();
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
     Rig {
@@ -43,7 +43,7 @@ fn rig(urls: &[&str]) -> Rig {
 }
 
 fn read_entries(db: &clave::db::Db, number: u64) -> Vec<serde_json::Value> {
-    db.block_entries(number).unwrap()
+    db.epoch_entries(number).unwrap()
 }
 
 #[test]
@@ -129,7 +129,7 @@ fn a_repeated_withdrawal_seals_and_keeps_the_first_height() {
 fn a_withdrawal_may_seal_beside_its_delta_but_not_before_it() {
     let r = rig(&["https://example.com/a", "https://example.com/b"]);
     let (first, second) = (&r.ids[0], &r.ids[1]);
-    r.db.set_param("domain_block_entries_max", 1).unwrap();
+    r.db.set_param("domain_epoch_entries_max", 1).unwrap();
     clave::governance::withdraw(&r.db, &r.sk, &r.host, first, "court order", "DE", NOW).unwrap();
     clave::governance::withdraw(&r.db, &r.sk, &r.host, second, "court order", "DE", NOW).unwrap();
     let seal = clave::seal::run(&r.db, r.data.path(), &r.sk, NOW).unwrap();

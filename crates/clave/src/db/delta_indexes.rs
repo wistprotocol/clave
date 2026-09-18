@@ -25,14 +25,14 @@ impl Db {
             return Ok(());
         }
         let mut indexes = Chains::default();
-        let head = self.last_block()?;
+        let head = self.last_epoch()?;
         if head.is_some() {
             let mut history =
                 History::open(self, path.parent().unwrap_or_else(|| Path::new(".")), head)?;
             let mut declarations = Declarations::default();
-            while let Some(block) = history.next_block()? {
-                declarations.apply(&block)?;
-                indexes.apply(&block, &declarations)?;
+            while let Some(epoch) = history.next_epoch()? {
+                declarations.apply(&epoch)?;
+                indexes.apply(&epoch, &declarations)?;
             }
         }
         let mut statement = tx.prepare(

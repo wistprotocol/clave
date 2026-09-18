@@ -735,10 +735,10 @@ fn unused_excluded_keys_survive_ingest_reopen_and_sealing_without_blocking_usabl
     let sealed = clave::seal::run(&db, data.path(), &sk, at).unwrap();
     assert_eq!(sealed.entry_count, 2);
     let mut history =
-        clave::history::History::open(&db, data.path(), db.last_block().unwrap()).unwrap();
-    let block = history.next_block().unwrap().unwrap();
-    assert_eq!(block.entries()[0]["body"], signed);
-    assert!(history.next_block().unwrap().is_none());
+        clave::history::History::open(&db, data.path(), db.last_epoch().unwrap()).unwrap();
+    let epoch = history.next_epoch().unwrap().unwrap();
+    assert_eq!(epoch.entries()[0]["body"], signed);
+    assert!(history.next_epoch().unwrap().is_none());
     assert_eq!(
         db.get_record("https://example.com/a", &host)
             .unwrap()
@@ -749,7 +749,7 @@ fn unused_excluded_keys_survive_ingest_reopen_and_sealing_without_blocking_usabl
     let state = clave::history::declarations::Declarations::reconstruct(
         &db,
         data.path(),
-        db.last_block().unwrap(),
+        db.last_epoch().unwrap(),
     )
     .unwrap();
     assert_eq!(*state.domains()[&host].current().envelope(), signed);
@@ -834,7 +834,7 @@ fn declaration_field_rejections_preserve_signed_state_through_reopen_and_sealing
     let state = clave::history::declarations::Declarations::reconstruct(
         &db,
         data.path(),
-        db.last_block().unwrap(),
+        db.last_epoch().unwrap(),
     )
     .unwrap();
     assert_eq!(*state.domains()[&host].current().envelope(), signed);

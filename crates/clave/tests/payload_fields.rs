@@ -341,7 +341,7 @@ fn invalid_retained_payload_vectors_stop_sealing_without_rejecting_deltas() {
                     case["name"]
                 );
             }
-            assert!(db.last_block().unwrap().is_none(), "{}", case["name"]);
+            assert!(db.last_epoch().unwrap().is_none(), "{}", case["name"]);
             assert_eq!(db.count_pending_entries("publisher_delta").unwrap(), 1);
             assert_eq!(
                 db.url_tip(&host, url).unwrap().as_deref(),
@@ -350,7 +350,7 @@ fn invalid_retained_payload_vectors_stop_sealing_without_rejecting_deltas() {
             assert!(db.is_delta_seen(&id).unwrap());
             assert!(db.list_rejections(&host).unwrap().is_empty());
             assert!(db.list_records().unwrap().is_empty());
-            assert!(db.block_at(0).unwrap().is_none());
+            assert!(db.epoch_at(0).unwrap().is_none());
             assert!(!data.path().join("checkpoint").exists());
             assert_eq!(std::fs::read(&payload).unwrap(), original);
             assert_eq!(
@@ -396,7 +396,7 @@ fn altered_retained_payload_preserves_chains_until_repaired_after_restart() {
         .as_second();
     let error = clave::seal::run(&db, data.path(), &sk, now).err().unwrap();
     assert!(error.to_string().contains("WIST1-E10"), "{error}");
-    assert!(db.last_block().unwrap().is_none());
+    assert!(db.last_epoch().unwrap().is_none());
     assert_eq!(db.count_pending_entries("publisher_delta").unwrap(), 3);
     assert_eq!(
         db.url_tip(&host, "https://localhost/chain").unwrap(),

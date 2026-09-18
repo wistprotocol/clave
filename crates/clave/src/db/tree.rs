@@ -129,16 +129,16 @@ pub(super) fn append(
 
 pub(super) fn put_entries(
     conn: &Connection,
-    block_number: u64,
+    epoch_number: u64,
     first_index: u64,
     entries: &[Vec<u8>],
 ) -> Result<()> {
     for (offset, entry) in entries.iter().enumerate() {
         conn.execute(
-            "INSERT INTO log_entries(leaf_index, block_number, entry_json) VALUES (?1, ?2, ?3)",
+            "INSERT INTO log_entries(leaf_index, epoch_number, entry_json) VALUES (?1, ?2, ?3)",
             (
                 (first_index + offset as u64) as i64,
-                block_number as i64,
+                epoch_number as i64,
                 entry,
             ),
         )?;

@@ -1,9 +1,9 @@
-//! WIST-3 §5 and §6: the distribution stage. A sealed Block's Entries
-//! reach their entry bundles and the tree its tiles before the Block's
+//! WIST-3 §5 and §6: the distribution stage. A sealed Epoch's Entries
+//! reach their entry bundles and the tree its tiles before the Epoch's
 //! Checkpoint is archived, and the head Checkpoint is written last, so
 //! `/checkpoint` never names a tree size whose Entries no path serves.
 //! A run interrupted anywhere is finished by the next one from the
-//! Blocks the store has committed but not marked published.
+//! Epochs the store has committed but not marked published.
 use crate::db::Db;
 use crate::error::{Error, Result};
 use std::io::Write;
@@ -40,8 +40,8 @@ pub fn head_path(data_dir: &Path) -> PathBuf {
     data_dir.join("checkpoint")
 }
 
-pub fn archive_path(data_dir: &Path, block_number: u64) -> PathBuf {
-    served(data_dir, &wist_core::checkpoint::archive_path(block_number))
+pub fn archive_path(data_dir: &Path, epoch_number: u64) -> PathBuf {
+    served(data_dir, &wist_core::checkpoint::archive_path(epoch_number))
 }
 
 fn meets(range: (u64, u64), from: u64, to: u64) -> bool {
@@ -64,7 +64,7 @@ fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<bool> {
 /// its index exists (WIST-3 §6).
 fn publish_tree(db: &Db, data_dir: &Path, from: u64, to: u64) -> Result<bool> {
     let mut wrote = false;
-    for bundle in tiles::required_bundles(to) {
+    for bundle in tiles::required_entry_bundles(to) {
         let path = served(data_dir, &bundle.path());
         let (start, end) = bundle.leaf_range();
         let recompute = bundle.width < TILE_WIDTH || meets((start, end), from, to);
@@ -77,7 +77,7 @@ fn publish_tree(db: &Db, data_dir: &Path, from: u64, to: u64) -> Result<bool> {
         if bundle.width == TILE_WIDTH {
             remove_partials(
                 data_dir,
-                &tiles::Bundle {
+                &tiles::EntryBundle {
                     index: bundle.index,
                     width: 1,
                 }
@@ -129,41 +129,41 @@ fn remove_partials(data_dir: &Path, partial_path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Publishes one committed Block: its Entries and the tree's hashes
+/// Publishes one committed Epoch: its Entries and the tree's hashes
 /// first, then the Checkpoint's archive copy, then the head.
-fn publish_block(db: &Db, data_dir: &Path, block_number: u64, note: &str) -> Result<bool> {
+fn publish_epoch(db: &Db, data_dir: &Path, epoch_number: u64, note: &str) -> Result<bool> {
     let checkpoint = Checkpoint::parse(note).map_err(|e| Error::Seal(e.to_string()))?;
-    if checkpoint.block_number() != block_number {
+    if checkpoint.epoch_number() != epoch_number {
         return Err(Error::Seal(
-            "the stored note is not the Block's Checkpoint".into(),
+            "the stored note is not the Epoch's Checkpoint".into(),
         ));
     }
-    let from = db.size_before(block_number)?;
+    let from = db.size_before(epoch_number)?;
     let mut wrote = publish_tree(db, data_dir, from, checkpoint.tree_size())?;
-    wrote |= write_if_changed(&archive_path(data_dir, block_number), note.as_bytes())?;
+    wrote |= write_if_changed(&archive_path(data_dir, epoch_number), note.as_bytes())?;
     wrote |= write_if_changed(&head_path(data_dir), note.as_bytes())?;
     Ok(wrote)
 }
 
 /// Finishes every publication the store committed to that the disk does
 /// not hold, lowest height first, then restores any file of the head
-/// Block a crash, a torn write or a deletion left wrong. Returns the
+/// Epoch a crash, a torn write or a deletion left wrong. Returns the
 /// heights it wrote for.
 pub fn recover(db: &Db, data_dir: &Path) -> Result<Vec<u64>> {
     let mut republished = Vec::new();
-    for (block_number, note) in db.unpublished_publications()? {
-        publish_block(db, data_dir, block_number, &note)?;
-        db.mark_published(block_number)?;
-        republished.push(block_number);
+    for (epoch_number, note) in db.unpublished_publications()? {
+        publish_epoch(db, data_dir, epoch_number, &note)?;
+        db.mark_published(epoch_number)?;
+        republished.push(epoch_number);
     }
-    let Some((block_number, note)) = db.head_publication()? else {
+    let Some((epoch_number, note)) = db.head_publication()? else {
         return Ok(republished);
     };
-    if republished.contains(&block_number) {
+    if republished.contains(&epoch_number) {
         return Ok(republished);
     }
-    if publish_block(db, data_dir, block_number, &note)? {
-        republished.push(block_number);
+    if publish_epoch(db, data_dir, epoch_number, &note)? {
+        republished.push(epoch_number);
     }
     Ok(republished)
 }
@@ -171,11 +171,11 @@ pub fn recover(db: &Db, data_dir: &Path) -> Result<Vec<u64>> {
 /// Rewrites the files that carry a Checkpoint whose signature lines have
 /// changed: the archive copy and, where it is the head, `/checkpoint`.
 /// The note text is untouched (WIST-3 §6).
-pub fn republish_checkpoint(db: &Db, data_dir: &Path, block_number: u64, note: &str) -> Result<()> {
-    write_durable(&archive_path(data_dir, block_number), note.as_bytes())?;
+pub fn republish_checkpoint(db: &Db, data_dir: &Path, epoch_number: u64, note: &str) -> Result<()> {
+    write_durable(&archive_path(data_dir, epoch_number), note.as_bytes())?;
     if db
         .head_publication()?
-        .is_some_and(|(head, _)| head == block_number)
+        .is_some_and(|(head, _)| head == epoch_number)
     {
         write_durable(&head_path(data_dir), note.as_bytes())?;
     }

@@ -1,4 +1,4 @@
-use super::prepare::PreparedBlock;
+use super::prepare::PreparedEpoch;
 use super::SealReport;
 use crate::db::Mutation;
 use crate::db::{
@@ -9,24 +9,24 @@ use crate::error::{Error, Result};
 use std::path::Path;
 use wist_core::crypto::SigningKey;
 
-/// Commits a prepared Block — the leaves it appends to the tree, its
+/// Commits a prepared Epoch — the leaves it appends to the tree, its
 /// Checkpoint and the acceptance, schedule, withdrawal and Declaration
 /// rows — then runs the distribution stage: the Entries and the tree's
 /// hashes reach their paths, the Checkpoint is archived and published,
 /// the Witnesses are asked to cosign it and the Snapshot is rebuilt.
-pub(super) fn block(
+pub(super) fn epoch(
     db: &Db,
     data_dir: &Path,
     sk: &SigningKey,
     client: &crate::fetch::Client,
     mutation: Mutation<'_>,
-    prepared: PreparedBlock,
+    prepared: PreparedEpoch,
 ) -> Result<SealReport> {
-    let PreparedBlock {
+    let PreparedEpoch {
         log_id,
         entries,
         octets,
-        block_number,
+        epoch_number,
         sealed_at,
         seal_entries,
         sealed_rowids,
@@ -138,7 +138,7 @@ pub(super) fn block(
         sk,
         &log_id,
         &sealed_rowids,
-        block_number,
+        epoch_number,
         &sealed_at,
         &entries,
         octets,
@@ -178,7 +178,7 @@ pub(super) fn block(
             &window.head,
             &window.before,
             &window.owner,
-            window.opened_block,
+            window.opened_epoch,
             &window.window_end,
         )?;
     }
@@ -212,7 +212,7 @@ pub(super) fn block(
         db,
         data_dir,
         sk,
-        block_number,
+        epoch_number,
         sealed.tree_size,
         &sealed.root,
         &snapshot_date,
@@ -220,7 +220,7 @@ pub(super) fn block(
     )?;
 
     Ok(SealReport {
-        block_number,
+        epoch_number,
         entry_count,
         dropped,
         late,

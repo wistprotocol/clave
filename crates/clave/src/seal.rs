@@ -19,35 +19,35 @@ pub(super) const ENTRY_TYPE_ORDER: [&str; 5] = [
 ];
 
 pub struct SealReport {
-    pub block_number: u64,
+    pub epoch_number: u64,
     pub entry_count: u64,
     pub dropped: Vec<String>,
     /// Deltas sealed past WIST-4 §5's inclusion ceiling, counted from
-    /// the Block each one's turn arrived in.
+    /// the Epoch each one's turn arrived in.
     pub late: Vec<String>,
 }
 
-pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<SealReport> {
+pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_unix: i64) -> Result<SealReport> {
     run_with_client(
         db,
         data_dir,
         sk,
         &crate::fetch::Client::new(false),
-        now_epoch,
+        now_unix,
     )
 }
 
-/// Seals the next Block and distributes it, submitting its Checkpoint to
+/// Seals the next Epoch and distributes it, submitting its Checkpoint to
 /// the configured Witnesses through `client`.
 pub fn run_with_client(
     db: &Db,
     data_dir: &Path,
     sk: &SigningKey,
     client: &crate::fetch::Client,
-    now_epoch: i64,
+    now_unix: i64,
 ) -> Result<SealReport> {
     crate::publication::recover(db, data_dir)?;
     let mutation = db.mutation()?;
-    let prepared = prepare::block(db, data_dir, sk, now_epoch)?;
-    publish::block(db, data_dir, sk, client, mutation, prepared)
+    let prepared = prepare::epoch(db, data_dir, sk, now_unix)?;
+    publish::epoch(db, data_dir, sk, client, mutation, prepared)
 }

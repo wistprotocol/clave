@@ -5,7 +5,7 @@ use clave::declaration::{evaluate_with_heads, Decision};
 use clave::history::declarations::Declarations;
 use clave::history::declarations::DeclarationsReplay;
 use serde_json::{json, Value};
-use wist_core::{block, envelope, jcs};
+use wist_core::{envelope, epoch, jcs};
 
 const DOMAIN: &str = "example.com";
 
@@ -48,10 +48,10 @@ fn append(db: &Db, path: &std::path::Path, sk: &wist_core::crypto::SigningKey, d
         sk,
         &anchor.log_id,
         &rowids,
-        checkpoint.block_number(),
+        checkpoint.epoch_number(),
         checkpoint.sealed_at(),
         &entries,
-        block::block_octets(&entries).unwrap(),
+        epoch::epoch_octets(&entries).unwrap(),
         &[],
         &[],
         &[],
@@ -99,14 +99,14 @@ fn signed_pending_declaration_settlement_vectors_survive_reopen_and_repeat() {
         .unwrap();
         let database = data.path().join("clave.sqlite");
         let mut db = Db::open(&database).unwrap();
-        for block in vector["blocks"].as_array().unwrap() {
-            for entry in block["entries"].as_array().unwrap() {
+        for epoch in vector["epochs"].as_array().unwrap() {
+            for entry in epoch["entries"].as_array().unwrap() {
                 store(&db, &entry["body"]);
             }
-            append(&db, data.path(), &key, block);
+            append(&db, data.path(), &key, epoch);
         }
         assert_eq!(
-            db.last_block().unwrap().unwrap().root,
+            db.last_epoch().unwrap().unwrap().root,
             vector["pinned_head"].as_str().unwrap()
         );
         db.open_recovery_window(
@@ -120,9 +120,9 @@ fn signed_pending_declaration_settlement_vectors_survive_reopen_and_repeat() {
         for declaration in case["admitted"].as_array().unwrap() {
             store(&db, &declarations[declaration.as_str().unwrap()]);
         }
-        append(&db, data.path(), &key, &case["last_inside_block"]);
+        append(&db, data.path(), &key, &case["last_inside_epoch"]);
         assert_eq!(
-            db.last_block().unwrap().unwrap().root,
+            db.last_epoch().unwrap().unwrap().root,
             case["last_inside_pin"].as_str().unwrap()
         );
         db = Db::open(&database).unwrap();
@@ -204,7 +204,7 @@ fn signed_pending_declaration_settlement_vectors_survive_reopen_and_repeat() {
         pending
             .sort_by_key(|entry| wist_core::merkle::leaf_hash(&jcs::canonicalize(entry).unwrap()));
         let history =
-            Declarations::reconstruct(&db, data.path(), db.last_block().unwrap()).unwrap();
+            Declarations::reconstruct(&db, data.path(), db.last_epoch().unwrap()).unwrap();
         let entries = pending
             .iter()
             .map(|entry| serde_json::from_value(entry.clone()).unwrap())
@@ -213,7 +213,7 @@ fn signed_pending_declaration_settlement_vectors_survive_reopen_and_repeat() {
             .project(
                 deadline,
                 7,
-                vector["declaration_activation_blocks"]
+                vector["declaration_activation_epochs"]
                     .as_i64()
                     .unwrap_or(24),
                 &entries,

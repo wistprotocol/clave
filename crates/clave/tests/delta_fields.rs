@@ -388,7 +388,7 @@ fn sealing_preserves_version_diagnostics_and_supported_signed_values() {
     assert_eq!(report.dropped.len(), 1);
     assert!(report.dropped[0].contains("WIST1-E15"));
     assert_eq!(
-        db.block_entries(0)
+        db.epoch_entries(0)
             .unwrap()
             .iter()
             .find(|entry| entry["type"] == "publisher_delta")
@@ -475,10 +475,10 @@ fn integral_byte_spellings_materialize_fetched_chains_through_restart_and_sealin
             assert_eq!(record.observed_at, "2026-08-09T12:00:01Z");
             assert_eq!(record.title, url);
             let mut history =
-                clave::history::History::open(&db, data.path(), db.last_block().unwrap()).unwrap();
-            let block = history.next_block().unwrap().unwrap();
+                clave::history::History::open(&db, data.path(), db.last_epoch().unwrap()).unwrap();
+            let epoch = history.next_epoch().unwrap().unwrap();
             for (id, (source, raw, original)) in [&first, &second].into_iter().zip(&originals) {
-                let sealed = block
+                let sealed = epoch
                     .entries()
                     .iter()
                     .find(|entry| {
@@ -501,7 +501,7 @@ fn integral_byte_spellings_materialize_fetched_chains_through_restart_and_sealin
                     .unwrap(),
                 );
             }
-            assert!(history.next_block().unwrap().is_none());
+            assert!(history.next_epoch().unwrap().is_none());
             drop(db);
             rusqlite::Connection::open(&path).unwrap().execute_batch(
                 "DROP TABLE delta_index_reconciliation; DELETE FROM seen_deltas; DELETE FROM url_tips;",

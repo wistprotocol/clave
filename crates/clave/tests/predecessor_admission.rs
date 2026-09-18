@@ -497,22 +497,22 @@ fn predecessor_retrieval_suspends_without_rejection_and_resumes_after_restart() 
     assert_eq!(db.url_tip(&host, URL).unwrap(), Some(last));
 }
 
-/// Reseals the Log from `blocks` — `(sealed_at, Entries)` per height —
+/// Reseals the Log from `epochs` — `(sealed_at, Entries)` per height —
 /// so a fixture can replace what the retained history says and still
 /// hold a tree its Checkpoints state.
-fn replace_blocks(data: &std::path::Path, blocks: &[(String, Vec<Value>)]) {
-    use wist_core::block;
+fn replace_epochs(data: &std::path::Path, epochs: &[(String, Vec<Value>)]) {
+    use wist_core::epoch;
     let key = clave::keys::load(&data.join("keys/seed")).unwrap();
     let anchor = clave::history::anchor(data).unwrap();
     let database = data.join("clave.sqlite");
     rusqlite::Connection::open(&database)
         .unwrap()
-        .execute_batch("DELETE FROM blocks; DELETE FROM log_entries; DELETE FROM log_tiles;")
+        .execute_batch("DELETE FROM epochs; DELETE FROM log_entries; DELETE FROM log_tiles;")
         .unwrap();
     let db = Db::connect(&database).unwrap();
-    for (height, (sealed_at, entries)) in blocks.iter().enumerate() {
+    for (height, (sealed_at, entries)) in epochs.iter().enumerate() {
         let mut ordered = entries.clone();
-        block::sort_entries(&mut ordered).unwrap();
+        epoch::sort_entries(&mut ordered).unwrap();
         db.commit_seal(
             &key,
             &anchor.log_id,
@@ -520,7 +520,7 @@ fn replace_blocks(data: &std::path::Path, blocks: &[(String, Vec<Value>)]) {
             height as u64,
             sealed_at,
             &ordered,
-            block::block_octets(&ordered).unwrap(),
+            epoch::epoch_octets(&ordered).unwrap(),
             &[],
             &[],
             &[],
@@ -567,8 +567,8 @@ fn sealed_predecessors_require_authored_connected_history_before_admission() {
         let originals: Vec<(String, Vec<Value>)> = (0..2)
             .map(|height| {
                 (
-                    db.block_at(height).unwrap().unwrap().sealed_at,
-                    db.block_entries(height).unwrap(),
+                    db.epoch_at(height).unwrap().unwrap().sealed_at,
+                    db.epoch_entries(height).unwrap(),
                 )
             })
             .collect();
@@ -614,10 +614,10 @@ fn sealed_predecessors_require_authored_connected_history_before_admission() {
             }
             altered[1].1 = vec![json!({"type":"publisher_delta", "body":doc})];
         }
-        replace_blocks(data.path(), &altered);
+        replace_epochs(data.path(), &altered);
         let mut history =
-            clave::history::History::open(&db, data.path(), db.last_block().unwrap()).unwrap();
-        while history.next_block().unwrap().is_some() {}
+            clave::history::History::open(&db, data.path(), db.last_epoch().unwrap()).unwrap();
+        while history.next_epoch().unwrap().is_some() {}
         drop(db);
         let next = add(&p, Some(&tip), "2026-08-09T12:00:03Z");
         write_feed(
@@ -646,7 +646,7 @@ fn sealed_predecessors_require_authored_connected_history_before_admission() {
             assert_eq!(db.count_pending_entries("publisher_delta").unwrap(), 0);
             assert!(db.list_rejections(&host).unwrap().is_empty());
         }
-        replace_blocks(data.path(), &originals);
+        replace_epochs(data.path(), &originals);
         let db = Db::open(&path).unwrap();
         let report =
             clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T16:00:00Z").unwrap();
@@ -709,7 +709,7 @@ fn sealed_predecessor_keeps_its_historical_authority_after_rotation_and_restart(
     let source = clave::history::deltas::DeltaSource::reconstruct(
         &db,
         data.path(),
-        db.last_block().unwrap(),
+        db.last_epoch().unwrap(),
         &first,
     )
     .unwrap();

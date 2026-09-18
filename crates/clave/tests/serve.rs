@@ -113,11 +113,11 @@ fn the_log_serves_checkpoints_as_text_and_full_tiles_as_immutable_octets() {
     let tmp = tempfile::tempdir().unwrap();
     clave::init::run(&host, tmp.path()).unwrap();
     let db = clave::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
-    db.set_param("block_cadence_seconds", 1).unwrap();
+    db.set_param("epoch_cadence_seconds", 1).unwrap();
     clave::ingest::run(&db, &client, tmp.path(), &host, "2026-08-09T12:00:00Z").unwrap();
     let sk = clave::keys::load(&tmp.path().join("keys/seed")).unwrap();
     clave::seal::run(&db, tmp.path(), &sk, 1_786_276_800).unwrap();
-    let size = db.last_block().unwrap().unwrap().tree_size;
+    let size = db.last_epoch().unwrap().unwrap().tree_size;
     drop(db);
 
     let addr = spawn_server(tmp.path());

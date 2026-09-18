@@ -88,11 +88,11 @@ pub struct PublisherStatusRow {
     pub state: PublisherState,
 }
 
-/// A sealed Block as its Checkpoint states it: the Block's number, the
-/// tree size and root at that Block, and its `sealed_at` (WIST-3 §3.1).
+/// A sealed Epoch as its Checkpoint states it: the Epoch's number, the
+/// tree size and root at that Epoch, and its `sealed_at` (WIST-3 §3.1).
 #[derive(Debug, Clone)]
-pub struct BlockRow {
-    pub block_number: u64,
+pub struct EpochRow {
+    pub epoch_number: u64,
     pub tree_size: u64,
     pub root: String,
     pub sealed_at: String,
@@ -106,7 +106,7 @@ pub struct RecordRow {
     pub title: String,
     pub abstract_text: Option<String>,
     pub lang: String,
-    /// `sealed_at` of the Block that sealed the Delta this record holds.
+    /// `sealed_at` of the Epoch that sealed the Delta this record holds.
     pub sealed_at: String,
 }
 
@@ -120,10 +120,10 @@ pub struct PendingEntryRow {
     pub entry_type: String,
     pub domain: String,
     pub entry_json: Value,
-    /// WIST-4 §5: the Block at which this Delta's turn arrived — the
+    /// WIST-4 §5: the Epoch at which this Delta's turn arrived — the
     /// first with room for it under WIST-3 §3.2's per-domain capacity.
     /// The inclusion ceiling runs from here.
-    pub turn_block: Option<u64>,
+    pub turn_epoch: Option<u64>,
 }
 
 pub struct ParamChangeRow<'a> {
@@ -143,14 +143,14 @@ pub struct WithdrawalRow<'a> {
 /// withdrawal, the WIST-3 §7 `withdrawal` tuple.
 pub type WithdrawalState = (String, String, u64);
 
-/// A `label` Entry this Block seals, at its canonical Entry index.
+/// A `label` Entry this Epoch seals, at its canonical Entry index.
 pub struct SealedLabelRow<'a> {
     pub label_id: &'a str,
     pub entry_index: u64,
     pub label: &'a wist_core::objects::Label,
 }
 
-/// A `dispute` Entry this Block seals, at its canonical Entry index.
+/// A `dispute` Entry this Epoch seals, at its canonical Entry index.
 pub struct SealedDisputeRow<'a> {
     pub dispute_id: &'a str,
     pub entry_index: u64,
@@ -165,7 +165,7 @@ pub struct SealedDeclarationRow<'a> {
 
 pub struct SealedDeclarationEntry {
     pub seq: u64,
-    pub block_number: u64,
+    pub epoch_number: u64,
     pub sealed_at: String,
     pub declaration_json: Vec<u8>,
 }
@@ -174,7 +174,7 @@ pub struct RecoveryWindowRow {
     pub declaration_json: Vec<u8>,
     pub owner_declaration_json: Vec<u8>,
     pub prior_declaration_json: Vec<u8>,
-    pub opened_block: Option<i64>,
+    pub opened_epoch: Option<i64>,
     pub window_end: Option<String>,
 }
 
@@ -298,7 +298,7 @@ pub struct Db {
 
 impl Db {
     pub(crate) fn observe_feed_generated_at(&self, domain: &str, at: &str) -> Result<bool> {
-        let at = crate::registry::epoch(at)?;
+        let at = crate::registry::unix(at)?;
         Ok(self
             .conn
             .query_row(
@@ -507,13 +507,13 @@ impl Db {
         head: &[u8],
         before: &[u8],
         owner: &[u8],
-        opened_block: u64,
+        opened_epoch: u64,
         window_end: &str,
     ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO recovery_windows(domain, declaration_json, prior_declaration_json, owner_declaration_json, opened_block, window_end) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(domain) DO UPDATE SET declaration_json = excluded.declaration_json, prior_declaration_json = excluded.prior_declaration_json, owner_declaration_json = excluded.owner_declaration_json, opened_block = excluded.opened_block, window_end = excluded.window_end",
-            (domain, head, before, owner, opened_block, window_end),
+            "INSERT INTO recovery_windows(domain, declaration_json, prior_declaration_json, owner_declaration_json, opened_epoch, window_end) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(domain) DO UPDATE SET declaration_json = excluded.declaration_json, prior_declaration_json = excluded.prior_declaration_json, owner_declaration_json = excluded.owner_declaration_json, opened_epoch = excluded.opened_epoch, window_end = excluded.window_end",
+            (domain, head, before, owner, opened_epoch, window_end),
         )?;
         Ok(())
     }
@@ -545,13 +545,13 @@ impl Db {
     /// than only at the present.
     pub fn sealed_declarations(&self, domain: &str) -> Result<Vec<SealedDeclarationEntry>> {
         let mut stmt = self.conn.prepare(
-            "SELECT seq, block_number, sealed_at, declaration_json FROM sealed_declarations WHERE domain = ?1 ORDER BY seq ASC",
+            "SELECT seq, epoch_number, sealed_at, declaration_json FROM sealed_declarations WHERE domain = ?1 ORDER BY seq ASC",
         )?;
         let rows = stmt
             .query_map([domain], |row| {
                 Ok(SealedDeclarationEntry {
                     seq: row.get::<_, i64>(0)? as u64,
-                    block_number: row.get::<_, i64>(1)? as u64,
+                    epoch_number: row.get::<_, i64>(1)? as u64,
                     sealed_at: row.get(2)?,
                     declaration_json: row.get(3)?,
                 })
@@ -560,10 +560,10 @@ impl Db {
         Ok(rows)
     }
 
-    pub fn set_turn_block(&self, rowid: i64, block_number: u64) -> Result<()> {
+    pub fn set_turn_epoch(&self, rowid: i64, epoch_number: u64) -> Result<()> {
         self.conn.execute(
-            "UPDATE pending_entries SET turn_block = ?2 WHERE rowid = ?1 AND turn_block IS NULL",
-            (rowid, block_number as i64),
+            "UPDATE pending_entries SET turn_epoch = ?2 WHERE rowid = ?1 AND turn_epoch IS NULL",
+            (rowid, epoch_number as i64),
         )?;
         Ok(())
     }
@@ -595,13 +595,13 @@ impl Db {
     pub fn get_recovery_window(&self, domain: &str) -> Result<Option<RecoveryWindowRow>> {
         self.conn
             .query_row(
-                "SELECT declaration_json, prior_declaration_json, opened_block, window_end, owner_declaration_json FROM recovery_windows WHERE domain = ?1",
+                "SELECT declaration_json, prior_declaration_json, opened_epoch, window_end, owner_declaration_json FROM recovery_windows WHERE domain = ?1",
                 [domain],
                 |row| {
                     Ok(RecoveryWindowRow {
                         declaration_json: row.get(0)?,
                         prior_declaration_json: row.get(1)?,
-                        opened_block: row.get(2)?,
+                        opened_epoch: row.get(2)?,
                         window_end: row.get(3)?,
                         owner_declaration_json: row.get(4)?,
                     })
@@ -624,7 +624,7 @@ impl Db {
 
     pub fn list_pending_recovery_windows(&self) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare(
-            "SELECT domain FROM recovery_windows WHERE opened_block IS NULL ORDER BY domain",
+            "SELECT domain FROM recovery_windows WHERE opened_epoch IS NULL ORDER BY domain",
         )?;
         let rows = stmt.query_map([], |row| row.get(0))?;
         rows.collect::<rusqlite::Result<Vec<String>>>()
@@ -634,12 +634,12 @@ impl Db {
     pub fn activate_recovery_window(
         &self,
         domain: &str,
-        opened_block: i64,
+        opened_epoch: i64,
         window_end: &str,
     ) -> Result<()> {
         self.conn.execute(
-            "UPDATE recovery_windows SET opened_block = ?2, window_end = ?3 WHERE domain = ?1 AND opened_block IS NULL",
-            (domain, opened_block, window_end),
+            "UPDATE recovery_windows SET opened_epoch = ?2, window_end = ?3 WHERE domain = ?1 AND opened_epoch IS NULL",
+            (domain, opened_epoch, window_end),
         )?;
         Ok(())
     }
@@ -655,7 +655,7 @@ impl Db {
 
     pub fn list_open_recovery_windows(&self) -> Result<Vec<(String, i64, String)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT domain, opened_block, window_end FROM recovery_windows WHERE opened_block IS NOT NULL ORDER BY domain",
+            "SELECT domain, opened_epoch, window_end FROM recovery_windows WHERE opened_epoch IS NOT NULL ORDER BY domain",
         )?;
         let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -966,25 +966,25 @@ impl Db {
         Ok(entries)
     }
 
-    pub fn last_block(&self) -> Result<Option<BlockRow>> {
-        self.block(
-            "SELECT block_number, tree_size, root, sealed_at FROM blocks ORDER BY block_number DESC LIMIT 1",
+    pub fn last_epoch(&self) -> Result<Option<EpochRow>> {
+        self.epoch(
+            "SELECT epoch_number, tree_size, root, sealed_at FROM epochs ORDER BY epoch_number DESC LIMIT 1",
             [],
         )
     }
 
-    pub fn block_at(&self, block_number: u64) -> Result<Option<BlockRow>> {
-        self.block(
-            "SELECT block_number, tree_size, root, sealed_at FROM blocks WHERE block_number = ?1",
-            [block_number as i64],
+    pub fn epoch_at(&self, epoch_number: u64) -> Result<Option<EpochRow>> {
+        self.epoch(
+            "SELECT epoch_number, tree_size, root, sealed_at FROM epochs WHERE epoch_number = ?1",
+            [epoch_number as i64],
         )
     }
 
-    fn block<P: rusqlite::Params>(&self, sql: &str, params: P) -> Result<Option<BlockRow>> {
+    fn epoch<P: rusqlite::Params>(&self, sql: &str, params: P) -> Result<Option<EpochRow>> {
         self.conn
             .query_row(sql, params, |row| {
-                Ok(BlockRow {
-                    block_number: row.get::<_, i64>(0)? as u64,
+                Ok(EpochRow {
+                    epoch_number: row.get::<_, i64>(0)? as u64,
                     tree_size: row.get::<_, i64>(1)? as u64,
                     root: row.get(2)?,
                     sealed_at: row.get(3)?,
@@ -994,12 +994,12 @@ impl Db {
             .map_err(Error::Db)
     }
 
-    /// The tree size Checkpoint `block_number - 1` states, `size(-1)`
+    /// The tree size Checkpoint `epoch_number - 1` states, `size(-1)`
     /// being 0 (WIST-3 §3).
-    pub fn size_before(&self, block_number: u64) -> Result<u64> {
+    pub fn size_before(&self, epoch_number: u64) -> Result<u64> {
         Ok(self.conn.query_row(
-            "SELECT COALESCE(MAX(tree_size), 0) FROM blocks WHERE block_number < ?1",
-            [block_number as i64],
+            "SELECT COALESCE(MAX(tree_size), 0) FROM epochs WHERE epoch_number < ?1",
+            [epoch_number as i64],
             |row| row.get::<_, i64>(0),
         )? as u64)
     }
@@ -1041,12 +1041,12 @@ impl Db {
             .map_err(|e| Error::History(e.to_string()))
     }
 
-    /// The Entries of Block `block_number` in canonical order.
-    pub fn block_entries(&self, block_number: u64) -> Result<Vec<Value>> {
-        let Some(block) = self.block_at(block_number)? else {
+    /// The Entries of Epoch `epoch_number` in canonical order.
+    pub fn epoch_entries(&self, epoch_number: u64) -> Result<Vec<Value>> {
+        let Some(epoch) = self.epoch_at(epoch_number)? else {
             return Ok(Vec::new());
         };
-        self.entry_range(self.size_before(block_number)?, block.tree_size)?
+        self.entry_range(self.size_before(epoch_number)?, epoch.tree_size)?
             .iter()
             .map(|bytes| crate::json::parse(bytes).map_err(Error::from))
             .collect()
@@ -1054,7 +1054,7 @@ impl Db {
 
     pub fn peek_pending_entries(&self) -> Result<(Vec<PendingEntryRow>, i64)> {
         let mut stmt = self.conn.prepare(
-            "SELECT rowid, entry_type, domain, entry_json, turn_block FROM pending_entries ORDER BY acceptance_order ASC",
+            "SELECT rowid, entry_type, domain, entry_json, turn_epoch FROM pending_entries ORDER BY acceptance_order ASC",
         )?;
         type PendingRow = (i64, String, String, Vec<u8>, Option<i64>);
         let rows: Vec<PendingRow> = stmt
@@ -1071,32 +1071,32 @@ impl Db {
         let max_rowid = rows.iter().map(|(rowid, ..)| *rowid).max().unwrap_or(0);
         let entries = rows
             .into_iter()
-            .map(|(rowid, entry_type, domain, blob, turn_block)| {
+            .map(|(rowid, entry_type, domain, blob, turn_epoch)| {
                 Ok(PendingEntryRow {
                     rowid,
                     entry_type,
                     domain,
                     entry_json: crate::json::parse(&blob)?,
-                    turn_block: turn_block.map(|b| b as u64),
+                    turn_epoch: turn_epoch.map(|b| b as u64),
                 })
             })
             .collect::<Result<_>>()?;
         Ok((entries, max_rowid))
     }
 
-    pub fn mark_published(&self, block_number: u64) -> Result<()> {
+    pub fn mark_published(&self, epoch_number: u64) -> Result<()> {
         self.conn.execute(
-            "UPDATE blocks SET published = 1 WHERE block_number = ?1",
-            [block_number as i64],
+            "UPDATE epochs SET published = 1 WHERE epoch_number = ?1",
+            [epoch_number as i64],
         )?;
         Ok(())
     }
 
-    /// Every sealed Block whose files are not yet confirmed on disk,
+    /// Every sealed Epoch whose files are not yet confirmed on disk,
     /// lowest height first.
     pub fn unpublished_publications(&self) -> Result<Vec<Publication>> {
         let mut statement = self.conn.prepare(
-            "SELECT block_number, note FROM blocks WHERE published = 0 ORDER BY block_number",
+            "SELECT epoch_number, note FROM epochs WHERE published = 0 ORDER BY epoch_number",
         )?;
         let rows = statement
             .query_map([], |row| Ok((row.get::<_, i64>(0)? as u64, row.get(1)?)))?
@@ -1104,25 +1104,25 @@ impl Db {
         Ok(rows)
     }
 
-    /// The note of the highest sealed Block's Checkpoint, with every
+    /// The note of the highest sealed Epoch's Checkpoint, with every
     /// signature line it has obtained.
     pub fn head_publication(&self) -> Result<Option<Publication>> {
         Ok(self
             .conn
             .query_row(
-                "SELECT block_number, note FROM blocks ORDER BY block_number DESC LIMIT 1",
+                "SELECT epoch_number, note FROM epochs ORDER BY epoch_number DESC LIMIT 1",
                 [],
                 |row| Ok((row.get::<_, i64>(0)? as u64, row.get(1)?)),
             )
             .optional()?)
     }
 
-    pub fn checkpoint_note(&self, block_number: u64) -> Result<Option<String>> {
+    pub fn checkpoint_note(&self, epoch_number: u64) -> Result<Option<String>> {
         Ok(self
             .conn
             .query_row(
-                "SELECT note FROM blocks WHERE block_number = ?1",
-                [block_number as i64],
+                "SELECT note FROM epochs WHERE epoch_number = ?1",
+                [epoch_number as i64],
                 |row| row.get(0),
             )
             .optional()?)
@@ -1130,10 +1130,10 @@ impl Db {
 
     /// Replaces a Checkpoint's stored note with one carrying a further
     /// signature line; the note text itself never changes (WIST-3 §6).
-    pub fn replace_checkpoint_note(&self, block_number: u64, note: &str) -> Result<()> {
+    pub fn replace_checkpoint_note(&self, epoch_number: u64, note: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE blocks SET note = ?2 WHERE block_number = ?1",
-            (block_number as i64, note),
+            "UPDATE epochs SET note = ?2 WHERE epoch_number = ?1",
+            (epoch_number as i64, note),
         )?;
         Ok(())
     }
@@ -1195,30 +1195,30 @@ impl Db {
         note_key_id: &str,
         key_id: &str,
         public_key: &str,
-        added_block: u64,
+        added_epoch: u64,
     ) -> Result<()> {
         self.conn.execute(
-            "INSERT OR IGNORE INTO aggregator_keys(note_key_id, key_id, public_key, added_block) VALUES (?1, ?2, ?3, ?4)",
-            (note_key_id, key_id, public_key, added_block as i64),
+            "INSERT OR IGNORE INTO aggregator_keys(note_key_id, key_id, public_key, added_epoch) VALUES (?1, ?2, ?3, ?4)",
+            (note_key_id, key_id, public_key, added_epoch as i64),
         )?;
         Ok(())
     }
 
-    /// Seals Block `block_number`: appends its Entries' leaves to the
+    /// Seals Epoch `epoch_number`: appends its Entries' leaves to the
     /// tree, signs the Checkpoint that states the root they reach and
     /// writes it with the acceptance, schedule, withdrawal, Label and
-    /// Declaration rows the Block carries, all in one transaction
-    /// (WIST-3 §3.2, §5). Returns the Block the Checkpoint states.
+    /// Declaration rows the Epoch carries, all in one transaction
+    /// (WIST-3 §3.2, §5). Returns the Epoch the Checkpoint states.
     #[allow(clippy::too_many_arguments)]
     pub fn commit_seal(
         &self,
         sk: &wist_core::crypto::SigningKey,
         log_id: &str,
         sealed_rowids: &[i64],
-        block_number: u64,
+        epoch_number: u64,
         sealed_at: &str,
         entries: &[Value],
-        decompressed_bytes: u64,
+        epoch_bytes: u64,
         records: &[RecordUpsert],
         param_changes: &[ParamChangeRow],
         withdrawals: &[WithdrawalRow],
@@ -1226,12 +1226,12 @@ impl Db {
         labels: &[SealedLabelRow],
         disputes: &[SealedDisputeRow],
         declarations: &[SealedDeclarationRow],
-    ) -> Result<BlockRow> {
+    ) -> Result<EpochRow> {
         let tx = self.mutation()?;
         for rowid in sealed_rowids {
             tx.execute("DELETE FROM pending_entries WHERE rowid = ?1", [rowid])?;
         }
-        let previous_size = self.size_before(block_number)?;
+        let previous_size = self.size_before(epoch_number)?;
         let mut leaf_data = Vec::with_capacity(entries.len());
         let mut leaves = Vec::with_capacity(entries.len());
         for entry in entries {
@@ -1247,27 +1247,27 @@ impl Db {
             log_id,
             tree_size,
             root,
-            block_number,
+            epoch_number,
             sealed_at,
         )
         .map_err(|e| Error::Seal(e.to_string()))?;
         checkpoint.sign(sk);
-        let block = BlockRow {
-            block_number,
+        let epoch = EpochRow {
+            epoch_number,
             tree_size,
             root: checkpoint.root_token(),
             sealed_at: sealed_at.to_owned(),
         };
-        tree::put_entries(&tx, block_number, previous_size, &leaf_data)?;
+        tree::put_entries(&tx, epoch_number, previous_size, &leaf_data)?;
         tx.execute(
-            "INSERT INTO blocks(block_number, tree_size, root, sealed_at, note, published, decompressed_bytes) VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)",
+            "INSERT INTO epochs(epoch_number, tree_size, root, sealed_at, note, published, epoch_bytes) VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)",
             (
-                block_number as i64,
+                epoch_number as i64,
                 tree_size as i64,
-                &block.root,
+                &epoch.root,
                 sealed_at,
                 checkpoint.encode(),
-                decompressed_bytes as i64,
+                epoch_bytes as i64,
             ),
         )?;
         for r in records {
@@ -1276,12 +1276,12 @@ impl Db {
         for d in declarations {
             exec_retain_declaration_seq(&tx, d.domain, d.seq)?;
             tx.execute(
-                "INSERT INTO sealed_declarations(domain, seq, block_number, sealed_at, declaration_json) VALUES (?1, ?2, ?3, ?4, ?5)
+                "INSERT INTO sealed_declarations(domain, seq, epoch_number, sealed_at, declaration_json) VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(domain, seq) DO NOTHING",
                 (
                     d.domain,
                     d.seq as i64,
-                    block_number as i64,
+                    epoch_number as i64,
                     sealed_at,
                     d.declaration_json,
                 ),
@@ -1289,26 +1289,26 @@ impl Db {
         }
         for c in param_changes {
             tx.execute(
-                "INSERT INTO param_changes(parameter, value, effective_at, block_number, entry_index) VALUES (?1, ?2, ?3, ?4, ?5)",
-                (c.parameter, c.value, c.effective_at, block_number as i64, c.entry_index),
+                "INSERT INTO param_changes(parameter, value, effective_at, epoch_number, entry_index) VALUES (?1, ?2, ?3, ?4, ?5)",
+                (c.parameter, c.value, c.effective_at, epoch_number as i64, c.entry_index),
             )?;
         }
         for w in withdrawals {
             tx.execute(
-                "INSERT OR IGNORE INTO withdrawals(delta_id, domain, update_id, block_number, sealed_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-                (w.delta_id, w.domain, w.update_id, block_number as i64, sealed_at),
+                "INSERT OR IGNORE INTO withdrawals(delta_id, domain, update_id, epoch_number, sealed_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                (w.delta_id, w.domain, w.update_id, epoch_number as i64, sealed_at),
             )?;
         }
         for identifier in suffix_lists {
             tx.execute(
-                "INSERT INTO suffix_list_acts(block_number, sha256) VALUES (?1, ?2)",
-                (block_number as i64, identifier),
+                "INSERT INTO suffix_list_acts(epoch_number, sha256) VALUES (?1, ?2)",
+                (epoch_number as i64, identifier),
             )?;
         }
         for row in labels {
             let label = row.label;
             tx.execute(
-                "INSERT OR IGNORE INTO labels(label_id, labeler, subject, name, value, asserted_at, retracted, expires_at, delta, block_number, entry_index) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                "INSERT OR IGNORE INTO labels(label_id, labeler, subject, name, value, asserted_at, retracted, expires_at, delta, epoch_number, entry_index) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 rusqlite::params![
                     row.label_id,
                     label.labeler,
@@ -1319,7 +1319,7 @@ impl Db {
                     label.retracted == Some(true),
                     label.expires_at,
                     label.delta,
-                    block_number as i64,
+                    epoch_number as i64,
                     row.entry_index as i64,
                 ],
             )?;
@@ -1331,14 +1331,14 @@ impl Db {
         for row in disputes {
             let dispute = row.dispute;
             tx.execute(
-                "INSERT OR IGNORE INTO disputes(dispute_id, label_id, disputant, reason, asserted_at, block_number, entry_index) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT OR IGNORE INTO disputes(dispute_id, label_id, disputant, reason, asserted_at, epoch_number, entry_index) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 rusqlite::params![
                     row.dispute_id,
                     dispute.label,
                     dispute.disputant,
                     dispute.reason,
                     dispute.asserted_at,
-                    block_number as i64,
+                    epoch_number as i64,
                     row.entry_index as i64,
                 ],
             )?;
@@ -1348,7 +1348,7 @@ impl Db {
             )?;
         }
         tx.commit()?;
-        Ok(block)
+        Ok(epoch)
     }
 
     /// WIST-2 §3.3: a Label ID or Dispute ID the Log sealed or holds
@@ -1388,7 +1388,7 @@ impl Db {
     /// The Label Feed's retained authenticated observation (WIST-2 §3.3,
     /// under §3.2's rules): accepted when `at` does not regress it.
     pub(crate) fn observe_label_feed_generated_at(&self, domain: &str, at: &str) -> Result<bool> {
-        let at = crate::registry::epoch(at)?;
+        let at = crate::registry::unix(at)?;
         Ok(self
             .conn
             .query_row(
@@ -1406,7 +1406,7 @@ impl Db {
     /// Every sealed `label` Entry in Log order.
     pub fn sealed_labels(&self) -> Result<Vec<wist_core::label::SealedLabel>> {
         let mut stmt = self.conn.prepare(
-            "SELECT label_id, labeler, subject, name, value, asserted_at, retracted, expires_at, delta, block_number, entry_index FROM labels ORDER BY block_number, entry_index",
+            "SELECT label_id, labeler, subject, name, value, asserted_at, retracted, expires_at, delta, epoch_number, entry_index FROM labels ORDER BY epoch_number, entry_index",
         )?;
         let rows = stmt
             .query_map([], |row| {
@@ -1434,7 +1434,7 @@ impl Db {
     /// Every sealed `dispute` Entry in Log order.
     pub fn sealed_disputes(&self) -> Result<Vec<wist_core::label::SealedDispute>> {
         let mut stmt = self.conn.prepare(
-            "SELECT dispute_id, label_id, disputant, reason, asserted_at, block_number, entry_index FROM disputes ORDER BY block_number, entry_index",
+            "SELECT dispute_id, label_id, disputant, reason, asserted_at, epoch_number, entry_index FROM disputes ORDER BY epoch_number, entry_index",
         )?;
         let rows = stmt
             .query_map([], |row| {
@@ -1493,7 +1493,7 @@ impl Db {
     pub fn suffix_list_acts(&self) -> Result<Vec<(u64, String)>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT block_number, sha256 FROM suffix_list_acts ORDER BY rowid")?;
+            .prepare("SELECT epoch_number, sha256 FROM suffix_list_acts ORDER BY rowid")?;
         let rows = stmt
             .query_map([], |row| {
                 Ok((row.get::<_, i64>(0)?.max(0) as u64, row.get(1)?))
@@ -1519,38 +1519,38 @@ impl Db {
     /// act that put it there: the most recent act sealed at or before `at`.
     pub fn suffix_list_in_force_at(&self, at: &str) -> Result<Option<(String, u64)>> {
         self.suffix_list_row(
-            "SELECT a.sha256, a.block_number FROM suffix_list_acts a JOIN blocks b ON b.block_number = a.block_number WHERE b.sealed_at <= ?1 ORDER BY a.rowid DESC LIMIT 1",
+            "SELECT a.sha256, a.epoch_number FROM suffix_list_acts a JOIN epochs b ON b.epoch_number = a.epoch_number WHERE b.sealed_at <= ?1 ORDER BY a.rowid DESC LIMIT 1",
             at,
         )
     }
 
-    /// The snapshot in force at Block `block_number`: the most recent act
+    /// The snapshot in force at Epoch `epoch_number`: the most recent act
     /// sealed below it.
-    pub fn suffix_list_in_force_at_block(
+    pub fn suffix_list_in_force_at_epoch(
         &self,
-        block_number: u64,
+        epoch_number: u64,
     ) -> Result<Option<(String, u64)>> {
         self.suffix_list_row(
-            "SELECT sha256, block_number FROM suffix_list_acts WHERE block_number < ?1 ORDER BY rowid DESC LIMIT 1",
-            block_number as i64,
+            "SELECT sha256, epoch_number FROM suffix_list_acts WHERE epoch_number < ?1 ORDER BY rowid DESC LIMIT 1",
+            epoch_number as i64,
         )
     }
 
-    /// WIST-3 §7: the `suffix_list` tuple at a Snapshot's Block, the most
+    /// WIST-3 §7: the `suffix_list` tuple at a Snapshot's Epoch, the most
     /// recent act sealed at or below it.
-    pub fn suffix_list_at_block(&self, block_number: u64) -> Result<Option<(String, u64)>> {
+    pub fn suffix_list_at_epoch(&self, epoch_number: u64) -> Result<Option<(String, u64)>> {
         self.suffix_list_row(
-            "SELECT sha256, block_number FROM suffix_list_acts WHERE block_number <= ?1 ORDER BY rowid DESC LIMIT 1",
-            block_number as i64,
+            "SELECT sha256, epoch_number FROM suffix_list_acts WHERE epoch_number <= ?1 ORDER BY rowid DESC LIMIT 1",
+            epoch_number as i64,
         )
     }
 
     /// WIST-3 §7 `withdrawal` tuples: every withdrawn Delta with its
-    /// Publisher and the earliest Block that sealed a withdrawal of it.
+    /// Publisher and the earliest Epoch that sealed a withdrawal of it.
     pub fn withdrawal_state(&self) -> Result<Vec<WithdrawalState>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT delta_id, domain, block_number FROM withdrawals ORDER BY delta_id")?;
+            .prepare("SELECT delta_id, domain, epoch_number FROM withdrawals ORDER BY delta_id")?;
         let rows = stmt
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1566,7 +1566,7 @@ impl Db {
     }
 
     /// Whether `delta_id` is an accepted Delta of `domain` that a sealed
-    /// Block already carries: accepted, and neither pending nor queued.
+    /// Epoch already carries: accepted, and neither pending nor queued.
     pub fn is_delta_sealed_for(&self, delta_id: &str, domain: &str) -> Result<bool> {
         if !self.is_delta_seen_for(delta_id, domain)? {
             return Ok(false);
@@ -1668,9 +1668,9 @@ impl Db {
         Ok(())
     }
 
-    pub fn largest_block_bytes(&self) -> Result<u64> {
+    pub fn largest_epoch_bytes(&self) -> Result<u64> {
         Ok(self.conn.query_row(
-            "SELECT COALESCE(MAX(decompressed_bytes), 0) FROM blocks",
+            "SELECT COALESCE(MAX(epoch_bytes), 0) FROM epochs",
             [],
             |row| row.get(0),
         )?)
@@ -1678,12 +1678,12 @@ impl Db {
 
     pub fn parameter_schedule(
         &self,
-        first_block_s: i64,
+        first_epoch_s: i64,
     ) -> Result<wist_core::parameters::Schedule> {
         let mut stmt = self.conn.prepare(
-            "SELECT block_number, sealed_at, decompressed_bytes FROM blocks ORDER BY block_number",
+            "SELECT epoch_number, sealed_at, epoch_bytes FROM epochs ORDER BY epoch_number",
         )?;
-        let blocks = stmt
+        let epochs = stmt
             .query_map([], |row| {
                 Ok((
                     row.get::<_, u64>(0)?,
@@ -1692,14 +1692,14 @@ impl Db {
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        let first = blocks
+        let first = epochs
             .first()
-            .map(|b| crate::registry::epoch(&b.1))
+            .map(|b| crate::registry::unix(&b.1))
             .transpose()?
-            .unwrap_or(first_block_s);
+            .unwrap_or(first_epoch_s);
         let mut schedule = wist_core::parameters::Schedule::new(first);
         let mut stmt = self.conn.prepare(
-            "SELECT parameter, value, block_number, entry_index, effective_at FROM param_changes ORDER BY block_number, entry_index",
+            "SELECT parameter, value, epoch_number, entry_index, effective_at FROM param_changes ORDER BY epoch_number, entry_index",
         )?;
         let changes = stmt
             .query_map([], |row| {
@@ -1714,49 +1714,49 @@ impl Db {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let mut changes = changes.into_iter().peekable();
         let mut largest = 0;
-        for (height, sealed_at, bytes) in blocks {
+        for (height, sealed_at, bytes) in epochs {
             largest = largest.max(bytes);
-            let at = crate::registry::epoch(&sealed_at)?;
+            let at = crate::registry::unix(&sealed_at)?;
             while changes.peek().is_some_and(|c| c.2 == height) {
-                let (parameter, value, block_number, entry_index, effective_at) =
+                let (parameter, value, epoch_number, entry_index, effective_at) =
                     changes.next().unwrap();
                 let amendment = wist_core::parameters::Amendment {
                     parameter,
                     value,
-                    block_number,
+                    epoch_number,
                     entry_index,
                     sealed_at_s: at,
-                    effective_at_s: crate::registry::epoch(&effective_at)?,
+                    effective_at_s: crate::registry::unix(&effective_at)?,
                 };
                 let _ = crate::registry::accept(&mut schedule, amendment, largest);
             }
-            if largest > schedule.block_size_bounds(at).0 {
+            if largest > schedule.epoch_size_bounds(at).0 {
                 return Err(Error::Seal(format!(
-                    "WIST3-E03 Block {height} exceeds the accepted size schedule"
+                    "WIST3-E03 Epoch {height} exceeds the accepted size schedule"
                 )));
             }
         }
         if changes.next().is_some() {
             return Err(Error::Seal(
-                "parameter history names a missing Block".into(),
+                "parameter history names a missing Epoch".into(),
             ));
         }
         Ok(schedule)
     }
 
     pub fn latest_param_change(&self, name: &str, at: &str) -> Result<Option<i64>> {
-        let at = crate::registry::epoch(at)?;
+        let at = crate::registry::unix(at)?;
         let schedule = self.parameter_schedule(at)?;
         Ok(schedule
             .accepted()
             .iter()
             .filter(|a| a.parameter == name && a.effective_at_s <= at)
-            .max_by_key(|a| (a.effective_at_s, a.block_number, a.entry_index))
+            .max_by_key(|a| (a.effective_at_s, a.epoch_number, a.entry_index))
             .map(|a| a.value))
     }
 
     pub fn parameter_state(&self, at: &str) -> Result<Vec<(String, i64, String)>> {
-        let at = crate::registry::epoch(at)?;
+        let at = crate::registry::unix(at)?;
         let schedule = self.parameter_schedule(at)?;
         let mut latest = std::collections::BTreeMap::new();
         for amendment in schedule.accepted().iter().filter(|a| a.sealed_at_s <= at) {
@@ -1941,19 +1941,19 @@ pub(crate) mod tests {
         wist_core::crypto::SigningKey::from_seed(&[7u8; 32])
     }
 
-    /// Seals an empty Block carrying only `param_changes`, for stores
+    /// Seals an empty Epoch carrying only `param_changes`, for stores
     /// whose Entries are not the subject under test.
-    pub(crate) fn seal_block(
+    pub(crate) fn seal_epoch(
         db: &Db,
-        block_number: u64,
+        epoch_number: u64,
         sealed_at: &str,
         param_changes: &[ParamChangeRow],
-    ) -> BlockRow {
+    ) -> EpochRow {
         db.commit_seal(
             &signing_key(),
             LOG_ID,
             &[],
-            block_number,
+            epoch_number,
             sealed_at,
             &[],
             0,
@@ -2000,14 +2000,14 @@ pub(crate) mod tests {
         let w = db.get_recovery_window("example.com").unwrap().unwrap();
         assert_eq!(w.declaration_json, b"{\"new\":1}");
         assert_eq!(w.prior_declaration_json, b"{\"old\":1}");
-        assert!(w.opened_block.is_none());
+        assert!(w.opened_epoch.is_none());
         assert!(w.window_end.is_none());
         assert_eq!(db.list_pending_recovery_windows().unwrap(), ["example.com"]);
 
         db.activate_recovery_window("example.com", 4, "2026-08-23T12:00:00Z")
             .unwrap();
         let w = db.get_recovery_window("example.com").unwrap().unwrap();
-        assert_eq!(w.opened_block, Some(4));
+        assert_eq!(w.opened_epoch, Some(4));
         assert_eq!(w.window_end.as_deref(), Some("2026-08-23T12:00:00Z"));
         assert!(db.list_pending_recovery_windows().unwrap().is_empty());
 
@@ -2186,10 +2186,10 @@ pub(crate) mod tests {
     fn set_param_then_param_roundtrips() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
-        db.set_param("block_cadence_seconds", 3600).unwrap();
-        assert_eq!(db.param("block_cadence_seconds").unwrap(), 3600);
-        db.set_param("block_cadence_seconds", 60).unwrap();
-        assert_eq!(db.param("block_cadence_seconds").unwrap(), 60);
+        db.set_param("epoch_cadence_seconds", 3600).unwrap();
+        assert_eq!(db.param("epoch_cadence_seconds").unwrap(), 3600);
+        db.set_param("epoch_cadence_seconds", 60).unwrap();
+        assert_eq!(db.param("epoch_cadence_seconds").unwrap(), 60);
     }
 
     #[test]
@@ -2203,7 +2203,7 @@ pub(crate) mod tests {
     fn commit_seal_records_param_changes_for_latest_lookup() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
-        seal_block(
+        seal_epoch(
             &db,
             0,
             "2026-01-01T00:00:00Z",
@@ -2224,7 +2224,7 @@ pub(crate) mod tests {
                 .unwrap(),
             Some(500)
         );
-        seal_block(
+        seal_epoch(
             &db,
             1,
             "2026-01-02T00:00:00Z",
@@ -2445,7 +2445,7 @@ pub(crate) mod tests {
         let (drained, _) = db.peek_pending_entries().unwrap();
         assert!(drained.is_empty());
         assert_eq!(
-            db.last_block().unwrap().unwrap().sealed_at,
+            db.last_epoch().unwrap().unwrap().sealed_at,
             "2026-08-09T00:00:00Z"
         );
         assert_eq!(
@@ -2458,7 +2458,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn commit_seal_rolls_back_pending_delete_on_conflicting_block_number() {
+    fn commit_seal_rolls_back_pending_delete_on_conflicting_epoch_number() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
         db.record_accepted_delta(
@@ -2525,7 +2525,7 @@ pub(crate) mod tests {
         assert_eq!(still_pending.len(), 1);
         assert_eq!(still_pending[0].rowid, peeked2[0].rowid);
         assert_eq!(
-            db.last_block().unwrap().unwrap().sealed_at,
+            db.last_epoch().unwrap().unwrap().sealed_at,
             "2026-08-09T00:00:00Z"
         );
     }

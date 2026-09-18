@@ -19,7 +19,7 @@ pub fn run(log_id: &str, data_dir: &Path) -> Result<String> {
 
     let public_key = keys::public_b64u(&seed);
     let created_at = jiff::Timestamp::from_second(jiff::Timestamp::now().as_second())
-        .expect("current epoch second is in range")
+        .expect("current Unix second is in range")
         .to_string();
 
     let anchor = Anchor {
@@ -88,7 +88,7 @@ mod tests {
             assert!(tmp.path().join(d).is_dir());
         }
         let db = crate::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
-        assert_eq!(db.param("block_cadence_seconds").unwrap(), 3600);
+        assert_eq!(db.param("epoch_cadence_seconds").unwrap(), 3600);
     }
 
     #[test]

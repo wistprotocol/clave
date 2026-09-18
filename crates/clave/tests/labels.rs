@@ -111,7 +111,7 @@ fn labels_and_disputes_are_pulled_sealed_and_carried() {
     let data = tempfile::tempdir().unwrap();
     clave::init::run(&host, data.path()).unwrap();
     let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
-    db.set_param("block_cadence_seconds", 1).unwrap();
+    db.set_param("epoch_cadence_seconds", 1).unwrap();
     let report =
         clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
     assert_eq!(report.labels, vec![id.clone()]);
@@ -130,8 +130,8 @@ fn labels_and_disputes_are_pulled_sealed_and_carried() {
 
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
     let r0 = clave::seal::run(&db, data.path(), &sk, SEAL_START).unwrap();
-    assert_eq!((r0.block_number, r0.entry_count), (0, 2));
-    assert_eq!(db.block_entries(0).unwrap()[1]["type"], "label");
+    assert_eq!((r0.epoch_number, r0.entry_count), (0, 2));
+    assert_eq!(db.epoch_entries(0).unwrap()[1]["type"], "label");
     let sealed = db.sealed_labels().unwrap();
     assert_eq!(sealed.len(), 1);
     assert_eq!((sealed[0].height, sealed[0].entry_index), (0, 1));
@@ -228,8 +228,8 @@ fn labels_and_disputes_are_pulled_sealed_and_carried() {
     assert_eq!(report.labels, vec![retraction.0.clone()]);
 
     let r1 = clave::seal::run(&db, data.path(), &sk, SEAL_START + 3600).unwrap();
-    assert_eq!((r1.block_number, r1.entry_count), (1, 3));
-    let sealed_entries = db.block_entries(1).unwrap();
+    assert_eq!((r1.epoch_number, r1.entry_count), (1, 3));
+    let sealed_entries = db.epoch_entries(1).unwrap();
     let types: Vec<&str> = sealed_entries
         .iter()
         .map(|e| e["type"].as_str().unwrap())

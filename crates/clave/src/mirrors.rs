@@ -26,8 +26,8 @@ pub fn list(data_dir: &Path) -> Result<Vec<String>> {
         .unwrap_or_default())
 }
 
-fn write(data_dir: &Path, sk: &SigningKey, urls: &[String], now_epoch: i64) -> Result<()> {
-    let updated_at = jiff::Timestamp::from_second(now_epoch)
+fn write(data_dir: &Path, sk: &SigningKey, urls: &[String], now_unix: i64) -> Result<()> {
+    let updated_at = jiff::Timestamp::from_second(now_unix)
         .map_err(|_| Error::Governance("timestamp out of range".into()))?
         .to_string();
     let inner = serde_json::json!({
@@ -41,7 +41,7 @@ fn write(data_dir: &Path, sk: &SigningKey, urls: &[String], now_epoch: i64) -> R
     Ok(())
 }
 
-pub fn add(data_dir: &Path, sk: &SigningKey, url: &str, now_epoch: i64) -> Result<Vec<String>> {
+pub fn add(data_dir: &Path, sk: &SigningKey, url: &str, now_unix: i64) -> Result<Vec<String>> {
     let parsed = url::Url::parse(url)
         .map_err(|e| Error::Governance(format!("invalid mirror URL {url:?}: {e}")))?;
     if parsed.scheme() != "https" {
@@ -60,14 +60,14 @@ pub fn add(data_dir: &Path, sk: &SigningKey, url: &str, now_epoch: i64) -> Resul
     if !urls.iter().any(|u| u == url) {
         urls.push(url.to_string());
     }
-    write(data_dir, sk, &urls, now_epoch)?;
+    write(data_dir, sk, &urls, now_unix)?;
     Ok(urls)
 }
 
-pub fn remove(data_dir: &Path, sk: &SigningKey, url: &str, now_epoch: i64) -> Result<Vec<String>> {
+pub fn remove(data_dir: &Path, sk: &SigningKey, url: &str, now_unix: i64) -> Result<Vec<String>> {
     let mut urls = list(data_dir)?;
     urls.retain(|u| u != url);
-    write(data_dir, sk, &urls, now_epoch)?;
+    write(data_dir, sk, &urls, now_unix)?;
     Ok(urls)
 }
 

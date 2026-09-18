@@ -1,8 +1,8 @@
 use super::{
     declarations::{Declaration, Declarations, Position},
-    History, VerifiedBlock,
+    History, VerifiedEpoch,
 };
-use crate::db::{BlockRow, Db};
+use crate::db::{Db, EpochRow};
 use crate::declaration::{self, delta::SizeCaps};
 use crate::error::{Error, Result};
 use crate::history::declarations::DeclarationsReplay;
@@ -16,7 +16,7 @@ pub struct DeltaSource {
     envelope: Value,
     position: Position,
     sealed_at_s: i64,
-    block_root: String,
+    epoch_root: String,
     declaration: Declaration,
     identity_start: Position,
     caps: SizeCaps,
@@ -27,7 +27,7 @@ impl DeltaSource {
     pub fn reconstruct(
         db: &Db,
         directory: &Path,
-        head: Option<BlockRow>,
+        head: Option<EpochRow>,
         delta_id: &str,
     ) -> Result<Self> {
         Self::reconstruct_matching(db, directory, head, |id, _| id == delta_id)?
@@ -38,17 +38,17 @@ impl DeltaSource {
     pub(crate) fn reconstruct_matching(
         db: &Db,
         directory: &Path,
-        head: Option<BlockRow>,
+        head: Option<EpochRow>,
         select: impl Fn(&str, &Value) -> bool,
     ) -> Result<Vec<Self>> {
         let mut history = History::open(db, directory, head)?;
         let mut declarations = Declarations::default();
         let mut chains = Chains::default();
         let mut found = Vec::new();
-        while let Some(block) = history.next_block()? {
-            declarations.apply(&block)?;
-            chains.apply(&block, &declarations)?;
-            for (entry_index, entry) in block.entries().iter().enumerate() {
+        while let Some(epoch) = history.next_epoch()? {
+            declarations.apply(&epoch)?;
+            chains.apply(&epoch, &declarations)?;
+            for (entry_index, entry) in epoch.entries().iter().enumerate() {
                 if entry["type"] != "publisher_delta" {
                     continue;
                 }
@@ -63,15 +63,15 @@ impl DeltaSource {
                     id,
                     envelope: envelope.clone(),
                     position: Position {
-                        block_number: block.block_number(),
+                        epoch_number: epoch.epoch_number(),
                         entry_index,
                     },
-                    sealed_at_s: block.sealed_at_s(),
-                    block_root: block.root().into(),
+                    sealed_at_s: epoch.sealed_at_s(),
+                    epoch_root: epoch.root().into(),
                     declaration: domain.delta_sealing_source().unwrap().clone(),
                     identity_start: domain.reset().unwrap_or(domain.first()),
-                    caps: block.delta_size_caps().clone(),
-                    clock_skew_seconds: block.clock_skew_seconds(),
+                    caps: epoch.delta_size_caps().clone(),
+                    clock_skew_seconds: epoch.clock_skew_seconds(),
                 });
             }
         }
@@ -86,9 +86,9 @@ impl DeltaSource {
         self.sealed_at_s
     }
 
-    /// The root of the tree at the Block that sealed this Delta.
-    pub fn block_root(&self) -> &str {
-        &self.block_root
+    /// The root of the tree at the Epoch that sealed this Delta.
+    pub fn epoch_root(&self) -> &str {
+        &self.epoch_root
     }
 
     pub fn clock_skew_seconds(&self) -> i64 {
@@ -180,7 +180,7 @@ impl Chains {
         Ok(())
     }
 
-    fn block(&mut self, deltas: Vec<Delta>) -> Result<()> {
+    fn epoch(&mut self, deltas: Vec<Delta>) -> Result<()> {
         let mut chains = BTreeMap::<_, BTreeMap<_, _>>::new();
         for delta in deltas {
             let chain = chains
@@ -205,24 +205,24 @@ impl Chains {
 
     pub(crate) fn apply(
         &mut self,
-        block: &VerifiedBlock,
+        epoch: &VerifiedEpoch,
         declarations: &Declarations,
     ) -> Result<()> {
-        let clock = jiff::Timestamp::from_second(block.sealed_at_s())
+        let clock = jiff::Timestamp::from_second(epoch.sealed_at_s())
             .map_err(|e| failure(&e.to_string()))?;
         let mut deltas = Vec::new();
-        for entry in block
+        for entry in epoch
             .entries()
             .iter()
             .filter(|entry| entry["type"] == "publisher_delta")
         {
             let envelope = &entry["body"];
-            block
+            epoch
                 .delta_size_caps()
                 .validate_delta(envelope)
                 .map_err(failure)?;
             let delta = Delta::read(envelope)?;
-            declaration::verify_delta_clock(envelope, clock, block.clock_skew_seconds())
+            declaration::verify_delta_clock(envelope, clock, epoch.clock_skew_seconds())
                 .map_err(failure)?;
             let source = declarations
                 .domains()
@@ -234,7 +234,7 @@ impl Chains {
             declaration::verify_delta_authority(&[&publisher], envelope).map_err(failure)?;
             deltas.push(delta);
         }
-        self.block(deltas)
+        self.epoch(deltas)
     }
 }
 

@@ -22,27 +22,27 @@ pub fn validate(name: &str, value: i64, lookup: impl Fn(&str) -> i64) -> Result<
 pub use wist_core::timestamp::LOG_TIMESTAMP_MIN_S;
 
 /// The whole-second UTC spelling of an instant anywhere in the Log's
-/// four-digit-year range, the inverse of `epoch`.
-pub fn instant(epoch_s: i64) -> Result<String> {
-    wist_core::timestamp::instant(epoch_s).map_err(|e| Error::ParamChange(e.to_string()))
+/// four-digit-year range, the inverse of `unix`.
+pub fn instant(unix_s: i64) -> Result<String> {
+    wist_core::timestamp::instant(unix_s).map_err(|e| Error::ParamChange(e.to_string()))
 }
 
-pub(crate) fn epoch(at: &str) -> Result<i64> {
+pub(crate) fn unix(at: &str) -> Result<i64> {
     wist_core::timestamp::log_seconds(at).map_err(|e| Error::ParamChange(e.to_string()))
 }
 
 pub(crate) fn accept(
     schedule: &mut wist_core::parameters::Schedule,
     amendment: wist_core::parameters::Amendment,
-    largest_block: u64,
+    largest_epoch: u64,
 ) -> Result<()> {
     schedule
-        .try_accept_with_block_size(amendment, largest_block)
+        .try_accept_with_epoch_size(amendment, largest_epoch)
         .map_err(|e| Error::ParamChange(format!("WIST4-E03 {e}")))
 }
 
-pub(crate) fn block_cap(schedule: &wist_core::parameters::Schedule, at: i64) -> i64 {
-    schedule.block_size_bounds(at).0 as i64
+pub(crate) fn epoch_cap(schedule: &wist_core::parameters::Schedule, at: i64) -> i64 {
+    schedule.epoch_size_bounds(at).0 as i64
 }
 
 #[cfg(test)]
@@ -62,7 +62,7 @@ mod tests {
             ),
         ] {
             assert_eq!(instant(seconds).unwrap(), spelled);
-            assert_eq!(epoch(spelled).unwrap(), seconds);
+            assert_eq!(unix(spelled).unwrap(), seconds);
         }
         assert!(instant(LOG_TIMESTAMP_MIN_S - 1).is_err());
         assert!(instant(wist_core::parameters::LOG_TIMESTAMP_MAX_S + 1).is_err());
@@ -82,12 +82,12 @@ mod tests {
         .unwrap();
         for case in vector["cases"].as_array().unwrap() {
             let at = case["value"].as_str().unwrap();
-            assert_eq!(epoch(at).ok(), case["epoch_seconds"].as_i64(), "{at:?}");
+            assert_eq!(unix(at).ok(), case["unix_seconds"].as_i64(), "{at:?}");
         }
         for case in vector["distances"].as_array().unwrap() {
             assert_eq!(
-                epoch(case["to"].as_str().unwrap()).unwrap()
-                    - epoch(case["from"].as_str().unwrap()).unwrap(),
+                unix(case["to"].as_str().unwrap()).unwrap()
+                    - unix(case["from"].as_str().unwrap()).unwrap(),
                 case["seconds"].as_i64().unwrap()
             );
         }
@@ -100,17 +100,17 @@ mod tests {
 
     #[test]
     fn validate_rejects_value_below_fixed_floor() {
-        assert!(validate("block_cadence_seconds", 0, defaults).is_err());
+        assert!(validate("epoch_cadence_seconds", 0, defaults).is_err());
     }
 
     #[test]
     fn validate_rejects_value_above_fixed_ceiling() {
-        assert!(validate("block_cadence_seconds", 86401, defaults).is_err());
+        assert!(validate("epoch_cadence_seconds", 86401, defaults).is_err());
     }
 
     #[test]
     fn validate_accepts_in_range_value() {
-        validate("block_cadence_seconds", 2700, defaults).unwrap();
+        validate("epoch_cadence_seconds", 2700, defaults).unwrap();
     }
 
     #[test]
@@ -182,7 +182,7 @@ mod tests {
             effective(&db, "feed_window", "2026-01-01T00:00:00Z").unwrap(),
             700
         );
-        crate::db::tests::seal_block(
+        crate::db::tests::seal_epoch(
             &db,
             0,
             "2026-01-01T00:00:00Z",

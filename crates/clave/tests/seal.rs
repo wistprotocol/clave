@@ -8,7 +8,7 @@ use common::{
 const SEAL_START: i64 = 1_786_276_800;
 
 /// A URL just under the default `url_cap_bytes`, so a handful of Deltas
-/// fill the smallest Block size cap the Registry admits.
+/// fill the smallest Epoch size cap the Registry admits.
 fn long_url(index: usize) -> String {
     format!("https://example.com/{index:04}/{}", "p".repeat(2000))
 }
@@ -29,25 +29,25 @@ fn seal_produces_a_verifiable_tree_and_checkpoints() {
     let data = tempfile::tempdir().unwrap();
     clave::init::run(&host, data.path()).unwrap();
     let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
-    db.set_param("block_cadence_seconds", 1).unwrap();
+    db.set_param("epoch_cadence_seconds", 1).unwrap();
     clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
 
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
     let r0 = clave::seal::run(&db, data.path(), &sk, SEAL_START).unwrap();
-    assert_eq!(r0.block_number, 0);
+    assert_eq!(r0.epoch_number, 0);
     assert_eq!(r0.entry_count, 2);
     let key = wist_core::checkpoint::AggregatorKey {
         key_id: "log1".into(),
         public_key: sk.public(),
     };
-    let block0 = head_checkpoint(data.path());
-    wist_core::checkpoint::verify(&block0, &host, std::slice::from_ref(&key), &[]).unwrap();
-    assert_eq!(block0.block_number(), 0);
-    assert_eq!(block0.tree_size(), 2);
-    let entries = served_entries(data.path(), 0, block0.tree_size());
-    wist_core::block::verify_block(
+    let epoch0 = head_checkpoint(data.path());
+    wist_core::checkpoint::verify(&epoch0, &host, std::slice::from_ref(&key), &[]).unwrap();
+    assert_eq!(epoch0.epoch_number(), 0);
+    assert_eq!(epoch0.tree_size(), 2);
+    let entries = served_entries(data.path(), 0, epoch0.tree_size());
+    wist_core::epoch::verify_epoch(
         0,
-        &block0,
+        &epoch0,
         &entries,
         &wist_core::merkle::LeafHashes(&[]),
         u64::MAX,
@@ -64,22 +64,22 @@ fn seal_produces_a_verifiable_tree_and_checkpoints() {
 
     assert!(clave::seal::run(&db, data.path(), &sk, SEAL_START).is_err());
     let r1 = clave::seal::run(&db, data.path(), &sk, SEAL_START + 3600).unwrap();
-    assert_eq!(r1.block_number, 1);
+    assert_eq!(r1.epoch_number, 1);
     assert_eq!(r1.entry_count, 0);
-    let block1 = head_checkpoint(data.path());
-    wist_core::checkpoint::verify(&block1, &host, std::slice::from_ref(&key), &[]).unwrap();
-    assert_eq!(block1.block_number(), 1);
+    let epoch1 = head_checkpoint(data.path());
+    wist_core::checkpoint::verify(&epoch1, &host, std::slice::from_ref(&key), &[]).unwrap();
+    assert_eq!(epoch1.epoch_number(), 1);
     assert_eq!(
-        (block1.tree_size(), block1.root()),
-        (block0.tree_size(), block0.root()),
-        "an empty Block restates the tree the Block before it states"
+        (epoch1.tree_size(), epoch1.root()),
+        (epoch0.tree_size(), epoch0.root()),
+        "an empty Epoch restates the tree the Epoch before it states"
     );
     let archived = std::fs::read_to_string(data.path().join("log/checkpoints/000000000")).unwrap();
     assert_eq!(
         wist_core::checkpoint::Checkpoint::parse(&archived)
             .unwrap()
             .note_text(),
-        block0.note_text()
+        epoch0.note_text()
     );
 }
 
@@ -102,7 +102,7 @@ fn seal_orders_same_type_entries_by_ascending_leaf_hash() {
     let data = tempfile::tempdir().unwrap();
     clave::init::run(&host, data.path()).unwrap();
     let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
-    db.set_param("block_cadence_seconds", 1).unwrap();
+    db.set_param("epoch_cadence_seconds", 1).unwrap();
     clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
 
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
@@ -111,7 +111,7 @@ fn seal_orders_same_type_entries_by_ascending_leaf_hash() {
 
     let head = head_checkpoint(data.path());
     let entries = served_entries(data.path(), 0, head.tree_size());
-    wist_core::block::verify_block(
+    wist_core::epoch::verify_epoch(
         0,
         &head,
         &entries,
@@ -179,7 +179,7 @@ fn seal_applies_chained_deltas_in_chain_order_regardless_of_storage_order() {
     let data = tempfile::tempdir().unwrap();
     clave::init::run(&host, data.path()).unwrap();
     let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
-    db.set_param("block_cadence_seconds", 1).unwrap();
+    db.set_param("epoch_cadence_seconds", 1).unwrap();
     clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
 
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
@@ -197,11 +197,11 @@ fn seal_applies_chained_deltas_in_chain_order_regardless_of_storage_order() {
 }
 
 #[test]
-fn an_empty_first_block_states_the_empty_tree_and_serves_no_tile() {
+fn an_empty_first_epoch_states_the_empty_tree_and_serves_no_tile() {
     let data = tempfile::tempdir().unwrap();
     clave::init::run("example-log.test", data.path()).unwrap();
     let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
-    db.set_param("block_cadence_seconds", 1).unwrap();
+    db.set_param("epoch_cadence_seconds", 1).unwrap();
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
     clave::seal::run(&db, data.path(), &sk, 1_800_000_000).unwrap();
     let head = head_checkpoint(data.path());
@@ -213,7 +213,7 @@ fn an_empty_first_block_states_the_empty_tree_and_serves_no_tile() {
 }
 
 #[test]
-fn a_block_over_the_entry_bundle_cap_defers_entries_to_the_next_seal() {
+fn a_epoch_over_the_entry_bundle_cap_defers_entries_to_the_next_seal() {
     let (listener, host, client) = reserve_addr();
     let p = make_publisher_with_scope(&host, &["example.com"]);
     let ids: Vec<String> = (0..40)
@@ -225,40 +225,40 @@ fn a_block_over_the_entry_bundle_cap_defers_entries_to_the_next_seal() {
     let data = tempfile::tempdir().unwrap();
     clave::init::run(&host, data.path()).unwrap();
     let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
-    db.set_param("block_cadence_seconds", 1).unwrap();
+    db.set_param("epoch_cadence_seconds", 1).unwrap();
     clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
 
     let cap = 65_537;
-    db.set_param("block_decompressed_cap_bytes", cap).unwrap();
+    db.set_param("epoch_cap_bytes", cap).unwrap();
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
     let mut total = 0u64;
-    let mut sealed_blocks = 0u64;
+    let mut sealed_epochs = 0u64;
     for i in 0..5 {
         let report = clave::seal::run(&db, data.path(), &sk, 1_800_000_000 + i * 3600).unwrap();
         total += report.entry_count;
-        let entries = db.block_entries(report.block_number).unwrap();
+        let entries = db.epoch_entries(report.epoch_number).unwrap();
         assert!(
-            wist_core::block::block_octets(&entries).unwrap() <= cap as u64,
-            "every emitted Block must respect the entry-bundle cap"
+            wist_core::epoch::epoch_octets(&entries).unwrap() <= cap as u64,
+            "every emitted Epoch must respect the entry-bundle cap"
         );
         if i == 0 {
             assert!(report.entry_count < 41, "cap must defer some entries");
         }
-        sealed_blocks += 1;
+        sealed_epochs += 1;
         let (pending, _) = db.peek_pending_entries().unwrap();
         if pending.is_empty() {
             break;
         }
     }
-    assert_eq!(total, 41, "deferred entries must seal in later Blocks");
-    assert!(sealed_blocks > 1);
+    assert_eq!(total, 41, "deferred entries must seal in later Epochs");
+    assert!(sealed_epochs > 1);
     for id in &ids {
         assert!(db.is_delta_seen(id).unwrap());
     }
 }
 
 #[test]
-fn the_per_domain_block_cap_defers_the_surplus_in_acceptance_order() {
+fn the_per_domain_epoch_cap_defers_the_surplus_in_acceptance_order() {
     let (listener, host, client) = reserve_addr();
     let p = make_publisher_with_scope(&host, &["example.com"]);
     let ids: Vec<String> = (0..5)
@@ -270,8 +270,8 @@ fn the_per_domain_block_cap_defers_the_surplus_in_acceptance_order() {
     let data = tempfile::tempdir().unwrap();
     clave::init::run(&host, data.path()).unwrap();
     let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
-    db.set_param("block_cadence_seconds", 1).unwrap();
-    db.set_param("domain_block_entries_max", 2).unwrap();
+    db.set_param("epoch_cadence_seconds", 1).unwrap();
+    db.set_param("domain_epoch_entries_max", 2).unwrap();
     clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
 
@@ -282,7 +282,7 @@ fn the_per_domain_block_cap_defers_the_surplus_in_acceptance_order() {
     {
         let report = clave::seal::run(&db, data.path(), &sk, at).unwrap();
         let deltas: Vec<String> = db
-            .block_entries(report.block_number)
+            .epoch_entries(report.epoch_number)
             .unwrap()
             .iter()
             .filter(|e| e["type"] == "publisher_delta")
@@ -290,7 +290,7 @@ fn the_per_domain_block_cap_defers_the_surplus_in_acceptance_order() {
             .collect();
         assert!(
             deltas.len() <= 2,
-            "block {i} carried {} deltas",
+            "epoch {i} carried {} deltas",
             deltas.len()
         );
         let mut expected = ids[i * 2..ids.len().min(i * 2 + 2)].to_vec();
@@ -299,7 +299,7 @@ fn the_per_domain_block_cap_defers_the_surplus_in_acceptance_order() {
         actual.sort();
         assert_eq!(
             actual, expected,
-            "Block {i} must select by acceptance order"
+            "Epoch {i} must select by acceptance order"
         );
         sealed.extend(deltas);
     }
@@ -319,10 +319,9 @@ fn a_delta_held_past_the_inclusion_ceiling_is_reported() {
     let data = tempfile::tempdir().unwrap();
     clave::init::run(&host, data.path()).unwrap();
     let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
-    db.set_param("block_cadence_seconds", 1).unwrap();
-    db.set_param("max_inclusion_blocks", 1).unwrap();
-    db.set_param("block_decompressed_cap_bytes", 65_537)
-        .unwrap();
+    db.set_param("epoch_cadence_seconds", 1).unwrap();
+    db.set_param("max_inclusion_epochs", 1).unwrap();
+    db.set_param("epoch_cap_bytes", 65_537).unwrap();
     clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
 

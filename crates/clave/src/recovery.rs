@@ -7,7 +7,7 @@ use std::path::Path;
 
 pub fn settle(db: &Db, data_dir: &Path, now: &str) -> Result<()> {
     let mutation = db.mutation()?;
-    let history = Declarations::reconstruct(db, data_dir, db.last_block()?)?;
+    let history = Declarations::reconstruct(db, data_dir, db.last_epoch()?)?;
     settle_due(db, &history, now)?;
     mutation.commit()
 }

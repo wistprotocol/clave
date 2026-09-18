@@ -20,15 +20,15 @@ enum Command {
         data: PathBuf,
         #[arg(long, default_value_t = 3600)]
         cadence: i64,
-        /// A Public Suffix List file to pin in Block 0, so quota, ingest
-        /// budget and Block capacity are keyed per Registrable Domain from
-        /// the first Block on; without one every Canonical Host is its own
+        /// A Public Suffix List file to pin in Epoch 0, so quota, ingest
+        /// budget and Epoch capacity are keyed per Registrable Domain from
+        /// the first Epoch on; without one every Canonical Host is its own
         /// unit until `suffix-list` pins a snapshot.
         #[arg(long = "suffix-list")]
         suffix_list: Option<PathBuf>,
     },
     /// Pins a Public Suffix List file as the snapshot in force from the
-    /// Block after the next one, and serves it at
+    /// Epoch after the next one, and serves it at
     /// /log/suffix-lists/<hex>.dat.
     SuffixList {
         #[arg(long)]
@@ -120,7 +120,7 @@ fn main() -> Result<(), clave::Error> {
             let verifier_key = clave::init::run(&log_id, &data)?;
             let db = clave::db::Db::open(&data.join("clave.sqlite"))?;
             println!("checkpoint verifier key: {verifier_key}");
-            db.set_param("block_cadence_seconds", cadence)?;
+            db.set_param("epoch_cadence_seconds", cadence)?;
             match suffix_list {
                 Some(file) => {
                     let sk = clave::keys::load(&data.join("keys/seed"))?;
@@ -132,7 +132,7 @@ fn main() -> Result<(), clave::Error> {
                         jiff::Timestamp::now().as_second(),
                     )?;
                     println!(
-                        "pinned suffix list {} ({} bytes) for Block 0",
+                        "pinned suffix list {} ({} bytes) for Epoch 0",
                         report.identifier, report.bytes
                     );
                 }
@@ -171,18 +171,18 @@ fn main() -> Result<(), clave::Error> {
         } => {
             let db = clave::db::Db::open(&data.join("clave.sqlite"))?;
             let sk = clave::keys::load(&data.join("keys/seed"))?;
-            let now_epoch = match at {
+            let now_unix = match at {
                 Some(at) => wist_core::timestamp::log_seconds(&at)?,
                 None => jiff::Timestamp::now().as_second(),
             };
             let client = clave::fetch::Client::new(allow_http);
-            let report = clave::seal::run_with_client(&db, &data, &sk, &client, now_epoch)?;
+            let report = clave::seal::run_with_client(&db, &data, &sk, &client, now_unix)?;
             let head = db
-                .last_block()?
-                .ok_or_else(|| clave::Error::Seal("the sealed Block is absent".into()))?;
+                .last_epoch()?
+                .ok_or_else(|| clave::Error::Seal("the sealed Epoch is absent".into()))?;
             println!(
-                "sealed block {} with {} entries; tree size {} root {}",
-                report.block_number, report.entry_count, head.tree_size, head.root
+                "sealed epoch {} with {} entries; tree size {} root {}",
+                report.epoch_number, report.entry_count, head.tree_size, head.root
             );
             for reason in &report.dropped {
                 println!("dropped: {reason}");
@@ -193,20 +193,20 @@ fn main() -> Result<(), clave::Error> {
         }
         Command::VerifyHistory { data } => {
             let db = clave::db::Db::open(&data.join("clave.sqlite"))?;
-            let mut history = clave::history::History::open(&db, &data, db.last_block()?)?;
-            let mut blocks = 0;
+            let mut history = clave::history::History::open(&db, &data, db.last_epoch()?)?;
+            let mut epochs = 0;
             let mut entries = 0;
             let mut rejected = 0;
             let mut head = None;
-            while let Some(block) = history.next_block()? {
-                blocks += 1;
-                entries += block.entries().len();
-                rejected += block.rejected_parameters().len();
-                head = Some((block.tree_size(), block.root().to_string()));
+            while let Some(epoch) = history.next_epoch()? {
+                epochs += 1;
+                entries += epoch.entries().len();
+                rejected += epoch.rejected_parameters().len();
+                head = Some((epoch.tree_size(), epoch.root().to_string()));
             }
             let (tree_size, root) = head.unwrap_or((0, String::from("sha256:")));
             println!(
-                "authenticated {blocks} Checkpoints over a tree of {tree_size} leaves at root {root}, containing {entries} Entries; {rejected} parameter candidates ignored; Entry eligibility and derived state are not verified"
+                "authenticated {epochs} Checkpoints over a tree of {tree_size} leaves at root {root}, containing {entries} Entries; {rejected} parameter candidates ignored; Entry eligibility and derived state are not verified"
             );
         }
         Command::ParamChange {
@@ -217,14 +217,14 @@ fn main() -> Result<(), clave::Error> {
         } => {
             let db = clave::db::Db::open(&data.join("clave.sqlite"))?;
             let sk = clave::keys::load(&data.join("keys/seed"))?;
-            let now_epoch = jiff::Timestamp::now().as_second();
+            let now_unix = jiff::Timestamp::now().as_second();
             let report = clave::param_change::run(
                 &db,
                 &sk,
                 &parameter,
                 value,
                 effective_at.as_deref(),
-                now_epoch,
+                now_unix,
             )?;
             println!(
                 "queued parameter change {} = {value}, effective {} ({})",
@@ -289,15 +289,15 @@ fn main() -> Result<(), clave::Error> {
             }
         }
         Command::Mirror { data, add, remove } => {
-            let now_epoch = jiff::Timestamp::now().as_second();
+            let now_unix = jiff::Timestamp::now().as_second();
             let urls = match (add, remove) {
                 (Some(url), None) => {
                     let sk = clave::keys::load(&data.join("keys/seed"))?;
-                    clave::mirrors::add(&data, &sk, &url, now_epoch)?
+                    clave::mirrors::add(&data, &sk, &url, now_unix)?
                 }
                 (None, Some(url)) => {
                     let sk = clave::keys::load(&data.join("keys/seed"))?;
-                    clave::mirrors::remove(&data, &sk, &url, now_epoch)?
+                    clave::mirrors::remove(&data, &sk, &url, now_unix)?
                 }
                 (None, None) => clave::mirrors::list(&data)?,
                 (Some(_), Some(_)) => {

@@ -262,7 +262,7 @@ fn build_label_tables(
 }
 
 /// WIST-2 §3.3 and WIST-3 §7: the current Labels and disputes the Log's
-/// sealed Entries leave at a Snapshot whose head Block is sealed at
+/// sealed Entries leave at a Snapshot whose head Epoch is sealed at
 /// `head_sealed_at`, and the labeler statistics over every sealed Label.
 fn label_state(
     db: &Db,
@@ -381,8 +381,8 @@ fn build_tier0(dir: &Path, records: &[RecordRow]) -> Result<Vec<u8>> {
 fn build_state(
     db: &Db,
     data_dir: &Path,
-    block_number: u64,
-    log_position: u64,
+    epoch_number: u64,
+    tree_size: u64,
     records: &[RecordRow],
     domains: &BTreeMap<String, Domain>,
 ) -> Result<(SnapshotState, String)> {
@@ -392,7 +392,7 @@ fn build_state(
         .map_err(|_| Error::Key("seed file must be exactly 32 bytes".into()))?;
     let aggregator_public_key = keys::public_b64u(&seed);
     let head_sealed_at = db
-        .last_block()?
+        .last_epoch()?
         .map(|b| b.sealed_at)
         .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
 
@@ -410,7 +410,7 @@ fn build_state(
             value,
         }));
     }
-    if let Some((identifier, sealing_height)) = db.suffix_list_at_block(block_number)? {
+    if let Some((identifier, sealing_height)) = db.suffix_list_at_epoch(epoch_number)? {
         entries.push(StateEntry::SuffixList(SuffixListEntry {
             identifier,
             sealing_height,
@@ -424,7 +424,7 @@ fn build_state(
         entries.push(StateEntry::Declaration(DeclarationEntry {
             domain: domain.clone(),
             declaration: current.envelope().clone(),
-            sealing_height: current.position().block_number,
+            sealing_height: current.position().epoch_number,
             highest_accepted_seq: state.highest_accepted_seq(),
         }));
     }
@@ -435,7 +435,7 @@ fn build_state(
         entries.push(StateEntry::PendingDeclaration(PendingDeclarationEntry {
             domain: domain.clone(),
             head: pending.head().envelope().clone(),
-            sealing_height: pending.head().position().block_number,
+            sealing_height: pending.head().position().epoch_number,
             activation_height: pending.activation_height(),
         }));
     }
@@ -449,10 +449,10 @@ fn build_state(
             .ok_or_else(|| Error::Snapshot("recovery window end is not a Log timestamp".into()))?;
         entries.push(StateEntry::RecoveryWindow(RecoveryWindowEntry {
             domain: domain.clone(),
-            declaration_height: window.owner().position().block_number,
+            declaration_height: window.owner().position().epoch_number,
             window_end: end,
             head: window.head().envelope().clone(),
-            head_height: window.head().position().block_number,
+            head_height: window.head().position().epoch_number,
         }));
     }
     for (delta_id, publisher, sealing_height) in db.withdrawal_state()? {
@@ -482,7 +482,7 @@ fn build_state(
     Ok((
         SnapshotState {
             wist_version: WIST_VERSION.to_string(),
-            log_position,
+            tree_size,
             entries,
         },
         digest,
@@ -492,7 +492,7 @@ fn build_state(
 fn update_index(
     data_dir: &Path,
     snapshot_date: &str,
-    log_position: u64,
+    tree_size: u64,
     content_digest_value: &str,
     sk: &SigningKey,
 ) -> Result<()> {
@@ -512,7 +512,7 @@ fn update_index(
     snapshots.retain(|e| e.snapshot_date != snapshot_date);
     snapshots.push(SnapshotIndexEntry {
         snapshot_date: snapshot_date.to_string(),
-        log_position,
+        tree_size,
         manifest_url: format!("/snapshots/{snapshot_date}/manifest.json"),
         content_digest: content_digest_value.to_string(),
     });
@@ -587,9 +587,9 @@ pub fn build(
     db: &Db,
     data_dir: &Path,
     sk: &SigningKey,
-    block_number: u64,
-    log_position: u64,
-    anchor_block_hash: &str,
+    epoch_number: u64,
+    tree_size: u64,
+    root_hash: &str,
     snapshot_date: &str,
     domains: &BTreeMap<String, Domain>,
 ) -> Result<()> {
@@ -607,7 +607,7 @@ pub fn build(
     let content_digest_value = content_digest(&whole_projection)?;
 
     let head_sealed_at = db
-        .last_block()?
+        .last_epoch()?
         .map(|b| b.sealed_at)
         .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
     let (label_rows, dispute_rows, labeler_rows) = label_state(db, &head_sealed_at)?;
@@ -671,7 +671,7 @@ pub fn build(
     let records = all_records;
 
     let (state, state_digest_value) =
-        build_state(db, data_dir, block_number, log_position, &records, domains)?;
+        build_state(db, data_dir, epoch_number, tree_size, &records, domains)?;
     let state_value = serde_json::to_value(&state)?;
     let state_envelope = sign_envelope(&state_value, "state", AGGREGATOR_KEY_ID, sk)?;
     let state_bytes = serde_json::to_vec(&state_envelope)?;
@@ -680,9 +680,9 @@ pub fn build(
     let manifest = SnapshotManifest {
         wist_version: WIST_VERSION.to_string(),
         snapshot_date: snapshot_date.to_string(),
-        block_number,
-        log_position,
-        anchor_block_hash: anchor_block_hash.to_string(),
+        epoch_number,
+        tree_size,
+        root_hash: root_hash.to_string(),
         content_digest: content_digest_value.clone(),
         state: SnapshotStateFile {
             path: "state.json".to_string(),
@@ -706,7 +706,7 @@ pub fn build(
     update_index(
         data_dir,
         snapshot_date,
-        log_position,
+        tree_size,
         &content_digest_value,
         sk,
     )
@@ -719,14 +719,14 @@ mod tests {
 
     const T0: i64 = 1_800_000_000;
 
-    fn ts(epoch: i64) -> String {
-        jiff::Timestamp::from_second(epoch).unwrap().to_string()
+    fn ts(unix: i64) -> String {
+        jiff::Timestamp::from_second(unix).unwrap().to_string()
     }
 
     fn seal_record_as(
         db: &Db,
-        block: u64,
-        sealed_epoch: i64,
+        epoch: u64,
+        sealed_unix: i64,
         url: &str,
         publisher: &str,
         declared: &[&str],
@@ -743,15 +743,15 @@ mod tests {
             &crate::db::tests::signing_key(),
             crate::db::tests::LOG_ID,
             &[],
-            block,
-            &ts(sealed_epoch),
+            epoch,
+            &ts(sealed_unix),
             &[],
             0,
             &[RecordUpsert {
                 url,
                 publisher,
-                delta_id: &format!("sha256:{:064x}", block),
-                observed_at: &ts(sealed_epoch),
+                delta_id: &format!("sha256:{:064x}", epoch),
+                observed_at: &ts(sealed_unix),
                 title: "t",
                 abstract_text: None,
                 lang: "en",
@@ -787,11 +787,11 @@ mod tests {
             ("https://a.notexample.com/x", "example.com", &[]),
             ("https://a.notexample.com/x", "beta.example", &[]),
         ];
-        for (block, (url, publisher, declared)) in rows.iter().enumerate() {
+        for (epoch, (url, publisher, declared)) in rows.iter().enumerate() {
             seal_record_as(
                 &db,
-                block as u64,
-                T0 + block as i64,
+                epoch as u64,
+                T0 + epoch as i64,
                 url,
                 publisher,
                 declared,

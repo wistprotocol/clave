@@ -22,7 +22,7 @@ fn rig(p_for: fn(&str) -> TestPub) -> Rig {
     let data = tempfile::tempdir().unwrap();
     clave::init::run(&host, data.path()).unwrap();
     let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
-    db.set_param("block_cadence_seconds", 1).unwrap();
+    db.set_param("epoch_cadence_seconds", 1).unwrap();
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
     Rig {
         host,
@@ -310,7 +310,7 @@ fn recovery_flow_queues_settles_and_rejects_superseded_deltas() {
     let rep = ingest(&r, "2026-08-09T12:00:05Z");
     assert_eq!(rep.accepted, vec![d1.clone()]);
     let b0 = clave::seal::run(&r.db, r.data.path(), &r.sk, T0).unwrap();
-    assert_eq!(b0.block_number, 0);
+    assert_eq!(b0.epoch_number, 0);
 
     let stored = current_declaration(&r.p);
     let recovery = serde_json::json!({
@@ -353,9 +353,9 @@ fn recovery_flow_queues_settles_and_rejects_superseded_deltas() {
     assert_eq!(r.db.count_pending_entries("publisher_delta").unwrap(), 0);
 
     let b1 = clave::seal::run(&r.db, r.data.path(), &r.sk, T0 + 7200).unwrap();
-    assert_eq!(b1.block_number, 1);
+    assert_eq!(b1.epoch_number, 1);
     let w = r.db.get_recovery_window(&r.host).unwrap().unwrap();
-    assert_eq!(w.opened_block, Some(1));
+    assert_eq!(w.opened_epoch, Some(1));
     let sealed_at = jiff::Timestamp::from_second(T0 + 7200).unwrap().to_string();
     let expected_end = jiff::Timestamp::from_second(T0 + 7200 + 7 * DAY)
         .unwrap()
@@ -415,11 +415,11 @@ fn recovery_flow_queues_settles_and_rejects_superseded_deltas() {
     assert_eq!(rep.queued, vec![d4.clone()]);
 
     let b2 = clave::seal::run(&r.db, r.data.path(), &r.sk, T0 + 2 * 7200).unwrap();
-    assert_eq!(b2.block_number, 2);
+    assert_eq!(b2.epoch_number, 2);
     assert!(r.db.get_recovery_window(&r.host).unwrap().is_some());
 
     let b3 = clave::seal::run(&r.db, r.data.path(), &r.sk, T0 + 7200 + 7 * DAY + 3600).unwrap();
-    assert_eq!(b3.block_number, 3);
+    assert_eq!(b3.epoch_number, 3);
     assert!(r.db.get_recovery_window(&r.host).unwrap().is_none());
     assert!(rejection_codes(&r).contains(&"WIST1-E13".to_string()));
     let e13: Vec<_> =
@@ -521,7 +521,7 @@ fn declaration_outside_the_recovery_chain_is_superseded_at_the_windows_end() {
 }
 
 #[test]
-fn a_queued_delta_whose_key_the_sealing_blocks_key_set_retired_is_not_sealed() {
+fn a_queued_delta_whose_key_the_sealing_epochs_key_set_retired_is_not_sealed() {
     let r = rig(make_publisher);
     let id = add_delta(&r.p, &format!("https://{}/a", r.host), "alpha body", None);
     write_feed(
@@ -587,7 +587,7 @@ fn a_delta_pending_when_the_window_opens_is_queued_not_sealed() {
         .iter()
         .filter(|e| e["type"] == "publisher_delta")
         .count();
-    assert_eq!(deltas, 0, "the Block that opens the window sealed a Delta");
+    assert_eq!(deltas, 0, "the Epoch that opens the window sealed a Delta");
     assert!(
         !rejection_codes(&r).contains(&"WIST1-E02".to_string()),
         "the Delta belongs in the window queue, not rejected at sealing: {:?}",
@@ -814,7 +814,7 @@ fn fixed_recovery_bindings_survive_followers_reopen_migration_and_settlement() {
             ids[4],
             "{migration}"
         );
-        let entries = stored_entries(&r, r.db.last_block().unwrap().unwrap().block_number);
+        let entries = stored_entries(&r, r.db.last_epoch().unwrap().unwrap().epoch_number);
         let deltas: Vec<_> = entries
             .iter()
             .filter(|entry| entry["type"] == "publisher_delta")
@@ -990,8 +990,8 @@ fn recovery_scope_sources_survive_reopen_and_gate_settlement() {
             .delta_id,
         ids[5]
     );
-    let head = r.db.last_block().unwrap().unwrap();
-    let entries = stored_entries(&r, head.block_number);
+    let head = r.db.last_epoch().unwrap().unwrap();
+    let entries = stored_entries(&r, head.epoch_number);
     let sealed: Vec<_> = entries
         .iter()
         .filter(|entry| entry["type"] == "publisher_delta")
@@ -1109,7 +1109,7 @@ fn sealed_recovery() -> (Rig, i64, serde_json::Value) {
 }
 
 fn stored_entries(r: &Rig, height: u64) -> Vec<serde_json::Value> {
-    r.db.block_entries(height).unwrap()
+    r.db.epoch_entries(height).unwrap()
 }
 
 #[test]
@@ -1181,17 +1181,16 @@ fn authenticated_sealing_separates_settlement_from_packed_authority() {
             clave::seal::run(&r.db, r.data.path(), &r.sk, start + 7200).unwrap();
         }
         if case == "deferred_follower" {
-            r.db.set_param("block_decompressed_cap_bytes", 1800)
-                .unwrap();
+            r.db.set_param("epoch_cap_bytes", 1800).unwrap();
         }
         r.db = clave::db::Db::open(&r.data.path().join("clave.sqlite")).unwrap();
         let report = clave::seal::run(&r.db, r.data.path(), &r.sk, start + 3600 + 7 * DAY).unwrap();
-        let entries = stored_entries(&r, report.block_number);
+        let entries = stored_entries(&r, report.epoch_number);
         assert_eq!(entries.len() as u64, report.entry_count);
         let state = clave::history::declarations::Declarations::reconstruct(
             &r.db,
             r.data.path(),
-            r.db.last_block().unwrap(),
+            r.db.last_epoch().unwrap(),
         )
         .unwrap();
         let current = &state.domains()[&r.host];
@@ -1286,7 +1285,7 @@ fn rejected_candidate_rolls_back_due_settlement_and_status() {
     let checkpoint = std::fs::read(r.data.path().join("checkpoint")).unwrap();
     assert!(clave::seal::run(&r.db, r.data.path(), &r.sk, start + 3600 + 7 * DAY).is_err());
     r.db = clave::db::Db::open(&r.data.path().join("clave.sqlite")).unwrap();
-    assert_eq!(r.db.last_block().unwrap().unwrap().block_number, 1);
+    assert_eq!(r.db.last_epoch().unwrap().unwrap().epoch_number, 1);
     assert_eq!(
         r.db.get_recovery_window(&r.host)
             .unwrap()
@@ -1308,7 +1307,7 @@ fn rejected_candidate_rolls_back_due_settlement_and_status() {
         std::fs::read(r.data.path().join("checkpoint")).unwrap(),
         checkpoint
     );
-    assert!(r.db.block_at(2).unwrap().is_none());
+    assert!(r.db.epoch_at(2).unwrap().is_none());
 }
 
 #[test]
@@ -1351,7 +1350,7 @@ fn corrupt_pinned_history_cannot_settle_a_queue() {
     r.db = clave::db::Db::connect(&r.data.path().join("clave.sqlite")).unwrap();
     assert!(r.db.get_recovery_window(&r.host).unwrap().is_some());
     assert!(r.db.list_rejections(&r.host).unwrap().is_empty());
-    assert_eq!(r.db.last_block().unwrap().unwrap().block_number, 1);
+    assert_eq!(r.db.last_epoch().unwrap().unwrap().epoch_number, 1);
     connection
         .execute(
             "UPDATE log_entries SET entry_json = ?1 WHERE leaf_index = 0",
@@ -1461,7 +1460,7 @@ fn recovery_preserves_cross_queue_order_and_defers_every_capped_copy() {
         write_feed(&r.p, &r.host, &older, "2026-08-09T12:00:00Z");
         assert_eq!(ingest(&r, "2026-08-09T12:00:05Z").accepted, older);
         for entry in r.db.peek_pending_entries().unwrap().0 {
-            r.db.set_turn_block(entry.rowid, 0).unwrap();
+            r.db.set_turn_epoch(entry.rowid, 0).unwrap();
         }
         let prior = current_declaration(&r.p);
         let mut owner = prior["publisher"].clone();
@@ -1496,13 +1495,12 @@ fn recovery_preserves_cross_queue_order_and_defers_every_capped_copy() {
         );
         let mut opening = stored_entries(&r, 0);
         opening[0]["body"] = current_declaration(&r.p);
-        let cap = wist_core::block::block_octets(&opening).unwrap() as i64;
-        let normal_cap = r.db.param("block_decompressed_cap_bytes").unwrap();
-        r.db.set_param("block_decompressed_cap_bytes", cap).unwrap();
-        r.db.set_param("domain_block_entries_max", 1).unwrap();
+        let cap = wist_core::epoch::epoch_octets(&opening).unwrap() as i64;
+        let normal_cap = r.db.param("epoch_cap_bytes").unwrap();
+        r.db.set_param("epoch_cap_bytes", cap).unwrap();
+        r.db.set_param("domain_epoch_entries_max", 1).unwrap();
         clave::seal::run(&r.db, r.data.path(), &r.sk, start + 3600).unwrap();
-        r.db.set_param("block_decompressed_cap_bytes", normal_cap)
-            .unwrap();
+        r.db.set_param("epoch_cap_bytes", normal_cap).unwrap();
         assert_eq!(r.db.count_pending_entries("publisher_delta").unwrap(), 0);
         r.db = clave::db::Db::open(&r.data.path().join("clave.sqlite")).unwrap();
         for hour in [2, 3, 4, 168] {
@@ -1676,7 +1674,7 @@ fn pending_copy_in_an_expired_window_receives_settlement_rejection() {
         .unwrap();
     for entry in r.db.peek_pending_entries().unwrap().0 {
         if entry.entry_type == "publisher_delta" {
-            r.db.set_turn_block(entry.rowid, 0).unwrap();
+            r.db.set_turn_epoch(entry.rowid, 0).unwrap();
         }
     }
     r.db = clave::db::Db::open(&r.data.path().join("clave.sqlite")).unwrap();
@@ -1791,7 +1789,7 @@ fn admission_uses_both_heads_without_joining_a_competing_branch() {
     let history = clave::history::declarations::Declarations::reconstruct(
         &r.db,
         r.data.path(),
-        r.db.last_block().unwrap(),
+        r.db.last_epoch().unwrap(),
     )
     .unwrap();
     assert_eq!(
@@ -1906,7 +1904,7 @@ fn capped_recovery_siblings_preserve_sequences_and_progress_after_restart() {
             .collect();
 
         let size_of = |declaration: &serde_json::Value| {
-            wist_core::block::block_octets(&[serde_json::json!({
+            wist_core::epoch::epoch_octets(&[serde_json::json!({
                 "type": "publisher_declaration", "body": declaration
             })])
             .unwrap() as i64
@@ -1915,7 +1913,7 @@ fn capped_recovery_siblings_preserve_sequences_and_progress_after_restart() {
         let higher_cap = size_of(&higher);
         assert!(lower_cap > higher_cap);
         r.db.set_param(
-            "block_decompressed_cap_bytes",
+            "epoch_cap_bytes",
             if oversized_lower {
                 higher_cap
             } else {
@@ -1977,7 +1975,7 @@ fn capped_recovery_siblings_preserve_sequences_and_progress_after_restart() {
                 let state = clave::history::declarations::Declarations::reconstruct(
                     &r.db,
                     r.data.path(),
-                    r.db.last_block().unwrap(),
+                    r.db.last_epoch().unwrap(),
                 )
                 .unwrap();
                 assert_eq!(
@@ -1989,8 +1987,7 @@ fn capped_recovery_siblings_preserve_sequences_and_progress_after_restart() {
                     &owner_envelope
                 );
             }
-            r.db.set_param("block_decompressed_cap_bytes", lower_cap)
-                .unwrap();
+            r.db.set_param("epoch_cap_bytes", lower_cap).unwrap();
             5
         } else {
             3
@@ -2001,16 +1998,16 @@ fn capped_recovery_siblings_preserve_sequences_and_progress_after_restart() {
                 clave::seal::run(&r.db, r.data.path(), &r.sk, start + height * 3600).unwrap();
             assert_eq!(report.entry_count, 1);
             assert!(report.dropped.is_empty());
-            let block = stored_entries(&r, height as u64);
+            let epoch = stored_entries(&r, height as u64);
             assert_eq!(
-                block,
+                epoch,
                 vec![serde_json::json!({"type": "publisher_declaration", "body": expected})]
             );
-            assert!(wist_core::block::block_octets(&block).unwrap() as i64 <= lower_cap);
+            assert!(wist_core::epoch::epoch_octets(&epoch).unwrap() as i64 <= lower_cap);
             let state = clave::history::declarations::Declarations::reconstruct(
                 &r.db,
                 r.data.path(),
-                r.db.last_block().unwrap(),
+                r.db.last_epoch().unwrap(),
             )
             .unwrap();
             assert_eq!(state.domains()[&r.host].current().envelope(), expected);
@@ -2046,7 +2043,7 @@ fn capped_recovery_siblings_preserve_sequences_and_progress_after_restart() {
         clave::history::declarations::Declarations::reconstruct(
             &r.db,
             r.data.path(),
-            r.db.last_block().unwrap(),
+            r.db.last_epoch().unwrap(),
         )
         .unwrap();
     }
@@ -2069,8 +2066,7 @@ fn pending_recovery_followers_remain_eligible_after_partial_sealing() {
     write_declaration(&r.p, &follower, &K2_SEED);
     let pending_follower = current_declaration(&r.p);
     ingest(&r, "2026-08-09T14:00:00Z");
-    r.db.set_param("block_decompressed_cap_bytes", 1800)
-        .unwrap();
+    r.db.set_param("epoch_cap_bytes", 1800).unwrap();
     clave::seal::run(&r.db, r.data.path(), &r.sk, start + 7200).unwrap();
     assert_eq!(
         r.db.count_pending_entries("publisher_declaration").unwrap(),
@@ -2103,13 +2099,12 @@ fn pending_recovery_followers_remain_eligible_after_partial_sealing() {
         3
     );
     assert!(!rejection_codes(&r).contains(&"WIST1-E08".into()));
-    r.db.set_param("block_decompressed_cap_bytes", 16_777_216)
-        .unwrap();
+    r.db.set_param("epoch_cap_bytes", 16_777_216).unwrap();
     clave::seal::run(&r.db, r.data.path(), &r.sk, start + 10800).unwrap();
     let state = clave::history::declarations::Declarations::reconstruct(
         &r.db,
         r.data.path(),
-        r.db.last_block().unwrap(),
+        r.db.last_epoch().unwrap(),
     )
     .unwrap();
     assert_eq!(
@@ -2320,7 +2315,7 @@ fn admission_deadline_preserves_pending_followers_and_later_replacements() {
         let state = clave::history::declarations::Declarations::reconstruct(
             &r.db,
             r.data.path(),
-            r.db.last_block().unwrap(),
+            r.db.last_epoch().unwrap(),
         )
         .unwrap();
         assert_eq!(state.domains()[&r.host].current().envelope(), &replacement);
@@ -2344,7 +2339,7 @@ fn admission_deadline_preserves_pending_followers_and_later_replacements() {
         if recovery_follower {
             let window = state.domains()[&r.host].window().unwrap();
             assert_eq!(window.owner().envelope(), &follower_envelope);
-            assert_eq!(window.owner().position().block_number, report.block_number);
+            assert_eq!(window.owner().position().epoch_number, report.epoch_number);
             assert_eq!(
                 r.db.drain_queued_deltas(&r.host).unwrap()[0].delta_id,
                 accepted
@@ -2406,13 +2401,13 @@ fn failed_admission_settlement_rolls_back_every_database_effect() {
 fn cadence_rounding_cannot_reopen_a_settled_admission_window() {
     let r = rig(make_publisher_with_recovery);
     let at = |seconds| jiff::Timestamp::from_second(seconds).unwrap().to_string();
-    r.db.set_param("block_cadence_seconds", 3600).unwrap();
+    r.db.set_param("epoch_cadence_seconds", 3600).unwrap();
     write_feed(&r.p, &r.host, &[], &at(T0));
     ingest(&r, &at(T0));
     let effective = T0 + 30 * DAY;
     let update = wist_core::envelope::sign_envelope(&serde_json::json!({
-        "wist_version": "1.0.0", "action": "parameter_change", "subject": "block_cadence_seconds",
-        "details": {"parameter": "block_cadence_seconds", "value": 3599}, "effective_at": at(effective)
+        "wist_version": "1.0.0", "action": "parameter_change", "subject": "epoch_cadence_seconds",
+        "details": {"parameter": "epoch_cadence_seconds", "value": 3599}, "effective_at": at(effective)
     }), "update", "log1", &r.sk).unwrap();
     r.db.insert_pending_entry("registry_update", "", &update, 0)
         .unwrap();
@@ -2472,7 +2467,7 @@ fn cadence_rounding_cannot_reopen_a_settled_admission_window() {
     clave::history::declarations::Declarations::reconstruct(
         &r.db,
         r.data.path(),
-        r.db.last_block().unwrap(),
+        r.db.last_epoch().unwrap(),
     )
     .unwrap();
 }

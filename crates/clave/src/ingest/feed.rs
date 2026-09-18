@@ -21,7 +21,7 @@ pub(super) fn validate_fields(doc: &Value) -> Result<FeedEnvelope, &'static str>
     {
         return Err("Feed domain is not a Canonical Host");
     }
-    crate::registry::epoch(&feed.generated_at).map_err(|_| "Feed timestamp is invalid")?;
+    crate::registry::unix(&feed.generated_at).map_err(|_| "Feed timestamp is invalid")?;
     let mut ids = std::collections::HashSet::new();
     if feed.deltas.len() > 1000
         || feed.deltas.iter().any(|id| {
@@ -77,7 +77,7 @@ mod tests {
             );
             if let Ok(parsed) = result {
                 if case["expected"] == "accepted" {
-                    let cut = crate::registry::epoch(&parsed.feed.generated_at).unwrap();
+                    let cut = crate::registry::unix(&parsed.feed.generated_at).unwrap();
                     assert!(super::super::verify_sealed_page(
                         &[(cut, 0, publisher.keys.clone())],
                         &original,

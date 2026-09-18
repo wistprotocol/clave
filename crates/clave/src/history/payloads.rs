@@ -1,5 +1,5 @@
 use super::deltas::DeltaSource;
-use crate::db::BlockRow;
+use crate::db::EpochRow;
 use crate::declaration::delta::SizeCaps;
 use crate::error::{Error, Result};
 use serde_json::Value;
@@ -72,7 +72,7 @@ impl PayloadSource {
     pub fn reconstruct(
         db: &crate::db::Db,
         directory: &Path,
-        head: Option<BlockRow>,
+        head: Option<EpochRow>,
         delta_id: &str,
     ) -> Result<Self> {
         let delta = DeltaSource::reconstruct(db, directory, head, delta_id)?;
@@ -95,8 +95,8 @@ impl PayloadSource {
         self.delta.envelope()
     }
 
-    pub fn block_number(&self) -> u64 {
-        self.delta.position().block_number
+    pub fn epoch_number(&self) -> u64 {
+        self.delta.position().epoch_number
     }
 
     pub fn size_caps(&self) -> &SizeCaps {

@@ -80,8 +80,8 @@ impl AdmissionProfile {
         clock: jiff::Timestamp,
     ) -> crate::error::Result<Self> {
         let at = clock.as_nanosecond().div_euclid(1_000_000_000) as i64;
-        let mut history = crate::history::History::open(db, data_dir, db.last_block()?)?;
-        while history.next_block()?.is_some() {}
+        let mut history = crate::history::History::open(db, data_dir, db.last_epoch()?)?;
+        while history.next_epoch()?.is_some() {}
         let initial = wist_core::parameters::Schedule::new(at);
         let schedule = history.schedule().unwrap_or(&initial);
         Ok(Self {

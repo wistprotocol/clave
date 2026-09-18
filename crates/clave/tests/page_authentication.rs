@@ -69,7 +69,7 @@ impl Fixture {
             let restored = clave::history::declarations::Declarations::reconstruct(
                 &self.db,
                 self.directory.path(),
-                self.db.last_block().unwrap(),
+                self.db.last_epoch().unwrap(),
             )
             .unwrap();
             assert_eq!(restored.domains()[&self.host].current().envelope(), &stored);
@@ -163,7 +163,7 @@ fn reused_page_identifiers_preserve_current_and_first_next_authority() {
 }
 
 #[test]
-fn a_lower_sequence_in_the_selected_block_cannot_supply_page_keys() {
+fn a_lower_sequence_in_the_selected_epoch_cannot_supply_page_keys() {
     let mut fixture = Fixture::new();
     fixture.install(0, page_key(&K2_SEED), "2026-08-09T12:00:00Z", true);
     fixture.install(1, page_key(&R1_SEED), "2026-08-09T12:30:00Z", false);
@@ -268,7 +268,7 @@ fn repeated_declaration_entries_bound_the_first_next_page_source() {
     )
     .unwrap();
     assert_eq!(
-        fixture.db.block_entries(1).unwrap()[0]["body"],
+        fixture.db.epoch_entries(1).unwrap()[0]["body"],
         current_declaration(&fixture.publisher)
     );
     fixture.install(1, page_key(&R1_SEED), "2026-08-09T14:00:00Z", true);

@@ -1,6 +1,6 @@
 mod common;
 
-use clave::db::BlockRow;
+use clave::db::EpochRow;
 use clave::history::{deltas::DeltaSource, History};
 use common::*;
 use serde_json::{json, Value};
@@ -16,15 +16,15 @@ fn vector() -> Value {
 fn append(
     db: &clave::db::Db,
     data: &std::path::Path,
-    head: Option<&BlockRow>,
+    head: Option<&EpochRow>,
     at: &str,
     entries: Vec<Value>,
-) -> BlockRow {
-    let height = head.map_or(0, |h| h.block_number + 1);
-    seal_fixture_block(db, data, height, at, &entries)
+) -> EpochRow {
+    let height = head.map_or(0, |h| h.epoch_number + 1);
+    seal_fixture_epoch(db, data, height, at, &entries)
 }
 
-fn genesis(db: &clave::db::Db, data: &std::path::Path, vector: &Value) -> BlockRow {
+fn genesis(db: &clave::db::Db, data: &std::path::Path, vector: &Value) -> EpochRow {
     let key = crypto::SigningKey::from_seed(&std::array::from_fn(|i| i as u8));
     let entry = wist_core::objects::PublisherKey::new(&key.public().to_b64u(), 0, None);
     let declaration = envelope::sign_envelope(
@@ -66,10 +66,10 @@ fn signed_clock_vectors_select_authenticated_profiles_and_exact_endpoints() {
     let db = store(data.path());
     let head = genesis(&db, data.path(), &vector);
     let mut history = History::open(&db, data.path(), Some(head)).unwrap();
-    let block = history.next_block().unwrap().unwrap();
-    assert_eq!(block.rejected_parameters().len(), 2);
-    assert_eq!(block.clock_skew_seconds(), 600);
-    assert!(history.next_block().unwrap().is_none());
+    let epoch = history.next_epoch().unwrap().unwrap();
+    assert_eq!(epoch.rejected_parameters().len(), 2);
+    assert_eq!(epoch.clock_skew_seconds(), 600);
+    assert!(history.next_epoch().unwrap().is_none());
     let schedule = history.schedule().unwrap();
     let key = crypto::PublicKey::from_b64u(vector["public_key"].as_str().unwrap()).unwrap();
     for probe in vector["probes"].as_array().unwrap() {
@@ -97,7 +97,7 @@ fn signed_clock_vectors_select_authenticated_profiles_and_exact_endpoints() {
 }
 
 #[test]
-fn historical_clock_rejections_survive_later_blocks_restart_and_repair() {
+fn historical_clock_rejections_survive_later_epochs_restart_and_repair() {
     let vector = vector();
     for probe in vector["probes"]
         .as_array()
@@ -125,15 +125,15 @@ fn historical_clock_rejections_survive_later_blocks_restart_and_repair() {
             vec![],
         );
         // A key entry's `nbf` is a NumericDate, so no binding reaches an
-        // instant before the epoch: such a Delta fails the WIST-1 §5.1 key
-        // check whatever the clock rule makes of it.
-        let before_epoch = wist_core::publisher_time::at_or_after(
+        // instant before Unix second zero: such a Delta fails the WIST-1
+        // §5.1 key check whatever the clock rule makes of it.
+        let before_unix_zero = wist_core::publisher_time::at_or_after(
             delta["delta"]["observed_at"].as_str().unwrap(),
             0,
         ) == Some(false);
         for pinned in [&head, &later, &later] {
             let result = DeltaSource::reconstruct(&db, data.path(), Some(pinned.clone()), &id);
-            if before_epoch {
+            if before_unix_zero {
                 let error = result.err().unwrap().to_string();
                 let clock = probe["expected"].as_str().unwrap_or("WIST1-E02");
                 assert!(
@@ -160,7 +160,7 @@ fn historical_clock_rejections_survive_later_blocks_restart_and_repair() {
                 assert!(error.contains("WIST1-E06"), "{}: {error}", probe["name"]);
             }
         }
-        if probe["expected"].is_null() && !before_epoch {
+        if probe["expected"].is_null() && !before_unix_zero {
             let connection = rusqlite::Connection::open(data.path().join("clave.sqlite")).unwrap();
             let original: Vec<u8> = connection
                 .query_row(
@@ -273,7 +273,7 @@ fn sealing_rechecks_clock_reductions_and_releases_rejected_chains_for_retry() {
         .unwrap()
         .is_none());
     let source =
-        DeltaSource::reconstruct(&db, data.path(), db.last_block().unwrap(), &boundary).unwrap();
+        DeltaSource::reconstruct(&db, data.path(), db.last_epoch().unwrap(), &boundary).unwrap();
     assert_eq!(source.clock_skew_seconds(), 60);
     drop(db);
     let db = clave::db::Db::open(&path).unwrap();
@@ -283,7 +283,7 @@ fn sealing_rechecks_clock_reductions_and_releases_rejected_chains_for_retry() {
     assert!(report.rejected.is_empty());
     clave::seal::run(&db, data.path(), &key, instant("2026-08-16T13:00:00Z")).unwrap();
     for id in [&root, &child, &boundary] {
-        DeltaSource::reconstruct(&db, data.path(), db.last_block().unwrap(), id).unwrap();
+        DeltaSource::reconstruct(&db, data.path(), db.last_epoch().unwrap(), id).unwrap();
     }
 }
 

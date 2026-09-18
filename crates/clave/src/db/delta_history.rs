@@ -19,7 +19,7 @@ impl Db {
                 return Ok(doc);
             }
         }
-        let source = DeltaSource::reconstruct(self, directory, self.last_block()?, id)?;
+        let source = DeltaSource::reconstruct(self, directory, self.last_epoch()?, id)?;
         Ok(source.envelope().clone())
     }
 }

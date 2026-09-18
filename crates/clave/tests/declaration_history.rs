@@ -1,11 +1,11 @@
-use clave::db::BlockRow;
+use clave::db::EpochRow;
 use clave::declaration::Decision;
 use clave::history::declarations::DeclarationsReplay;
 use clave::history::declarations::{Declarations, Domain, Effects};
 use clave::history::History;
 use serde_json::{json, Value};
 use wist_core::crypto::{hex_encode, SigningKey};
-use wist_core::{block, envelope, jcs};
+use wist_core::{envelope, epoch, jcs};
 
 fn vector(name: &str) -> Value {
     let root = std::env::var_os("WIST_SPEC_DIR")
@@ -25,14 +25,14 @@ fn field_rejection_preserves_the_complete_declaration_prefix() {
         "wist1/declaration-hosts",
     ] {
         let vector = vector(name);
-        for case in vector["block_cases"].as_array().unwrap() {
-            let mut blocks = vector["prefixes"][case["prefix"].as_str().unwrap()]
+        for case in vector["epoch_cases"].as_array().unwrap() {
+            let mut epochs = vector["prefixes"][case["prefix"].as_str().unwrap()]
                 .as_array()
                 .unwrap()
                 .clone();
-            let prefix_length = blocks.len();
-            blocks.push(case["block"].clone());
-            let fixture = Fixture::new(&blocks);
+            let prefix_length = epochs.len();
+            epochs.push(case["epoch"].clone());
+            let fixture = Fixture::new(&epochs);
             assert_eq!(
                 fixture.head().unwrap().root,
                 case["pinned_head"].as_str().unwrap()
@@ -40,26 +40,26 @@ fn field_rejection_preserves_the_complete_declaration_prefix() {
             let mut reader = fixture.reader();
             let mut state = Declarations::default();
             for _ in 0..prefix_length {
-                state.apply(&reader.next_block().unwrap().unwrap()).unwrap();
+                state.apply(&reader.next_epoch().unwrap().unwrap()).unwrap();
             }
             let before = format!("{state:?}");
-            let block = reader.next_block().unwrap().unwrap();
+            let epoch = reader.next_epoch().unwrap().unwrap();
             let projection = state.project(
-                block.sealed_at(),
+                epoch.sealed_at(),
                 reader
                     .schedule()
                     .unwrap()
-                    .value_at("recovery_window_days", block.sealed_at_s())
+                    .value_at("recovery_window_days", epoch.sealed_at_s())
                     .unwrap(),
                 reader
                     .schedule()
                     .unwrap()
-                    .value_at("declaration_activation_blocks", block.sealed_at_s())
+                    .value_at("declaration_activation_epochs", epoch.sealed_at_s())
                     .unwrap(),
-                block.entries(),
+                epoch.entries(),
             );
             assert_eq!(format!("{state:?}"), before);
-            let result = state.apply(&block);
+            let result = state.apply(&epoch);
             assert_eq!(projection.is_ok(), result.is_ok());
             if let Ok(projected) = projection {
                 assert_eq!(
@@ -106,18 +106,18 @@ fn delta_bindings_use_frozen_authenticated_recovery_sources() {
     let vector = vector("wist1/recovery-bindings");
     let mut prefixes = std::collections::BTreeMap::new();
     for (name, history) in vector["histories"].as_object().unwrap() {
-        let blocks = history["blocks"].as_array().unwrap();
-        let fixture = Fixture::new(blocks);
+        let epochs = history["epochs"].as_array().unwrap();
+        let fixture = Fixture::new(epochs);
         assert_eq!(
             fixture.head().unwrap().root,
             history["pinned_head"].as_str().unwrap()
         );
         let mut reader = fixture.reader();
         let mut state = Declarations::default();
-        while let Some(block) = reader.next_block().unwrap() {
-            state.apply(&block).unwrap();
+        while let Some(epoch) = reader.next_epoch().unwrap() {
+            state.apply(&epoch).unwrap();
             if state.domains()["example.com"].window().is_some() {
-                prefixes.insert((name.clone(), block.block_number()), state.clone());
+                prefixes.insert((name.clone(), epoch.epoch_number()), state.clone());
             }
         }
         assert_eq!(
@@ -133,8 +133,8 @@ fn delta_bindings_use_frozen_authenticated_recovery_sources() {
         )];
         let before = format!("{state:?}");
         let window = state.domains()["example.com"].window().unwrap();
-        assert_eq!(window.owner().position().block_number, 1);
-        assert_eq!(window.before().position().block_number, 0);
+        assert_eq!(window.owner().position().epoch_number, 1);
+        assert_eq!(window.before().position().epoch_number, 0);
         let prior = clave::declaration::publisher_of(window.before().envelope()).unwrap();
         let owner = clave::declaration::publisher_of(window.owner().envelope()).unwrap();
         let mut keys: Vec<_> = prior.keys.iter().chain(&owner.keys).collect();
@@ -167,17 +167,17 @@ fn delta_scope_stays_with_its_authenticated_declaration_source() {
     let key_id = vector["log_key"]["key_id"].as_str().unwrap();
     let mut sources = std::collections::BTreeMap::new();
     for (name, history) in vector["histories"].as_object().unwrap() {
-        let blocks = history["blocks"].as_array().unwrap();
-        let fixture = Fixture::with_key_id(blocks, key_id);
+        let epochs = history["epochs"].as_array().unwrap();
+        let fixture = Fixture::with_key_id(epochs, key_id);
         assert_eq!(
             fixture.head().unwrap().root,
             history["pinned_head"].as_str().unwrap()
         );
         let mut reader = fixture.reader();
         let mut state = Declarations::default();
-        while let Some(block) = reader.next_block().unwrap() {
-            let effects = state.apply(&block).unwrap();
-            let height = block.block_number();
+        while let Some(epoch) = reader.next_epoch().unwrap() {
+            let effects = state.apply(&epoch).unwrap();
+            let height = epoch.epoch_number();
             let domain = &state.domains()["example.com"];
             fn parse(doc: &Value) -> wist_core::objects::Publisher {
                 clave::declaration::publisher_of(doc).unwrap()
@@ -209,7 +209,7 @@ fn delta_scope_stays_with_its_authenticated_declaration_source() {
                 .iter()
                 .any(|probe| probe["history"] == *name && probe["height"] == height)
             {
-                let restored = Fixture::with_key_id(&blocks[..=height as usize], key_id)
+                let restored = Fixture::with_key_id(&epochs[..=height as usize], key_id)
                     .restore()
                     .unwrap();
                 assert_eq!(format!("{restored:?}"), format!("{state:?}"));
@@ -266,20 +266,20 @@ fn timestamp(at: i64) -> String {
     clave::registry::instant(at).unwrap()
 }
 
-/// A fixture Block's `sealed_at`, whether it carries a Checkpoint note
-/// (a vector Block) or the plain field a locally built one carries.
-fn sealed_at(block: &Value) -> String {
-    match block.get("checkpoint").and_then(Value::as_str) {
+/// A fixture Epoch's `sealed_at`, whether it carries a Checkpoint note
+/// (a vector Epoch) or the plain field a locally built one carries.
+fn sealed_at(epoch: &Value) -> String {
+    match epoch.get("checkpoint").and_then(Value::as_str) {
         Some(note) => wist_core::checkpoint::Checkpoint::parse(note)
             .unwrap()
             .sealed_at()
             .to_owned(),
-        None => block["sealed_at"].as_str().unwrap().to_owned(),
+        None => epoch["sealed_at"].as_str().unwrap().to_owned(),
     }
 }
 
-fn entries_of(block: &Value) -> Vec<Value> {
-    serde_json::from_value(block["entries"].clone()).unwrap()
+fn entries_of(epoch: &Value) -> Vec<Value> {
+    serde_json::from_value(epoch["entries"].clone()).unwrap()
 }
 
 fn digest(value: &Value) -> String {
@@ -290,24 +290,24 @@ fn digest(value: &Value) -> String {
     )
 }
 
-fn signed_block(prefix: &[Value], at: &str, mut entries: Vec<Value>) -> Value {
+fn signed_epoch(prefix: &[Value], at: &str, mut entries: Vec<Value>) -> Value {
     let _ = prefix;
-    block::sort_entries(&mut entries).unwrap();
+    epoch::sort_entries(&mut entries).unwrap();
     json!({"sealed_at": at, "entries": entries})
 }
 
 struct Fixture {
     data: tempfile::TempDir,
     db: clave::db::Db,
-    head: Option<BlockRow>,
+    head: Option<EpochRow>,
 }
 
 impl Fixture {
-    fn new(blocks: &[Value]) -> Self {
-        Self::with_key_id(blocks, "test-log-k1")
+    fn new(epochs: &[Value]) -> Self {
+        Self::with_key_id(epochs, "test-log-k1")
     }
 
-    fn with_key_id(blocks: &[Value], key_id: &str) -> Self {
+    fn with_key_id(epochs: &[Value], key_id: &str) -> Self {
         let data = tempfile::tempdir().unwrap();
         let anchor = json!({"wist_version":"1.0.0", "log_id":"log.example.org", "genesis_key":{"key_id":key_id,"alg":"Ed25519","public_key":"A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg"},"created_at":"2026-08-02T00:00:00Z"});
         let anchor = envelope::sign_envelope(&anchor, "anchor", key_id, &log_key()).unwrap();
@@ -318,18 +318,18 @@ impl Fixture {
         .unwrap();
         let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
         let mut head = None;
-        for (height, block) in blocks.iter().enumerate() {
-            let mut entries = entries_of(block);
-            block::sort_entries(&mut entries).unwrap();
+        for (height, epoch) in epochs.iter().enumerate() {
+            let mut entries = entries_of(epoch);
+            epoch::sort_entries(&mut entries).unwrap();
             head = Some(
                 db.commit_seal(
                     &log_key(),
                     "log.example.org",
                     &[],
                     height as u64,
-                    &sealed_at(block),
+                    &sealed_at(epoch),
                     &entries,
-                    block::block_octets(&entries).unwrap(),
+                    epoch::epoch_octets(&entries).unwrap(),
                     &[],
                     &[],
                     &[],
@@ -344,7 +344,7 @@ impl Fixture {
         Self { data, db, head }
     }
 
-    fn head(&self) -> Option<BlockRow> {
+    fn head(&self) -> Option<EpochRow> {
         self.head.clone()
     }
 
@@ -374,9 +374,9 @@ fn outcome(effects: &Effects) -> &'static str {
         })
 }
 
-fn probe(blocks: &[Value], probe: &Value) -> (Declarations, Result<Effects, String>, u64) {
+fn probe(epochs: &[Value], probe: &Value) -> (Declarations, Result<Effects, String>, u64) {
     let height = probe["prefix_height"].as_u64().unwrap() as usize;
-    let mut candidate = blocks[..=height].to_vec();
+    let mut candidate = epochs[..=height].to_vec();
     let mut entries = if let Some(candidates) = probe["candidates"].as_array() {
         candidates
             .iter()
@@ -388,7 +388,7 @@ fn probe(blocks: &[Value], probe: &Value) -> (Declarations, Result<Effects, Stri
     if !probe["successor"].is_null() {
         entries.push(json!({"type":"publisher_declaration","body":probe["successor"]}));
     }
-    let next = signed_block(
+    let next = signed_epoch(
         &candidate,
         probe["candidate_sealed_at"].as_str().unwrap(),
         entries,
@@ -400,7 +400,7 @@ fn probe(blocks: &[Value], probe: &Value) -> (Declarations, Result<Effects, Stri
     let mut windows = 0;
     for _ in 0..=height {
         let effects = state
-            .apply(&history.next_block().unwrap().unwrap())
+            .apply(&history.next_epoch().unwrap().unwrap())
             .unwrap();
         windows += effects
             .installations
@@ -409,7 +409,7 @@ fn probe(blocks: &[Value], probe: &Value) -> (Declarations, Result<Effects, Stri
             .count() as u64;
     }
     let before = format!("{state:?}");
-    let candidate = history.next_block().unwrap().unwrap();
+    let candidate = history.next_epoch().unwrap().unwrap();
     let projection = state.project(
         candidate.sealed_at(),
         history
@@ -420,7 +420,7 @@ fn probe(blocks: &[Value], probe: &Value) -> (Declarations, Result<Effects, Stri
         history
             .schedule()
             .unwrap()
-            .value_at("declaration_activation_blocks", candidate.sealed_at_s())
+            .value_at("declaration_activation_epochs", candidate.sealed_at_s())
             .unwrap(),
         candidate.entries(),
     );
@@ -433,7 +433,7 @@ fn probe(blocks: &[Value], probe: &Value) -> (Declarations, Result<Effects, Stri
                 format!("{:?}", state.domains())
             );
             assert_eq!(format!("{:?}", projected.effects()), format!("{effects:?}"));
-            assert_eq!(projected.block_number(), candidate.block_number());
+            assert_eq!(projected.epoch_number(), candidate.epoch_number());
             assert_eq!(projected.sealed_at_s(), candidate.sealed_at_s());
         }
         (Err(projected), Err(applied)) => assert_eq!(projected.to_string(), *applied),
@@ -469,18 +469,18 @@ fn probe(blocks: &[Value], probe: &Value) -> (Declarations, Result<Effects, Stri
 #[test]
 fn recovery_ownership_uses_sequence_with_original_canonical_positions() {
     for case in vector("wist1/recovery-order")["cases"].as_array().unwrap() {
-        let blocks = case["blocks"].as_array().unwrap();
-        let fixture = Fixture::new(blocks);
+        let epochs = case["epochs"].as_array().unwrap();
+        let fixture = Fixture::new(epochs);
         let mut reader = fixture.reader();
         let mut state = Declarations::default();
         let mut sequences = Vec::new();
         let mut windows = 0;
-        while let Some(block) = reader.next_block().unwrap() {
-            for installation in state.apply(&block).unwrap().installations {
+        while let Some(epoch) = reader.next_epoch().unwrap() {
+            for installation in state.apply(&epoch).unwrap().installations {
                 let declaration = installation.declaration;
                 let position = declaration.position();
                 assert_eq!(
-                    &blocks[position.block_number as usize]["entries"][position.entry_index]
+                    &epochs[position.epoch_number as usize]["entries"][position.entry_index]
                         ["body"],
                     declaration.envelope()
                 );
@@ -493,7 +493,7 @@ fn recovery_ownership_uses_sequence_with_original_canonical_positions() {
         let window = state.domains()["example.com"].window().unwrap();
         assert_eq!(window.owner().hash(), case["expected"]["owner_declaration"]);
         assert_eq!(
-            window.owner().position().block_number,
+            window.owner().position().epoch_number,
             case["expected"]["owner_height"]
         );
         assert_eq!(state.head().unwrap().1, case["pinned_head"]);
@@ -508,13 +508,13 @@ fn recovery_ownership_uses_sequence_with_original_canonical_positions() {
 fn recovery_heads_sequence_floors_and_named_predecessors_match_signed_vectors() {
     let vector = vector("wist1/recovery-heads");
     for branch in std::iter::once(&vector).chain(vector["branches"].as_array().unwrap()) {
-        let blocks = branch["blocks"].as_array().unwrap();
-        let fixture = Fixture::new(blocks);
+        let epochs = branch["epochs"].as_array().unwrap();
+        let fixture = Fixture::new(epochs);
         let mut reader = fixture.reader();
         let mut state = Declarations::default();
         let mut windows = 0;
-        while let Some(block) = reader.next_block().unwrap() {
-            let effects = state.apply(&block).unwrap();
+        while let Some(epoch) = reader.next_epoch().unwrap() {
+            let effects = state.apply(&epoch).unwrap();
             windows += effects
                 .installations
                 .iter()
@@ -522,7 +522,7 @@ fn recovery_heads_sequence_floors_and_named_predecessors_match_signed_vectors() 
                 .count() as u64;
             if let Some(expected_states) = branch["expected_prefix_states"].as_array() {
                 for expected in expected_states {
-                    if expected["height"] == block.block_number() {
+                    if expected["height"] == epoch.epoch_number() {
                         assert_eq!(
                             summary(&state.domains()["example.com"], windows),
                             expected["state"]
@@ -532,12 +532,12 @@ fn recovery_heads_sequence_floors_and_named_predecessors_match_signed_vectors() 
             }
         }
         for candidate in branch["probes"].as_array().into_iter().flatten() {
-            let selected_blocks = candidate["branch"].as_u64().map_or(blocks, |index| {
-                vector["branches"][index as usize]["blocks"]
+            let selected_epochs = candidate["branch"].as_u64().map_or(epochs, |index| {
+                vector["branches"][index as usize]["epochs"]
                     .as_array()
                     .unwrap()
             });
-            let (state, result, windows) = probe(selected_blocks, candidate);
+            let (state, result, windows) = probe(selected_epochs, candidate);
             if result.is_ok() {
                 assert_eq!(
                     summary(&state.domains()["example.com"], windows),
@@ -557,42 +557,42 @@ fn recovery_heads_sequence_floors_and_named_predecessors_match_signed_vectors() 
     }
 }
 
-/// Applies one authenticated Block under the parameter map a vector
+/// Applies one authenticated Epoch under the parameter map a vector
 /// declares, rather than the registry defaults its fixture Log carries.
 fn apply_under(
     state: &mut Declarations,
-    block: &clave::history::VerifiedBlock,
+    epoch: &clave::history::VerifiedEpoch,
     days: i64,
-    activation_blocks: i64,
+    activation_epochs: i64,
 ) -> Result<clave::history::declarations::Effects, clave::Error> {
-    Ok(state.apply_block(
-        block.block_number(),
-        block.root(),
-        block.sealed_at(),
+    Ok(state.apply_epoch(
+        epoch.epoch_number(),
+        epoch.root(),
+        epoch.sealed_at(),
         days,
-        activation_blocks,
-        block.entries(),
+        activation_epochs,
+        epoch.entries(),
     )?)
 }
 
 #[test]
-fn conflicting_groups_and_failed_authors_reject_blocks_atomically() {
+fn conflicting_groups_and_failed_authors_reject_epochs_atomically() {
     let vector = vector("wist1/declaration-conflicts");
     let days = vector["recovery_window_days"].as_i64().unwrap();
-    let activation_blocks = vector["declaration_activation_blocks"].as_i64().unwrap();
+    let activation_epochs = vector["declaration_activation_epochs"].as_i64().unwrap();
     for case in vector["cases"].as_array().unwrap() {
-        let mut blocks = vector["prefixes"][case["prefix"].as_str().unwrap()]
+        let mut epochs = vector["prefixes"][case["prefix"].as_str().unwrap()]
             .as_array()
             .unwrap()
             .clone();
-        blocks.push(case["block"].clone());
-        let fixture = Fixture::new(&blocks);
+        epochs.push(case["epoch"].clone());
+        let fixture = Fixture::new(&epochs);
         let mut history = fixture.reader();
         let mut state = Declarations::default();
         let mut windows = std::collections::BTreeMap::<String, u64>::new();
-        while let Some(block) = history.next_block().unwrap() {
+        while let Some(epoch) = history.next_epoch().unwrap() {
             let before = format!("{state:?}");
-            match apply_under(&mut state, &block, days, activation_blocks) {
+            match apply_under(&mut state, &epoch, days, activation_epochs) {
                 Ok(effects) => {
                     for installation in effects.installations {
                         let domain = installation.declaration.envelope()["publisher"]["domain"]
@@ -601,7 +601,7 @@ fn conflicting_groups_and_failed_authors_reject_blocks_atomically() {
                             .to_string();
                         *windows.entry(domain).or_default() += u64::from(installation.opens_window);
                     }
-                    if block.block_number() as usize == blocks.len() - 1 {
+                    if epoch.epoch_number() as usize == epochs.len() - 1 {
                         assert!(case["expected_results"]
                             .as_array()
                             .unwrap()
@@ -609,7 +609,7 @@ fn conflicting_groups_and_failed_authors_reject_blocks_atomically() {
                     }
                 }
                 Err(error) => {
-                    assert_eq!(block.block_number() as usize, blocks.len() - 1);
+                    assert_eq!(epoch.epoch_number() as usize, epochs.len() - 1);
                     assert!(
                         case["expected_results"]
                             .as_array()
@@ -624,7 +624,7 @@ fn conflicting_groups_and_failed_authors_reject_blocks_atomically() {
                 }
             }
         }
-        let actual:serde_json::Map<_,_>=state.domains().iter().map(|(name,domain)|(name.clone(),json!({"current_envelope":digest(domain.current().envelope()),"recovery_envelope":domain.window().map(|w|digest(w.head().envelope())),"highest_accepted_seq":domain.highest_accepted_seq(),"window_end":domain.window().map(|w|timestamp(w.end_s().try_into().unwrap())),"windows_opened":windows[name],"reset_height":domain.reset().map(|p|p.block_number)}))).collect();
+        let actual:serde_json::Map<_,_>=state.domains().iter().map(|(name,domain)|(name.clone(),json!({"current_envelope":digest(domain.current().envelope()),"recovery_envelope":domain.window().map(|w|digest(w.head().envelope())),"highest_accepted_seq":domain.highest_accepted_seq(),"window_end":domain.window().map(|w|timestamp(w.end_s().try_into().unwrap())),"windows_opened":windows[name],"reset_height":domain.reset().map(|p|p.epoch_number)}))).collect();
         assert_eq!(
             Value::Object(actual),
             case["expected_state"],
@@ -645,13 +645,13 @@ fn settlement_restores_authenticated_chain_and_reports_competitors() {
         .as_array()
         .unwrap()
     {
-        let blocks = case["blocks"].as_array().unwrap();
-        let fixture = Fixture::new(blocks);
+        let epochs = case["epochs"].as_array().unwrap();
+        let fixture = Fixture::new(epochs);
         let mut reader = fixture.reader();
         let mut state = Declarations::default();
         let mut superseded = Vec::new();
-        while let Some(block) = reader.next_block().unwrap() {
-            for settlement in state.apply(&block).unwrap().settlements {
+        while let Some(epoch) = reader.next_epoch().unwrap() {
+            for settlement in state.apply(&epoch).unwrap().settlements {
                 superseded.extend(settlement.superseded.iter().map(|d| d.hash().to_string()));
             }
         }
@@ -664,7 +664,7 @@ fn settlement_restores_authenticated_chain_and_reports_competitors() {
             let mut candidate = candidate.clone();
             let height = candidate["prefix_height"].as_u64().unwrap() as usize;
             candidate["candidate_sealed_at"] = timestamp(
-                sealed_at(&blocks[height])
+                sealed_at(&epochs[height])
                     .as_str()
                     .parse::<jiff::Timestamp>()
                     .unwrap()
@@ -672,7 +672,7 @@ fn settlement_restores_authenticated_chain_and_reports_competitors() {
                     + 3600,
             )
             .into();
-            assert!(probe(blocks, &candidate).1.is_err());
+            assert!(probe(epochs, &candidate).1.is_err());
         }
     }
 }
@@ -680,11 +680,11 @@ fn settlement_restores_authenticated_chain_and_reports_competitors() {
 #[test]
 fn reconstruction_requires_complete_pinned_history_and_sequential_application() {
     let vector = vector("wist1/recovery-heads");
-    let blocks = vector["blocks"].as_array().unwrap();
-    let fixture = Fixture::new(blocks);
+    let epochs = vector["epochs"].as_array().unwrap();
+    let fixture = Fixture::new(epochs);
     let mut reader = fixture.reader();
-    let first = reader.next_block().unwrap().unwrap();
-    let second = reader.next_block().unwrap().unwrap();
+    let first = reader.next_epoch().unwrap().unwrap();
+    let second = reader.next_epoch().unwrap().unwrap();
     let mut state = Declarations::default();
     assert!(state.apply(&second).is_err());
     assert!(state.domains().is_empty());
@@ -698,8 +698,8 @@ fn reconstruction_requires_complete_pinned_history_and_sequential_application() 
     rusqlite::Connection::open(fixture.data.path().join("clave.sqlite"))
         .unwrap()
         .execute(
-            "DELETE FROM blocks WHERE block_number = ?1",
-            [(blocks.len() - 1) as i64],
+            "DELETE FROM epochs WHERE epoch_number = ?1",
+            [(epochs.len() - 1) as i64],
         )
         .unwrap();
     assert!(fixture.restore().is_err());
@@ -764,18 +764,18 @@ fn authenticated_parameter_schedules_freeze_window_length_at_each_owner() {
                 .entry(probe["at_s"].as_i64().unwrap().div_euclid(3600) * 3600)
                 .or_default();
         }
-        let mut blocks = Vec::new();
+        let mut epochs = Vec::new();
         for (at, entries) in timeline {
-            blocks.push(signed_block(&blocks, &timestamp(base + at), entries));
+            epochs.push(signed_epoch(&epochs, &timestamp(base + at), entries));
         }
-        let fixture = Fixture::new(&blocks);
+        let fixture = Fixture::new(&epochs);
         let mut reader = fixture.reader();
         let mut state = Declarations::default();
         let mut stopped = false;
-        while let Some(block) = reader.next_block().unwrap() {
-            let at = block.sealed_at_s() - base;
+        while let Some(epoch) = reader.next_epoch().unwrap() {
+            let at = epoch.sealed_at_s() - base;
             assert_eq!(
-                block.rejected_parameters().len(),
+                epoch.rejected_parameters().len(),
                 if at == 0 {
                     rejected_amendments.len()
                 } else {
@@ -786,7 +786,7 @@ fn authenticated_parameter_schedules_freeze_window_length_at_each_owner() {
             );
             if unsealable == Some(at) {
                 let failure = state
-                    .apply(&block)
+                    .apply(&epoch)
                     .err()
                     .map(|e| e.to_string())
                     .unwrap_or_default();
@@ -798,7 +798,7 @@ fn authenticated_parameter_schedules_freeze_window_length_at_each_owner() {
                 stopped = true;
                 break;
             }
-            state.apply(&block).unwrap();
+            state.apply(&epoch).unwrap();
             for event in events.iter().filter(|event| event["sealed_at_s"] == at) {
                 let window = state.domains()["example.com"].window().unwrap();
                 assert_eq!(
@@ -851,9 +851,9 @@ fn authenticated_parameter_schedules_freeze_window_length_at_each_owner() {
 fn legacy_recovery_owners_require_authenticated_matching_history() {
     let vector = vector("wist1/recovery-bindings");
     for (name, history) in vector["histories"].as_object().unwrap() {
-        for mutation in ["none", "opening", "prior", "missing_block", "corrupt_block"] {
-            let blocks = history["blocks"].as_array().unwrap();
-            let fixture = Fixture::new(blocks);
+        for mutation in ["none", "opening", "prior", "missing_epoch", "corrupt_epoch"] {
+            let epochs = history["epochs"].as_array().unwrap();
+            let fixture = Fixture::new(epochs);
             let state = fixture.restore().unwrap();
             let window = state.domains()["example.com"].window().unwrap();
             let path = fixture.data.path().join("clave.sqlite");
@@ -885,11 +885,11 @@ fn legacy_recovery_owners_require_authenticated_matching_history() {
                 .unwrap();
             drop(connection);
             let connection = rusqlite::Connection::open(&path).unwrap();
-            if mutation == "missing_block" {
+            if mutation == "missing_epoch" {
                 connection
-                    .execute("DELETE FROM blocks WHERE block_number = 1", [])
+                    .execute("DELETE FROM epochs WHERE epoch_number = 1", [])
                     .unwrap();
-            } else if mutation == "corrupt_block" {
+            } else if mutation == "corrupt_epoch" {
                 connection
                     .execute(
                         "UPDATE log_entries SET entry_json = ?1 WHERE leaf_index = 0",
@@ -934,8 +934,8 @@ fn candidate_sources_keep_settlement_separate_from_deadline_replacements() {
     let vector = vector("wist1/recovery-scope");
     let key_id = vector["log_key"]["key_id"].as_str().unwrap();
     for history in vector["histories"].as_object().unwrap().values() {
-        let blocks = history["blocks"].as_array().unwrap();
-        let fixture = Fixture::with_key_id(&blocks[..169], key_id);
+        let epochs = history["epochs"].as_array().unwrap();
+        let fixture = Fixture::with_key_id(&epochs[..169], key_id);
         let state = fixture.restore().unwrap();
         let before = format!("{state:?}");
         let domain = &state.domains()["example.com"];
@@ -979,10 +979,10 @@ fn candidate_sources_keep_settlement_separate_from_deadline_replacements() {
 
         let replacement = state
             .project(
-                sealed_at(&blocks[169]).as_str(),
+                sealed_at(&epochs[169]).as_str(),
                 7,
                 0,
-                blocks[169]["entries"].as_array().unwrap(),
+                epochs[169]["entries"].as_array().unwrap(),
             )
             .unwrap();
         let settlement = &replacement.effects().settlements[0];
@@ -1003,11 +1003,11 @@ fn candidate_sources_keep_settlement_separate_from_deadline_replacements() {
                 .is_none()
         );
         assert_eq!(current.delta_admission_sources().len(), 1);
-        assert_eq!(replacement.block_number(), 169);
+        assert_eq!(replacement.epoch_number(), 169);
         assert_eq!(replacement.sealed_at_s(), deadline);
         assert_eq!(format!("{state:?}"), before);
 
-        let mut corrupted = blocks[169]["entries"].as_array().unwrap().clone();
+        let mut corrupted = epochs[169]["entries"].as_array().unwrap().clone();
         let signature = corrupted[0]["body"]["sig"]["value"].as_str().unwrap();
         corrupted[0]["body"]["sig"]["value"] = format!(
             "{}{}",
@@ -1037,16 +1037,16 @@ fn unsealed_candidate_followers_do_not_advance_recovery_authority() {
     let vector = vector("wist1/recovery-scope");
     let key_id = vector["log_key"]["key_id"].as_str().unwrap();
     for history in vector["histories"].as_object().unwrap().values() {
-        let blocks = history["blocks"].as_array().unwrap();
-        let fixture = Fixture::with_key_id(&blocks[..3], key_id);
+        let epochs = history["epochs"].as_array().unwrap();
+        let fixture = Fixture::with_key_id(&epochs[..3], key_id);
         let state = fixture.restore().unwrap();
         let before = format!("{state:?}");
         let candidate = state
             .project(
-                sealed_at(&blocks[3]).as_str(),
+                sealed_at(&epochs[3]).as_str(),
                 7,
                 0,
-                blocks[3]["entries"].as_array().unwrap(),
+                epochs[3]["entries"].as_array().unwrap(),
             )
             .unwrap();
         let projected = &candidate.domains()["example.com"];
@@ -1085,14 +1085,14 @@ fn unsealed_candidate_followers_do_not_advance_recovery_authority() {
 #[test]
 fn candidate_projection_requires_valid_time_profile_and_entry_order() {
     let vector = vector("wist1/recovery-heads");
-    let blocks = vector["blocks"].as_array().unwrap();
-    let state = Fixture::new(&blocks[..2]).restore().unwrap();
+    let epochs = vector["epochs"].as_array().unwrap();
+    let state = Fixture::new(&epochs[..2]).restore().unwrap();
     let before = format!("{state:?}");
-    let at = sealed_at(&blocks[2]);
+    let at = sealed_at(&epochs[2]);
     let at = at.as_str();
     for invalid in [
-        sealed_at(&blocks[0]).as_str(),
-        sealed_at(&blocks[1]).as_str(),
+        sealed_at(&epochs[0]).as_str(),
+        sealed_at(&epochs[1]).as_str(),
         "2026-08-04T02:00:60Z",
         "2026-08-04T02:00:00.0Z",
         "2026-08-04T02:00:00+00:00",
@@ -1105,7 +1105,7 @@ fn candidate_projection_requires_valid_time_profile_and_entry_order() {
     assert!(state.project(at, 7, 0, &[malformed]).is_err());
     let mut entries = vec![
         json!({"type":"label","body":{}}),
-        blocks[2]["entries"][0].clone(),
+        epochs[2]["entries"][0].clone(),
     ];
     assert!(state.project(at, 7, 0, &entries).is_err());
     entries.reverse();

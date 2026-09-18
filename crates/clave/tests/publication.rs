@@ -11,7 +11,7 @@ const SEAL_START: i64 = 1_786_276_800;
 fn sealed_store(host: &str, client: &clave::fetch::Client, data: &Path) -> clave::db::Db {
     clave::init::run(host, data).unwrap();
     let db = clave::db::Db::open(&data.join("clave.sqlite")).unwrap();
-    db.set_param("block_cadence_seconds", 1).unwrap();
+    db.set_param("epoch_cadence_seconds", 1).unwrap();
     clave::ingest::run(&db, client, data, host, "2026-08-09T12:00:00Z").unwrap();
     db
 }
@@ -54,7 +54,7 @@ fn a_seal_records_its_checkpoint_before_publishing_the_tree_it_states() {
     let head = head_checkpoint(data.path());
     assert_eq!(
         served_entries(data.path(), 0, head.tree_size()),
-        db.block_entries(0).unwrap()
+        db.epoch_entries(0).unwrap()
     );
     assert!(db.unpublished_publications().unwrap().is_empty());
     for dir in ["log", "log/checkpoints", "tile/0", "tile/entries"] {
@@ -91,23 +91,23 @@ fn a_publication_interrupted_after_its_commit_is_finished_from_the_stored_checkp
     let head = wist_core::checkpoint::Checkpoint::parse(&note).unwrap();
     assert_eq!(
         served_entries(data.path(), 0, head.tree_size()),
-        db.block_entries(0).unwrap(),
+        db.epoch_entries(0).unwrap(),
         "the Entries reach their bundles before the Checkpoint is archived"
     );
     assert!(
         !data.path().join("checkpoint").exists(),
         "no Checkpoint is published before its archive copy is durable"
     );
-    assert_eq!(db.last_block().unwrap().unwrap().block_number, 0);
+    assert_eq!(db.last_epoch().unwrap().unwrap().epoch_number, 0);
 
     let report = clave::seal::run(&db, data.path(), &sk, SEAL_START + 3600).unwrap();
-    assert_eq!(report.block_number, 1);
+    assert_eq!(report.epoch_number, 1);
     assert_eq!(
         std::fs::read_to_string(checkpoints.join("000000000")).unwrap(),
         note
     );
     assert!(db.unpublished_publications().unwrap().is_empty());
-    assert_eq!(head_checkpoint(data.path()).block_number(), 1);
+    assert_eq!(head_checkpoint(data.path()).epoch_number(), 1);
 }
 
 #[test]
@@ -189,7 +189,7 @@ fn the_head_checkpoint_never_names_entries_the_log_does_not_serve() {
     {
         clave::seal::run(&db, data.path(), &sk, at).unwrap();
         let head = head_checkpoint(data.path());
-        assert_eq!(head.block_number(), index as u64);
+        assert_eq!(head.epoch_number(), index as u64);
         let entries = served_entries(data.path(), 0, head.tree_size());
         assert_eq!(entries.len() as u64, head.tree_size());
         let leaves: Vec<[u8; 32]> = entries

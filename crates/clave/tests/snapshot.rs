@@ -35,15 +35,15 @@ fn snapshot_build_produces_verifiable_tier0_state_and_signed_artifacts() {
     let data = tempfile::tempdir().unwrap();
     clave::init::run(&host, data.path()).unwrap();
     let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
-    db.set_param("block_cadence_seconds", 1).unwrap();
+    db.set_param("epoch_cadence_seconds", 1).unwrap();
     clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
 
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
     let report = clave::seal::run(&db, data.path(), &sk, SEAL_START).unwrap();
-    assert_eq!(report.block_number, 0);
+    assert_eq!(report.epoch_number, 0);
 
-    let head = db.last_block().unwrap().unwrap();
-    let block_root = head.root.clone();
+    let head = db.last_epoch().unwrap().unwrap();
+    let epoch_root = head.root.clone();
 
     let snapdir = data.path().join("snapshots");
     let idx: serde_json::Value =
@@ -53,7 +53,7 @@ fn snapshot_build_produces_verifiable_tier0_state_and_signed_artifacts() {
     assert_eq!(snapshots.len(), 1);
     let entry = &snapshots[0];
     assert_eq!(entry["snapshot_date"], "2026-08-09");
-    assert_eq!(entry["log_position"], head.tree_size);
+    assert_eq!(entry["tree_size"], head.tree_size);
     assert_eq!(entry["manifest_url"], "/snapshots/2026-08-09/manifest.json");
 
     let man_path = data.path().join(
@@ -68,9 +68,9 @@ fn snapshot_build_produces_verifiable_tier0_state_and_signed_artifacts() {
 
     assert_eq!(man["manifest"]["wist_version"], "1.0.0");
     assert_eq!(man["manifest"]["snapshot_date"], "2026-08-09");
-    assert_eq!(man["manifest"]["block_number"], 0);
-    assert_eq!(man["manifest"]["log_position"], head.tree_size);
-    assert_eq!(man["manifest"]["anchor_block_hash"], block_root);
+    assert_eq!(man["manifest"]["epoch_number"], 0);
+    assert_eq!(man["manifest"]["tree_size"], head.tree_size);
+    assert_eq!(man["manifest"]["root_hash"], epoch_root);
     assert_eq!(man["manifest"]["content_digest"], entry["content_digest"]);
 
     let snapshot_dir = man_path.parent().unwrap();
@@ -127,7 +127,7 @@ fn snapshot_build_produces_verifiable_tier0_state_and_signed_artifacts() {
     let state: wist_core::objects::SnapshotState =
         serde_json::from_value(state_env["state"].clone()).unwrap();
     assert_eq!(state.wist_version, "1.0.0");
-    assert_eq!(state.log_position, head.tree_size);
+    assert_eq!(state.tree_size, head.tree_size);
 
     let entry_values: Vec<serde_json::Value> = state
         .entries
@@ -198,13 +198,13 @@ fn snapshot_index_replaces_same_date_entry_on_reseal() {
     let data = tempfile::tempdir().unwrap();
     clave::init::run(&host, data.path()).unwrap();
     let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
-    db.set_param("block_cadence_seconds", 1).unwrap();
+    db.set_param("epoch_cadence_seconds", 1).unwrap();
     clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
 
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
     clave::seal::run(&db, data.path(), &sk, SEAL_START).unwrap();
     let r1 = clave::seal::run(&db, data.path(), &sk, SEAL_START + 3600).unwrap();
-    assert_eq!(r1.block_number, 1);
+    assert_eq!(r1.epoch_number, 1);
 
     let idx: serde_json::Value =
         serde_json::from_slice(&std::fs::read(data.path().join("snapshots/index.json")).unwrap())
@@ -218,8 +218,8 @@ fn snapshot_index_replaces_same_date_entry_on_reseal() {
     );
     assert_eq!(snapshots[0]["snapshot_date"], "2026-08-09");
     assert_eq!(
-        snapshots[0]["log_position"],
-        db.last_block().unwrap().unwrap().tree_size
+        snapshots[0]["tree_size"],
+        db.last_epoch().unwrap().unwrap().tree_size
     );
 }
 
@@ -239,7 +239,7 @@ fn tier1_fixture(shards: Option<i64>) -> (common::TestPub, tempfile::TempDir, St
     let data = tempfile::tempdir().unwrap();
     clave::init::run(&host, data.path()).unwrap();
     let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
-    db.set_param("block_cadence_seconds", 1).unwrap();
+    db.set_param("epoch_cadence_seconds", 1).unwrap();
     if let Some(n) = shards {
         db.set_param("snapshot_shard_count", n).unwrap();
     }
@@ -367,7 +367,7 @@ fn the_state_artifact_carries_every_kind_with_live_instances() {
     let data = tempfile::tempdir().unwrap();
     clave::init::run(&host, data.path()).unwrap();
     let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
-    db.set_param("block_cadence_seconds", 1).unwrap();
+    db.set_param("epoch_cadence_seconds", 1).unwrap();
     clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
     clave::seal::run(&db, data.path(), &sk, SEAL_START).unwrap();

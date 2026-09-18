@@ -3,8 +3,8 @@ mod common;
 const NOW: i64 = 1_800_000_000;
 const DAY: i64 = 86400;
 
-fn ts(epoch: i64) -> String {
-    jiff::Timestamp::from_second(epoch).unwrap().to_string()
+fn ts(unix: i64) -> String {
+    jiff::Timestamp::from_second(unix).unwrap().to_string()
 }
 
 fn setup() -> (
@@ -20,7 +20,7 @@ fn setup() -> (
 }
 
 fn read_entries(db: &clave::db::Db, number: u64) -> Vec<serde_json::Value> {
-    db.block_entries(number).unwrap()
+    db.epoch_entries(number).unwrap()
 }
 
 #[test]
@@ -73,13 +73,13 @@ fn seal_drops_and_reports_parameter_change_gone_stale_in_queue() {
 }
 
 #[test]
-fn seal_reads_cadence_in_force_at_previous_block_sealed_at() {
+fn seal_reads_cadence_in_force_at_previous_epoch_sealed_at() {
     let (data, db, sk) = setup();
     let effective_at = ts(NOW + 7 * DAY);
     clave::param_change::run(
         &db,
         &sk,
-        "block_cadence_seconds",
+        "epoch_cadence_seconds",
         3500,
         Some(&effective_at),
         NOW,
@@ -88,19 +88,19 @@ fn seal_reads_cadence_in_force_at_previous_block_sealed_at() {
 
     clave::seal::run(&db, data.path(), &sk, NOW).unwrap();
     let b1 = clave::seal::run(&db, data.path(), &sk, NOW + 7 * DAY).unwrap();
-    assert_eq!(b1.block_number, 1);
+    assert_eq!(b1.epoch_number, 1);
     assert_eq!(
-        db.last_block().unwrap().unwrap().sealed_at,
+        db.last_epoch().unwrap().unwrap().sealed_at,
         ts(NOW + 7 * DAY),
-        "the activation Block still uses the prior hourly grid"
+        "the activation Epoch still uses the prior hourly grid"
     );
 
     let b2 = clave::seal::run(&db, data.path(), &sk, NOW + 7 * DAY + 3600).unwrap();
-    assert_eq!(b2.block_number, 2);
+    assert_eq!(b2.epoch_number, 2);
     assert_eq!(
-        db.last_block().unwrap().unwrap().sealed_at,
+        db.last_epoch().unwrap().unwrap().sealed_at,
         ts((NOW + 7 * DAY + 3600).div_euclid(3500) * 3500),
-        "the following Block uses the new 3500-second grid"
+        "the following Epoch uses the new 3500-second grid"
     );
 }
 

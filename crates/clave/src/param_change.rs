@@ -12,8 +12,8 @@ pub struct ParamChangeReport {
     pub effective_at: String,
 }
 
-fn whole_second(epoch: i64) -> Result<String> {
-    Ok(jiff::Timestamp::from_second(epoch)
+fn whole_second(unix: i64) -> Result<String> {
+    Ok(jiff::Timestamp::from_second(unix)
         .map_err(|_| Error::ParamChange("timestamp out of range".into()))?
         .to_string())
 }
@@ -24,14 +24,14 @@ pub fn run(
     parameter: &str,
     value: i64,
     effective_at: Option<&str>,
-    now_epoch: i64,
+    now_unix: i64,
 ) -> Result<ParamChangeReport> {
-    let schedule = db.parameter_schedule(now_epoch)?;
-    let grace_days = schedule.value_at("param_grace_days", now_epoch).unwrap();
+    let schedule = db.parameter_schedule(now_unix)?;
+    let grace_days = schedule.value_at("param_grace_days", now_unix).unwrap();
     let cadence = schedule
-        .value_at("block_cadence_seconds", now_epoch)
+        .value_at("epoch_cadence_seconds", now_unix)
         .unwrap();
-    let earliest_epoch = i128::from(now_epoch) + i128::from(grace_days) * 86400;
+    let earliest_unix = i128::from(now_unix) + i128::from(grace_days) * 86400;
     let effective_at = match effective_at {
         Some(given) => {
             let ts: jiff::Timestamp = given
@@ -43,7 +43,7 @@ pub fn run(
                     "effective_at must be whole-second UTC with trailing Z, got {given:?}"
                 )));
             }
-            if i128::from(ts.as_second()) < earliest_epoch {
+            if i128::from(ts.as_second()) < earliest_unix {
                 return Err(Error::ParamChange(format!(
                     "effective_at {given} is inside the {grace_days}-day grace period"
                 )));
@@ -51,7 +51,7 @@ pub fn run(
             canonical
         }
         None => whole_second(
-            i64::try_from(earliest_epoch + i128::from(cadence))
+            i64::try_from(earliest_unix + i128::from(cadence))
                 .map_err(|_| Error::ParamChange("effective_at out of range".into()))?,
         )?,
     };
@@ -63,7 +63,7 @@ pub fn run(
         "details": {"parameter": parameter, "value": value},
         "effective_at": effective_at,
     });
-    crate::seal::validate_pending_parameter(db, &update, sk, now_epoch)?;
+    crate::seal::validate_pending_parameter(db, &update, sk, now_unix)?;
     let update_id = format!(
         "sha256:{}",
         hex_encode(&Sha256::digest(wist_core::jcs::canonicalize(&update)?))
@@ -85,7 +85,7 @@ mod tests {
     fn setup() -> (tempfile::TempDir, Db, SigningKey) {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
-        db.set_param("block_cadence_seconds", 3600).unwrap();
+        db.set_param("epoch_cadence_seconds", 3600).unwrap();
         let sk = SigningKey::from_seed(&[9u8; 32]);
         (tmp, db, sk)
     }
@@ -144,7 +144,7 @@ mod tests {
     #[test]
     fn run_rejects_out_of_bounds_value_without_enqueueing() {
         let (_tmp, db, sk) = setup();
-        assert!(run(&db, &sk, "block_cadence_seconds", 0, None, NOW).is_err());
+        assert!(run(&db, &sk, "epoch_cadence_seconds", 0, None, NOW).is_err());
         let (pending, _) = db.peek_pending_entries().unwrap();
         assert!(pending.is_empty());
     }

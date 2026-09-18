@@ -31,7 +31,7 @@ impl Db {
             tx.commit()?;
             return Ok(());
         }
-        let head = self.last_block()?;
+        let head = self.last_epoch()?;
         let history = if head.is_some() {
             crate::history::declarations::Declarations::reconstruct(
                 self,
@@ -61,7 +61,7 @@ impl Db {
 
     pub(super) fn restore_recovery_owners(&self, path: &Path) -> Result<()> {
         let mut statement = self.conn.prepare(
-            "SELECT domain, prior_declaration_json, opened_block FROM recovery_windows WHERE owner_declaration_json IS NULL ORDER BY domain",
+            "SELECT domain, prior_declaration_json, opened_epoch FROM recovery_windows WHERE owner_declaration_json IS NULL ORDER BY domain",
         )?;
         let rows = statement
             .query_map([], |row| {
@@ -79,7 +79,7 @@ impl Db {
             Some(crate::history::declarations::Declarations::reconstruct(
                 self,
                 path.parent().unwrap_or_else(|| Path::new(".")),
-                self.last_block()?,
+                self.last_epoch()?,
             )?)
         } else {
             None
@@ -99,7 +99,7 @@ impl Db {
                     .and_then(|state| state.domains().get(&domain))
                     .and_then(|state| state.window())
                     .ok_or_else(unavailable)?;
-                if window.owner().position().block_number != opened
+                if window.owner().position().epoch_number != opened
                     || *window.before().envelope() != prior
                 {
                     return Err(unavailable());

@@ -12,8 +12,8 @@ pub struct GovernanceReport {
     pub update_id: String,
 }
 
-fn whole_second(epoch: i64) -> Result<String> {
-    Ok(jiff::Timestamp::from_second(epoch)
+fn whole_second(unix: i64) -> Result<String> {
+    Ok(jiff::Timestamp::from_second(unix)
         .map_err(|_| Error::ParamChange("timestamp out of range".into()))?
         .to_string())
 }
@@ -39,7 +39,7 @@ fn is_delta_id(id: &str) -> bool {
 
 /// WIST-4 §5.1 and WIST-3 §6.2: queues a `payload_withdrawal` naming a
 /// Delta of `domain` the Log has accepted; the seal checks that the Delta
-/// is sealed at or below the act's Block before the act is sealed.
+/// is sealed at or below the act's Epoch before the act is sealed.
 pub fn withdraw(
     db: &Db,
     sk: &SigningKey,
@@ -47,7 +47,7 @@ pub fn withdraw(
     delta_id: &str,
     legal_basis: &str,
     jurisdiction: &str,
-    now_epoch: i64,
+    now_unix: i64,
 ) -> Result<GovernanceReport> {
     if !is_delta_id(delta_id) {
         return Err(Error::Governance(format!(
@@ -64,7 +64,7 @@ pub fn withdraw(
             "{delta_id} is not a sealed or accepted Delta of {domain} (WIST-4 \u{a7}5.1)"
         )));
     }
-    let now = whole_second(now_epoch)?;
+    let now = whole_second(now_unix)?;
     let update = serde_json::json!({
         "wist_version": WIST_VERSION,
         "action": "payload_withdrawal",

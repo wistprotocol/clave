@@ -30,12 +30,12 @@ impl Fixture {
     }
 
     fn append(&self, entries: Vec<Value>) {
-        let head = self.db.last_block().unwrap();
-        let height = head.as_ref().map_or(0, |head| head.block_number + 1);
+        let head = self.db.last_epoch().unwrap();
+        let height = head.as_ref().map_or(0, |head| head.epoch_number + 1);
         let at = jiff::Timestamp::from_second(START + height as i64 * 3600)
             .unwrap()
             .to_string();
-        seal_fixture_block(&self.db, self.directory.path(), height, &at, &entries);
+        seal_fixture_epoch(&self.db, self.directory.path(), height, &at, &entries);
     }
 
     fn legacy(&self) {
@@ -166,7 +166,7 @@ fn missing_or_corrupt_pinned_history_preserves_indexes_and_can_retry() {
         f.db.set_url_tip("https://example.com/", &publisher.domain, "residue")
             .unwrap();
         f.legacy();
-        let head = f.db.last_block().unwrap().unwrap();
+        let head = f.db.last_epoch().unwrap().unwrap();
         let leaf: Vec<u8> = f
             .connection()
             .query_row(
@@ -192,7 +192,7 @@ fn missing_or_corrupt_pinned_history_preserves_indexes_and_can_retry() {
             _ => {
                 f.connection()
                     .execute(
-                        "UPDATE blocks SET root = 'sha256:wrong' WHERE block_number = 1",
+                        "UPDATE epochs SET root = 'sha256:wrong' WHERE epoch_number = 1",
                         [],
                     )
                     .unwrap();
@@ -212,13 +212,13 @@ fn missing_or_corrupt_pinned_history_preserves_indexes_and_can_retry() {
         let connection = f.connection();
         connection
             .execute(
-                "INSERT OR REPLACE INTO log_entries(leaf_index, block_number, entry_json) VALUES (0, 0, ?1)",
+                "INSERT OR REPLACE INTO log_entries(leaf_index, epoch_number, entry_json) VALUES (0, 0, ?1)",
                 [leaf],
             )
             .unwrap();
         connection
             .execute(
-                "UPDATE blocks SET root = ?1 WHERE block_number = 1",
+                "UPDATE epochs SET root = ?1 WHERE epoch_number = 1",
                 [head.root],
             )
             .unwrap();
@@ -389,7 +389,7 @@ fn supported_versions_restore_chains_across_sealed_and_both_unsealed_stores() {
             }
             chain.push((id, envelope));
         }
-        let sealed_entries = f.db.block_entries(0).unwrap();
+        let sealed_entries = f.db.epoch_entries(0).unwrap();
         f.connection()
             .execute_batch("DELETE FROM seen_deltas; DELETE FROM url_tips;")
             .unwrap();
@@ -406,7 +406,7 @@ fn supported_versions_restore_chains_across_sealed_and_both_unsealed_stores() {
                 db.url_tip(&publisher.domain, url).unwrap().as_deref(),
                 Some(chain[2].0.as_str())
             );
-            assert_eq!(db.block_entries(0).unwrap(), sealed_entries);
+            assert_eq!(db.epoch_entries(0).unwrap(), sealed_entries);
             assert_eq!(
                 db.peek_pending_entries().unwrap().0[0].entry_json,
                 chain[1].1
@@ -558,7 +558,7 @@ fn missing_content_and_predecessor_vectors_stop_restoration_atomically() {
                 let marker: bool = f.connection().query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'delta_index_reconciliation')", [], |row| row.get(0)).unwrap();
                 assert!(!marker, "{context}");
                 let retained = match store {
-                    "sealed" => f.db.block_entries(1).unwrap()[0]["body"].clone(),
+                    "sealed" => f.db.epoch_entries(1).unwrap()[0]["body"].clone(),
                     _ => {
                         let query = if store == "pending" {
                             "SELECT entry_json FROM pending_entries"
@@ -663,7 +663,7 @@ fn signed_predecessor_times_reconcile_across_sealed_and_retained_chains() {
         }
         cases += 1;
         for (prior_store, next_store) in [
-            ("same_block", "same_block"),
+            ("same_epoch", "same_epoch"),
             ("sealed", "sealed"),
             ("sealed", "pending"),
             ("sealed", "recovery"),
@@ -682,7 +682,7 @@ fn signed_predecessor_times_reconcile_across_sealed_and_retained_chains() {
             f.append(vec![
                 json!({"type":"publisher_declaration", "body":vector["stored"]}),
             ]);
-            if prior_store == "same_block" {
+            if prior_store == "same_epoch" {
                 f.append(vec![entry(predecessor.clone()), entry(envelope.clone())]);
             } else {
                 for (store, id, body) in [
@@ -807,17 +807,17 @@ fn observation_history_stays_with_its_publisher_through_identity_reset() {
             json!({"type":"publisher_declaration", "body":replacement}),
         ]);
         // WIST-1 §5.2: a fresh identity is pending and supplies no authority
-        // until `declaration_activation_blocks` Blocks after the one sealing
+        // until `declaration_activation_epochs` Epochs after the one sealing
         // it, so its first Delta seals at the activation height.
-        let activation_height = f.db.last_block().unwrap().unwrap().block_number
+        let activation_height = f.db.last_epoch().unwrap().unwrap().epoch_number
             + u64::try_from(
-                wist_core::parameters::spec("declaration_activation_blocks")
+                wist_core::parameters::spec("declaration_activation_epochs")
                     .unwrap()
                     .default
                     .unwrap(),
             )
             .unwrap();
-        while f.db.last_block().unwrap().unwrap().block_number < activation_height - 1 {
+        while f.db.last_epoch().unwrap().unwrap().epoch_number < activation_height - 1 {
             f.append(Vec::new());
         }
         f.append(vec![entry(body)]);

@@ -2,7 +2,7 @@ pub mod declarations;
 pub mod deltas;
 pub mod payloads;
 
-use crate::db::{BlockRow, Db};
+use crate::db::{Db, EpochRow};
 use crate::error::{Error, Result};
 use crate::registry;
 use serde_json::Value;
@@ -47,11 +47,11 @@ pub fn anchor(directory: &Path) -> Result<LogAnchor> {
     })
 }
 
-/// One Block of the Log with its Checkpoint verified and its Entries
+/// One Epoch of the Log with its Checkpoint verified and its Entries
 /// checked against the tree that Checkpoint states.
 #[derive(Debug)]
-pub struct VerifiedBlock {
-    block_number: u64,
+pub struct VerifiedEpoch {
+    epoch_number: u64,
     tree_size: u64,
     root: String,
     sealed_at: String,
@@ -60,21 +60,21 @@ pub struct VerifiedBlock {
     octets: u64,
     rejected_parameters: Vec<usize>,
     recovery_window_days: i64,
-    declaration_activation_blocks: i64,
+    declaration_activation_epochs: i64,
     delta_size_caps: crate::declaration::delta::SizeCaps,
     clock_skew_seconds: i64,
 }
 
-impl VerifiedBlock {
-    pub fn block_number(&self) -> u64 {
-        self.block_number
+impl VerifiedEpoch {
+    pub fn epoch_number(&self) -> u64 {
+        self.epoch_number
     }
 
     pub fn tree_size(&self) -> u64 {
         self.tree_size
     }
 
-    /// The root of the tree at this Block in the `"sha256:" + hex` form
+    /// The root of the tree at this Epoch in the `"sha256:" + hex` form
     /// WIST-3 §3.1 gives it.
     pub fn root(&self) -> &str {
         &self.root
@@ -92,7 +92,7 @@ impl VerifiedBlock {
         self.sealed_at_s
     }
 
-    /// The octets this Block's Entries occupy in entry bundles
+    /// The octets this Epoch's Entries occupy in entry bundles
     /// (WIST-3 §6).
     pub fn octets(&self) -> u64 {
         self.octets
@@ -113,7 +113,7 @@ impl VerifiedBlock {
 
 pub struct History<'a> {
     db: &'a Db,
-    head: Option<BlockRow>,
+    head: Option<EpochRow>,
     log_id: String,
     key: PublicKey,
     key_id: String,
@@ -126,7 +126,7 @@ pub struct History<'a> {
 }
 
 impl<'a> History<'a> {
-    pub fn open(db: &'a Db, directory: &Path, head: Option<BlockRow>) -> Result<Self> {
+    pub fn open(db: &'a Db, directory: &Path, head: Option<EpochRow>) -> Result<Self> {
         let anchor = anchor(directory)?;
         Ok(Self {
             db,
@@ -159,7 +159,7 @@ impl<'a> History<'a> {
         &self.key_id
     }
 
-    pub fn next_block(&mut self) -> Result<Option<VerifiedBlock>> {
+    pub fn next_epoch(&mut self) -> Result<Option<VerifiedEpoch>> {
         if self.failed {
             return Err(failure("history reader cannot continue after a failure"));
         }
@@ -168,22 +168,22 @@ impl<'a> History<'a> {
         result
     }
 
-    fn read_next(&mut self) -> Result<Option<VerifiedBlock>> {
+    fn read_next(&mut self) -> Result<Option<VerifiedEpoch>> {
         let Some(head) = &self.head else {
             return Ok(None);
         };
         let height = self.next_height;
-        if height > head.block_number {
+        if height > head.epoch_number {
             return Ok(None);
         }
         let row = self
             .db
-            .block_at(height)?
-            .ok_or_else(|| failure("the store is missing a Block below its head"))?;
+            .epoch_at(height)?
+            .ok_or_else(|| failure("the store is missing an Epoch below its head"))?;
         let note = self
             .db
             .checkpoint_note(height)?
-            .ok_or_else(|| failure("the store is missing a Block's Checkpoint"))?;
+            .ok_or_else(|| failure("the store is missing an Epoch's Checkpoint"))?;
         let checkpoint = Checkpoint::parse(&note).map_err(|e| failure(&e.to_string()))?;
         checkpoint::verify(
             &checkpoint,
@@ -195,19 +195,19 @@ impl<'a> History<'a> {
             &[],
         )
         .map_err(|e| failure(&e.to_string()))?;
-        if checkpoint.block_number() != height
+        if checkpoint.epoch_number() != height
             || checkpoint.tree_size() != row.tree_size
             || checkpoint.root_token() != row.root
             || checkpoint.sealed_at() != row.sealed_at
         {
             return Err(Error::History(
-                "WIST3-E02 the stored Checkpoint is not the Block the store records".into(),
+                "WIST3-E02 the stored Checkpoint is not the Epoch the store records".into(),
             ));
         }
-        if height == head.block_number && (row.root != head.root || row.sealed_at != head.sealed_at)
+        if height == head.epoch_number && (row.root != head.root || row.sealed_at != head.sealed_at)
         {
             return Err(Error::History(
-                "WIST3-E02 Block does not match the pinned history head".into(),
+                "WIST3-E02 Epoch does not match the pinned history head".into(),
             ));
         }
         let at = checkpoint
@@ -215,15 +215,15 @@ impl<'a> History<'a> {
             .map_err(|e| failure(&e.to_string()))?;
         let mut schedule = self.schedule.clone().unwrap_or_else(|| Schedule::new(at));
         let cadence = schedule
-            .value_at("block_cadence_seconds", self.prior_at.unwrap_or(at))
+            .value_at("epoch_cadence_seconds", self.prior_at.unwrap_or(at))
             .unwrap();
         checkpoint::check_sequence(self.previous.as_ref(), &checkpoint, cadence)
             .map_err(|e| failure(&e.to_string()))?;
 
         let previous_size = self.db.size_before(height)?;
-        let entries = self.db.block_entries(height)?;
-        let cap = schedule.block_size_bounds(at).1;
-        let summary = wist_core::block::verify_block(
+        let entries = self.db.epoch_entries(height)?;
+        let cap = schedule.epoch_size_bounds(at).1;
+        let summary = wist_core::epoch::verify_epoch(
             previous_size,
             &checkpoint,
             &entries,
@@ -254,24 +254,24 @@ impl<'a> History<'a> {
                 rejected_parameters.push(index);
             }
         }
-        if largest > schedule.block_size_bounds(at).0 {
-            return Err(failure("Block exceeds the accepted size schedule"));
+        if largest > schedule.epoch_size_bounds(at).0 {
+            return Err(failure("Epoch exceeds the accepted size schedule"));
         }
         self.next_height = height
             .checked_add(1)
-            .ok_or_else(|| failure("Block height overflow"))?;
+            .ok_or_else(|| failure("Epoch height overflow"))?;
         self.prior_at = Some(at);
         self.largest = largest;
         let recovery_window_days = schedule.value_at("recovery_window_days", at).unwrap();
-        let declaration_activation_blocks = schedule
-            .value_at("declaration_activation_blocks", at)
+        let declaration_activation_epochs = schedule
+            .value_at("declaration_activation_epochs", at)
             .unwrap();
         let delta_size_caps = crate::declaration::delta::SizeCaps::from_schedule(&schedule, at);
         let clock_skew_seconds = schedule.value_at("clock_skew_seconds", at).unwrap();
         self.schedule = Some(schedule);
         self.previous = Some(checkpoint);
-        Ok(Some(VerifiedBlock {
-            block_number: height,
+        Ok(Some(VerifiedEpoch {
+            epoch_number: height,
             tree_size: row.tree_size,
             root: row.root,
             sealed_at: row.sealed_at,
@@ -280,7 +280,7 @@ impl<'a> History<'a> {
             octets: summary.octets,
             rejected_parameters,
             recovery_window_days,
-            declaration_activation_blocks,
+            declaration_activation_epochs,
             delta_size_caps,
             clock_skew_seconds,
         }))
@@ -315,7 +315,7 @@ impl<'a> History<'a> {
         ) else {
             return false;
         };
-        let Ok(effective_at_s) = registry::epoch(effective_at) else {
+        let Ok(effective_at_s) = registry::unix(effective_at) else {
             return false;
         };
         registry::accept(
@@ -323,7 +323,7 @@ impl<'a> History<'a> {
             Amendment {
                 parameter: parameter.into(),
                 value,
-                block_number: height,
+                epoch_number: height,
                 entry_index: index as u64,
                 sealed_at_s: at,
                 effective_at_s,

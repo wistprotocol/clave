@@ -20,11 +20,11 @@ fn authenticated_settlement_declarations_and_rejection_twins() {
         let mut chain: Option<Value> = None;
         let mut floor = 0;
         let mut leaves: Vec<[u8; 32]> = Vec::new();
-        let mut previous_block = String::new();
+        let mut previous_epoch = String::new();
         let mut prefixes = Vec::new();
         let mut superseded = Vec::new();
-        for (height, block) in case["blocks"].as_array().unwrap().iter().enumerate() {
-            let checkpoint = Checkpoint::parse(block["checkpoint"].as_str().unwrap()).unwrap();
+        for (height, epoch) in case["epochs"].as_array().unwrap().iter().enumerate() {
+            let checkpoint = Checkpoint::parse(epoch["checkpoint"].as_str().unwrap()).unwrap();
             let log_id = checkpoint.origin().to_owned();
             checkpoint::verify(
                 &checkpoint,
@@ -36,9 +36,9 @@ fn authenticated_settlement_declarations_and_rejection_twins() {
                 &[],
             )
             .unwrap();
-            assert_eq!(checkpoint.block_number(), height as u64, "{name}");
-            let entries: Vec<Value> = serde_json::from_value(block["entries"].clone()).unwrap();
-            let summary = wist_core::block::verify_block(
+            assert_eq!(checkpoint.epoch_number(), height as u64, "{name}");
+            let entries: Vec<Value> = serde_json::from_value(epoch["entries"].clone()).unwrap();
+            let summary = wist_core::epoch::verify_epoch(
                 leaves.len() as u64,
                 &checkpoint,
                 &entries,
@@ -47,7 +47,7 @@ fn authenticated_settlement_declarations_and_rejection_twins() {
             )
             .unwrap();
             leaves.extend(summary.leaf_hashes);
-            previous_block = checkpoint.root_token();
+            previous_epoch = checkpoint.root_token();
             if height == 169 {
                 current = chain.take();
             }
@@ -83,7 +83,7 @@ fn authenticated_settlement_declarations_and_rejection_twins() {
             }
             prefixes.push((current.clone().unwrap(), chain.clone(), floor));
         }
-        assert_eq!(previous_block, case["pinned_head"], "{name}");
+        assert_eq!(previous_epoch, case["pinned_head"], "{name}");
         assert_eq!(
             inner_hash(current.as_ref().unwrap()).unwrap(),
             case["expected"]["effective_declaration"],

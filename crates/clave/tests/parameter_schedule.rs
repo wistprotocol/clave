@@ -37,8 +37,8 @@ fn queue(db: &Db, body: &Value) {
         .unwrap();
 }
 
-/// Seals an empty Block carrying `changes` at `sealed_at`, recording
-/// `octets` as the Block's entry-bundle size.
+/// Seals an empty Epoch carrying `changes` at `sealed_at`, recording
+/// `octets` as the Epoch's entry-bundle size.
 fn seal_sizes(db: &Db, height: u64, sealed_at: &str, changes: &[ParamChangeRow], octets: u64) {
     db.commit_seal(
         &SigningKey::from_seed(&[9u8; 32]),
@@ -69,11 +69,11 @@ fn fixture() -> Value {
 
 #[test]
 fn historical_size_vectors_replay_identically_after_reopening() {
-    for case in fixture()["block_size_cases"].as_array().unwrap() {
+    for case in fixture()["epoch_size_cases"].as_array().unwrap() {
         let data = tempfile::tempdir().unwrap();
         let path = data.path().join("clave.sqlite");
         let mut db = Db::open(&path).unwrap();
-        for (height, b) in case["blocks"].as_array().unwrap().iter().enumerate() {
+        for (height, b) in case["epochs"].as_array().unwrap().iter().enumerate() {
             let expected = &case["expected"][height];
             let at = b["sealed_at_s"].as_i64().unwrap();
             let effective: Vec<_> = b["amendments"]
@@ -89,7 +89,7 @@ fn historical_size_vectors_replay_identically_after_reopening() {
                 .filter_map(|(i, c)| {
                     Some(ParamChangeRow {
                         entry_index: i as u64,
-                        parameter: "block_decompressed_cap_bytes",
+                        parameter: "epoch_cap_bytes",
                         value: c["value"].as_i64()?,
                         effective_at: &effective[i],
                     })
@@ -103,7 +103,7 @@ fn historical_size_vectors_replay_identically_after_reopening() {
                 b["jcs_bytes"].as_u64().unwrap(),
             );
             let replay = db.parameter_schedule(0);
-            if !expected["block_valid"].as_bool().unwrap() {
+            if !expected["epoch_valid"].as_bool().unwrap() {
                 assert!(
                     replay.err().unwrap().to_string().contains("WIST3-E03"),
                     "{}",
@@ -119,7 +119,7 @@ fn historical_size_vectors_replay_identically_after_reopening() {
                     !replay
                         .accepted()
                         .iter()
-                        .any(|a| a.block_number == height as u64 && a.entry_index == i as u64)
+                        .any(|a| a.epoch_number == height as u64 && a.entry_index == i as u64)
                 })
                 .collect();
             assert_eq!(
@@ -129,7 +129,7 @@ fn historical_size_vectors_replay_identically_after_reopening() {
                 case["label"]
             );
             assert_eq!(
-                replay.block_size_bounds(at).0,
+                replay.epoch_size_bounds(at).0,
                 expected["sealing_cap"].as_u64().unwrap(),
                 "{}",
                 case["label"]
@@ -144,7 +144,7 @@ fn historical_size_vectors_replay_identically_after_reopening() {
                 case["label"]
             );
             assert_eq!(
-                db.largest_block_bytes().unwrap(),
+                db.largest_epoch_bytes().unwrap(),
                 expected["largest_bytes"].as_u64().unwrap()
             );
         }
@@ -158,14 +158,14 @@ fn prospective_vectors_filter_rejected_history_and_preserve_every_future_map() {
         let path = data.path().join("clave.sqlite");
         let db = Db::open(&path).unwrap();
         let changes = case["changes"].as_array().unwrap();
-        let mut blocks = std::collections::BTreeMap::new();
+        let mut epochs = std::collections::BTreeMap::new();
         for c in changes {
-            blocks
-                .entry(c["block_height"].as_u64().unwrap())
+            epochs
+                .entry(c["epoch_height"].as_u64().unwrap())
                 .or_insert_with(Vec::new)
                 .push(c);
         }
-        for (height, group) in blocks {
+        for (height, group) in epochs {
             let effective: Vec<_> = group
                 .iter()
                 .map(|c| ts(c["effective_at_s"].as_i64().unwrap()))
@@ -196,7 +196,7 @@ fn prospective_vectors_filter_rejected_history_and_preserve_every_future_map() {
             .enumerate()
             .filter(|(_, c)| {
                 !accepted.accepted().iter().any(|a| {
-                    a.block_number == c["block_height"].as_u64().unwrap()
+                    a.epoch_number == c["epoch_height"].as_u64().unwrap()
                         && a.entry_index == c["entry_index"].as_u64().unwrap()
                 })
             })
@@ -262,7 +262,7 @@ fn queued_conflicts_use_canonical_entry_order_for_admission_and_sealing() {
     assert_eq!(report.entry_count, 1);
     assert_eq!(report.dropped.len(), 1);
     assert!(report.dropped[0].contains("WIST4-E03"));
-    assert_eq!(db.block_entries(0).unwrap()[0]["body"], candidates[0]);
+    assert_eq!(db.epoch_entries(0).unwrap()[0]["body"], candidates[0]);
 }
 
 #[test]
@@ -301,7 +301,7 @@ fn accepted_pending_reduction_bounds_actual_entry_bundle_octets_after_restart() 
     clave::param_change::run(
         &db,
         &sk,
-        "block_decompressed_cap_bytes",
+        "epoch_cap_bytes",
         65_537,
         Some(&ts(NOW + 10 * DAY)),
         NOW,
@@ -311,7 +311,7 @@ fn accepted_pending_reduction_bounds_actual_entry_bundle_octets_after_restart() 
     drop(db);
     let db = Db::open(&data.path().join("clave.sqlite")).unwrap();
     assert_eq!(
-        clave::registry::effective(&db, "block_decompressed_cap_bytes", &ts(NOW + DAY)).unwrap(),
+        clave::registry::effective(&db, "epoch_cap_bytes", &ts(NOW + DAY)).unwrap(),
         268_435_456
     );
     for value in 0..400 {
@@ -323,9 +323,9 @@ fn accepted_pending_reduction_bounds_actual_entry_bundle_octets_after_restart() 
     let mut count = 0;
     for i in 1..=10 {
         let report = clave::seal::run(&db, data.path(), &sk, NOW + DAY + i * 3600).unwrap();
-        let sealed = db.block_at(report.block_number).unwrap().unwrap();
+        let sealed = db.epoch_at(report.epoch_number).unwrap().unwrap();
         let octets =
-            wist_core::block::block_octets(&db.block_entries(sealed.block_number).unwrap())
+            wist_core::epoch::epoch_octets(&db.epoch_entries(sealed.epoch_number).unwrap())
                 .unwrap();
         assert!(octets <= 65_537);
         count += report.entry_count;
@@ -334,12 +334,12 @@ fn accepted_pending_reduction_bounds_actual_entry_bundle_octets_after_restart() 
         }
     }
     assert_eq!(count, 400);
-    assert!(db.last_block().unwrap().unwrap().block_number > 1);
-    assert!(db.largest_block_bytes().unwrap() <= 65_537);
+    assert!(db.last_epoch().unwrap().unwrap().epoch_number > 1);
+    assert!(db.largest_epoch_bytes().unwrap() <= 65_537);
 }
 
 #[test]
-fn historical_block_size_rejects_a_reduction_at_admission_and_sealing() {
+fn historical_epoch_size_rejects_a_reduction_at_admission_and_sealing() {
     let (data, db, sk) = setup();
     for value in 0..400 {
         queue(
@@ -348,11 +348,11 @@ fn historical_block_size_rejects_a_reduction_at_admission_and_sealing() {
         );
     }
     clave::seal::run(&db, data.path(), &sk, NOW).unwrap();
-    assert!(db.largest_block_bytes().unwrap() > 65_537);
+    assert!(db.largest_epoch_bytes().unwrap() > 65_537);
     assert!(clave::param_change::run(
         &db,
         &sk,
-        "block_decompressed_cap_bytes",
+        "epoch_cap_bytes",
         65_537,
         Some(&ts(NOW + 10 * DAY)),
         NOW + DAY
@@ -360,14 +360,14 @@ fn historical_block_size_rejects_a_reduction_at_admission_and_sealing() {
     .err()
     .unwrap()
     .to_string()
-    .contains("Block cap"));
+    .contains("Epoch cap"));
     queue(
         &db,
-        &envelope(&sk, "block_decompressed_cap_bytes", 65_537, NOW + 10 * DAY),
+        &envelope(&sk, "epoch_cap_bytes", 65_537, NOW + 10 * DAY),
     );
     let report = clave::seal::run(&db, data.path(), &sk, NOW + DAY).unwrap();
     assert_eq!(report.entry_count, 0);
-    assert!(report.dropped[0].contains("Block cap"));
+    assert!(report.dropped[0].contains("Epoch cap"));
 }
 
 #[test]
@@ -377,7 +377,7 @@ fn snapshot_parameters_include_pending_amendments_and_only_the_winning_ties() {
         queue(&db, &envelope(&sk, "feed_window", value, NOW + days * DAY));
     }
     clave::seal::run(&db, data.path(), &sk, NOW).unwrap();
-    let sealed = db.block_entries(0).unwrap();
+    let sealed = db.epoch_entries(0).unwrap();
     let last = sealed
         .iter()
         .rfind(|e| e["body"]["update"]["effective_at"] == ts(NOW + 10 * DAY))
@@ -414,10 +414,12 @@ fn snapshot_parameters_include_pending_amendments_and_only_the_winning_ties() {
 fn a_store_in_the_superseded_block_format_is_refused_with_its_rows_untouched() {
     let (data, db, sk) = setup();
     clave::seal::run(&db, data.path(), &sk, NOW).unwrap();
-    let head = db.last_block().unwrap().unwrap();
+    let head = db.last_epoch().unwrap().unwrap();
     drop(db);
     let path = data.path().join("clave.sqlite");
     let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute("ALTER TABLE epochs RENAME TO blocks", [])
+        .unwrap();
     conn.execute("ALTER TABLE blocks RENAME COLUMN root TO block_hash", [])
         .unwrap();
     drop(conn);
@@ -430,6 +432,30 @@ fn a_store_in_the_superseded_block_format_is_refused_with_its_rows_untouched() {
     assert_eq!(
         conn.query_row("SELECT block_hash FROM blocks", [], |r| r
             .get::<_, String>(0))
+            .unwrap(),
+        head.root
+    );
+}
+
+#[test]
+fn a_store_in_the_pre_epoch_block_named_schema_is_refused_with_its_rows_untouched() {
+    let (data, db, sk) = setup();
+    clave::seal::run(&db, data.path(), &sk, NOW).unwrap();
+    let head = db.last_epoch().unwrap().unwrap();
+    drop(db);
+    let path = data.path().join("clave.sqlite");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute("ALTER TABLE epochs RENAME TO blocks", [])
+        .unwrap();
+    drop(conn);
+    let error = match Db::open(&path) {
+        Ok(_) => panic!("a pre-rename store must be refused"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("superseded"), "{error}");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    assert_eq!(
+        conn.query_row("SELECT root FROM blocks", [], |r| r.get::<_, String>(0))
             .unwrap(),
         head.root
     );

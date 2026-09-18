@@ -35,15 +35,15 @@ fn signed_cap_profiles_follow_authenticated_prefixes_and_survive_later_amendment
     let data = tempfile::tempdir().unwrap();
     anchor(data.path());
     let db = Db::open(&data.path().join("clave.sqlite")).unwrap();
-    let blocks = vector["blocks"].as_array().unwrap();
-    let head = seal_vector_blocks(&db, data.path(), &log_key(), blocks);
+    let epochs = vector["epochs"].as_array().unwrap();
+    let head = seal_vector_epochs(&db, data.path(), &log_key(), epochs);
     assert_eq!(head.root, vector["pinned_head"].as_str().unwrap());
     let mut history = History::open(&db, data.path(), Some(head)).unwrap();
     let mut schedules = Vec::new();
     let mut profiles = Vec::new();
-    while let Some(block) = history.next_block().unwrap() {
-        assert!(block.rejected_parameters().is_empty());
-        profiles.push(block.delta_size_caps().clone());
+    while let Some(epoch) = history.next_epoch().unwrap() {
+        assert!(epoch.rejected_parameters().is_empty());
+        profiles.push(epoch.delta_size_caps().clone());
         schedules.push(history.schedule().unwrap().clone());
     }
     for probe in vector["probes"].as_array().unwrap() {
@@ -56,7 +56,7 @@ fn signed_cap_profiles_follow_authenticated_prefixes_and_survive_later_amendment
             "sealing" => {
                 let height = probe["candidate_height"].as_u64().unwrap() as usize;
                 let sealed_at = wist_core::checkpoint::Checkpoint::parse(
-                    blocks[height]["checkpoint"].as_str().unwrap(),
+                    epochs[height]["checkpoint"].as_str().unwrap(),
                 )
                 .unwrap();
                 SizeCaps::from_schedule(&schedules[height - 1], timestamp(sealed_at.sealed_at()))
@@ -75,19 +75,19 @@ fn signed_cap_profiles_follow_authenticated_prefixes_and_survive_later_amendment
         let result = delta.and_then(|()| caps.validate_payload_sizes(&object["payload"]));
         assert_eq!(json!(result.err()), probe["expected"], "{}", probe["name"]);
     }
-    for case in vector["invalid_blocks"].as_array().unwrap() {
-        let doc = &case["block"];
+    for case in vector["invalid_epochs"].as_array().unwrap() {
+        let doc = &case["epoch"];
         let height = wist_core::checkpoint::Checkpoint::parse(doc["checkpoint"].as_str().unwrap())
             .unwrap()
-            .block_number() as usize;
-        let mut replaced = blocks[..height].to_vec();
+            .epoch_number() as usize;
+        let mut replaced = epochs[..height].to_vec();
         replaced.push(doc.clone());
-        let head = seal_vector_blocks(&db, data.path(), &log_key(), &replaced);
+        let head = seal_vector_epochs(&db, data.path(), &log_key(), &replaced);
         let mut history = History::open(&db, data.path(), Some(head)).unwrap();
         let candidate = loop {
-            let block = history.next_block().unwrap().unwrap();
-            if block.block_number() == height as u64 {
-                break block;
+            let epoch = history.next_epoch().unwrap().unwrap();
+            if epoch.epoch_number() == height as u64 {
+                break epoch;
             }
         };
         let caps = candidate.delta_size_caps();
@@ -96,7 +96,7 @@ fn signed_cap_profiles_follow_authenticated_prefixes_and_survive_later_amendment
             .and_then(|()| caps.validate_payload_sizes(&case["payload"]));
         assert_eq!(json!(result.err()), case["expected"], "{}", case["name"]);
     }
-    seal_vector_blocks(&db, data.path(), &log_key(), blocks);
+    seal_vector_epochs(&db, data.path(), &log_key(), epochs);
 }
 
 #[test]
@@ -107,8 +107,8 @@ fn historical_payload_sources_keep_the_committing_profile_after_restart() {
     let data = tempfile::tempdir().unwrap();
     anchor(data.path());
     let db = Db::open(&data.path().join("clave.sqlite")).unwrap();
-    let blocks = vector["blocks"].as_array().unwrap();
-    let head = seal_vector_blocks(&db, data.path(), &log_key(), blocks);
+    let epochs = vector["epochs"].as_array().unwrap();
+    let head = seal_vector_epochs(&db, data.path(), &log_key(), epochs);
     std::fs::create_dir_all(data.path().join("payloads")).unwrap();
     let (listener, host, client) = reserve_addr();
     serve_static(listener, data.path().to_owned());
@@ -134,7 +134,7 @@ fn historical_payload_sources_keep_the_committing_profile_after_restart() {
             let source =
                 PayloadSource::reconstruct(&db, data.path(), Some(head.clone()), &id).unwrap();
             assert_eq!(source.envelope(), &object["envelope"]);
-            assert_eq!(json!(source.block_number()), object["sealed_height"]);
+            assert_eq!(json!(source.epoch_number()), object["sealed_height"]);
             assert_eq!(json!(source.size_caps()), probe["expected_profile"]);
             assert_eq!(json!(source.validate(&raw).err()), probe["expected"]);
             let discovered = source.discover(
@@ -182,14 +182,14 @@ fn historical_payload_sources_keep_the_committing_profile_after_restart() {
             }
         }
     }
-    for case in vector["invalid_blocks"].as_array().unwrap() {
-        let doc = &case["block"];
+    for case in vector["invalid_epochs"].as_array().unwrap() {
+        let doc = &case["epoch"];
         let height = wist_core::checkpoint::Checkpoint::parse(doc["checkpoint"].as_str().unwrap())
             .unwrap()
-            .block_number() as usize;
-        let mut replaced = blocks[..height].to_vec();
+            .epoch_number() as usize;
+        let mut replaced = epochs[..height].to_vec();
         replaced.push(doc.clone());
-        let head = seal_vector_blocks(&db, data.path(), &log_key(), &replaced);
+        let head = seal_vector_epochs(&db, data.path(), &log_key(), &replaced);
         let id = wist_core::delta::delta_id(&doc["entries"][0]["body"]["delta"]).unwrap();
         let error = match PayloadSource::reconstruct(&db, data.path(), Some(head), &id) {
             Ok(source) => source
@@ -423,7 +423,7 @@ fn missing_or_corrupt_retained_payload_rolls_back_sealing() {
         assert!(
             clave::seal::run(&db, data.path(), &sk, timestamp("2026-08-09T12:00:00Z")).is_err()
         );
-        assert!(db.last_block().unwrap().is_none());
+        assert!(db.last_epoch().unwrap().is_none());
         assert_eq!(db.count_pending_entries("publisher_delta").unwrap(), 1);
         assert!(db.is_delta_seen(&id).unwrap());
         assert!(db.list_rejections(&host).unwrap().is_empty());
@@ -436,7 +436,7 @@ fn missing_or_corrupt_retained_payload_rolls_back_sealing() {
 }
 
 #[test]
-fn index_restoration_uses_signed_block_caps_and_rejects_oversized_history_atomically() {
+fn index_restoration_uses_signed_epoch_caps_and_rejects_oversized_history_atomically() {
     let vector = fixture();
     for invalid in [false, true] {
         let data = tempfile::tempdir().unwrap();
@@ -444,17 +444,17 @@ fn index_restoration_uses_signed_block_caps_and_rejects_oversized_history_atomic
         anchor(data.path());
         let path = data.path().join("clave.sqlite");
         let db = Db::open(&path).unwrap();
-        let mut blocks = vector["blocks"].as_array().unwrap().clone();
+        let mut epochs = vector["epochs"].as_array().unwrap().clone();
         if invalid {
-            let candidate = &vector["invalid_blocks"][0]["block"];
+            let candidate = &vector["invalid_epochs"][0]["epoch"];
             let height =
                 wist_core::checkpoint::Checkpoint::parse(candidate["checkpoint"].as_str().unwrap())
                     .unwrap()
-                    .block_number() as usize;
-            blocks.truncate(height);
-            blocks.push(candidate.clone());
+                    .epoch_number() as usize;
+            epochs.truncate(height);
+            epochs.push(candidate.clone());
         }
-        seal_vector_blocks(&db, data.path(), &log_key(), &blocks);
+        seal_vector_epochs(&db, data.path(), &log_key(), &epochs);
         db.set_param("url_cap_bytes", 9000).unwrap();
         let connection = rusqlite::Connection::open(&path).unwrap();
         connection

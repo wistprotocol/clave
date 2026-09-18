@@ -66,7 +66,7 @@ impl Rig {
             at.parse::<jiff::Timestamp>().unwrap().as_second(),
         )
         .unwrap()
-        .block_number
+        .epoch_number
     }
 
     fn assert_sealed(&self, declaration: &Value, height: u64, at: &str) {
@@ -76,7 +76,7 @@ impl Rig {
             .iter()
             .find(|row| row.seq == seq)
             .expect("sealed Declaration metadata");
-        assert_eq!(row.block_number, height);
+        assert_eq!(row.epoch_number, height);
         assert_eq!(
             row.declaration_json,
             serde_json::to_vec(declaration).unwrap()
@@ -84,7 +84,7 @@ impl Rig {
         let history = clave::history::declarations::Declarations::reconstruct(
             &self.db,
             self.data.path(),
-            self.db.last_block().unwrap(),
+            self.db.last_epoch().unwrap(),
         )
         .unwrap();
         assert_eq!(

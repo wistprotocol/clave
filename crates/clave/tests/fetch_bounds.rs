@@ -289,7 +289,7 @@ fn fetch_bounds_vector() {
             schedule.adopt(wist_core::parameters::Amendment {
                 parameter: name.into(),
                 value: params[name].as_i64().unwrap(),
-                block_number: 0,
+                epoch_number: 0,
                 entry_index: index as u64,
                 sealed_at_s: 0,
                 effective_at_s: 0,

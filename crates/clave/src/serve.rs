@@ -160,7 +160,7 @@ struct IngestRequest {
 
 /// WIST-3 §6 and [tlog-tiles]: the head Checkpoint and the archive are
 /// text served without caching, since both are rewritten — the head at
-/// every Block, an archived note whenever a Cosignature is added.
+/// every Epoch, an archived note whenever a Cosignature is added.
 const NOTE_CONTENT_TYPE: &str = "text/plain; charset=utf-8";
 const NO_CACHE: &str = "no-store";
 /// A full tile or entry bundle never changes once written, so it is
@@ -247,7 +247,7 @@ async fn log_handler(
 
 fn now_utc() -> String {
     jiff::Timestamp::from_second(jiff::Timestamp::now().as_second())
-        .expect("current epoch second is in range")
+        .expect("current Unix second is in range")
         .to_string()
 }
 
@@ -430,8 +430,8 @@ pub fn run_with_options(
                     let Ok(db) = Db::connect(&db_path) else {
                         return;
                     };
-                    let now_epoch = jiff::Timestamp::now().as_second();
-                    let _ = crate::baseline::run_pass_gated(&db, &client, &data, now_epoch, &gate);
+                    let now_unix = jiff::Timestamp::now().as_second();
+                    let _ = crate::baseline::run_pass_gated(&db, &client, &data, now_unix, &gate);
                 })
                 .await;
             }

@@ -2,27 +2,27 @@
 
 use std::fs;
 
-/// Seals `entries` as Block `block_number` of the Log in `data_dir` and
+/// Seals `entries` as Epoch `epoch_number` of the Log in `data_dir` and
 /// distributes it, for fixtures that build a Log directly rather than
 /// through admission.
-pub fn seal_fixture_block(
+pub fn seal_fixture_epoch(
     db: &clave::db::Db,
     data_dir: &std::path::Path,
-    block_number: u64,
+    epoch_number: u64,
     sealed_at: &str,
     entries: &[serde_json::Value],
-) -> clave::db::BlockRow {
+) -> clave::db::EpochRow {
     let sk = clave::keys::load(&data_dir.join("keys/seed")).unwrap();
     let anchor = clave::history::anchor(data_dir).unwrap();
     let mut ordered = entries.to_vec();
-    wist_core::block::sort_entries(&mut ordered).unwrap();
-    let octets = wist_core::block::block_octets(&ordered).unwrap();
+    wist_core::epoch::sort_entries(&mut ordered).unwrap();
+    let octets = wist_core::epoch::epoch_octets(&ordered).unwrap();
     let row = db
         .commit_seal(
             &sk,
             &anchor.log_id,
             &[],
-            block_number,
+            epoch_number,
             sealed_at,
             &ordered,
             octets,
@@ -39,38 +39,38 @@ pub fn seal_fixture_block(
     row
 }
 
-/// Seals the Blocks a vector carries — each
+/// Seals the Epochs a vector carries — each
 /// `{"checkpoint": <note>, "entries": [...]}` — from an empty tree,
 /// signing every Checkpoint with `sk` under the data directory's
 /// `log_id`, and returns the head.
-pub fn seal_vector_blocks(
+pub fn seal_vector_epochs(
     db: &clave::db::Db,
     data_dir: &std::path::Path,
     sk: &wist_core::crypto::SigningKey,
-    blocks: &[serde_json::Value],
-) -> clave::db::BlockRow {
+    epochs: &[serde_json::Value],
+) -> clave::db::EpochRow {
     let anchor = clave::history::anchor(data_dir).unwrap();
     rusqlite::Connection::open(data_dir.join("clave.sqlite"))
         .unwrap()
-        .execute_batch("DELETE FROM blocks; DELETE FROM log_entries; DELETE FROM log_tiles;")
+        .execute_batch("DELETE FROM epochs; DELETE FROM log_entries; DELETE FROM log_tiles;")
         .unwrap();
     let mut head = None;
-    for block in blocks {
+    for epoch in epochs {
         let checkpoint =
-            wist_core::checkpoint::Checkpoint::parse(block["checkpoint"].as_str().unwrap())
+            wist_core::checkpoint::Checkpoint::parse(epoch["checkpoint"].as_str().unwrap())
                 .unwrap();
         let mut entries: Vec<serde_json::Value> =
-            serde_json::from_value(block["entries"].clone()).unwrap();
-        wist_core::block::sort_entries(&mut entries).unwrap();
+            serde_json::from_value(epoch["entries"].clone()).unwrap();
+        wist_core::epoch::sort_entries(&mut entries).unwrap();
         head = Some(
             db.commit_seal(
                 sk,
                 &anchor.log_id,
                 &[],
-                checkpoint.block_number(),
+                checkpoint.epoch_number(),
                 checkpoint.sealed_at(),
                 &entries,
-                wist_core::block::block_octets(&entries).unwrap(),
+                wist_core::epoch::epoch_octets(&entries).unwrap(),
                 &[],
                 &[],
                 &[],
@@ -82,7 +82,7 @@ pub fn seal_vector_blocks(
             .unwrap(),
         );
     }
-    head.expect("a vector carries at least one Block")
+    head.expect("a vector carries at least one Epoch")
 }
 
 /// The signed note of the Checkpoint the Log's static files publish as
@@ -92,7 +92,7 @@ pub fn head_checkpoint(data_dir: &std::path::Path) -> wist_core::checkpoint::Che
     wist_core::checkpoint::Checkpoint::parse(&note).unwrap()
 }
 
-/// The Entries of Block `block_number`, read back from the entry bundles
+/// The Entries of Epoch `epoch_number`, read back from the entry bundles
 /// the Log serves.
 pub fn served_entries(data_dir: &std::path::Path, from: u64, to: u64) -> Vec<serde_json::Value> {
     let serving = fs::read_to_string(data_dir.join("checkpoint"))
@@ -101,7 +101,7 @@ pub fn served_entries(data_dir: &std::path::Path, from: u64, to: u64) -> Vec<ser
         .map_or(to, |head| head.tree_size())
         .max(to);
     let mut leaves = Vec::new();
-    for bundle in wist_core::tiles::bundles_for_range(from, to, serving) {
+    for bundle in wist_core::tiles::entry_bundles_for_range(from, to, serving) {
         let bytes = fs::read(data_dir.join(bundle.path().trim_start_matches('/'))).unwrap();
         let (start, _) = bundle.leaf_range();
         for (offset, entry) in wist_core::tiles::decode_entry_bundle(&bytes)
@@ -115,7 +115,7 @@ pub fn served_entries(data_dir: &std::path::Path, from: u64, to: u64) -> Vec<ser
             }
         }
     }
-    wist_core::block::parse_entries(&leaves).unwrap()
+    wist_core::epoch::parse_entries(&leaves).unwrap()
 }
 
 pub fn spec_dir() -> std::path::PathBuf {

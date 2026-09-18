@@ -1,5 +1,5 @@
-use super::{History, VerifiedBlock};
-use crate::db::{BlockRow, Db};
+use super::{History, VerifiedEpoch};
+use crate::db::{Db, EpochRow};
 use crate::error::Result;
 use std::path::Path;
 
@@ -8,29 +8,29 @@ pub use wist_core::declarations::{
     Settlement,
 };
 
-/// Replay over the authenticated Block history the aggregator retains.
+/// Replay over the authenticated Epoch history the aggregator retains.
 pub trait DeclarationsReplay: Sized {
-    fn reconstruct(db: &Db, directory: &Path, head: Option<BlockRow>) -> Result<Self>;
-    fn apply(&mut self, verified: &VerifiedBlock) -> Result<Effects>;
+    fn reconstruct(db: &Db, directory: &Path, head: Option<EpochRow>) -> Result<Self>;
+    fn apply(&mut self, verified: &VerifiedEpoch) -> Result<Effects>;
 }
 
 impl DeclarationsReplay for Declarations {
-    fn reconstruct(db: &Db, directory: &Path, head: Option<BlockRow>) -> Result<Self> {
+    fn reconstruct(db: &Db, directory: &Path, head: Option<EpochRow>) -> Result<Self> {
         let mut history = History::open(db, directory, head)?;
         let mut state = Self::default();
-        while let Some(block) = history.next_block()? {
-            state.apply(&block)?;
+        while let Some(epoch) = history.next_epoch()? {
+            state.apply(&epoch)?;
         }
         Ok(state)
     }
 
-    fn apply(&mut self, verified: &VerifiedBlock) -> Result<Effects> {
-        Ok(self.apply_block(
-            verified.block_number(),
+    fn apply(&mut self, verified: &VerifiedEpoch) -> Result<Effects> {
+        Ok(self.apply_epoch(
+            verified.epoch_number(),
             verified.root(),
             verified.sealed_at(),
             verified.recovery_window_days,
-            verified.declaration_activation_blocks,
+            verified.declaration_activation_epochs,
             verified.entries(),
         )?)
     }

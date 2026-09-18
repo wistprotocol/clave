@@ -207,7 +207,7 @@ fn sealing_rejects_a_shared_key_delta_assigned_to_another_domain() {
         .iter()
         .any(|error| error.contains("WIST1-E02")));
     assert!(db
-        .block_entries(0)
+        .epoch_entries(0)
         .unwrap()
         .iter()
         .all(|entry| entry["type"] != "publisher_delta"));

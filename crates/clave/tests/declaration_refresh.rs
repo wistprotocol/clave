@@ -806,7 +806,7 @@ fn settlement_after_payload_fetch_retries_before_final_delta_admission() {
         clave::init::run(&host, data.path()).unwrap();
         let path = data.path().join("clave.sqlite");
         let db = Db::open(&path).unwrap();
-        db.set_param("block_cadence_seconds", 1).unwrap();
+        db.set_param("epoch_cadence_seconds", 1).unwrap();
         let key = clave::keys::load(&data.path().join("keys/seed")).unwrap();
         for (at, seed) in [
             ("2026-08-09T12:00:00Z", &K1_SEED),

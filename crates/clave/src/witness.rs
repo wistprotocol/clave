@@ -204,7 +204,7 @@ pub fn submit_head(db: &Db, client: &Client, data_dir: &Path) -> Result<Vec<Stri
     if witnesses.is_empty() {
         return Ok(Vec::new());
     }
-    let Some((block_number, mut note)) = db.head_publication()? else {
+    let Some((epoch_number, mut note)) = db.head_publication()? else {
         return Ok(Vec::new());
     };
     let mut cosigned = Vec::new();
@@ -239,8 +239,8 @@ pub fn submit_head(db: &Db, client: &Client, data_dir: &Path) -> Result<Vec<Stri
             updated.add_signature(line);
         }
         note = updated.encode();
-        db.replace_checkpoint_note(block_number, &note)?;
-        crate::publication::republish_checkpoint(db, data_dir, block_number, &note)?;
+        db.replace_checkpoint_note(epoch_number, &note)?;
+        crate::publication::republish_checkpoint(db, data_dir, epoch_number, &note)?;
         db.set_witness_size(&witness.name, size)?;
         cosigned.push(witness.name);
     }

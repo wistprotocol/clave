@@ -6,10 +6,10 @@ use serde_json::Value;
 const SEAL_START: i64 = 1_786_276_800;
 const NOW: &str = "2026-08-09T12:00:00Z";
 
-/// The Blocks a fresh identity waits before it takes effect (WIST-1 §5.2).
+/// The Epochs a fresh identity waits before it takes effect (WIST-1 §5.2).
 fn activation_delay() -> u64 {
     u64::try_from(
-        wist_core::parameters::spec("declaration_activation_blocks")
+        wist_core::parameters::spec("declaration_activation_epochs")
             .unwrap()
             .default
             .unwrap(),
@@ -36,7 +36,7 @@ impl Harness {
         let data = tempfile::tempdir().unwrap();
         clave::init::run(&host, data.path()).unwrap();
         let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
-        db.set_param("block_cadence_seconds", 1).unwrap();
+        db.set_param("epoch_cadence_seconds", 1).unwrap();
         let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
         clave::ingest::run(&db, &client, data.path(), &host, NOW).unwrap();
         let mut harness = Harness {
@@ -60,7 +60,7 @@ impl Harness {
         let at = SEAL_START + self.height as i64 * 3600;
         let report = clave::seal::run(&self.db, self.data.path(), &self.sk, at).unwrap();
         self.height += 1;
-        report.block_number
+        report.epoch_number
     }
 
     fn stored_declaration(&self) -> Value {

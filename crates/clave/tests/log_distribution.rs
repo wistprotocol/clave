@@ -1,7 +1,7 @@
 mod common;
 
 use common::{
-    add_delta, head_checkpoint, make_publisher_with_scope, reserve_addr, seal_fixture_block,
+    add_delta, head_checkpoint, make_publisher_with_scope, reserve_addr, seal_fixture_epoch,
     serve_static, served_entries, spec_dir, write_feed,
 };
 use serde_json::Value;
@@ -28,8 +28,8 @@ fn served_tiles(data: &Path, tree_size: u64) -> tiles::TileSet {
 
 /// Verifies a Log's static files on their own, as a Consumer holding the
 /// Log Anchor does: the head Checkpoint, every archived Checkpoint from
-/// Block 0, the consistency of consecutive sizes computed from the
-/// served tiles, and each Block's Entries against the root its
+/// Epoch 0, the consistency of consecutive sizes computed from the
+/// served tiles, and each Epoch's Entries against the root its
 /// Checkpoint states (WIST-3 §4, §5, §6).
 fn verify_static_log(data: &Path, log_id: &str, key: &AggregatorKey) -> Vec<Checkpoint> {
     let head = Checkpoint::parse(&String::from_utf8(read(data, "/checkpoint")).unwrap()).unwrap();
@@ -38,7 +38,7 @@ fn verify_static_log(data: &Path, log_id: &str, key: &AggregatorKey) -> Vec<Chec
 
     let mut leaves: Vec<[u8; 32]> = Vec::new();
     let mut checkpoints: Vec<Checkpoint> = Vec::new();
-    for number in 0..=head.block_number() {
+    for number in 0..=head.epoch_number() {
         let note = String::from_utf8(read(data, &checkpoint::archive_path(number))).unwrap();
         let archived = Checkpoint::parse(&note).unwrap();
         checkpoint::check_archive_path(&archived, &checkpoint::archive_path(number)).unwrap();
@@ -53,7 +53,7 @@ fn verify_static_log(data: &Path, log_id: &str, key: &AggregatorKey) -> Vec<Chec
         }
 
         let entries = served_entries(data, previous_size, archived.tree_size());
-        let summary = wist_core::block::verify_block(
+        let summary = wist_core::epoch::verify_epoch(
             previous_size,
             &archived,
             &entries,
@@ -79,7 +79,7 @@ fn verify_static_log(data: &Path, log_id: &str, key: &AggregatorKey) -> Vec<Chec
 fn sealed_log(host: &str, client: &clave::fetch::Client, data: &Path) -> clave::db::Db {
     clave::init::run(host, data).unwrap();
     let db = clave::db::Db::open(&data.join("clave.sqlite")).unwrap();
-    db.set_param("block_cadence_seconds", 1).unwrap();
+    db.set_param("epoch_cadence_seconds", 1).unwrap();
     clave::ingest::run(&db, client, data, host, "2026-08-09T12:00:00Z").unwrap();
     db
 }
@@ -121,7 +121,7 @@ fn a_sealed_log_verifies_end_to_end_from_its_static_files_alone() {
     assert_eq!(
         checkpoints[1].tree_size(),
         checkpoints[0].tree_size(),
-        "the empty Block restates the tree size"
+        "the empty Epoch restates the tree size"
     );
     assert_eq!(checkpoints[1].root(), checkpoints[0].root());
     assert!(checkpoints[2].tree_size() > checkpoints[1].tree_size());
@@ -138,7 +138,7 @@ fn crossing_a_tile_boundary_publishes_a_full_tile_and_removes_its_partials() {
             .collect()
     };
 
-    seal_fixture_block(
+    seal_fixture_epoch(
         &db,
         data.path(),
         0,
@@ -150,7 +150,7 @@ fn crossing_a_tile_boundary_publishes_a_full_tile_and_removes_its_partials() {
     assert!(!data.path().join("tile/0/000").exists());
     assert!(data.path().join("tile/entries/000.p/200").exists());
 
-    seal_fixture_block(
+    seal_fixture_epoch(
         &db,
         data.path(),
         1,
@@ -197,7 +197,7 @@ fn crossing_a_tile_boundary_publishes_a_full_tile_and_removes_its_partials() {
 #[test]
 fn tiles_and_entry_bundles_take_the_paths_and_encodings_the_vector_fixes() {
     let vector: Value = serde_json::from_slice(
-        &std::fs::read(spec_dir().join("vectors/wist3/block.json")).unwrap(),
+        &std::fs::read(spec_dir().join("vectors/wist3/epoch.json")).unwrap(),
     )
     .unwrap();
     let entries: Vec<Value> = serde_json::from_value(vector["entries"].clone()).unwrap();
@@ -216,7 +216,7 @@ fn tiles_and_entry_bundles_take_the_paths_and_encodings_the_vector_fixes() {
         wist_core::crypto::hex_encode(&tiles::encode_tile(&leaves)),
         vector["tile_0_000_p_4"].as_str().unwrap()
     );
-    let bundle = &tiles::required_bundles(vector["tree_size"].as_u64().unwrap())[0];
+    let bundle = &tiles::required_entry_bundles(vector["tree_size"].as_u64().unwrap())[0];
     assert_eq!(
         bundle.path(),
         vector["entry_bundle_000_p_4_path"].as_str().unwrap()
@@ -230,7 +230,7 @@ fn tiles_and_entry_bundles_take_the_paths_and_encodings_the_vector_fixes() {
     let log_id = vector["log_id"].as_str().unwrap();
     clave::init::run(log_id, data.path()).unwrap();
     let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
-    let sealed = seal_fixture_block(&db, data.path(), 0, "2026-08-02T13:00:00Z", &entries);
+    let sealed = seal_fixture_epoch(&db, data.path(), 0, "2026-08-02T13:00:00Z", &entries);
     assert_eq!(sealed.tree_size, vector["tree_size"].as_u64().unwrap());
     assert_eq!(sealed.root, vector["root"].as_str().unwrap());
     assert_eq!(
