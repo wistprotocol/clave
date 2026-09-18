@@ -408,7 +408,10 @@ pub fn run_with_options(
         .route("/log/*path", get(log_handler))
         .nest_service("/payloads", ServeDir::new(data_dir.join("payloads")))
         .nest_service("/snapshots", ServeDir::new(data_dir.join("snapshots")))
-        .route_service("/anchor.json", ServeFile::new(data_dir.join("anchor.json")))
+        .route_service(
+            "/log/anchor.json",
+            ServeFile::new(data_dir.join("anchor.json")),
+        )
         .with_state(state);
 
     let bg_data = data_dir.clone();

@@ -92,7 +92,7 @@ fn serve_exposes_only_public_subtrees() {
     let r = c.get(format!("{addr}/checkpoint")).send().unwrap();
     assert_eq!(r.status(), 200);
 
-    let r = c.get(format!("{addr}/anchor.json")).send().unwrap();
+    let r = c.get(format!("{addr}/log/anchor.json")).send().unwrap();
     assert_eq!(r.status(), 200);
 
     let r = c.get(format!("{addr}/tile/../keys/seed")).send().unwrap();
