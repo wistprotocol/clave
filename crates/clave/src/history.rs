@@ -2,21 +2,62 @@ pub mod declarations;
 pub mod deltas;
 pub mod payloads;
 
-use crate::db::BlockRow;
+use crate::db::{BlockRow, Db};
 use crate::error::{Error, Result};
 use crate::registry;
 use serde_json::Value;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use wist_core::checkpoint::{self, AggregatorKey, Checkpoint};
 use wist_core::crypto::PublicKey;
-use wist_core::objects::{Block, LogAnchorEnvelope, RegistryUpdateEnvelope};
+use wist_core::objects::{LogAnchorEnvelope, RegistryUpdateEnvelope};
 use wist_core::parameters::{Amendment, Schedule};
 
+/// The Log's out-of-band trust root as the data directory holds it.
+pub struct LogAnchor {
+    pub log_id: String,
+    pub key: PublicKey,
+    pub key_id: String,
+}
+
+/// Reads and verifies `anchor.json`: it is self-signed under the very
+/// genesis key it declares (WIST-3 §3.4).
+pub fn anchor(directory: &Path) -> Result<LogAnchor> {
+    let doc: Value = crate::json::parse(&std::fs::read(directory.join("anchor.json"))?)?;
+    let parsed: LogAnchorEnvelope = serde_json::from_value(doc.clone())?;
+    let genesis = &parsed.anchor.genesis_key;
+    if parsed.anchor.wist_version != crate::WIST_VERSION || parsed.anchor.predecessor.is_some() {
+        return Err(Error::History(
+            "unsupported Log Anchor version or predecessor".into(),
+        ));
+    }
+    if genesis.alg != "Ed25519"
+        || parsed.sig.alg != "Ed25519"
+        || parsed.sig.key_id != genesis.key_id
+    {
+        return Err(failure(
+            "Log Anchor signature does not name its genesis key",
+        ));
+    }
+    let key = PublicKey::from_b64u(&genesis.public_key)?;
+    wist_core::envelope::verify_envelope(&doc, "anchor", &key)?;
+    Ok(LogAnchor {
+        log_id: parsed.anchor.log_id.clone(),
+        key,
+        key_id: genesis.key_id.clone(),
+    })
+}
+
+/// One Block of the Log with its Checkpoint verified and its Entries
+/// checked against the tree that Checkpoint states.
 #[derive(Debug)]
 pub struct VerifiedBlock {
-    block: Block,
-    hash: String,
+    block_number: u64,
+    tree_size: u64,
+    root: String,
+    sealed_at: String,
+    entries: Vec<Value>,
     sealed_at_s: i64,
-    decompressed_bytes: u64,
+    octets: u64,
     rejected_parameters: Vec<usize>,
     recovery_window_days: i64,
     declaration_activation_blocks: i64,
@@ -25,20 +66,36 @@ pub struct VerifiedBlock {
 }
 
 impl VerifiedBlock {
-    pub fn block(&self) -> &Block {
-        &self.block
+    pub fn block_number(&self) -> u64 {
+        self.block_number
     }
 
-    pub fn hash(&self) -> &str {
-        &self.hash
+    pub fn tree_size(&self) -> u64 {
+        self.tree_size
+    }
+
+    /// The root of the tree at this Block in the `"sha256:" + hex` form
+    /// WIST-3 §3.1 gives it.
+    pub fn root(&self) -> &str {
+        &self.root
+    }
+
+    pub fn sealed_at(&self) -> &str {
+        &self.sealed_at
+    }
+
+    pub fn entries(&self) -> &[Value] {
+        &self.entries
     }
 
     pub fn sealed_at_s(&self) -> i64 {
         self.sealed_at_s
     }
 
-    pub fn decompressed_bytes(&self) -> u64 {
-        self.decompressed_bytes
+    /// The octets this Block's Entries occupy in entry bundles
+    /// (WIST-3 §6).
+    pub fn octets(&self) -> u64 {
+        self.octets
     }
 
     pub fn delta_size_caps(&self) -> &crate::declaration::delta::SizeCaps {
@@ -54,49 +111,31 @@ impl VerifiedBlock {
     }
 }
 
-pub struct History {
-    directory: PathBuf,
+pub struct History<'a> {
+    db: &'a Db,
     head: Option<BlockRow>,
     log_id: String,
     key: PublicKey,
     key_id: String,
     next_height: u64,
-    prior_hash: String,
+    previous: Option<Checkpoint>,
     prior_at: Option<i64>,
     largest: u64,
     schedule: Option<Schedule>,
     failed: bool,
 }
 
-impl History {
-    pub fn open(directory: &Path, head: Option<BlockRow>) -> Result<Self> {
-        let doc: Value = crate::json::parse(&std::fs::read(directory.join("anchor.json"))?)?;
-        let anchor: LogAnchorEnvelope = serde_json::from_value(doc.clone())?;
-        let genesis = &anchor.anchor.genesis_key;
-        if anchor.anchor.wist_version != crate::WIST_VERSION || anchor.anchor.predecessor.is_some()
-        {
-            return Err(Error::History(
-                "unsupported Log Anchor version or predecessor".into(),
-            ));
-        }
-        if genesis.alg != "Ed25519"
-            || anchor.sig.alg != "Ed25519"
-            || anchor.sig.key_id != genesis.key_id
-        {
-            return Err(failure(
-                "Log Anchor signature does not name its genesis key",
-            ));
-        }
-        let key = PublicKey::from_b64u(&genesis.public_key)?;
-        wist_core::envelope::verify_envelope(&doc, "anchor", &key)?;
+impl<'a> History<'a> {
+    pub fn open(db: &'a Db, directory: &Path, head: Option<BlockRow>) -> Result<Self> {
+        let anchor = anchor(directory)?;
         Ok(Self {
-            directory: directory.into(),
+            db,
             head,
-            log_id: anchor.anchor.log_id.clone(),
-            key,
-            key_id: genesis.key_id.clone(),
+            log_id: anchor.log_id,
+            key: anchor.key,
+            key_id: anchor.key_id,
             next_height: 0,
-            prior_hash: "sha256:genesis".into(),
+            previous: None,
             prior_at: None,
             largest: 0,
             schedule: None,
@@ -137,63 +176,65 @@ impl History {
         if height > head.block_number {
             return Ok(None);
         }
-        let bound = match (&self.schedule, self.prior_at) {
-            (Some(schedule), Some(at)) => schedule.block_size_bounds(at).1,
-            _ => registry::spec("block_decompressed_cap_bytes")
-                .unwrap()
-                .default
-                .unwrap() as u64,
-        };
-        let bytes = crate::block_file::read(
-            &self
-                .directory
-                .join(format!("log/blocks/{height:09}.json.zst")),
-            bound,
-        )?;
-        let doc: Value = crate::json::parse(&bytes).map_err(|e| failure(&e.to_string()))?;
-        let block: Block =
-            serde_json::from_value(doc.clone()).map_err(|e| failure(&e.to_string()))?;
-        if block.header.wist_version != crate::WIST_VERSION {
-            return Err(Error::History("unsupported Block version".into()));
-        }
-        if block.sig.alg != "Ed25519" || block.sig.key_id != self.key_id {
+        let row = self
+            .db
+            .block_at(height)?
+            .ok_or_else(|| failure("the store is missing a Block below its head"))?;
+        let note = self
+            .db
+            .checkpoint_note(height)?
+            .ok_or_else(|| failure("the store is missing a Block's Checkpoint"))?;
+        let checkpoint = Checkpoint::parse(&note).map_err(|e| failure(&e.to_string()))?;
+        checkpoint::verify(
+            &checkpoint,
+            &self.log_id,
+            &[AggregatorKey {
+                key_id: self.key_id.clone(),
+                public_key: self.key.clone(),
+            }],
+            &[],
+        )
+        .map_err(|e| failure(&e.to_string()))?;
+        if checkpoint.block_number() != height
+            || checkpoint.tree_size() != row.tree_size
+            || checkpoint.root_token() != row.root
+            || checkpoint.sealed_at() != row.sealed_at
+        {
             return Err(Error::History(
-                "unsupported Block signing key or algorithm".into(),
+                "WIST3-E02 the stored Checkpoint is not the Block the store records".into(),
             ));
         }
-        wist_core::block::verify_block(&doc, &self.key).map_err(|e| failure(&e.to_string()))?;
-        wist_core::block::verify_chain_link(&doc["header"], &self.prior_hash)
-            .map_err(|e| Error::History(format!("WIST3-E02 {e}")))?;
-        let hash = wist_core::block::block_hash(&doc["header"])?;
-        if block.header.block_number != height {
-            return Err(failure("Block height does not match its path"));
-        }
-        if height == head.block_number
-            && (hash != head.block_hash || block.header.sealed_at != head.sealed_at)
+        if height == head.block_number && (row.root != head.root || row.sealed_at != head.sealed_at)
         {
             return Err(Error::History(
                 "WIST3-E02 Block does not match the pinned history head".into(),
             ));
         }
-        let at = registry::epoch(&block.header.sealed_at).map_err(|e| failure(&e.to_string()))?;
-        if self.prior_at.is_some_and(|prior| at <= prior) {
-            return Err(failure("Block timestamps are not strictly increasing"));
-        }
-        if wist_core::jcs::canonicalize(&doc)? != bytes {
-            return Err(failure("Block file does not contain canonical JCS bytes"));
-        }
+        let at = checkpoint
+            .sealed_at_s()
+            .map_err(|e| failure(&e.to_string()))?;
         let mut schedule = self.schedule.clone().unwrap_or_else(|| Schedule::new(at));
         let cadence = schedule
             .value_at("block_cadence_seconds", self.prior_at.unwrap_or(at))
             .unwrap();
-        if at.rem_euclid(cadence) != 0 {
-            return Err(failure("Block timestamp is off the accepted cadence grid"));
-        }
-        validate_entry_order(&block.entries)?;
-        let size = bytes.len() as u64;
-        let largest = self.largest.max(size);
+        checkpoint::check_sequence(self.previous.as_ref(), &checkpoint, cadence)
+            .map_err(|e| failure(&e.to_string()))?;
+
+        let previous_size = self.db.size_before(height)?;
+        let entries = self.db.block_entries(height)?;
+        let cap = schedule.block_size_bounds(at).1;
+        let summary = wist_core::block::verify_block(
+            previous_size,
+            &checkpoint,
+            &entries,
+            &self.db.log_tree(),
+            cap,
+        )
+        .map_err(|e| failure(&e.to_string()))?;
+
+        let largest = self.largest.max(summary.octets);
         let mut rejected_parameters = Vec::new();
-        for (index, entry) in block.entries.iter().enumerate() {
+        for (index, entry) in entries.iter().enumerate() {
             if entry["type"] != "registry_update" {
                 continue;
             }
@@ -219,7 +260,6 @@ impl History {
         self.next_height = height
             .checked_add(1)
             .ok_or_else(|| failure("Block height overflow"))?;
-        self.prior_hash = hash.clone();
         self.prior_at = Some(at);
         self.largest = largest;
         let recovery_window_days = schedule.value_at("recovery_window_days", at).unwrap();
@@ -227,22 +267,22 @@ impl History {
             .value_at("declaration_activation_blocks", at)
             .unwrap();
         let delta_size_caps = crate::declaration::delta::SizeCaps::from_schedule(&schedule, at);
+        let clock_skew_seconds = schedule.value_at("clock_skew_seconds", at).unwrap();
         self.schedule = Some(schedule);
+        self.previous = Some(checkpoint);
         Ok(Some(VerifiedBlock {
-            block,
-            hash,
+            block_number: height,
+            tree_size: row.tree_size,
+            root: row.root,
+            sealed_at: row.sealed_at,
+            entries,
             sealed_at_s: at,
-            decompressed_bytes: size,
+            octets: summary.octets,
             rejected_parameters,
             recovery_window_days,
             declaration_activation_blocks,
             delta_size_caps,
-            clock_skew_seconds: self
-                .schedule
-                .as_ref()
-                .unwrap()
-                .value_at("clock_skew_seconds", at)
-                .unwrap(),
+            clock_skew_seconds,
         }))
     }
 
@@ -292,10 +332,6 @@ impl History {
         )
         .is_ok()
     }
-}
-
-fn validate_entry_order(entries: &[Value]) -> Result<()> {
-    wist_core::block::validate_entry_order(entries).map_err(|e| Error::History(e.to_string()))
 }
 
 fn failure(message: &str) -> Error {

@@ -1,11 +1,11 @@
 mod common;
 
-use clave::db::{BlockRow, Db};
+use clave::db::Db;
 use clave::declaration::delta::SizeCaps;
 use clave::history::History;
 use common::*;
 use serde_json::{json, Value};
-use wist_core::{block, crypto::SigningKey, envelope, jcs};
+use wist_core::{crypto::SigningKey, envelope, jcs};
 
 fn fixture() -> Value {
     serde_json::from_slice(
@@ -18,26 +18,12 @@ fn timestamp(at: &str) -> i64 {
     at.parse::<jiff::Timestamp>().unwrap().as_second()
 }
 
-fn write_blocks(data: &std::path::Path, blocks: &[Value]) -> BlockRow {
-    std::fs::create_dir_all(data.join("log/blocks")).unwrap();
-    for doc in blocks {
-        let height = doc["header"]["block_number"].as_u64().unwrap();
-        std::fs::write(
-            data.join(format!("log/blocks/{height:09}.json.zst")),
-            zstd::bulk::compress(&jcs::canonicalize(doc).unwrap(), 1).unwrap(),
-        )
-        .unwrap();
-    }
-    let last = blocks.last().unwrap();
-    BlockRow {
-        block_number: last["header"]["block_number"].as_u64().unwrap(),
-        block_hash: block::block_hash(&last["header"]).unwrap(),
-        sealed_at: last["header"]["sealed_at"].as_str().unwrap().into(),
-    }
+fn log_key() -> SigningKey {
+    SigningKey::from_seed(&std::array::from_fn(|i| i as u8))
 }
 
 fn anchor(data: &std::path::Path) {
-    let key = SigningKey::from_seed(&std::array::from_fn(|i| i as u8));
+    let key = log_key();
     let body = json!({"wist_version":"1.0.0", "log_id":"log.example.net", "genesis_key":{"key_id":"test-log-k1", "alg":"Ed25519", "public_key":key.public().to_b64u()}, "created_at":"2026-08-02T00:00:00Z"});
     let doc = envelope::sign_envelope(&body, "anchor", "test-log-k1", &key).unwrap();
     std::fs::write(data.join("anchor.json"), jcs::canonicalize(&doc).unwrap()).unwrap();
@@ -48,10 +34,11 @@ fn signed_cap_profiles_follow_authenticated_prefixes_and_survive_later_amendment
     let vector = fixture();
     let data = tempfile::tempdir().unwrap();
     anchor(data.path());
+    let db = Db::open(&data.path().join("clave.sqlite")).unwrap();
     let blocks = vector["blocks"].as_array().unwrap();
-    let head = write_blocks(data.path(), blocks);
-    assert_eq!(head.block_hash, vector["pinned_head"]);
-    let mut history = History::open(data.path(), Some(head)).unwrap();
+    let head = seal_vector_blocks(&db, data.path(), &log_key(), blocks);
+    assert_eq!(head.root, vector["pinned_head"].as_str().unwrap());
+    let mut history = History::open(&db, data.path(), Some(head)).unwrap();
     let mut schedules = Vec::new();
     let mut profiles = Vec::new();
     while let Some(block) = history.next_block().unwrap() {
@@ -68,10 +55,11 @@ fn signed_cap_profiles_follow_authenticated_prefixes_and_survive_later_amendment
             ),
             "sealing" => {
                 let height = probe["candidate_height"].as_u64().unwrap() as usize;
-                SizeCaps::from_schedule(
-                    &schedules[height - 1],
-                    timestamp(blocks[height]["header"]["sealed_at"].as_str().unwrap()),
+                let sealed_at = wist_core::checkpoint::Checkpoint::parse(
+                    blocks[height]["checkpoint"].as_str().unwrap(),
                 )
+                .unwrap();
+                SizeCaps::from_schedule(&schedules[height - 1], timestamp(sealed_at.sealed_at()))
             }
             "historical" => profiles[object["sealed_height"].as_u64().unwrap() as usize].clone(),
             stage => panic!("unknown stage {stage}"),
@@ -89,12 +77,16 @@ fn signed_cap_profiles_follow_authenticated_prefixes_and_survive_later_amendment
     }
     for case in vector["invalid_blocks"].as_array().unwrap() {
         let doc = &case["block"];
-        let height = doc["header"]["block_number"].as_u64().unwrap() as usize;
-        let head = write_blocks(data.path(), std::slice::from_ref(doc));
-        let mut history = History::open(data.path(), Some(head)).unwrap();
+        let height = wist_core::checkpoint::Checkpoint::parse(doc["checkpoint"].as_str().unwrap())
+            .unwrap()
+            .block_number() as usize;
+        let mut replaced = blocks[..height].to_vec();
+        replaced.push(doc.clone());
+        let head = seal_vector_blocks(&db, data.path(), &log_key(), &replaced);
+        let mut history = History::open(&db, data.path(), Some(head)).unwrap();
         let candidate = loop {
             let block = history.next_block().unwrap().unwrap();
-            if block.block().header.block_number == height as u64 {
+            if block.block_number() == height as u64 {
                 break block;
             }
         };
@@ -103,8 +95,8 @@ fn signed_cap_profiles_follow_authenticated_prefixes_and_survive_later_amendment
             .validate_delta(&doc["entries"][0]["body"])
             .and_then(|()| caps.validate_payload_sizes(&case["payload"]));
         assert_eq!(json!(result.err()), case["expected"], "{}", case["name"]);
-        write_blocks(data.path(), std::slice::from_ref(&blocks[height]));
     }
+    seal_vector_blocks(&db, data.path(), &log_key(), blocks);
 }
 
 #[test]
@@ -114,10 +106,13 @@ fn historical_payload_sources_keep_the_committing_profile_after_restart() {
     let vector = fixture();
     let data = tempfile::tempdir().unwrap();
     anchor(data.path());
-    let head = write_blocks(data.path(), vector["blocks"].as_array().unwrap());
+    let db = Db::open(&data.path().join("clave.sqlite")).unwrap();
+    let blocks = vector["blocks"].as_array().unwrap();
+    let head = seal_vector_blocks(&db, data.path(), &log_key(), blocks);
     std::fs::create_dir_all(data.path().join("payloads")).unwrap();
     let (listener, host, client) = reserve_addr();
     serve_static(listener, data.path().to_owned());
+    std::fs::create_dir_all(data.path().join("log")).unwrap();
     std::fs::write(
         data.path().join("log/mirrors.json"),
         serde_json::to_vec(&json!({"mirrors":{"mirror_urls":[format!("http://{host}/")]}}))
@@ -136,7 +131,8 @@ fn historical_payload_sources_keep_the_committing_profile_after_restart() {
         let name = format!("payloads/{}.json", &id[7..]);
         std::fs::write(data.path().join(&name), &raw).unwrap();
         for _ in 0..2 {
-            let source = PayloadSource::reconstruct(data.path(), Some(head.clone()), &id).unwrap();
+            let source =
+                PayloadSource::reconstruct(&db, data.path(), Some(head.clone()), &id).unwrap();
             assert_eq!(source.envelope(), &object["envelope"]);
             assert_eq!(json!(source.block_number()), object["sealed_height"]);
             assert_eq!(json!(source.size_caps()), probe["expected_profile"]);
@@ -188,10 +184,14 @@ fn historical_payload_sources_keep_the_committing_profile_after_restart() {
     }
     for case in vector["invalid_blocks"].as_array().unwrap() {
         let doc = &case["block"];
-        let height = doc["header"]["block_number"].as_u64().unwrap() as usize;
-        let head = write_blocks(data.path(), std::slice::from_ref(doc));
+        let height = wist_core::checkpoint::Checkpoint::parse(doc["checkpoint"].as_str().unwrap())
+            .unwrap()
+            .block_number() as usize;
+        let mut replaced = blocks[..height].to_vec();
+        replaced.push(doc.clone());
+        let head = seal_vector_blocks(&db, data.path(), &log_key(), &replaced);
         let id = wist_core::delta::delta_id(&doc["entries"][0]["body"]["delta"]).unwrap();
-        let error = match PayloadSource::reconstruct(data.path(), Some(head), &id) {
+        let error = match PayloadSource::reconstruct(&db, data.path(), Some(head), &id) {
             Ok(source) => source
                 .validate(&serde_json::to_vec(&case["payload"]).unwrap())
                 .err()
@@ -204,7 +204,6 @@ fn historical_payload_sources_keep_the_committing_profile_after_restart() {
             "{}: {error}",
             case["name"]
         );
-        write_blocks(data.path(), std::slice::from_ref(&vector["blocks"][height]));
     }
 }
 
@@ -448,27 +447,14 @@ fn index_restoration_uses_signed_block_caps_and_rejects_oversized_history_atomic
         let mut blocks = vector["blocks"].as_array().unwrap().clone();
         if invalid {
             let candidate = &vector["invalid_blocks"][0]["block"];
-            blocks.truncate(candidate["header"]["block_number"].as_u64().unwrap() as usize);
+            let height =
+                wist_core::checkpoint::Checkpoint::parse(candidate["checkpoint"].as_str().unwrap())
+                    .unwrap()
+                    .block_number() as usize;
+            blocks.truncate(height);
             blocks.push(candidate.clone());
         }
-        write_blocks(data.path(), &blocks);
-        for doc in &blocks {
-            db.commit_seal(
-                &[],
-                doc["header"]["block_number"].as_u64().unwrap(),
-                &block::block_hash(&doc["header"]).unwrap(),
-                doc["header"]["sealed_at"].as_str().unwrap(),
-                &[],
-                &[],
-                &[],
-                &[],
-                &[],
-                &[],
-                &[],
-                jcs::canonicalize(doc).unwrap().len() as u64,
-            )
-            .unwrap();
-        }
+        seal_vector_blocks(&db, data.path(), &log_key(), &blocks);
         db.set_param("url_cap_bytes", 9000).unwrap();
         let connection = rusqlite::Connection::open(&path).unwrap();
         connection

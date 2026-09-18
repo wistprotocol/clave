@@ -37,11 +37,26 @@ fn queue(db: &Db, body: &Value) {
         .unwrap();
 }
 
-fn block(data: &std::path::Path, height: u64) -> (Vec<u8>, Value) {
-    let raw = std::fs::read(data.join(format!("log/blocks/{height:09}.json.zst"))).unwrap();
-    let bytes = zstd::decode_all(&raw[..]).unwrap();
-    let doc = serde_json::from_slice(&bytes).unwrap();
-    (bytes, doc)
+/// Seals an empty Block carrying `changes` at `sealed_at`, recording
+/// `octets` as the Block's entry-bundle size.
+fn seal_sizes(db: &Db, height: u64, sealed_at: &str, changes: &[ParamChangeRow], octets: u64) {
+    db.commit_seal(
+        &SigningKey::from_seed(&[9u8; 32]),
+        "log.example.test",
+        &[],
+        height,
+        sealed_at,
+        &[],
+        octets,
+        &[],
+        changes,
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+    )
+    .unwrap();
 }
 
 fn fixture() -> Value {
@@ -80,21 +95,13 @@ fn historical_size_vectors_replay_identically_after_reopening() {
                     })
                 })
                 .collect();
-            db.commit_seal(
-                &[],
+            seal_sizes(
+                &db,
                 height as u64,
-                "sha256:fixture",
                 &ts(at),
-                &[],
                 &changes,
-                &[],
-                &[],
-                &[],
-                &[],
-                &[],
                 b["jcs_bytes"].as_u64().unwrap(),
-            )
-            .unwrap();
+            );
             let replay = db.parameter_schedule(0);
             if !expected["block_valid"].as_bool().unwrap() {
                 assert!(
@@ -173,21 +180,13 @@ fn prospective_vectors_filter_rejected_history_and_preserve_every_future_map() {
                     effective_at: &effective[i],
                 })
                 .collect();
-            db.commit_seal(
-                &[],
+            seal_sizes(
+                &db,
                 height,
-                "sha256:fixture",
                 &ts(group[0]["sealed_at_s"].as_i64().unwrap()),
-                &[],
                 &rows,
-                &[],
-                &[],
-                &[],
-                &[],
-                &[],
                 0,
-            )
-            .unwrap();
+            );
         }
         drop(db);
         let db = Db::open(&path).unwrap();
@@ -263,8 +262,7 @@ fn queued_conflicts_use_canonical_entry_order_for_admission_and_sealing() {
     assert_eq!(report.entry_count, 1);
     assert_eq!(report.dropped.len(), 1);
     assert!(report.dropped[0].contains("WIST4-E03"));
-    let (_, doc) = block(data.path(), 0);
-    assert_eq!(doc["entries"][0]["body"], candidates[0]);
+    assert_eq!(db.block_entries(0).unwrap()[0]["body"], candidates[0]);
 }
 
 #[test]
@@ -298,13 +296,13 @@ fn grace_changes_are_read_from_the_accepted_sealing_prefix() {
 }
 
 #[test]
-fn accepted_pending_reduction_bounds_actual_jcs_blocks_after_restart() {
+fn accepted_pending_reduction_bounds_actual_entry_bundle_octets_after_restart() {
     let (data, db, sk) = setup();
     clave::param_change::run(
         &db,
         &sk,
         "block_decompressed_cap_bytes",
-        4096,
+        65_537,
         Some(&ts(NOW + 10 * DAY)),
         NOW,
     )
@@ -316,7 +314,7 @@ fn accepted_pending_reduction_bounds_actual_jcs_blocks_after_restart() {
         clave::registry::effective(&db, "block_decompressed_cap_bytes", &ts(NOW + DAY)).unwrap(),
         268_435_456
     );
-    for value in 0..30 {
+    for value in 0..400 {
         queue(
             &db,
             &envelope(&sk, "clock_skew_seconds", value, NOW + 30 * DAY),
@@ -325,36 +323,37 @@ fn accepted_pending_reduction_bounds_actual_jcs_blocks_after_restart() {
     let mut count = 0;
     for i in 1..=10 {
         let report = clave::seal::run(&db, data.path(), &sk, NOW + DAY + i * 3600).unwrap();
-        let (bytes, doc) = block(data.path(), report.block_number);
-        assert_eq!(bytes, wist_core::jcs::canonicalize(&doc).unwrap());
-        assert!(bytes.len() <= 4096);
-        wist_core::block::verify_block(&doc, &sk.public()).unwrap();
+        let sealed = db.block_at(report.block_number).unwrap().unwrap();
+        let octets =
+            wist_core::block::block_octets(&db.block_entries(sealed.block_number).unwrap())
+                .unwrap();
+        assert!(octets <= 65_537);
         count += report.entry_count;
         if db.peek_pending_entries().unwrap().0.is_empty() {
             break;
         }
     }
-    assert_eq!(count, 30);
+    assert_eq!(count, 400);
     assert!(db.last_block().unwrap().unwrap().block_number > 1);
-    assert!(db.largest_block_bytes().unwrap() <= 4096);
+    assert!(db.largest_block_bytes().unwrap() <= 65_537);
 }
 
 #[test]
 fn historical_block_size_rejects_a_reduction_at_admission_and_sealing() {
     let (data, db, sk) = setup();
-    for value in 0..20 {
+    for value in 0..400 {
         queue(
             &db,
             &envelope(&sk, "clock_skew_seconds", value, NOW + 30 * DAY),
         );
     }
     clave::seal::run(&db, data.path(), &sk, NOW).unwrap();
-    assert!(db.largest_block_bytes().unwrap() > 4096);
+    assert!(db.largest_block_bytes().unwrap() > 65_537);
     assert!(clave::param_change::run(
         &db,
         &sk,
         "block_decompressed_cap_bytes",
-        4096,
+        65_537,
         Some(&ts(NOW + 10 * DAY)),
         NOW + DAY
     )
@@ -364,7 +363,7 @@ fn historical_block_size_rejects_a_reduction_at_admission_and_sealing() {
     .contains("Block cap"));
     queue(
         &db,
-        &envelope(&sk, "block_decompressed_cap_bytes", 4096, NOW + 10 * DAY),
+        &envelope(&sk, "block_decompressed_cap_bytes", 65_537, NOW + 10 * DAY),
     );
     let report = clave::seal::run(&db, data.path(), &sk, NOW + DAY).unwrap();
     assert_eq!(report.entry_count, 0);
@@ -378,10 +377,8 @@ fn snapshot_parameters_include_pending_amendments_and_only_the_winning_ties() {
         queue(&db, &envelope(&sk, "feed_window", value, NOW + days * DAY));
     }
     clave::seal::run(&db, data.path(), &sk, NOW).unwrap();
-    let (_, doc) = block(data.path(), 0);
-    let last = doc["entries"]
-        .as_array()
-        .unwrap()
+    let sealed = db.block_entries(0).unwrap();
+    let last = sealed
         .iter()
         .rfind(|e| e["body"]["update"]["effective_at"] == ts(NOW + 10 * DAY))
         .unwrap();
@@ -414,97 +411,26 @@ fn snapshot_parameters_include_pending_amendments_and_only_the_winning_ties() {
 }
 
 #[test]
-fn legacy_migration_recovers_sizes_and_canonical_positions_from_blocks() {
+fn a_store_in_the_superseded_block_format_is_refused_with_its_rows_untouched() {
     let (data, db, sk) = setup();
-    for value in [500, 600] {
-        queue(&db, &envelope(&sk, "feed_window", value, NOW + 10 * DAY));
-    }
     clave::seal::run(&db, data.path(), &sk, NOW).unwrap();
-    let before = db.parameter_schedule(NOW).unwrap().accepted().to_vec();
-    let (bytes, doc) = block(data.path(), 0);
-    let typed: wist_core::objects::Block = serde_json::from_value(doc.clone()).unwrap();
-    let legacy = serde_json::to_vec(&typed).unwrap();
-    assert_ne!(legacy, bytes);
-    std::fs::write(
-        data.path().join("log/blocks/000000000.json.zst"),
-        zstd::bulk::compress(&legacy, 0).unwrap(),
-    )
-    .unwrap();
+    let head = db.last_block().unwrap().unwrap();
     drop(db);
     let path = data.path().join("clave.sqlite");
     let conn = rusqlite::Connection::open(&path).unwrap();
-    conn.execute("ALTER TABLE blocks DROP COLUMN decompressed_bytes", [])
-        .unwrap();
-    conn.execute("ALTER TABLE param_changes DROP COLUMN entry_index", [])
-        .unwrap();
-    conn.execute("UPDATE param_changes SET value = -1", [])
+    conn.execute("ALTER TABLE blocks RENAME COLUMN root TO block_hash", [])
         .unwrap();
     drop(conn);
-    std::fs::remove_file(data.path().join("keys/seed")).unwrap();
-    let db = Db::open(&path).unwrap();
-    assert_eq!(db.largest_block_bytes().unwrap(), bytes.len() as u64);
-    assert_eq!(db.parameter_schedule(NOW).unwrap().accepted(), before);
-    assert_eq!(block(data.path(), 0), (bytes, doc));
-}
-
-#[test]
-fn incomplete_legacy_block_history_fails_without_guessing_sizes() {
-    let (data, db, sk) = setup();
-    clave::seal::run(&db, data.path(), &sk, NOW).unwrap();
-    drop(db);
-    let path = data.path().join("clave.sqlite");
-    let conn = rusqlite::Connection::open(&path).unwrap();
-    conn.execute("UPDATE blocks SET decompressed_bytes = NULL", [])
-        .unwrap();
-    drop(conn);
-    std::fs::remove_file(data.path().join("log/blocks/000000000.json.zst")).unwrap();
-    assert!(Db::open(&path).is_err());
+    let error = match Db::open(&path) {
+        Ok(_) => panic!("a superseded store must be refused"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("superseded"), "{error}");
     let conn = rusqlite::Connection::open(&path).unwrap();
     assert_eq!(
-        conn.query_row("SELECT decompressed_bytes FROM blocks", [], |r| r
-            .get::<_, Option<u64>>(0))
+        conn.query_row("SELECT block_hash FROM blocks", [], |r| r
+            .get::<_, String>(0))
             .unwrap(),
-        None
+        head.root
     );
-}
-
-#[test]
-fn false_frame_sizes_fail_migration_with_the_protocol_error() {
-    for difference in [-1i64, 1] {
-        let (data, db, sk) = setup();
-        clave::seal::run(&db, data.path(), &sk, NOW).unwrap();
-        drop(db);
-        let path = data.path().join("clave.sqlite");
-        let conn = rusqlite::Connection::open(&path).unwrap();
-        conn.execute("UPDATE blocks SET decompressed_bytes = NULL", [])
-            .unwrap();
-        drop(conn);
-        let file = data.path().join("log/blocks/000000000.json.zst");
-        let raw = std::fs::read(&file).unwrap();
-        let declared = zstd::zstd_safe::get_frame_content_size(&raw)
-            .unwrap()
-            .unwrap();
-        let target = (declared as i64 + difference) as u64;
-        let mut changed = None;
-        'search: for index in 4..raw.len().min(18) {
-            for byte in 0..=255 {
-                let mut candidate = raw.clone();
-                candidate[index] = byte;
-                if zstd::zstd_safe::get_frame_content_size(&candidate)
-                    .ok()
-                    .flatten()
-                    == Some(target)
-                {
-                    changed = Some(candidate);
-                    break 'search;
-                }
-            }
-        }
-        std::fs::write(file, changed.expect("frame-size mutation")).unwrap();
-        assert!(Db::open(&path)
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("WIST3-E03"));
-    }
 }

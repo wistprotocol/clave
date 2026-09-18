@@ -4,7 +4,7 @@ use clave::db::Db;
 use common::*;
 use rusqlite::Connection;
 use serde_json::{json, Value};
-use wist_core::{block, crypto, jcs, merkle};
+use wist_core::{crypto, jcs, merkle};
 
 const START: i64 = 1_800_000_000;
 
@@ -29,60 +29,13 @@ impl Fixture {
         Db::open(&self.directory.path().join("clave.sqlite"))
     }
 
-    fn append(&self, mut entries: Vec<Value>) {
-        entries.sort_by_key(|entry| {
-            (
-                if entry["type"] == "publisher_declaration" {
-                    0
-                } else {
-                    2
-                },
-                merkle::leaf_hash(&jcs::canonicalize(entry).unwrap()),
-            )
-        });
+    fn append(&self, entries: Vec<Value>) {
         let head = self.db.last_block().unwrap();
         let height = head.as_ref().map_or(0, |head| head.block_number + 1);
         let at = jiff::Timestamp::from_second(START + height as i64 * 3600)
             .unwrap()
             .to_string();
-        let leaves: Vec<_> = entries
-            .iter()
-            .map(|entry| merkle::leaf_hash(&jcs::canonicalize(entry).unwrap()))
-            .collect();
-        let root = if leaves.is_empty() {
-            merkle::leaf_hash(&[])
-        } else {
-            merkle::merkle_root(&leaves).unwrap()
-        };
-        let header = json!({"wist_version":"1.0.0", "block_number":height,
-            "prev_block_hash":head.map_or("sha256:genesis".into(), |head| head.block_hash),
-            "sealed_at":at, "entry_count":entries.len(), "merkle_root":format!("sha256:{}", crypto::hex_encode(&root))});
-        let key = clave::keys::load(&self.directory.path().join("keys/seed")).unwrap();
-        let doc = json!({"sig":{"key_id":"log1", "alg":"Ed25519", "value":key.sign(&jcs::canonicalize(&header).unwrap())}, "header":header, "entries":entries});
-        let bytes = jcs::canonicalize(&doc).unwrap();
-        std::fs::write(
-            self.directory
-                .path()
-                .join(format!("log/blocks/{height:09}.json.zst")),
-            zstd::bulk::compress(&bytes, 3).unwrap(),
-        )
-        .unwrap();
-        self.db
-            .commit_seal(
-                &[],
-                height,
-                &block::block_hash(&header).unwrap(),
-                &at,
-                &[],
-                &[],
-                &[],
-                &[],
-                &[],
-                &[],
-                &[],
-                bytes.len() as u64,
-            )
-            .unwrap();
+        seal_fixture_block(&self.db, self.directory.path(), height, &at, &entries);
     }
 
     fn legacy(&self) {
@@ -202,7 +155,7 @@ fn empty_unsealed_history_removes_only_index_residue() {
 
 #[test]
 fn missing_or_corrupt_pinned_history_preserves_indexes_and_can_retry() {
-    for corruption in ["missing", "bytes", "head"] {
+    for corruption in ["missing", "bytes", "root"] {
         let f = Fixture::new();
         let publisher = make_publisher("example.com");
         let (id, body) = delta(&publisher, "https://example.com/", "body", None);
@@ -213,16 +166,33 @@ fn missing_or_corrupt_pinned_history_preserves_indexes_and_can_retry() {
         f.db.set_url_tip("https://example.com/", &publisher.domain, "residue")
             .unwrap();
         f.legacy();
-        let path = f.directory.path().join("log/blocks/000000001.json.zst");
-        let bytes = std::fs::read(&path).unwrap();
         let head = f.db.last_block().unwrap().unwrap();
+        let leaf: Vec<u8> = f
+            .connection()
+            .query_row(
+                "SELECT entry_json FROM log_entries WHERE leaf_index = 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         match corruption {
-            "missing" => std::fs::remove_file(&path).unwrap(),
-            "bytes" => std::fs::write(&path, b"broken").unwrap(),
+            "missing" => {
+                f.connection()
+                    .execute("DELETE FROM log_entries WHERE leaf_index = 0", [])
+                    .unwrap();
+            }
+            "bytes" => {
+                f.connection()
+                    .execute(
+                        "UPDATE log_entries SET entry_json = ?1 WHERE leaf_index = 0",
+                        [br#"{"type":"label","body":{}}"#.as_slice()],
+                    )
+                    .unwrap();
+            }
             _ => {
                 f.connection()
                     .execute(
-                        "UPDATE blocks SET block_hash = 'sha256:wrong' WHERE block_number = 1",
+                        "UPDATE blocks SET root = 'sha256:wrong' WHERE block_number = 1",
                         [],
                     )
                     .unwrap();
@@ -239,11 +209,17 @@ fn missing_or_corrupt_pinned_history_preserves_indexes_and_can_retry() {
                 Some("residue")
             );
         }
-        std::fs::write(path, bytes).unwrap();
-        f.connection()
+        let connection = f.connection();
+        connection
             .execute(
-                "UPDATE blocks SET block_hash = ?1 WHERE block_number = 1",
-                [head.block_hash],
+                "INSERT OR REPLACE INTO log_entries(leaf_index, block_number, entry_json) VALUES (0, 0, ?1)",
+                [leaf],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE blocks SET root = ?1 WHERE block_number = 1",
+                [head.root],
             )
             .unwrap();
         assert!(f.reopen().unwrap().is_delta_seen(&id).unwrap());
@@ -413,8 +389,7 @@ fn supported_versions_restore_chains_across_sealed_and_both_unsealed_stores() {
             }
             chain.push((id, envelope));
         }
-        let block_path = f.directory.path().join("log/blocks/000000000.json.zst");
-        let block_bytes = std::fs::read(&block_path).unwrap();
+        let sealed_entries = f.db.block_entries(0).unwrap();
         f.connection()
             .execute_batch("DELETE FROM seen_deltas; DELETE FROM url_tips;")
             .unwrap();
@@ -431,7 +406,7 @@ fn supported_versions_restore_chains_across_sealed_and_both_unsealed_stores() {
                 db.url_tip(&publisher.domain, url).unwrap().as_deref(),
                 Some(chain[2].0.as_str())
             );
-            assert_eq!(std::fs::read(&block_path).unwrap(), block_bytes);
+            assert_eq!(db.block_entries(0).unwrap(), sealed_entries);
             assert_eq!(
                 db.peek_pending_entries().unwrap().0[0].entry_json,
                 chain[1].1
@@ -583,14 +558,7 @@ fn missing_content_and_predecessor_vectors_stop_restoration_atomically() {
                 let marker: bool = f.connection().query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'delta_index_reconciliation')", [], |row| row.get(0)).unwrap();
                 assert!(!marker, "{context}");
                 let retained = match store {
-                    "sealed" => {
-                        let bytes =
-                            std::fs::read(f.directory.path().join("log/blocks/000000001.json.zst"))
-                                .unwrap();
-                        let block: Value =
-                            serde_json::from_slice(&zstd::decode_all(&bytes[..]).unwrap()).unwrap();
-                        block["entries"][0]["body"].clone()
-                    }
+                    "sealed" => f.db.block_entries(1).unwrap()[0]["body"].clone(),
                     _ => {
                         let query = if store == "pending" {
                             "SELECT entry_json FROM pending_entries"

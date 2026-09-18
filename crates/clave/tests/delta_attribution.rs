@@ -206,10 +206,8 @@ fn sealing_rejects_a_shared_key_delta_assigned_to_another_domain() {
         .dropped
         .iter()
         .any(|error| error.contains("WIST1-E02")));
-    let bytes = fs::read(data.path().join("log/blocks/000000000.json.zst")).unwrap();
-    let block: Value = serde_json::from_slice(&zstd::decode_all(&bytes[..]).unwrap()).unwrap();
-    assert!(block["entries"]
-        .as_array()
+    assert!(db
+        .block_entries(0)
         .unwrap()
         .iter()
         .all(|entry| entry["type"] != "publisher_delta"));

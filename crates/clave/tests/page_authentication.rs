@@ -67,6 +67,7 @@ impl Fixture {
             )
             .unwrap();
             let restored = clave::history::declarations::Declarations::reconstruct(
+                &self.db,
                 self.directory.path(),
                 self.db.last_block().unwrap(),
             )
@@ -266,20 +267,8 @@ fn repeated_declaration_entries_bound_the_first_next_page_source() {
             .as_second(),
     )
     .unwrap();
-    let bytes = zstd::bulk::decompress(
-        &std::fs::read(
-            fixture
-                .directory
-                .path()
-                .join("log/blocks/000000001.json.zst"),
-        )
-        .unwrap(),
-        1_048_576,
-    )
-    .unwrap();
-    let block: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(
-        block["entries"][0]["body"],
+        fixture.db.block_entries(1).unwrap()[0]["body"],
         current_declaration(&fixture.publisher)
     );
     fixture.install(1, page_key(&R1_SEED), "2026-08-09T14:00:00Z", true);

@@ -1,11 +1,15 @@
-//! WIST-3 §5 and §6: a Block and its Checkpoint reach disk complete and
-//! durable, the Checkpoint only after the Block, and a publication the
-//! store committed to is finished after a restart from the recorded
-//! bytes rather than sealed again.
+//! WIST-3 §5 and §6: the distribution stage. A sealed Block's Entries
+//! reach their entry bundles and the tree its tiles before the Block's
+//! Checkpoint is archived, and the head Checkpoint is written last, so
+//! `/checkpoint` never names a tree size whose Entries no path serves.
+//! A run interrupted anywhere is finished by the next one from the
+//! Blocks the store has committed but not marked published.
 use crate::db::Db;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use wist_core::checkpoint::Checkpoint;
+use wist_core::tiles::{self, TILE_WIDTH};
 
 /// Writes `bytes` to `path` through a sibling temporary file, syncing the
 /// file and then its directory, so the path holds either the previous
@@ -27,114 +31,153 @@ pub fn write_durable(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn block_path(data_dir: &Path, block_number: u64) -> std::path::PathBuf {
-    data_dir.join(format!("log/blocks/{block_number:09}.json.zst"))
+/// The file under `data_dir` that serves a path of the static layout.
+pub fn served(data_dir: &Path, path: &str) -> PathBuf {
+    data_dir.join(path.trim_start_matches('/'))
 }
 
-fn checkpoint_path(data_dir: &Path, block_number: u64) -> std::path::PathBuf {
-    data_dir.join(format!("log/checkpoints/{block_number:09}.json"))
+pub fn head_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("checkpoint")
 }
 
-fn publish_block(data_dir: &Path, block_number: u64, block_json: &[u8]) -> Result<()> {
-    let compressed = zstd::bulk::compress(block_json, zstd::DEFAULT_COMPRESSION_LEVEL)?;
-    write_durable(&block_path(data_dir, block_number), &compressed)
+pub fn archive_path(data_dir: &Path, block_number: u64) -> PathBuf {
+    served(data_dir, &wist_core::checkpoint::archive_path(block_number))
 }
 
-fn publish_checkpoint(data_dir: &Path, block_number: u64, checkpoint_json: &[u8]) -> Result<()> {
-    write_durable(&checkpoint_path(data_dir, block_number), checkpoint_json)?;
-    write_durable(&data_dir.join("log/checkpoint.json"), checkpoint_json)
+fn meets(range: (u64, u64), from: u64, to: u64) -> bool {
+    range.0 < to && from < range.1
 }
 
-/// Publishes one committed Block: the Block file first, then its
-/// numbered Checkpoint copy, then the fixed Checkpoint path, each
-/// durable before the next.
-pub fn publish(
-    data_dir: &Path,
-    block_number: u64,
-    block_json: &[u8],
-    checkpoint_json: &[u8],
-) -> Result<()> {
-    publish_block(data_dir, block_number, block_json)?;
-    publish_checkpoint(data_dir, block_number, checkpoint_json)
-}
-
-enum BlockFile {
-    Recorded,
-    Missing,
-    Recoded,
-    Other(String),
-}
-
-/// How the head Block's file on disk relates to the bytes the store
-/// committed to: the same bytes, absent or unreadable, the same Block in
-/// another encoding, or a different Block at that height.
-fn block_file_state(data_dir: &Path, block_number: u64, block_json: &[u8]) -> Result<BlockFile> {
-    let Some(decoded) = std::fs::read(block_path(data_dir, block_number))
-        .ok()
-        .and_then(|raw| zstd::decode_all(raw.as_slice()).ok())
-    else {
-        return Ok(BlockFile::Missing);
-    };
-    if decoded == block_json {
-        return Ok(BlockFile::Recorded);
+fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<bool> {
+    if std::fs::read(path).is_ok_and(|held| held == bytes) {
+        return Ok(false);
     }
-    let Ok(on_disk) = crate::json::parse(&decoded) else {
-        return Ok(BlockFile::Missing);
-    };
-    let recorded = crate::json::parse(block_json)?;
-    let recorded_hash = wist_core::block::block_hash(&recorded["header"])?;
-    match wist_core::block::block_hash(&on_disk["header"]) {
-        Ok(hash) if hash == recorded_hash => Ok(BlockFile::Recoded),
-        Ok(hash) => Ok(BlockFile::Other(hash)),
-        Err(_) => Ok(BlockFile::Missing),
+    write_durable(path, bytes)?;
+    Ok(true)
+}
+
+/// Lays out the tree at size `to`: every entry bundle and tile whose
+/// leaves the range `[from, to)` reaches is recomputed and rewritten
+/// where it differs, every partial one the size requires is rewritten
+/// where it differs, and any other required file the disk has lost is
+/// restored. A partial tile or bundle is removed once the full one at
+/// its index exists (WIST-3 §6).
+fn publish_tree(db: &Db, data_dir: &Path, from: u64, to: u64) -> Result<bool> {
+    let mut wrote = false;
+    for bundle in tiles::required_bundles(to) {
+        let path = served(data_dir, &bundle.path());
+        let (start, end) = bundle.leaf_range();
+        let recompute = bundle.width < TILE_WIDTH || meets((start, end), from, to);
+        if !recompute && path.exists() {
+            continue;
+        }
+        let bytes = tiles::encode_entry_bundle(&db.entry_range(start, end)?)
+            .map_err(|e| Error::Seal(e.to_string()))?;
+        wrote |= write_if_changed(&path, &bytes)?;
+        if bundle.width == TILE_WIDTH {
+            remove_partials(
+                data_dir,
+                &tiles::Bundle {
+                    index: bundle.index,
+                    width: 1,
+                }
+                .path(),
+            )?;
+        }
     }
+    for tile in tiles::required_tiles(to) {
+        let path = served(data_dir, &tile.path());
+        let recompute = tile.width < TILE_WIDTH || meets(tile.leaf_range(), from, to);
+        if !recompute && path.exists() {
+            continue;
+        }
+        let hashes = db
+            .tile_hashes(tile.level, tile.index)?
+            .ok_or_else(|| Error::Seal("the store is missing a tile the tree requires".into()))?;
+        let width = tile.width as usize;
+        if hashes.len() < width {
+            return Err(Error::Seal(
+                "the store holds fewer hashes than the tile the tree requires".into(),
+            ));
+        }
+        wrote |= write_if_changed(&path, &tiles::encode_tile(&hashes[..width]))?;
+        if tile.width == TILE_WIDTH {
+            remove_partials(
+                data_dir,
+                &tiles::Tile {
+                    level: tile.level,
+                    index: tile.index,
+                    width: 1,
+                }
+                .path(),
+            )?;
+        }
+    }
+    Ok(wrote)
+}
+
+/// Removes the directory of partial files at a tile or bundle index,
+/// named by the `.p/<width>` path any of its partials carries.
+fn remove_partials(data_dir: &Path, partial_path: &str) -> Result<()> {
+    let directory = served(data_dir, partial_path);
+    let Some(directory) = directory.parent() else {
+        return Ok(());
+    };
+    if directory.is_dir() {
+        std::fs::remove_dir_all(directory)?;
+    }
+    Ok(())
+}
+
+/// Publishes one committed Block: its Entries and the tree's hashes
+/// first, then the Checkpoint's archive copy, then the head.
+fn publish_block(db: &Db, data_dir: &Path, block_number: u64, note: &str) -> Result<bool> {
+    let checkpoint = Checkpoint::parse(note).map_err(|e| Error::Seal(e.to_string()))?;
+    if checkpoint.block_number() != block_number {
+        return Err(Error::Seal(
+            "the stored note is not the Block's Checkpoint".into(),
+        ));
+    }
+    let from = db.size_before(block_number)?;
+    let mut wrote = publish_tree(db, data_dir, from, checkpoint.tree_size())?;
+    wrote |= write_if_changed(&archive_path(data_dir, block_number), note.as_bytes())?;
+    wrote |= write_if_changed(&head_path(data_dir), note.as_bytes())?;
+    Ok(wrote)
 }
 
 /// Finishes every publication the store committed to that the disk does
-/// not hold as recorded: each unpublished height, lowest first, and the
-/// head Block whose files a crash, a torn write or a restore may have
-/// left behind. A head file holding a different Block is refused rather
-/// than overwritten, since the store and the disk then disagree beyond a
-/// torn write. Returns the heights republished.
+/// not hold, lowest height first, then restores any file of the head
+/// Block a crash, a torn write or a deletion left wrong. Returns the
+/// heights it wrote for.
 pub fn recover(db: &Db, data_dir: &Path) -> Result<Vec<u64>> {
     let mut republished = Vec::new();
-    for (block_number, block_json, checkpoint_json) in db.unpublished_publications()? {
-        publish(data_dir, block_number, &block_json, &checkpoint_json)?;
+    for (block_number, note) in db.unpublished_publications()? {
+        publish_block(db, data_dir, block_number, &note)?;
         db.mark_published(block_number)?;
         republished.push(block_number);
     }
-    let Some((block_number, block_json, checkpoint_json)) = db.head_publication()? else {
+    let Some((block_number, note)) = db.head_publication()? else {
         return Ok(republished);
     };
     if republished.contains(&block_number) {
         return Ok(republished);
     }
-    let block_written = match block_file_state(data_dir, block_number, &block_json)? {
-        BlockFile::Recorded => false,
-        BlockFile::Missing | BlockFile::Recoded => {
-            publish_block(data_dir, block_number, &block_json)?;
-            true
-        }
-        BlockFile::Other(hash) => {
-            let recorded = crate::json::parse(&block_json)?;
-            return Err(crate::error::Error::Seal(format!(
-                "Block {block_number} on disk hashes to {hash} but the store committed {}",
-                wist_core::block::block_hash(&recorded["header"])?
-            )));
-        }
-    };
-    let checkpoints_written = if std::fs::read(checkpoint_path(data_dir, block_number))
-        .is_ok_and(|raw| raw == checkpoint_json)
-        && std::fs::read(data_dir.join("log/checkpoint.json"))
-            .is_ok_and(|raw| raw == checkpoint_json)
-    {
-        false
-    } else {
-        publish_checkpoint(data_dir, block_number, &checkpoint_json)?;
-        true
-    };
-    if block_written || checkpoints_written {
+    if publish_block(db, data_dir, block_number, &note)? {
         republished.push(block_number);
     }
     Ok(republished)
+}
+
+/// Rewrites the files that carry a Checkpoint whose signature lines have
+/// changed: the archive copy and, where it is the head, `/checkpoint`.
+/// The note text is untouched (WIST-3 §6).
+pub fn republish_checkpoint(db: &Db, data_dir: &Path, block_number: u64, note: &str) -> Result<()> {
+    write_durable(&archive_path(data_dir, block_number), note.as_bytes())?;
+    if db
+        .head_publication()?
+        .is_some_and(|(head, _)| head == block_number)
+    {
+        write_durable(&head_path(data_dir), note.as_bytes())?;
+    }
+    Ok(())
 }

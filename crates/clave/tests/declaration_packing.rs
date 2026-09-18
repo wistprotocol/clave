@@ -4,6 +4,12 @@ use serde_json::{json, Value};
 use wist_core::crypto::SigningKey;
 use wist_core::{block, envelope, jcs, merkle};
 
+/// The octets an Entry carrying `declaration` occupies in an entry
+/// bundle: its JCS serialization behind a two-octet length prefix.
+fn octets(declaration: &Value) -> u64 {
+    jcs::canonicalize(&entry(declaration)).unwrap().len() as u64 + 2
+}
+
 mod common;
 use common::{key_entry_public, kid};
 
@@ -13,12 +19,6 @@ fn entry(declaration: &Value) -> Value {
 
 fn leaf(declaration: &Value) -> [u8; 32] {
     merkle::leaf_hash(&jcs::canonicalize(&entry(declaration)).unwrap())
-}
-
-fn read_block(directory: &std::path::Path, height: u64) -> Value {
-    let compressed =
-        std::fs::read(directory.join(format!("log/blocks/{height:09}.json.zst"))).unwrap();
-    serde_json::from_slice(&zstd::decode_all(&compressed[..]).unwrap()).unwrap()
 }
 
 #[test]
@@ -100,19 +100,10 @@ fn check_capped_chain(oversized_predecessor: bool, spellings: [&str; 2]) {
     clave::declaration::evaluate(&initial, &predecessor).unwrap();
     clave::declaration::evaluate(&predecessor, &successor).unwrap();
 
-    let mut candidate = read_block(data.path(), 0);
-    candidate["header"]["prev_block_hash"] =
-        block::block_hash(&candidate["header"]).unwrap().into();
-    candidate["header"]["block_number"] = json!(1);
-    candidate["header"]["entry_count"] = json!(1);
-    candidate["entries"] = json!([entry(&predecessor)]);
-    let predecessor_bytes = jcs::canonicalize(&candidate).unwrap().len();
-    candidate["entries"] = json!([entry(&successor)]);
-    let successor_bytes = jcs::canonicalize(&candidate).unwrap().len();
+    let predecessor_bytes = octets(&predecessor);
+    let successor_bytes = octets(&successor);
     let cap = predecessor_bytes.max(successor_bytes);
-    candidate["entries"] = json!([entry(&successor), entry(&predecessor)]);
-    candidate["header"]["entry_count"] = json!(2);
-    assert!(jcs::canonicalize(&candidate).unwrap().len() > cap);
+    assert!(predecessor_bytes + successor_bytes > cap);
     let initial_cap = if oversized_predecessor {
         assert!(predecessor_bytes > successor_bytes);
         successor_bytes
@@ -137,10 +128,10 @@ fn check_capped_chain(oversized_predecessor: bool, spellings: [&str; 2]) {
         let db = clave::db::Db::open(&database).unwrap();
         let report = clave::seal::run(&db, data.path(), &log_key, start + 3600).unwrap();
         assert_eq!(report.entry_count, 0);
-        assert_eq!(read_block(data.path(), 1)["entries"], json!([]));
+        assert!(db.block_entries(1).unwrap().is_empty());
         assert_eq!(db.peek_pending_entries().unwrap().0.len(), 2);
         let reconstructed =
-            Declarations::reconstruct(data.path(), db.last_block().unwrap()).unwrap();
+            Declarations::reconstruct(&db, data.path(), db.last_block().unwrap()).unwrap();
         assert_eq!(
             reconstructed.domains()["example.com"].current().envelope(),
             &initial
@@ -156,14 +147,13 @@ fn check_capped_chain(oversized_predecessor: bool, spellings: [&str; 2]) {
         let report =
             clave::seal::run(&db, data.path(), &log_key, start + height as i64 * 3600).unwrap();
         assert_eq!(report.entry_count, 1);
-        let sealed = read_block(data.path(), height);
+        let sealed = db.block_entries(height).unwrap();
         let canonical_expected: Value =
             serde_json::from_slice(&jcs::canonicalize(expected).unwrap()).unwrap();
-        assert_eq!(sealed["entries"], json!([entry(&canonical_expected)]));
-        assert!(jcs::canonicalize(&sealed).unwrap().len() <= cap);
-        block::verify_block(&sealed, &log_key.public()).unwrap();
+        assert_eq!(sealed, vec![entry(&canonical_expected)]);
+        assert!(block::block_octets(&sealed).unwrap() <= cap);
         let reconstructed =
-            Declarations::reconstruct(data.path(), db.last_block().unwrap()).unwrap();
+            Declarations::reconstruct(&db, data.path(), db.last_block().unwrap()).unwrap();
         assert_eq!(
             reconstructed.domains()["example.com"].current().envelope(),
             &canonical_expected

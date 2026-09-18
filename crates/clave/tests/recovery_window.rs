@@ -544,12 +544,8 @@ fn a_queued_delta_whose_key_the_sealing_blocks_key_set_retired_is_not_sealed() {
 
     clave::seal::run(&r.db, r.data.path(), &r.sk, T0).unwrap();
 
-    let raw = std::fs::read(r.data.path().join("log/blocks/000000000.json.zst")).unwrap();
-    let block: serde_json::Value =
-        serde_json::from_slice(&zstd::decode_all(&raw[..]).unwrap()).unwrap();
-    let deltas: Vec<&str> = block["entries"]
-        .as_array()
-        .unwrap()
+    let entries = stored_entries(&r, 0);
+    let deltas: Vec<&str> = entries
         .iter()
         .filter(|e| e["type"] == "publisher_delta")
         .map(|e| e["body"]["sig"]["key_id"].as_str().unwrap())
@@ -587,12 +583,7 @@ fn a_delta_pending_when_the_window_opens_is_queued_not_sealed() {
 
     clave::seal::run(&r.db, r.data.path(), &r.sk, T0).unwrap();
 
-    let raw = std::fs::read(r.data.path().join("log/blocks/000000000.json.zst")).unwrap();
-    let block: serde_json::Value =
-        serde_json::from_slice(&zstd::decode_all(&raw[..]).unwrap()).unwrap();
-    let deltas = block["entries"]
-        .as_array()
-        .unwrap()
+    let deltas = stored_entries(&r, 0)
         .iter()
         .filter(|e| e["type"] == "publisher_delta")
         .count();
@@ -823,16 +814,8 @@ fn fixed_recovery_bindings_survive_followers_reopen_migration_and_settlement() {
             ids[4],
             "{migration}"
         );
-        let raw = std::fs::read(r.data.path().join(format!(
-            "log/blocks/{:09}.json.zst",
-            r.db.last_block().unwrap().unwrap().block_number
-        )))
-        .unwrap();
-        let block: serde_json::Value =
-            serde_json::from_slice(&zstd::decode_all(&raw[..]).unwrap()).unwrap();
-        let deltas: Vec<_> = block["entries"]
-            .as_array()
-            .unwrap()
+        let entries = stored_entries(&r, r.db.last_block().unwrap().unwrap().block_number);
+        let deltas: Vec<_> = entries
             .iter()
             .filter(|entry| entry["type"] == "publisher_delta")
             .collect();
@@ -1008,17 +991,8 @@ fn recovery_scope_sources_survive_reopen_and_gate_settlement() {
         ids[5]
     );
     let head = r.db.last_block().unwrap().unwrap();
-    let raw = std::fs::read(
-        r.data
-            .path()
-            .join(format!("log/blocks/{:09}.json.zst", head.block_number)),
-    )
-    .unwrap();
-    let block: serde_json::Value =
-        serde_json::from_slice(&zstd::decode_all(&raw[..]).unwrap()).unwrap();
-    let sealed: Vec<_> = block["entries"]
-        .as_array()
-        .unwrap()
+    let entries = stored_entries(&r, head.block_number);
+    let sealed: Vec<_> = entries
         .iter()
         .filter(|entry| entry["type"] == "publisher_delta")
         .map(|entry| wist_core::delta::delta_id(&entry["body"]["delta"]).unwrap())
@@ -1134,14 +1108,8 @@ fn sealed_recovery() -> (Rig, i64, serde_json::Value) {
     (r, start, owner)
 }
 
-fn stored_block(r: &Rig, height: u64) -> serde_json::Value {
-    let bytes = std::fs::read(
-        r.data
-            .path()
-            .join(format!("log/blocks/{height:09}.json.zst")),
-    )
-    .unwrap();
-    serde_json::from_slice(&zstd::decode_all(bytes.as_slice()).unwrap()).unwrap()
+fn stored_entries(r: &Rig, height: u64) -> Vec<serde_json::Value> {
+    r.db.block_entries(height).unwrap()
 }
 
 #[test]
@@ -1218,9 +1186,10 @@ fn authenticated_sealing_separates_settlement_from_packed_authority() {
         }
         r.db = clave::db::Db::open(&r.data.path().join("clave.sqlite")).unwrap();
         let report = clave::seal::run(&r.db, r.data.path(), &r.sk, start + 3600 + 7 * DAY).unwrap();
-        let block = stored_block(&r, report.block_number);
-        wist_core::block::verify_block(&block, &r.sk.public()).unwrap();
+        let entries = stored_entries(&r, report.block_number);
+        assert_eq!(entries.len() as u64, report.entry_count);
         let state = clave::history::declarations::Declarations::reconstruct(
+            &r.db,
             r.data.path(),
             r.db.last_block().unwrap(),
         )
@@ -1314,7 +1283,7 @@ fn rejected_candidate_rolls_back_due_settlement_and_status() {
             .unwrap()
             .declaration_json;
     let pending = r.db.count_pending_entries("publisher_declaration").unwrap();
-    let checkpoint = std::fs::read(r.data.path().join("log/checkpoint.json")).unwrap();
+    let checkpoint = std::fs::read(r.data.path().join("checkpoint")).unwrap();
     assert!(clave::seal::run(&r.db, r.data.path(), &r.sk, start + 3600 + 7 * DAY).is_err());
     r.db = clave::db::Db::open(&r.data.path().join("clave.sqlite")).unwrap();
     assert_eq!(r.db.last_block().unwrap().unwrap().block_number, 1);
@@ -1336,10 +1305,10 @@ fn rejected_candidate_rolls_back_due_settlement_and_status() {
         delta
     );
     assert_eq!(
-        std::fs::read(r.data.path().join("log/checkpoint.json")).unwrap(),
+        std::fs::read(r.data.path().join("checkpoint")).unwrap(),
         checkpoint
     );
-    assert!(!r.data.path().join("log/blocks/000000002.json.zst").exists());
+    assert!(r.db.block_at(2).unwrap().is_none());
 }
 
 #[test]
@@ -1364,15 +1333,31 @@ fn corrupt_pinned_history_cannot_settle_a_queue() {
         ingest(&r, "2026-08-09T15:00:00Z").queued,
         std::slice::from_ref(&delta)
     );
-    let block = r.data.path().join("log/blocks/000000000.json.zst");
-    let original = std::fs::read(&block).unwrap();
-    std::fs::write(&block, b"invalid frame").unwrap();
+    let connection = rusqlite::Connection::open(r.data.path().join("clave.sqlite")).unwrap();
+    let original: Vec<u8> = connection
+        .query_row(
+            "SELECT entry_json FROM log_entries WHERE leaf_index = 0",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE log_entries SET entry_json = ?1 WHERE leaf_index = 0",
+            [br#"{"type":"label","body":{}}"#.as_slice()],
+        )
+        .unwrap();
     assert!(clave::seal::run(&r.db, r.data.path(), &r.sk, start + 3600 + 7 * DAY).is_err());
-    r.db = clave::db::Db::open(&r.data.path().join("clave.sqlite")).unwrap();
+    r.db = clave::db::Db::connect(&r.data.path().join("clave.sqlite")).unwrap();
     assert!(r.db.get_recovery_window(&r.host).unwrap().is_some());
     assert!(r.db.list_rejections(&r.host).unwrap().is_empty());
     assert_eq!(r.db.last_block().unwrap().unwrap().block_number, 1);
-    std::fs::write(&block, original).unwrap();
+    connection
+        .execute(
+            "UPDATE log_entries SET entry_json = ?1 WHERE leaf_index = 0",
+            [original],
+        )
+        .unwrap();
     clave::seal::run(&r.db, r.data.path(), &r.sk, start + 3600 + 7 * DAY).unwrap();
     assert_eq!(
         r.db.get_record("https://example.com/survivor", &r.host)
@@ -1509,11 +1494,9 @@ fn recovery_preserves_cross_queue_order_and_defers_every_capped_copy() {
             ingest(&r, "2026-08-09T13:00:00Z").queued,
             vec![newer.clone()]
         );
-        let mut opening = stored_block(&r, 0);
-        opening["entries"][0]["body"] = current_declaration(&r.p);
-        opening["header"]["prev_block_hash"] =
-            r.db.last_block().unwrap().unwrap().block_hash.into();
-        let cap = wist_core::jcs::canonicalize(&opening).unwrap().len() as i64;
+        let mut opening = stored_entries(&r, 0);
+        opening[0]["body"] = current_declaration(&r.p);
+        let cap = wist_core::block::block_octets(&opening).unwrap() as i64;
         let normal_cap = r.db.param("block_decompressed_cap_bytes").unwrap();
         r.db.set_param("block_decompressed_cap_bytes", cap).unwrap();
         r.db.set_param("domain_block_entries_max", 1).unwrap();
@@ -1545,10 +1528,7 @@ fn recovery_preserves_cross_queue_order_and_defers_every_capped_copy() {
             )
             .unwrap();
             assert!(report.late.is_empty());
-            let block = stored_block(&r, height);
-            let ids: Vec<_> = block["entries"]
-                .as_array()
-                .unwrap()
+            let ids: Vec<_> = stored_entries(&r, height)
                 .iter()
                 .filter(|entry| entry["type"] == "publisher_delta")
                 .map(|entry| wist_core::delta::delta_id(&entry["body"]["delta"]).unwrap())
@@ -1809,6 +1789,7 @@ fn admission_uses_both_heads_without_joining_a_competing_branch() {
     );
     clave::seal::run(&r.db, r.data.path(), &r.sk, start + 7200).unwrap();
     let history = clave::history::declarations::Declarations::reconstruct(
+        &r.db,
         r.data.path(),
         r.db.last_block().unwrap(),
     )
@@ -1924,14 +1905,11 @@ fn capped_recovery_siblings_preserve_sequences_and_progress_after_restart() {
             .map(|p| (p.rowid, p.entry_json.clone()))
             .collect();
 
-        let mut candidate = stored_block(&r, 2);
-        candidate["header"]["block_number"] = 3.into();
-        candidate["header"]["entry_count"] = 1.into();
-        let mut size_of = |declaration: &serde_json::Value| {
-            candidate["entries"] = serde_json::json!([{
+        let size_of = |declaration: &serde_json::Value| {
+            wist_core::block::block_octets(&[serde_json::json!({
                 "type": "publisher_declaration", "body": declaration
-            }]);
-            wist_core::jcs::canonicalize(&candidate).unwrap().len() as i64
+            })])
+            .unwrap() as i64
         };
         let lower_cap = size_of(&lower);
         let higher_cap = size_of(&higher);
@@ -1977,10 +1955,10 @@ fn capped_recovery_siblings_preserve_sequences_and_progress_after_restart() {
                 assert!(report.dropped.is_empty());
                 if height == 3 {
                     assert_eq!(
-                        stored_block(&r, 3)["entries"],
-                        serde_json::json!([{
+                        stored_entries(&r, 3),
+                        vec![serde_json::json!({
                             "type": "publisher_declaration", "body": independent
-                        }])
+                        })]
                     );
                 }
                 assert_eq!(
@@ -1997,6 +1975,7 @@ fn capped_recovery_siblings_preserve_sequences_and_progress_after_restart() {
                     Some(4)
                 );
                 let state = clave::history::declarations::Declarations::reconstruct(
+                    &r.db,
                     r.data.path(),
                     r.db.last_block().unwrap(),
                 )
@@ -2022,13 +2001,14 @@ fn capped_recovery_siblings_preserve_sequences_and_progress_after_restart() {
                 clave::seal::run(&r.db, r.data.path(), &r.sk, start + height * 3600).unwrap();
             assert_eq!(report.entry_count, 1);
             assert!(report.dropped.is_empty());
-            let block = stored_block(&r, height as u64);
+            let block = stored_entries(&r, height as u64);
             assert_eq!(
-                block["entries"],
-                serde_json::json!([{"type": "publisher_declaration", "body": expected}])
+                block,
+                vec![serde_json::json!({"type": "publisher_declaration", "body": expected})]
             );
-            assert!(wist_core::jcs::canonicalize(&block).unwrap().len() as i64 <= lower_cap);
+            assert!(wist_core::block::block_octets(&block).unwrap() as i64 <= lower_cap);
             let state = clave::history::declarations::Declarations::reconstruct(
+                &r.db,
                 r.data.path(),
                 r.db.last_block().unwrap(),
             )
@@ -2064,6 +2044,7 @@ fn capped_recovery_siblings_preserve_sequences_and_progress_after_restart() {
             0
         );
         clave::history::declarations::Declarations::reconstruct(
+            &r.db,
             r.data.path(),
             r.db.last_block().unwrap(),
         )
@@ -2126,6 +2107,7 @@ fn pending_recovery_followers_remain_eligible_after_partial_sealing() {
         .unwrap();
     clave::seal::run(&r.db, r.data.path(), &r.sk, start + 10800).unwrap();
     let state = clave::history::declarations::Declarations::reconstruct(
+        &r.db,
         r.data.path(),
         r.db.last_block().unwrap(),
     )
@@ -2154,9 +2136,18 @@ fn floor_migration_authenticates_the_pinned_prefix_before_writing() {
     )
     .unwrap();
     conn.execute("DROP TABLE declaration_floors", []).unwrap();
-    let block = r.data.path().join("log/blocks/000000001.json.zst");
-    let original = std::fs::read(&block).unwrap();
-    std::fs::write(&block, b"corrupt").unwrap();
+    let corrupted: Vec<u8> = conn
+        .query_row(
+            "SELECT entry_json FROM log_entries WHERE leaf_index = 0",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    conn.execute(
+        "UPDATE log_entries SET entry_json = ?1 WHERE leaf_index = 0",
+        [br#"{"type":"label","body":{}}"#.as_slice()],
+    )
+    .unwrap();
     assert!(clave::db::Db::open(&database).is_err());
     assert_eq!(
         conn.query_row("SELECT count(*) FROM declaration_floors", [], |row| row
@@ -2168,7 +2159,11 @@ fn floor_migration_authenticates_the_pinned_prefix_before_writing() {
         r.db.count_pending_entries("publisher_declaration").unwrap(),
         1
     );
-    std::fs::write(&block, original).unwrap();
+    conn.execute(
+        "UPDATE log_entries SET entry_json = ?1 WHERE leaf_index = 0",
+        [corrupted],
+    )
+    .unwrap();
     r.db = clave::db::Db::open(&database).unwrap();
     assert_eq!(
         r.db.highest_accepted_declaration_seq(&r.host).unwrap(),
@@ -2323,6 +2318,7 @@ fn admission_deadline_preserves_pending_followers_and_later_replacements() {
         ingest(&r, deadline);
         let report = clave::seal::run(&r.db, r.data.path(), &r.sk, start + 3600 + 7 * DAY).unwrap();
         let state = clave::history::declarations::Declarations::reconstruct(
+            &r.db,
             r.data.path(),
             r.db.last_block().unwrap(),
         )
@@ -2474,6 +2470,7 @@ fn cadence_rounding_cannot_reopen_a_settled_admission_window() {
         survivor
     );
     clave::history::declarations::Declarations::reconstruct(
+        &r.db,
         r.data.path(),
         r.db.last_block().unwrap(),
     )

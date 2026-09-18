@@ -33,31 +33,25 @@ fn store(db: &Db, doc: &Value) {
     }
 }
 
-fn append(db: &Db, path: &std::path::Path, doc: &Value) {
-    let height = doc["header"]["block_number"].as_u64().unwrap();
-    let bytes = jcs::canonicalize(doc).unwrap();
-    std::fs::write(
-        path.join(format!("log/blocks/{height:09}.json.zst")),
-        zstd::bulk::compress(&bytes, 1).unwrap(),
-    )
-    .unwrap();
+fn append(db: &Db, path: &std::path::Path, sk: &wist_core::crypto::SigningKey, doc: &Value) {
+    let checkpoint =
+        wist_core::checkpoint::Checkpoint::parse(doc["checkpoint"].as_str().unwrap()).unwrap();
+    let entries: Vec<Value> = serde_json::from_value(doc["entries"].clone()).unwrap();
     let pending = db.peek_pending_entries().unwrap().0;
     let rowids = pending
         .iter()
-        .filter(|row| {
-            doc["entries"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|entry| entry["body"] == row.entry_json)
-        })
+        .filter(|row| entries.iter().any(|entry| entry["body"] == row.entry_json))
         .map(|row| row.rowid)
         .collect::<Vec<_>>();
+    let anchor = clave::history::anchor(path).unwrap();
     db.commit_seal(
+        sk,
+        &anchor.log_id,
         &rowids,
-        height,
-        &block::block_hash(&doc["header"]).unwrap(),
-        doc["header"]["sealed_at"].as_str().unwrap(),
+        checkpoint.block_number(),
+        checkpoint.sealed_at(),
+        &entries,
+        block::block_octets(&entries).unwrap(),
         &[],
         &[],
         &[],
@@ -65,9 +59,9 @@ fn append(db: &Db, path: &std::path::Path, doc: &Value) {
         &[],
         &[],
         &[],
-        bytes.len() as u64,
     )
     .unwrap();
+    clave::publication::recover(db, path).unwrap();
 }
 
 fn current(db: &Db) -> Value {
@@ -109,11 +103,11 @@ fn signed_pending_declaration_settlement_vectors_survive_reopen_and_repeat() {
             for entry in block["entries"].as_array().unwrap() {
                 store(&db, &entry["body"]);
             }
-            append(&db, data.path(), block);
+            append(&db, data.path(), &key, block);
         }
         assert_eq!(
-            db.last_block().unwrap().unwrap().block_hash,
-            vector["pinned_head"]
+            db.last_block().unwrap().unwrap().root,
+            vector["pinned_head"].as_str().unwrap()
         );
         db.open_recovery_window(
             DOMAIN,
@@ -126,10 +120,10 @@ fn signed_pending_declaration_settlement_vectors_survive_reopen_and_repeat() {
         for declaration in case["admitted"].as_array().unwrap() {
             store(&db, &declarations[declaration.as_str().unwrap()]);
         }
-        append(&db, data.path(), &case["last_inside_block"]);
+        append(&db, data.path(), &key, &case["last_inside_block"]);
         assert_eq!(
-            db.last_block().unwrap().unwrap().block_hash,
-            case["last_inside_pin"]
+            db.last_block().unwrap().unwrap().root,
+            case["last_inside_pin"].as_str().unwrap()
         );
         db = Db::open(&database).unwrap();
         let before = current(&db);
@@ -209,7 +203,8 @@ fn signed_pending_declaration_settlement_vectors_survive_reopen_and_repeat() {
             .collect::<Vec<_>>();
         pending
             .sort_by_key(|entry| wist_core::merkle::leaf_hash(&jcs::canonicalize(entry).unwrap()));
-        let history = Declarations::reconstruct(data.path(), db.last_block().unwrap()).unwrap();
+        let history =
+            Declarations::reconstruct(&db, data.path(), db.last_block().unwrap()).unwrap();
         let entries = pending
             .iter()
             .map(|entry| serde_json::from_value(entry.clone()).unwrap())

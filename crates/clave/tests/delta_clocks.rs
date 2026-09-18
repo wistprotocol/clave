@@ -4,7 +4,7 @@ use clave::db::BlockRow;
 use clave::history::{deltas::DeltaSource, History};
 use common::*;
 use serde_json::{json, Value};
-use wist_core::{block, crypto, envelope, jcs, merkle};
+use wist_core::{crypto, envelope};
 
 fn vector() -> Value {
     serde_json::from_slice(
@@ -14,53 +14,17 @@ fn vector() -> Value {
 }
 
 fn append(
+    db: &clave::db::Db,
     data: &std::path::Path,
     head: Option<&BlockRow>,
     at: &str,
-    mut entries: Vec<Value>,
+    entries: Vec<Value>,
 ) -> BlockRow {
-    entries.sort_by_key(|entry| {
-        (
-            match entry["type"].as_str().unwrap() {
-                "publisher_declaration" => 0,
-                "registry_update" => 1,
-                "publisher_delta" => 2,
-                _ => 3,
-            },
-            merkle::leaf_hash(&jcs::canonicalize(entry).unwrap()),
-        )
-    });
-    let hashes: Vec<_> = entries
-        .iter()
-        .map(|entry| merkle::leaf_hash(&jcs::canonicalize(entry).unwrap()))
-        .collect();
-    let root = if hashes.is_empty() {
-        merkle::leaf_hash(&[])
-    } else {
-        merkle::merkle_root(&hashes).unwrap()
-    };
     let height = head.map_or(0, |h| h.block_number + 1);
-    let header = json!({"wist_version":"1.0.0", "block_number":height,
-        "prev_block_hash":head.map_or("sha256:genesis", |h| h.block_hash.as_str()),
-        "sealed_at":at, "entry_count":entries.len(),
-        "merkle_root":format!("sha256:{}", crypto::hex_encode(&root))});
-    let key = clave::keys::load(&data.join("keys/seed")).unwrap();
-    let mut doc = envelope::sign_envelope(&header, "header", "log1", &key).unwrap();
-    doc["entries"] = json!(entries);
-    std::fs::write(
-        data.join(format!("log/blocks/{height:09}.json.zst")),
-        zstd::bulk::compress(&jcs::canonicalize(&doc).unwrap(), 1).unwrap(),
-    )
-    .unwrap();
-    BlockRow {
-        block_number: height,
-        block_hash: block::block_hash(&header).unwrap(),
-        sealed_at: at.into(),
-    }
+    seal_fixture_block(db, data, height, at, &entries)
 }
 
-fn genesis(data: &std::path::Path, vector: &Value) -> BlockRow {
-    clave::init::run("log.example.net", data).unwrap();
+fn genesis(db: &clave::db::Db, data: &std::path::Path, vector: &Value) -> BlockRow {
     let key = crypto::SigningKey::from_seed(&std::array::from_fn(|i| i as u8));
     let entry = wist_core::objects::PublisherKey::new(&key.public().to_b64u(), 0, None);
     let declaration = envelope::sign_envelope(
@@ -82,6 +46,7 @@ fn genesis(data: &std::path::Path, vector: &Value) -> BlockRow {
         entries.push(json!({"type":"registry_update", "body":doc}));
     }
     append(
+        db,
         data,
         None,
         vector["amendments"][0]["sealed_at"].as_str().unwrap(),
@@ -89,12 +54,18 @@ fn genesis(data: &std::path::Path, vector: &Value) -> BlockRow {
     )
 }
 
+fn store(data: &std::path::Path) -> clave::db::Db {
+    clave::init::run("log.example.net", data).unwrap();
+    clave::db::Db::open(&data.join("clave.sqlite")).unwrap()
+}
+
 #[test]
 fn signed_clock_vectors_select_authenticated_profiles_and_exact_endpoints() {
     let vector = vector();
     let data = tempfile::tempdir().unwrap();
-    let head = genesis(data.path(), &vector);
-    let mut history = History::open(data.path(), Some(head)).unwrap();
+    let db = store(data.path());
+    let head = genesis(&db, data.path(), &vector);
+    let mut history = History::open(&db, data.path(), Some(head)).unwrap();
     let block = history.next_block().unwrap().unwrap();
     assert_eq!(block.rejected_parameters().len(), 2);
     assert_eq!(block.clock_skew_seconds(), 600);
@@ -135,16 +106,19 @@ fn historical_clock_rejections_survive_later_blocks_restart_and_repair() {
         .filter(|p| p["stage"] == "historical")
     {
         let data = tempfile::tempdir().unwrap();
-        let first = genesis(data.path(), &vector);
+        let db = store(data.path());
+        let first = genesis(&db, data.path(), &vector);
         let delta = &probe["envelope"];
         let id = wist_core::delta::delta_id(&delta["delta"]).unwrap();
         let head = append(
+            &db,
             data.path(),
             Some(&first),
             probe["sealed_at"].as_str().unwrap(),
             vec![json!({"type":"publisher_delta", "body":delta})],
         );
         let later = append(
+            &db,
             data.path(),
             Some(&head),
             probe["checked_at"].as_str().unwrap(),
@@ -158,7 +132,7 @@ fn historical_clock_rejections_survive_later_blocks_restart_and_repair() {
             0,
         ) == Some(false);
         for pinned in [&head, &later, &later] {
-            let result = DeltaSource::reconstruct(data.path(), Some(pinned.clone()), &id);
+            let result = DeltaSource::reconstruct(&db, data.path(), Some(pinned.clone()), &id);
             if before_epoch {
                 let error = result.err().unwrap().to_string();
                 let clock = probe["expected"].as_str().unwrap_or("WIST1-E02");
@@ -187,12 +161,28 @@ fn historical_clock_rejections_survive_later_blocks_restart_and_repair() {
             }
         }
         if probe["expected"].is_null() && !before_epoch {
-            let path = data.path().join("log/blocks/000000001.json.zst");
-            let original = std::fs::read(&path).unwrap();
-            std::fs::write(&path, b"corrupt").unwrap();
-            assert!(DeltaSource::reconstruct(data.path(), Some(later.clone()), &id).is_err());
-            std::fs::write(&path, original).unwrap();
-            DeltaSource::reconstruct(data.path(), Some(later), &id).unwrap();
+            let connection = rusqlite::Connection::open(data.path().join("clave.sqlite")).unwrap();
+            let original: Vec<u8> = connection
+                .query_row(
+                    "SELECT entry_json FROM log_entries WHERE leaf_index = 0",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "UPDATE log_entries SET entry_json = ?1 WHERE leaf_index = 0",
+                    [br#"{"type":"label","body":{}}"#.as_slice()],
+                )
+                .unwrap();
+            assert!(DeltaSource::reconstruct(&db, data.path(), Some(later.clone()), &id).is_err());
+            connection
+                .execute(
+                    "UPDATE log_entries SET entry_json = ?1 WHERE leaf_index = 0",
+                    [original],
+                )
+                .unwrap();
+            DeltaSource::reconstruct(&db, data.path(), Some(later), &id).unwrap();
         }
     }
 }
@@ -283,7 +273,7 @@ fn sealing_rechecks_clock_reductions_and_releases_rejected_chains_for_retry() {
         .unwrap()
         .is_none());
     let source =
-        DeltaSource::reconstruct(data.path(), db.last_block().unwrap(), &boundary).unwrap();
+        DeltaSource::reconstruct(&db, data.path(), db.last_block().unwrap(), &boundary).unwrap();
     assert_eq!(source.clock_skew_seconds(), 60);
     drop(db);
     let db = clave::db::Db::open(&path).unwrap();
@@ -293,7 +283,7 @@ fn sealing_rechecks_clock_reductions_and_releases_rejected_chains_for_retry() {
     assert!(report.rejected.is_empty());
     clave::seal::run(&db, data.path(), &key, instant("2026-08-16T13:00:00Z")).unwrap();
     for id in [&root, &child, &boundary] {
-        DeltaSource::reconstruct(data.path(), db.last_block().unwrap(), id).unwrap();
+        DeltaSource::reconstruct(&db, data.path(), db.last_block().unwrap(), id).unwrap();
     }
 }
 

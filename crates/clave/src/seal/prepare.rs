@@ -5,23 +5,23 @@ use crate::history::declarations::DeclarationsReplay;
 use crate::history::declarations::{Declarations, Projection};
 use crate::history::History;
 use crate::registry;
-use crate::WIST_VERSION;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use wist_core::crypto::{hex_encode, SigningKey};
 use wist_core::envelope::sign_envelope;
-use wist_core::objects::{Block, BlockHeader, ChangeType, Sig};
-use wist_core::{jcs, merkle};
+use wist_core::objects::ChangeType;
+use wist_core::{jcs, merkle, tiles};
 
-/// One Block prepared for publication: the signed Block, the rows its
-/// commit writes and the effects its publication applies.
+/// One Block prepared for publication: its Checkpoint, the leaves it
+/// appends to the tree, the rows its commit writes and the effects its
+/// publication applies.
 pub(super) struct PreparedBlock {
-    pub(super) block: Block,
-    pub(super) block_hash: String,
+    pub(super) log_id: String,
+    pub(super) entries: Vec<Value>,
+    pub(super) octets: u64,
     pub(super) block_number: u64,
     pub(super) sealed_at: String,
-    pub(super) cap: i64,
     pub(super) seal_entries: Vec<SealEntry>,
     pub(super) sealed_rowids: Vec<i64>,
     pub(super) accepted_changes: Vec<AcceptedParamChange>,
@@ -75,17 +75,17 @@ pub(super) fn block(
         .map_err(|_| Error::Seal("sealed_at out of range".into()))?
         .to_string();
 
-    let (block_number, prev_block_hash) = match &prev {
+    let block_number = match &prev {
         Some(p) => {
             if sealed_at.as_str() <= p.sealed_at.as_str() {
                 return Err(Error::Seal("cadence slot already sealed".into()));
             }
-            (p.block_number + 1, p.block_hash.clone())
+            p.block_number + 1
         }
-        None => (0, "sha256:genesis".to_string()),
+        None => 0,
     };
 
-    let mut history = History::open(data_dir, db.last_block()?)?;
+    let mut history = History::open(db, data_dir, db.last_block()?)?;
     let mut declarations = Declarations::default();
     while let Some(block) = history.next_block()? {
         declarations.apply(&block)?;
@@ -139,7 +139,7 @@ pub(super) fn block(
     let domain_cap = registry::effective(db, "domain_block_entries_max", &sealed_at)?;
     let labeler_cap = registry::effective(db, "labeler_block_entries_max", &sealed_at)?;
     let peeked = fit_to_domain_cap(db, peeked, domain_cap, labeler_cap, block_number)?;
-    let seal_entries = storage_order(peeked)?;
+    let (seal_entries, oversized) = hold_out_oversize_entries(storage_order(peeked)?);
     let schedule = db.parameter_schedule(sealed_epoch)?;
     let mut cap = registry::block_cap(&schedule, sealed_epoch).min(registry::effective(
         db,
@@ -165,15 +165,6 @@ pub(super) fn block(
             cap = cap.min(registry::block_cap(&tentative, sealed_epoch));
         }
     }
-    let empty = encoded_block(
-        block_number,
-        &prev_block_hash,
-        &sealed_at,
-        Vec::new(),
-        merkle::leaf_hash(&[]),
-        sk,
-    )?;
-    let framing = jcs::canonicalize(&serde_json::to_value(&empty)?)?.len();
     let installed = settlement
         .domains()
         .values()
@@ -185,7 +176,7 @@ pub(super) fn block(
             )
         })
         .collect();
-    let (seal_entries, _deferred) = fit_to_cap(seal_entries, cap, framing, &installed)?;
+    let (seal_entries, _deferred) = fit_to_cap(seal_entries, cap, &installed)?;
     let projection = declarations.project(
         &sealed_at,
         recovery_days,
@@ -226,25 +217,27 @@ pub(super) fn block(
     )?;
     let ceiling = registry::effective(db, "max_inclusion_blocks", &sealed_at)?;
     let late = late_inclusions(&seal_entries, block_number, ceiling);
-    let candidate = encoded_block(
-        block_number,
-        &prev_block_hash,
-        &sealed_at,
-        seal_entries.iter().map(|e| e.wrapped.clone()).collect(),
-        merkle::leaf_hash(&[]),
-        sk,
-    )?;
-    let candidate_bytes = jcs::canonicalize(&serde_json::to_value(&candidate)?)?.len() as u64;
+    let candidate_octets = seal_entries.iter().map(SealEntry::octets).sum();
     let mut outcome = enforce_governance(
         db,
         &sk.public(),
+        history.log_id(),
         seal_entries,
         sealed_epoch,
         block_number,
-        candidate_bytes,
+        candidate_octets,
     )?;
     outcome.dropped.extend(retired);
     outcome.dropped_rowids.extend(retired_rowids);
+    outcome.dropped.extend(oversized.iter().map(|e| {
+        format!(
+            "WIST3-E03 {} Entry of {} over 65 535 octets is not sealed",
+            e.entry_type, e.domain
+        )
+    }));
+    outcome
+        .dropped_rowids
+        .extend(oversized.iter().map(|e| e.rowid));
     let GovernanceOutcome {
         kept: seal_entries,
         param_changes: accepted_changes,
@@ -259,26 +252,15 @@ pub(super) fn block(
         .chain(dropped_rowids.iter().copied())
         .collect();
     let entries: Vec<Value> = seal_entries.iter().map(|e| e.wrapped.clone()).collect();
-    let leaves: Vec<[u8; 32]> = seal_entries.iter().map(|e| e.leaf).collect();
+    let octets: u64 = seal_entries.iter().map(SealEntry::octets).sum();
     let entry_count = entries.len() as u64;
-    let merkle_root = if leaves.is_empty() {
-        merkle::leaf_hash(&[])
-    } else {
-        merkle::merkle_root(&leaves)?
-    };
-
-    let block = encoded_block(
-        block_number,
-        &prev_block_hash,
-        &sealed_at,
-        entries,
-        merkle_root,
-        sk,
-    )?;
-    let block_hash = wist_core::block::block_hash(&serde_json::to_value(&block.header)?)?;
-
+    if octets > cap.max(0) as u64 {
+        return Err(Error::Seal(
+            "the Block's entry-bundle octets exceed the decompressed cap".into(),
+        ));
+    }
     let projection =
-        declarations.project(&sealed_at, recovery_days, activation_blocks, &block.entries)?;
+        declarations.project(&sealed_at, recovery_days, activation_blocks, &entries)?;
     let windows = projection
         .domains()
         .iter()
@@ -304,11 +286,11 @@ pub(super) fn block(
     let record_updates = resolve_record_updates(data_dir, &size_caps, &seal_entries)?;
 
     Ok(PreparedBlock {
-        block,
-        block_hash,
+        log_id: history.log_id().to_owned(),
+        entries,
+        octets,
         block_number,
         sealed_at,
-        cap,
         seal_entries,
         sealed_rowids,
         accepted_changes,
@@ -674,9 +656,40 @@ fn check_withdrawal(
     }
 }
 
+/// WIST-3 §3.4: an Aggregator key signs a Checkpoint as a signed-note
+/// signer whose note key ID a Consumer maps back to a `key_id`, so an
+/// `aggregator_key_add` whose note key ID equals that of any key already
+/// admitted — the genesis key included — is never sealed. This Log seals
+/// no key transition at all, because its replay reads every Checkpoint
+/// under the genesis key; the collision is reported separately from that
+/// refusal so the reason a Consumer would reject the act is the reason
+/// the Aggregator gives.
+fn refuse_aggregator_key_add(admitted: &[String], log_id: &str, update: &Value) -> String {
+    let details = &update["details"];
+    let (Some(key_id), Some(public_key)) =
+        (details["key_id"].as_str(), details["public_key"].as_str())
+    else {
+        return "WIST4-E04 aggregator_key_add without a key_id and public_key".into();
+    };
+    let collides = details["alg"] == "Ed25519"
+        && wist_core::crypto::PublicKey::from_b64u(public_key).is_ok_and(|key| {
+            admitted.contains(&hex_encode(&wist_core::checkpoint::aggregator_key_id(
+                log_id, &key,
+            )))
+        });
+    if collides {
+        return format!(
+            "WIST3-E03 aggregator_key_add {key_id} collides with an admitted key's note key ID"
+        );
+    }
+    format!("aggregator_key_add {key_id} is not sealed: this Log signs every Checkpoint under its genesis key")
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) fn enforce_governance(
     db: &Db,
     log_key: &wist_core::crypto::PublicKey,
+    log_id: &str,
     entries: Vec<SealEntry>,
     sealed_epoch: i64,
     block_number: u64,
@@ -684,6 +697,12 @@ pub(super) fn enforce_governance(
 ) -> Result<GovernanceOutcome> {
     let mut schedule = db.parameter_schedule(sealed_epoch)?;
     let largest = db.largest_block_bytes()?.max(block_bytes);
+    let mut admitted = db.admitted_note_key_ids()?;
+    if admitted.is_empty() {
+        admitted.push(hex_encode(&wist_core::checkpoint::aggregator_key_id(
+            log_id, log_key,
+        )));
+    }
     let mut out = GovernanceOutcome {
         kept: Vec::with_capacity(entries.len()),
         param_changes: Vec::new(),
@@ -786,24 +805,26 @@ pub(super) fn enforce_governance(
                     }
                 }
             }
+            Some("aggregator_key_add") => {
+                out.dropped
+                    .push(refuse_aggregator_key_add(&admitted, log_id, &update));
+                out.dropped_rowids.push(e.rowid);
+            }
             _ => out.kept.push(e),
         }
     }
     Ok(out)
 }
 
+/// WIST-3 §6: a Block's size is the octets its Entries occupy in entry
+/// bundles — each Entry's JCS serialization plus two — and it must not
+/// exceed the `block_decompressed_cap_bytes` in force.
 pub(super) fn fit_to_cap(
     entries: Vec<SealEntry>,
     cap: i64,
-    empty_block_bytes: usize,
     installed: &HashSet<String>,
 ) -> Result<(Vec<SealEntry>, usize)> {
-    let cap = usize::try_from(cap).map_err(|_| Error::Seal("invalid Block cap".into()))?;
-    if empty_block_bytes > cap {
-        return Err(Error::Seal(
-            "empty Block exceeds the decompressed cap".into(),
-        ));
-    }
+    let cap = u64::try_from(cap).map_err(|_| Error::Seal("invalid Block cap".into()))?;
     let pending_declarations: HashSet<_> = entries
         .iter()
         .filter(|entry| entry.entry_type == "publisher_declaration")
@@ -830,7 +851,7 @@ pub(super) fn fit_to_cap(
     });
     let mut selected = installed.clone();
     let mut deferred_domains = HashSet::new();
-    let mut used = empty_block_bytes;
+    let mut used = 0u64;
     let mut kept = Vec::with_capacity(entries.len());
     let mut deferred = 0usize;
     for (_, e) in entries {
@@ -849,9 +870,7 @@ pub(super) fn fit_to_cap(
             continue;
         }
 
-        let count_bytes = (kept.len() + 1).to_string().len() - kept.len().to_string().len();
-        let size =
-            jcs::canonicalize(&e.wrapped)?.len() + usize::from(!kept.is_empty()) + count_bytes;
+        let size = e.octets();
         if size > cap - used {
             if let Some(domain) = declaration_domain {
                 deferred_domains.insert(domain.to_string());
@@ -875,42 +894,35 @@ pub(super) fn fit_to_cap(
     Ok((kept, deferred))
 }
 
-pub(super) fn encoded_block(
-    block_number: u64,
-    prev_block_hash: &str,
-    sealed_at: &str,
-    entries: Vec<Value>,
-    merkle_root: [u8; 32],
-    sk: &SigningKey,
-) -> Result<Block> {
-    let header = BlockHeader {
-        wist_version: WIST_VERSION.into(),
-        block_number,
-        prev_block_hash: prev_block_hash.into(),
-        sealed_at: sealed_at.into(),
-        merkle_root: format!("sha256:{}", hex_encode(&merkle_root)),
-        entry_count: entries.len() as u64,
-    };
-    let sig_value = sk.sign(&jcs::canonicalize(&serde_json::to_value(&header)?)?);
-    Ok(Block {
-        header,
-        entries,
-        sig: Sig {
-            key_id: GENESIS_KEY_ID.into(),
-            alg: "Ed25519".into(),
-            value: sig_value,
-        },
-    })
-}
-
 pub(super) struct SealEntry {
     pub(super) rowid: i64,
     pub(super) entry_type: String,
     pub(super) domain: String,
     pub(super) body: Value,
     pub(super) wrapped: Value,
+    pub(super) canonical: Vec<u8>,
     pub(super) leaf: [u8; 32],
     pub(super) turn_block: Option<u64>,
+}
+
+impl SealEntry {
+    /// The octets this Entry occupies in an entry bundle: its JCS
+    /// serialization behind a two-octet length prefix (WIST-3 §6).
+    pub(super) fn octets(&self) -> u64 {
+        self.canonical.len() as u64 + 2
+    }
+}
+
+/// WIST-3 §3.3: an Entry whose JCS serialization exceeds 65 535 octets
+/// does not fit a leaf of an entry bundle and is never sealed. It is
+/// held out of the Block here, the last point at which the Aggregator
+/// still decides membership, and reported with the Block's drops.
+pub(super) fn hold_out_oversize_entries(
+    entries: Vec<SealEntry>,
+) -> (Vec<SealEntry>, Vec<SealEntry>) {
+    entries
+        .into_iter()
+        .partition(|entry| entry.canonical.len() as u64 <= tiles::ENTRY_MAX_BYTES)
 }
 
 pub(super) struct DeltaApply {
@@ -941,13 +953,15 @@ pub(super) fn storage_order(peeked: Vec<PendingEntryRow>) -> Result<Vec<SealEntr
         .into_iter()
         .map(|p| {
             let wrapped = serde_json::json!({"type": p.entry_type, "body": p.entry_json});
-            let leaf = merkle::leaf_hash(&jcs::canonicalize(&wrapped)?);
+            let canonical = jcs::canonicalize(&wrapped)?;
+            let leaf = merkle::leaf_hash(&canonical);
             Ok(SealEntry {
                 rowid: p.rowid,
                 entry_type: p.entry_type,
                 domain: p.domain,
                 body: p.entry_json,
                 wrapped,
+                canonical,
                 leaf,
                 turn_block: p.turn_block,
             })
@@ -1043,6 +1057,8 @@ pub(super) fn resolve_record_updates(
 
 #[cfg(test)]
 mod tests {
+    use crate::WIST_VERSION;
+
     #[test]
     fn domain_cap_counts_per_registrable_domain() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1051,10 +1067,13 @@ mod tests {
         let identifier = wist_core::suffix_list::identifier(list);
         db.store_suffix_list(&identifier, list).unwrap();
         db.commit_seal(
+            &crate::db::tests::signing_key(),
+            crate::db::tests::LOG_ID,
             &[],
             0,
-            "sha256:h0",
             "2026-08-09T00:00:00Z",
+            &[],
+            0,
             &[],
             &[],
             &[],
@@ -1062,7 +1081,6 @@ mod tests {
             &[],
             &[],
             &[],
-            0,
         )
         .unwrap();
         for domain in ["a.example.com", "b.example.com", "alice.github.io"] {
@@ -1081,9 +1099,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn packing_accounts_for_entry_count_digits_at_exact_jcs_size() {
+    fn packing_counts_each_entry_as_its_jcs_octets_plus_a_length_prefix() {
         let sk = SigningKey::from_seed(&[42; 32]);
-        let at = "2026-09-07T00:00:00Z";
         let entries = |count| {
             storage_order(
                 (0..count)
@@ -1107,30 +1124,16 @@ mod tests {
         };
         for count in [9, 10, 99, 100] {
             let all = entries(count);
-            let values = all.iter().map(|e| e.wrapped.clone()).collect();
-            let root =
-                merkle::merkle_root(&all.iter().map(|e| e.leaf).collect::<Vec<_>>()).unwrap();
-            let block = encoded_block(10, "sha256:previous", at, values, root, &sk).unwrap();
-            let size = jcs::canonicalize(&serde_json::to_value(block).unwrap())
-                .unwrap()
-                .len();
-            let empty = encoded_block(
-                10,
-                "sha256:previous",
-                at,
-                Vec::new(),
-                merkle::leaf_hash(&[]),
-                &sk,
-            )
-            .unwrap();
-            let framing = jcs::canonicalize(&serde_json::to_value(empty).unwrap())
-                .unwrap()
-                .len();
-            let (fit, deferred) = fit_to_cap(all, size as i64, framing, &HashSet::new()).unwrap();
+            let size: u64 = all
+                .iter()
+                .map(|e| jcs::canonicalize(&e.wrapped).unwrap().len() as u64 + 2)
+                .sum();
+            assert_eq!(size, all.iter().map(SealEntry::octets).sum::<u64>());
+            let (fit, deferred) = fit_to_cap(all, size as i64, &HashSet::new()).unwrap();
             assert_eq!(fit.len(), count as usize);
             assert_eq!(deferred, 0);
             let (fit, deferred) =
-                fit_to_cap(entries(count), size as i64 - 1, framing, &HashSet::new()).unwrap();
+                fit_to_cap(entries(count), size as i64 - 1, &HashSet::new()).unwrap();
             assert_eq!(fit.len(), count as usize - 1);
             assert_eq!(deferred, 1);
         }

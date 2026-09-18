@@ -8,6 +8,9 @@ mod delta_history;
 mod delta_indexes;
 mod restore;
 mod schema;
+mod tree;
+
+pub use tree::StoredTree;
 
 /// A write transaction: at the top level it begins immediately, taking
 /// the store's write lock before any read so a concurrent connection can
@@ -85,10 +88,13 @@ pub struct PublisherStatusRow {
     pub state: PublisherState,
 }
 
+/// A sealed Block as its Checkpoint states it: the Block's number, the
+/// tree size and root at that Block, and its `sealed_at` (WIST-3 §3.1).
 #[derive(Debug, Clone)]
 pub struct BlockRow {
     pub block_number: u64,
-    pub block_hash: String,
+    pub tree_size: u64,
+    pub root: String,
     pub sealed_at: String,
 }
 
@@ -271,8 +277,20 @@ fn exec_upsert_record(conn: &Connection, r: &RecordUpsert, sealed_at: &str) -> R
     Ok(())
 }
 
-/// A sealed height with the Block and Checkpoint bytes it committed to.
-pub type Publication = (u64, Vec<u8>, Vec<u8>);
+/// A sealed height with the signed note its Checkpoint carries.
+pub type Publication = (u64, String);
+
+/// A Witness the Aggregator submits its Checkpoints to (WIST-3 §5).
+#[derive(Debug, Clone)]
+pub struct WitnessRow {
+    pub name: String,
+    /// The Witness's verifier-key string, as configured.
+    pub public_key: String,
+    pub base_url: String,
+    /// The tree size this Witness last cosigned, the size a Consistency
+    /// Proof for its next `add-checkpoint` call runs from.
+    pub last_size: u64,
+}
 
 pub struct Db {
     conn: Connection,
@@ -948,20 +966,89 @@ impl Db {
     }
 
     pub fn last_block(&self) -> Result<Option<BlockRow>> {
+        self.block(
+            "SELECT block_number, tree_size, root, sealed_at FROM blocks ORDER BY block_number DESC LIMIT 1",
+            [],
+        )
+    }
+
+    pub fn block_at(&self, block_number: u64) -> Result<Option<BlockRow>> {
+        self.block(
+            "SELECT block_number, tree_size, root, sealed_at FROM blocks WHERE block_number = ?1",
+            [block_number as i64],
+        )
+    }
+
+    fn block<P: rusqlite::Params>(&self, sql: &str, params: P) -> Result<Option<BlockRow>> {
         self.conn
-            .query_row(
-                "SELECT block_number, block_hash, sealed_at FROM blocks ORDER BY block_number DESC LIMIT 1",
-                [],
-                |row| {
-                    Ok(BlockRow {
-                        block_number: row.get::<_, i64>(0)? as u64,
-                        block_hash: row.get(1)?,
-                        sealed_at: row.get(2)?,
-                    })
-                },
-            )
+            .query_row(sql, params, |row| {
+                Ok(BlockRow {
+                    block_number: row.get::<_, i64>(0)? as u64,
+                    tree_size: row.get::<_, i64>(1)? as u64,
+                    root: row.get(2)?,
+                    sealed_at: row.get(3)?,
+                })
+            })
             .optional()
             .map_err(Error::Db)
+    }
+
+    /// The tree size Checkpoint `block_number - 1` states, `size(-1)`
+    /// being 0 (WIST-3 §3).
+    pub fn size_before(&self, block_number: u64) -> Result<u64> {
+        Ok(self.conn.query_row(
+            "SELECT COALESCE(MAX(tree_size), 0) FROM blocks WHERE block_number < ?1",
+            [block_number as i64],
+            |row| row.get::<_, i64>(0),
+        )? as u64)
+    }
+
+    pub fn tree_size(&self) -> Result<u64> {
+        self.size_before(u64::MAX)
+    }
+
+    /// A `HashReader` over the stored tree hashes.
+    pub fn log_tree(&self) -> StoredTree<'_> {
+        StoredTree::new(&self.conn)
+    }
+
+    /// The leaf data of the leaves in `[from, to)`, in leaf order.
+    pub fn entry_range(&self, from: u64, to: u64) -> Result<Vec<Vec<u8>>> {
+        tree::entry_range(&self.conn, from, to)
+    }
+
+    /// The hashes one stored tile holds, as many as the tree the store
+    /// has reached requires of it.
+    pub fn tile_hashes(&self, level: u8, index: u64) -> Result<Option<Vec<[u8; 32]>>> {
+        tree::read_tile(&self.conn, level, index)
+    }
+
+    /// The root the tree reaches when `leaves` are appended at
+    /// `previous_size`, computed without writing anything.
+    pub fn root_after_appending(
+        &self,
+        previous_size: u64,
+        leaves: &[[u8; 32]],
+    ) -> Result<[u8; 32]> {
+        tree::root_after_appending(&self.conn, previous_size, leaves)
+    }
+
+    /// The Consistency Proof from tree size `from` to tree size `to`
+    /// (WIST-3 §4).
+    pub fn consistency_proof(&self, from: u64, to: u64) -> Result<Vec<[u8; 32]>> {
+        wist_core::merkle::consistency_proof_from(&self.log_tree(), from, to)
+            .map_err(|e| Error::History(e.to_string()))
+    }
+
+    /// The Entries of Block `block_number` in canonical order.
+    pub fn block_entries(&self, block_number: u64) -> Result<Vec<Value>> {
+        let Some(block) = self.block_at(block_number)? else {
+            return Ok(Vec::new());
+        };
+        self.entry_range(self.size_before(block_number)?, block.tree_size)?
+            .iter()
+            .map(|bytes| crate::json::parse(bytes).map_err(Error::from))
+            .collect()
     }
 
     pub fn peek_pending_entries(&self) -> Result<(Vec<PendingEntryRow>, i64)> {
@@ -996,63 +1083,141 @@ impl Db {
         Ok((entries, max_rowid))
     }
 
-    /// Records the exact Block and Checkpoint bytes a seal committed to,
-    /// before either file is published, so a restart republishes the
-    /// same bytes instead of sealing the height again (WIST-3 §5).
-    pub fn record_publication(
-        &self,
-        block_number: u64,
-        block_json: &[u8],
-        checkpoint_json: &[u8],
-    ) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO publications(block_number, block_json, checkpoint_json, published) VALUES (?1, ?2, ?3, 0)",
-            (block_number as i64, block_json, checkpoint_json),
-        )?;
-        Ok(())
-    }
-
     pub fn mark_published(&self, block_number: u64) -> Result<()> {
         self.conn.execute(
-            "UPDATE publications SET published = 1 WHERE block_number = ?1",
+            "UPDATE blocks SET published = 1 WHERE block_number = ?1",
             [block_number as i64],
         )?;
         Ok(())
     }
 
-    /// Every recorded publication whose files are not yet confirmed on
-    /// disk, lowest height first.
+    /// Every sealed Block whose files are not yet confirmed on disk,
+    /// lowest height first.
     pub fn unpublished_publications(&self) -> Result<Vec<Publication>> {
         let mut statement = self.conn.prepare(
-            "SELECT block_number, block_json, checkpoint_json FROM publications WHERE published = 0 ORDER BY block_number",
+            "SELECT block_number, note FROM blocks WHERE published = 0 ORDER BY block_number",
         )?;
         let rows = statement
+            .query_map([], |row| Ok((row.get::<_, i64>(0)? as u64, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// The note of the highest sealed Block's Checkpoint, with every
+    /// signature line it has obtained.
+    pub fn head_publication(&self) -> Result<Option<Publication>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT block_number, note FROM blocks ORDER BY block_number DESC LIMIT 1",
+                [],
+                |row| Ok((row.get::<_, i64>(0)? as u64, row.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    pub fn checkpoint_note(&self, block_number: u64) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT note FROM blocks WHERE block_number = ?1",
+                [block_number as i64],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Replaces a Checkpoint's stored note with one carrying a further
+    /// signature line; the note text itself never changes (WIST-3 §6).
+    pub fn replace_checkpoint_note(&self, block_number: u64, note: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE blocks SET note = ?2 WHERE block_number = ?1",
+            (block_number as i64, note),
+        )?;
+        Ok(())
+    }
+
+    pub fn witnesses(&self) -> Result<Vec<WitnessRow>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT name, public_key, base_url, last_size FROM witnesses ORDER BY name")?;
+        let rows = statement
             .query_map([], |row| {
-                Ok((row.get::<_, i64>(0)? as u64, row.get(1)?, row.get(2)?))
+                Ok(WitnessRow {
+                    name: row.get(0)?,
+                    public_key: row.get(1)?,
+                    base_url: row.get(2)?,
+                    last_size: row.get::<_, i64>(3)?.max(0) as u64,
+                })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
-    /// The recorded bytes of the highest sealed Block's publication.
-    pub fn head_publication(&self) -> Result<Option<Publication>> {
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT block_number, block_json, checkpoint_json FROM publications ORDER BY block_number DESC LIMIT 1",
-                [],
-                |row| Ok((row.get::<_, i64>(0)? as u64, row.get(1)?, row.get(2)?)),
-            )
-            .optional()?)
+    pub fn add_witness(&self, name: &str, public_key: &str, base_url: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO witnesses(name, public_key, base_url, last_size) VALUES (?1, ?2, ?3, 0)
+             ON CONFLICT(name) DO UPDATE SET public_key = excluded.public_key, base_url = excluded.base_url",
+            (name, public_key, base_url),
+        )?;
+        Ok(())
     }
 
+    pub fn remove_witness(&self, name: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM witnesses WHERE name = ?1", [name])?;
+        Ok(())
+    }
+
+    pub fn set_witness_size(&self, name: &str, size: u64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE witnesses SET last_size = ?2 WHERE name = ?1",
+            (name, size as i64),
+        )?;
+        Ok(())
+    }
+
+    /// WIST-3 §3.4: the note key ID of every Aggregator key ever admitted
+    /// to the Log, the genesis key included.
+    pub fn admitted_note_key_ids(&self) -> Result<Vec<String>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT note_key_id FROM aggregator_keys ORDER BY note_key_id")?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn admit_aggregator_key(
+        &self,
+        note_key_id: &str,
+        key_id: &str,
+        public_key: &str,
+        added_block: u64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO aggregator_keys(note_key_id, key_id, public_key, added_block) VALUES (?1, ?2, ?3, ?4)",
+            (note_key_id, key_id, public_key, added_block as i64),
+        )?;
+        Ok(())
+    }
+
+    /// Seals Block `block_number`: appends its Entries' leaves to the
+    /// tree, signs the Checkpoint that states the root they reach and
+    /// writes it with the acceptance, schedule, withdrawal, Label and
+    /// Declaration rows the Block carries, all in one transaction
+    /// (WIST-3 §3.2, §5). Returns the Block the Checkpoint states.
     #[allow(clippy::too_many_arguments)]
     pub fn commit_seal(
         &self,
+        sk: &wist_core::crypto::SigningKey,
+        log_id: &str,
         sealed_rowids: &[i64],
         block_number: u64,
-        block_hash: &str,
         sealed_at: &str,
+        entries: &[Value],
+        decompressed_bytes: u64,
         records: &[RecordUpsert],
         param_changes: &[ParamChangeRow],
         withdrawals: &[WithdrawalRow],
@@ -1060,15 +1225,49 @@ impl Db {
         labels: &[SealedLabelRow],
         disputes: &[SealedDisputeRow],
         declarations: &[SealedDeclarationRow],
-        decompressed_bytes: u64,
-    ) -> Result<()> {
+    ) -> Result<BlockRow> {
         let tx = self.mutation()?;
         for rowid in sealed_rowids {
             tx.execute("DELETE FROM pending_entries WHERE rowid = ?1", [rowid])?;
         }
+        let previous_size = self.size_before(block_number)?;
+        let mut leaf_data = Vec::with_capacity(entries.len());
+        let mut leaves = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let canonical = wist_core::jcs::canonicalize(entry)?;
+            wist_core::tiles::check_entry_bytes(canonical.len() as u64)
+                .map_err(|e| Error::Seal(e.to_string()))?;
+            leaves.push(wist_core::merkle::leaf_hash(&canonical));
+            leaf_data.push(canonical);
+        }
+        let root = tree::append(&tx, previous_size, &leaves)?;
+        let tree_size = previous_size + leaves.len() as u64;
+        let mut checkpoint = wist_core::checkpoint::Checkpoint::new(
+            log_id,
+            tree_size,
+            root,
+            block_number,
+            sealed_at,
+        )
+        .map_err(|e| Error::Seal(e.to_string()))?;
+        checkpoint.sign(sk);
+        let block = BlockRow {
+            block_number,
+            tree_size,
+            root: checkpoint.root_token(),
+            sealed_at: sealed_at.to_owned(),
+        };
+        tree::put_entries(&tx, block_number, previous_size, &leaf_data)?;
         tx.execute(
-            "INSERT INTO blocks(block_number, block_hash, sealed_at, decompressed_bytes) VALUES (?1, ?2, ?3, ?4)",
-            (block_number as i64, block_hash, sealed_at, decompressed_bytes),
+            "INSERT INTO blocks(block_number, tree_size, root, sealed_at, note, published, decompressed_bytes) VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)",
+            (
+                block_number as i64,
+                tree_size as i64,
+                &block.root,
+                sealed_at,
+                checkpoint.encode(),
+                decompressed_bytes as i64,
+            ),
         )?;
         for r in records {
             exec_upsert_record(&tx, r, sealed_at)?;
@@ -1148,7 +1347,7 @@ impl Db {
             )?;
         }
         tx.commit()?;
-        Ok(())
+        Ok(block)
     }
 
     /// WIST-2 §3.3: a Label ID or Dispute ID the Log sealed or holds
@@ -1336,12 +1535,12 @@ impl Db {
         )
     }
 
-    /// WIST-3 §7: the `suffix_list` tuple at `log_position`, the most
+    /// WIST-3 §7: the `suffix_list` tuple at a Snapshot's Block, the most
     /// recent act sealed at or below it.
-    pub fn suffix_list_at_position(&self, log_position: u64) -> Result<Option<(String, u64)>> {
+    pub fn suffix_list_at_block(&self, block_number: u64) -> Result<Option<(String, u64)>> {
         self.suffix_list_row(
             "SELECT sha256, block_number FROM suffix_list_acts WHERE block_number <= ?1 ORDER BY rowid DESC LIMIT 1",
-            log_position as i64,
+            block_number as i64,
         )
     }
 
@@ -1732,8 +1931,41 @@ impl Db {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    pub(crate) const LOG_ID: &str = "log.example.org";
+
+    pub(crate) fn signing_key() -> wist_core::crypto::SigningKey {
+        wist_core::crypto::SigningKey::from_seed(&[7u8; 32])
+    }
+
+    /// Seals an empty Block carrying only `param_changes`, for stores
+    /// whose Entries are not the subject under test.
+    pub(crate) fn seal_block(
+        db: &Db,
+        block_number: u64,
+        sealed_at: &str,
+        param_changes: &[ParamChangeRow],
+    ) -> BlockRow {
+        db.commit_seal(
+            &signing_key(),
+            LOG_ID,
+            &[],
+            block_number,
+            sealed_at,
+            &[],
+            0,
+            &[],
+            param_changes,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap()
+    }
 
     fn test_declaration(seq: u64) -> Value {
         let key = wist_core::crypto::SigningKey::from_seed(&[1; 32]);
@@ -1965,26 +2197,17 @@ mod tests {
     fn commit_seal_records_param_changes_for_latest_lookup() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
-        db.commit_seal(
-            &[],
+        seal_block(
+            &db,
             0,
-            "sha256:h0",
             "2026-01-01T00:00:00Z",
-            &[],
             &[ParamChangeRow {
                 entry_index: 0,
                 parameter: "feed_window",
                 value: 500,
                 effective_at: "2026-01-10T00:00:00Z",
             }],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            0,
-        )
-        .unwrap();
+        );
         assert_eq!(
             db.latest_param_change("feed_window", "2026-01-09T23:59:59Z")
                 .unwrap(),
@@ -1995,26 +2218,17 @@ mod tests {
                 .unwrap(),
             Some(500)
         );
-        db.commit_seal(
-            &[],
+        seal_block(
+            &db,
             1,
-            "sha256:h1",
             "2026-01-02T00:00:00Z",
-            &[],
             &[ParamChangeRow {
                 entry_index: 0,
                 parameter: "feed_window",
                 value: 800,
                 effective_at: "2026-01-20T00:00:00Z",
             }],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            0,
-        )
-        .unwrap();
+        );
         assert_eq!(
             db.latest_param_change("feed_window", "2026-01-15T00:00:00Z")
                 .unwrap(),
@@ -2197,10 +2411,13 @@ mod tests {
 
         let sealed: Vec<i64> = peeked.iter().map(|e| e.rowid).collect();
         db.commit_seal(
+            &signing_key(),
+            LOG_ID,
             &sealed,
             0,
-            "sha256:blockhash0",
             "2026-08-09T00:00:00Z",
+            &[],
+            0,
             &[RecordUpsert {
                 url: "https://example.com/x",
                 publisher: "example.com",
@@ -2216,15 +2433,14 @@ mod tests {
             &[],
             &[],
             &[],
-            0,
         )
         .unwrap();
 
         let (drained, _) = db.peek_pending_entries().unwrap();
         assert!(drained.is_empty());
         assert_eq!(
-            db.last_block().unwrap().unwrap().block_hash,
-            "sha256:blockhash0"
+            db.last_block().unwrap().unwrap().sealed_at,
+            "2026-08-09T00:00:00Z"
         );
         assert_eq!(
             db.get_record("https://example.com/x", "example.com")
@@ -2251,18 +2467,20 @@ mod tests {
         let (peeked, _up_to) = db.peek_pending_entries().unwrap();
         let sealed: Vec<i64> = peeked.iter().map(|e| e.rowid).collect();
         db.commit_seal(
+            &signing_key(),
+            LOG_ID,
             &sealed,
             0,
-            "sha256:blockhash0",
             "2026-08-09T00:00:00Z",
             &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
             0,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
         )
         .unwrap();
 
@@ -2280,18 +2498,20 @@ mod tests {
 
         let sealed2: Vec<i64> = peeked2.iter().map(|e| e.rowid).collect();
         let result = db.commit_seal(
+            &signing_key(),
+            LOG_ID,
             &sealed2,
             0,
-            "sha256:blockhash0-conflict",
             "2026-08-09T00:01:00Z",
             &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
             0,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
         );
         assert!(result.is_err());
 
@@ -2299,8 +2519,8 @@ mod tests {
         assert_eq!(still_pending.len(), 1);
         assert_eq!(still_pending[0].rowid, peeked2[0].rowid);
         assert_eq!(
-            db.last_block().unwrap().unwrap().block_hash,
-            "sha256:blockhash0"
+            db.last_block().unwrap().unwrap().sealed_at,
+            "2026-08-09T00:00:00Z"
         );
     }
 

@@ -350,8 +350,8 @@ fn invalid_retained_payload_vectors_stop_sealing_without_rejecting_deltas() {
             assert!(db.is_delta_seen(&id).unwrap());
             assert!(db.list_rejections(&host).unwrap().is_empty());
             assert!(db.list_records().unwrap().is_empty());
-            assert!(!data.path().join("log/blocks/000000000.json.zst").exists());
-            assert!(!data.path().join("log/checkpoint.json").exists());
+            assert!(db.block_at(0).unwrap().is_none());
+            assert!(!data.path().join("checkpoint").exists());
             assert_eq!(std::fs::read(&payload).unwrap(), original);
             assert_eq!(
                 db.peek_pending_entries()

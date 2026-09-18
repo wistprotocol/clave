@@ -84,7 +84,7 @@ fn page_declarations(
     data_dir: &Path,
     host: &str,
 ) -> Result<Vec<(i64, u64, Vec<wist_core::objects::PublisherKey>)>> {
-    let mut history = crate::history::History::open(data_dir, db.last_block()?)?;
+    let mut history = crate::history::History::open(db, data_dir, db.last_block()?)?;
     let mut state = crate::history::declarations::Declarations::default();
     let mut sources = Vec::new();
     let mut superseded = std::collections::BTreeSet::new();
@@ -127,7 +127,7 @@ fn page_declarations(
                 (block.sealed_at_s(), publisher.seq, publisher.keys),
             ));
         }
-        for entry in block.block().entries.iter().filter(|entry| {
+        for entry in block.entries().iter().filter(|entry| {
             entry["type"] == "publisher_declaration" && entry["body"]["publisher"]["domain"] == host
         }) {
             let source = &entry["body"];
@@ -190,8 +190,11 @@ fn accepted_recovery_head(
     window: &crate::db::RecoveryWindowRow,
 ) -> Result<Value> {
     let mut head = if window.opened_block.is_some() {
-        let state =
-            crate::history::declarations::Declarations::reconstruct(data_dir, db.last_block()?)?;
+        let state = crate::history::declarations::Declarations::reconstruct(
+            db,
+            data_dir,
+            db.last_block()?,
+        )?;
         state
             .domains()
             .get(host)

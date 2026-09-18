@@ -734,9 +734,10 @@ fn unused_excluded_keys_survive_ingest_reopen_and_sealing_without_blocking_usabl
         .as_second();
     let sealed = clave::seal::run(&db, data.path(), &sk, at).unwrap();
     assert_eq!(sealed.entry_count, 2);
-    let mut history = clave::history::History::open(data.path(), db.last_block().unwrap()).unwrap();
+    let mut history =
+        clave::history::History::open(&db, data.path(), db.last_block().unwrap()).unwrap();
     let block = history.next_block().unwrap().unwrap();
-    assert_eq!(block.block().entries[0]["body"], signed);
+    assert_eq!(block.entries()[0]["body"], signed);
     assert!(history.next_block().unwrap().is_none());
     assert_eq!(
         db.get_record("https://example.com/a", &host)
@@ -746,6 +747,7 @@ fn unused_excluded_keys_survive_ingest_reopen_and_sealing_without_blocking_usabl
         id
     );
     let state = clave::history::declarations::Declarations::reconstruct(
+        &db,
         data.path(),
         db.last_block().unwrap(),
     )
@@ -830,6 +832,7 @@ fn declaration_field_rejections_preserve_signed_state_through_reopen_and_sealing
         2
     );
     let state = clave::history::declarations::Declarations::reconstruct(
+        &db,
         data.path(),
         db.last_block().unwrap(),
     )

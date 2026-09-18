@@ -52,6 +52,10 @@ enum Command {
         /// accepted cadence grid like the wall clock is.
         #[arg(long)]
         at: Option<String>,
+        /// Reach a configured Witness at a loopback address over plain
+        /// http, as `serve --allow-http` does for Publishers.
+        #[arg(long = "allow-http")]
+        allow_http: bool,
     },
     VerifyHistory {
         #[arg(long)]
@@ -87,6 +91,21 @@ enum Command {
         #[arg(long)]
         remove: Option<String>,
     },
+    /// Maintains the Witnesses each sealed Checkpoint is submitted to
+    /// (WIST-3 §5). Without `--add` or `--remove`, lists them.
+    Witness {
+        #[arg(long)]
+        data: PathBuf,
+        /// The Witness's `<name>+<key ID>+<key>` verifier-key string.
+        #[arg(long, requires = "url")]
+        add: Option<String>,
+        /// The Witness's base URL, under which `add-checkpoint` is called.
+        #[arg(long)]
+        url: Option<String>,
+        /// The name of a Witness to stop submitting to.
+        #[arg(long)]
+        remove: Option<String>,
+    },
 }
 
 fn main() -> Result<(), clave::Error> {
@@ -98,8 +117,9 @@ fn main() -> Result<(), clave::Error> {
             cadence,
             suffix_list,
         } => {
-            clave::init::run(&log_id, &data)?;
+            let verifier_key = clave::init::run(&log_id, &data)?;
             let db = clave::db::Db::open(&data.join("clave.sqlite"))?;
+            println!("checkpoint verifier key: {verifier_key}");
             db.set_param("block_cadence_seconds", cadence)?;
             match suffix_list {
                 Some(file) => {
@@ -144,17 +164,25 @@ fn main() -> Result<(), clave::Error> {
             let db_path = data.join("clave.sqlite");
             clave::serve::run(data, db_path, bind, allow_http)?;
         }
-        Command::Seal { data, at } => {
+        Command::Seal {
+            data,
+            at,
+            allow_http,
+        } => {
             let db = clave::db::Db::open(&data.join("clave.sqlite"))?;
             let sk = clave::keys::load(&data.join("keys/seed"))?;
             let now_epoch = match at {
                 Some(at) => wist_core::timestamp::log_seconds(&at)?,
                 None => jiff::Timestamp::now().as_second(),
             };
-            let report = clave::seal::run(&db, &data, &sk, now_epoch)?;
+            let client = clave::fetch::Client::new(allow_http);
+            let report = clave::seal::run_with_client(&db, &data, &sk, &client, now_epoch)?;
+            let head = db
+                .last_block()?
+                .ok_or_else(|| clave::Error::Seal("the sealed Block is absent".into()))?;
             println!(
-                "sealed block {} with {} entries",
-                report.block_number, report.entry_count
+                "sealed block {} with {} entries; tree size {} root {}",
+                report.block_number, report.entry_count, head.tree_size, head.root
             );
             for reason in &report.dropped {
                 println!("dropped: {reason}");
@@ -165,17 +193,20 @@ fn main() -> Result<(), clave::Error> {
         }
         Command::VerifyHistory { data } => {
             let db = clave::db::Db::open(&data.join("clave.sqlite"))?;
-            let mut history = clave::history::History::open(&data, db.last_block()?)?;
+            let mut history = clave::history::History::open(&db, &data, db.last_block()?)?;
             let mut blocks = 0;
             let mut entries = 0;
             let mut rejected = 0;
+            let mut head = None;
             while let Some(block) = history.next_block()? {
                 blocks += 1;
-                entries += block.block().entries.len();
+                entries += block.entries().len();
                 rejected += block.rejected_parameters().len();
+                head = Some((block.tree_size(), block.root().to_string()));
             }
+            let (tree_size, root) = head.unwrap_or((0, String::from("sha256:")));
             println!(
-                "authenticated {blocks} Blocks containing {entries} Entries; {rejected} parameter candidates ignored; Entry eligibility and derived state are not verified"
+                "authenticated {blocks} Checkpoints over a tree of {tree_size} leaves at root {root}, containing {entries} Entries; {rejected} parameter candidates ignored; Entry eligibility and derived state are not verified"
             );
         }
         Command::ParamChange {
@@ -219,6 +250,43 @@ fn main() -> Result<(), clave::Error> {
                 jiff::Timestamp::now().as_second(),
             )?;
             println!("queued payload withdrawal {}", report.update_id);
+        }
+        Command::Witness {
+            data,
+            add,
+            url,
+            remove,
+        } => {
+            let db = clave::db::Db::open(&data.join("clave.sqlite"))?;
+            match (add, remove) {
+                (Some(key), None) => {
+                    let (name, _) = clave::witness::parse_verifier_key(&key)?;
+                    let url = url.expect("--add requires --url");
+                    db.add_witness(&name, &key, &url)?;
+                    println!("submitting Checkpoints to {name} at {url}");
+                }
+                (None, Some(name)) => {
+                    db.remove_witness(&name)?;
+                    println!("no longer submitting Checkpoints to {name}");
+                }
+                (None, None) => {
+                    let witnesses = db.witnesses()?;
+                    if witnesses.is_empty() {
+                        println!("no witnesses configured");
+                    }
+                    for witness in witnesses {
+                        println!(
+                            "{} {} last cosigned tree size {}",
+                            witness.name, witness.base_url, witness.last_size
+                        );
+                    }
+                }
+                (Some(_), Some(_)) => {
+                    return Err(clave::Error::Governance(
+                        "pass either --add or --remove, not both".into(),
+                    ));
+                }
+            }
         }
         Command::Mirror { data, add, remove } => {
             let now_epoch = jiff::Timestamp::now().as_second();

@@ -5,7 +5,7 @@ use clave::history::declarations::{Declarations, Domain, Effects};
 use clave::history::History;
 use serde_json::{json, Value};
 use wist_core::crypto::{hex_encode, SigningKey};
-use wist_core::{block, envelope, jcs, merkle};
+use wist_core::{block, envelope, jcs};
 
 fn vector(name: &str) -> Value {
     let root = std::env::var_os("WIST_SPEC_DIR")
@@ -32,11 +32,11 @@ fn field_rejection_preserves_the_complete_declaration_prefix() {
                 .clone();
             let prefix_length = blocks.len();
             blocks.push(case["block"].clone());
-            assert_eq!(
-                digest(&blocks.last().unwrap()["header"]),
-                case["pinned_head"]
-            );
             let fixture = Fixture::new(&blocks);
+            assert_eq!(
+                fixture.head().unwrap().root,
+                case["pinned_head"].as_str().unwrap()
+            );
             let mut reader = fixture.reader();
             let mut state = Declarations::default();
             for _ in 0..prefix_length {
@@ -45,7 +45,7 @@ fn field_rejection_preserves_the_complete_declaration_prefix() {
             let before = format!("{state:?}");
             let block = reader.next_block().unwrap().unwrap();
             let projection = state.project(
-                &block.block().header.sealed_at,
+                block.sealed_at(),
                 reader
                     .schedule()
                     .unwrap()
@@ -56,7 +56,7 @@ fn field_rejection_preserves_the_complete_declaration_prefix() {
                     .unwrap()
                     .value_at("declaration_activation_blocks", block.sealed_at_s())
                     .unwrap(),
-                &block.block().entries,
+                block.entries(),
             );
             assert_eq!(format!("{state:?}"), before);
             let result = state.apply(&block);
@@ -107,20 +107,17 @@ fn delta_bindings_use_frozen_authenticated_recovery_sources() {
     let mut prefixes = std::collections::BTreeMap::new();
     for (name, history) in vector["histories"].as_object().unwrap() {
         let blocks = history["blocks"].as_array().unwrap();
-        assert_eq!(
-            digest(&blocks.last().unwrap()["header"]),
-            history["pinned_head"]
-        );
         let fixture = Fixture::new(blocks);
+        assert_eq!(
+            fixture.head().unwrap().root,
+            history["pinned_head"].as_str().unwrap()
+        );
         let mut reader = fixture.reader();
         let mut state = Declarations::default();
         while let Some(block) = reader.next_block().unwrap() {
             state.apply(&block).unwrap();
             if state.domains()["example.com"].window().is_some() {
-                prefixes.insert(
-                    (name.clone(), block.block().header.block_number),
-                    state.clone(),
-                );
+                prefixes.insert((name.clone(), block.block_number()), state.clone());
             }
         }
         assert_eq!(
@@ -171,16 +168,16 @@ fn delta_scope_stays_with_its_authenticated_declaration_source() {
     let mut sources = std::collections::BTreeMap::new();
     for (name, history) in vector["histories"].as_object().unwrap() {
         let blocks = history["blocks"].as_array().unwrap();
-        assert_eq!(
-            digest(&blocks.last().unwrap()["header"]),
-            history["pinned_head"]
-        );
         let fixture = Fixture::with_key_id(blocks, key_id);
+        assert_eq!(
+            fixture.head().unwrap().root,
+            history["pinned_head"].as_str().unwrap()
+        );
         let mut reader = fixture.reader();
         let mut state = Declarations::default();
         while let Some(block) = reader.next_block().unwrap() {
             let effects = state.apply(&block).unwrap();
-            let height = block.block().header.block_number;
+            let height = block.block_number();
             let domain = &state.domains()["example.com"];
             fn parse(doc: &Value) -> wist_core::objects::Publisher {
                 clave::declaration::publisher_of(doc).unwrap()
@@ -269,6 +266,22 @@ fn timestamp(at: i64) -> String {
     clave::registry::instant(at).unwrap()
 }
 
+/// A fixture Block's `sealed_at`, whether it carries a Checkpoint note
+/// (a vector Block) or the plain field a locally built one carries.
+fn sealed_at(block: &Value) -> String {
+    match block.get("checkpoint").and_then(Value::as_str) {
+        Some(note) => wist_core::checkpoint::Checkpoint::parse(note)
+            .unwrap()
+            .sealed_at()
+            .to_owned(),
+        None => block["sealed_at"].as_str().unwrap().to_owned(),
+    }
+}
+
+fn entries_of(block: &Value) -> Vec<Value> {
+    serde_json::from_value(block["entries"].clone()).unwrap()
+}
+
 fn digest(value: &Value) -> String {
     use sha2::Digest;
     format!(
@@ -278,33 +291,14 @@ fn digest(value: &Value) -> String {
 }
 
 fn signed_block(prefix: &[Value], at: &str, mut entries: Vec<Value>) -> Value {
-    entries.sort_by_key(|entry| {
-        let rank = match entry["type"].as_str().unwrap() {
-            "publisher_declaration" => 0,
-            "registry_update" => 1,
-            "publisher_delta" => 2,
-            "label" => 3,
-            _ => unreachable!(),
-        };
-        (rank, merkle::leaf_hash(&jcs::canonicalize(entry).unwrap()))
-    });
-    let leaves: Vec<_> = entries
-        .iter()
-        .map(|entry| merkle::leaf_hash(&jcs::canonicalize(entry).unwrap()))
-        .collect();
-    let root = if leaves.is_empty() {
-        merkle::leaf_hash(&[])
-    } else {
-        merkle::merkle_root(&leaves).unwrap()
-    };
-    let header = json!({"wist_version":"1.0.0", "block_number":prefix.len(),
-        "prev_block_hash":prefix.last().map_or("sha256:genesis".into(), |b| digest(&b["header"])),
-        "sealed_at":at, "entry_count":entries.len(), "merkle_root":format!("sha256:{}",hex_encode(&root))});
-    json!({"sig":{"key_id":"test-log-k1","alg":"Ed25519","value":log_key().sign(&jcs::canonicalize(&header).unwrap())},"header":header,"entries":entries})
+    let _ = prefix;
+    block::sort_entries(&mut entries).unwrap();
+    json!({"sealed_at": at, "entries": entries})
 }
 
 struct Fixture {
     data: tempfile::TempDir,
+    db: clave::db::Db,
     head: Option<BlockRow>,
 }
 
@@ -312,6 +306,7 @@ impl Fixture {
     fn new(blocks: &[Value]) -> Self {
         Self::with_key_id(blocks, "test-log-k1")
     }
+
     fn with_key_id(blocks: &[Value], key_id: &str) -> Self {
         let data = tempfile::tempdir().unwrap();
         let anchor = json!({"wist_version":"1.0.0", "log_id":"log.example.org", "genesis_key":{"key_id":key_id,"alg":"Ed25519","public_key":"A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg"},"created_at":"2026-08-02T00:00:00Z"});
@@ -321,33 +316,44 @@ impl Fixture {
             jcs::canonicalize(&anchor).unwrap(),
         )
         .unwrap();
-        std::fs::create_dir_all(data.path().join("log/blocks")).unwrap();
+        let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
+        let mut head = None;
         for (height, block) in blocks.iter().enumerate() {
-            std::fs::write(
-                data.path().join(format!("log/blocks/{height:09}.json.zst")),
-                zstd::bulk::compress(&jcs::canonicalize(block).unwrap(), 1).unwrap(),
-            )
-            .unwrap();
+            let mut entries = entries_of(block);
+            block::sort_entries(&mut entries).unwrap();
+            head = Some(
+                db.commit_seal(
+                    &log_key(),
+                    "log.example.org",
+                    &[],
+                    height as u64,
+                    &sealed_at(block),
+                    &entries,
+                    block::block_octets(&entries).unwrap(),
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                )
+                .unwrap(),
+            );
         }
-        let head = blocks.last().map(|last| BlockRow {
-            block_number: last["header"]["block_number"].as_u64().unwrap(),
-            block_hash: block::block_hash(&last["header"]).unwrap(),
-            sealed_at: last["header"]["sealed_at"].as_str().unwrap().into(),
-        });
-        Self { data, head }
+        Self { data, db, head }
     }
+
     fn head(&self) -> Option<BlockRow> {
-        self.head.as_ref().map(|head| BlockRow {
-            block_number: head.block_number,
-            block_hash: head.block_hash.clone(),
-            sealed_at: head.sealed_at.clone(),
-        })
+        self.head.clone()
     }
-    fn reader(&self) -> History {
-        History::open(self.data.path(), self.head()).unwrap()
+
+    fn reader(&self) -> History<'_> {
+        History::open(&self.db, self.data.path(), self.head()).unwrap()
     }
+
     fn restore(&self) -> clave::error::Result<Declarations> {
-        Declarations::reconstruct(self.data.path(), self.head())
+        Declarations::reconstruct(&self.db, self.data.path(), self.head())
     }
 }
 
@@ -405,7 +411,7 @@ fn probe(blocks: &[Value], probe: &Value) -> (Declarations, Result<Effects, Stri
     let before = format!("{state:?}");
     let candidate = history.next_block().unwrap().unwrap();
     let projection = state.project(
-        &candidate.block().header.sealed_at,
+        candidate.sealed_at(),
         history
             .schedule()
             .unwrap()
@@ -416,7 +422,7 @@ fn probe(blocks: &[Value], probe: &Value) -> (Declarations, Result<Effects, Stri
             .unwrap()
             .value_at("declaration_activation_blocks", candidate.sealed_at_s())
             .unwrap(),
-        &candidate.block().entries,
+        candidate.entries(),
     );
     assert_eq!(format!("{state:?}"), before);
     let result = state.apply(&candidate).map_err(|e| e.to_string());
@@ -427,10 +433,7 @@ fn probe(blocks: &[Value], probe: &Value) -> (Declarations, Result<Effects, Stri
                 format!("{:?}", state.domains())
             );
             assert_eq!(format!("{:?}", projected.effects()), format!("{effects:?}"));
-            assert_eq!(
-                projected.block_number(),
-                candidate.block().header.block_number
-            );
+            assert_eq!(projected.block_number(), candidate.block_number());
             assert_eq!(projected.sealed_at_s(), candidate.sealed_at_s());
         }
         (Err(projected), Err(applied)) => assert_eq!(projected.to_string(), *applied),
@@ -519,7 +522,7 @@ fn recovery_heads_sequence_floors_and_named_predecessors_match_signed_vectors() 
                 .count() as u64;
             if let Some(expected_states) = branch["expected_prefix_states"].as_array() {
                 for expected in expected_states {
-                    if expected["height"] == block.block().header.block_number {
+                    if expected["height"] == block.block_number() {
                         assert_eq!(
                             summary(&state.domains()["example.com"], windows),
                             expected["state"]
@@ -562,15 +565,13 @@ fn apply_under(
     days: i64,
     activation_blocks: i64,
 ) -> Result<clave::history::declarations::Effects, clave::Error> {
-    let header = &block.block().header;
     Ok(state.apply_block(
-        header.block_number,
-        &header.prev_block_hash,
-        block.hash(),
-        &header.sealed_at,
+        block.block_number(),
+        block.root(),
+        block.sealed_at(),
         days,
         activation_blocks,
-        &block.block().entries,
+        block.entries(),
     )?)
 }
 
@@ -600,7 +601,7 @@ fn conflicting_groups_and_failed_authors_reject_blocks_atomically() {
                             .to_string();
                         *windows.entry(domain).or_default() += u64::from(installation.opens_window);
                     }
-                    if block.block().header.block_number as usize == blocks.len() - 1 {
+                    if block.block_number() as usize == blocks.len() - 1 {
                         assert!(case["expected_results"]
                             .as_array()
                             .unwrap()
@@ -608,7 +609,7 @@ fn conflicting_groups_and_failed_authors_reject_blocks_atomically() {
                     }
                 }
                 Err(error) => {
-                    assert_eq!(block.block().header.block_number as usize, blocks.len() - 1);
+                    assert_eq!(block.block_number() as usize, blocks.len() - 1);
                     assert!(
                         case["expected_results"]
                             .as_array()
@@ -630,8 +631,9 @@ fn conflicting_groups_and_failed_authors_reject_blocks_atomically() {
             "{}",
             case["name"]
         );
+        let empty_tree = format!("sha256:{}", hex_encode(&wist_core::merkle::EMPTY_ROOT));
         assert_eq!(
-            state.head().map_or("sha256:genesis", |h| h.1),
+            state.head().map_or(empty_tree.as_str(), |h| h.1),
             case["expected_accepted_head"]
         );
     }
@@ -662,9 +664,8 @@ fn settlement_restores_authenticated_chain_and_reports_competitors() {
             let mut candidate = candidate.clone();
             let height = candidate["prefix_height"].as_u64().unwrap() as usize;
             candidate["candidate_sealed_at"] = timestamp(
-                blocks[height]["header"]["sealed_at"]
+                sealed_at(&blocks[height])
                     .as_str()
-                    .unwrap()
                     .parse::<jiff::Timestamp>()
                     .unwrap()
                     .as_second()
@@ -692,15 +693,15 @@ fn reconstruction_requires_complete_pinned_history_and_sequential_application() 
     state.apply(&second).unwrap();
     assert!(fixture.restore().is_ok());
     let mut wrong_head = fixture.head().unwrap();
-    wrong_head.block_hash = "sha256:wrong".into();
-    assert!(Declarations::reconstruct(fixture.data.path(), Some(wrong_head)).is_err());
-    std::fs::remove_file(
-        fixture
-            .data
-            .path()
-            .join(format!("log/blocks/{:09}.json.zst", blocks.len() - 1)),
-    )
-    .unwrap();
+    wrong_head.root = "sha256:wrong".into();
+    assert!(Declarations::reconstruct(&fixture.db, fixture.data.path(), Some(wrong_head)).is_err());
+    rusqlite::Connection::open(fixture.data.path().join("clave.sqlite"))
+        .unwrap()
+        .execute(
+            "DELETE FROM blocks WHERE block_number = ?1",
+            [(blocks.len() - 1) as i64],
+        )
+        .unwrap();
     assert!(fixture.restore().is_err());
 }
 
@@ -856,24 +857,7 @@ fn legacy_recovery_owners_require_authenticated_matching_history() {
             let state = fixture.restore().unwrap();
             let window = state.domains()["example.com"].window().unwrap();
             let path = fixture.data.path().join("clave.sqlite");
-            let db = clave::db::Db::open(&path).unwrap();
-            for block in blocks {
-                db.commit_seal(
-                    &[],
-                    block["header"]["block_number"].as_u64().unwrap(),
-                    &digest(&block["header"]),
-                    block["header"]["sealed_at"].as_str().unwrap(),
-                    &[],
-                    &[],
-                    &[],
-                    &[],
-                    &[],
-                    &[],
-                    &[],
-                    jcs::canonicalize(block).unwrap().len() as u64,
-                )
-                .unwrap();
-            }
+            let db = clave::db::Db::connect(&path).unwrap();
             db.open_recovery_window(
                 "example.com",
                 &serde_json::to_vec(window.head().envelope()).unwrap(),
@@ -900,12 +884,20 @@ fn legacy_recovery_owners_require_authenticated_matching_history() {
                 )
                 .unwrap();
             drop(connection);
-            let block_path = fixture.data.path().join("log/blocks/000000001.json.zst");
+            let connection = rusqlite::Connection::open(&path).unwrap();
             if mutation == "missing_block" {
-                std::fs::remove_file(&block_path).unwrap();
+                connection
+                    .execute("DELETE FROM blocks WHERE block_number = 1", [])
+                    .unwrap();
             } else if mutation == "corrupt_block" {
-                std::fs::write(&block_path, b"invalid frame").unwrap();
+                connection
+                    .execute(
+                        "UPDATE log_entries SET entry_json = ?1 WHERE leaf_index = 0",
+                        [br#"{"type":"label","body":{}}"#.as_slice()],
+                    )
+                    .unwrap();
             }
+            drop(connection);
             let restored = clave::db::Db::open(&path);
             if mutation == "none" {
                 let db = restored.unwrap();
@@ -987,7 +979,7 @@ fn candidate_sources_keep_settlement_separate_from_deadline_replacements() {
 
         let replacement = state
             .project(
-                blocks[169]["header"]["sealed_at"].as_str().unwrap(),
+                sealed_at(&blocks[169]).as_str(),
                 7,
                 0,
                 blocks[169]["entries"].as_array().unwrap(),
@@ -1051,7 +1043,7 @@ fn unsealed_candidate_followers_do_not_advance_recovery_authority() {
         let before = format!("{state:?}");
         let candidate = state
             .project(
-                blocks[3]["header"]["sealed_at"].as_str().unwrap(),
+                sealed_at(&blocks[3]).as_str(),
                 7,
                 0,
                 blocks[3]["entries"].as_array().unwrap(),
@@ -1096,10 +1088,11 @@ fn candidate_projection_requires_valid_time_profile_and_entry_order() {
     let blocks = vector["blocks"].as_array().unwrap();
     let state = Fixture::new(&blocks[..2]).restore().unwrap();
     let before = format!("{state:?}");
-    let at = blocks[2]["header"]["sealed_at"].as_str().unwrap();
+    let at = sealed_at(&blocks[2]);
+    let at = at.as_str();
     for invalid in [
-        blocks[0]["header"]["sealed_at"].as_str().unwrap(),
-        blocks[1]["header"]["sealed_at"].as_str().unwrap(),
+        sealed_at(&blocks[0]).as_str(),
+        sealed_at(&blocks[1]).as_str(),
         "2026-08-04T02:00:60Z",
         "2026-08-04T02:00:00.0Z",
         "2026-08-04T02:00:00+00:00",

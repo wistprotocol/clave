@@ -2,6 +2,122 @@
 
 use std::fs;
 
+/// Seals `entries` as Block `block_number` of the Log in `data_dir` and
+/// distributes it, for fixtures that build a Log directly rather than
+/// through admission.
+pub fn seal_fixture_block(
+    db: &clave::db::Db,
+    data_dir: &std::path::Path,
+    block_number: u64,
+    sealed_at: &str,
+    entries: &[serde_json::Value],
+) -> clave::db::BlockRow {
+    let sk = clave::keys::load(&data_dir.join("keys/seed")).unwrap();
+    let anchor = clave::history::anchor(data_dir).unwrap();
+    let mut ordered = entries.to_vec();
+    wist_core::block::sort_entries(&mut ordered).unwrap();
+    let octets = wist_core::block::block_octets(&ordered).unwrap();
+    let row = db
+        .commit_seal(
+            &sk,
+            &anchor.log_id,
+            &[],
+            block_number,
+            sealed_at,
+            &ordered,
+            octets,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+    clave::publication::recover(db, data_dir).unwrap();
+    row
+}
+
+/// Seals the Blocks a vector carries — each
+/// `{"checkpoint": <note>, "entries": [...]}` — from an empty tree,
+/// signing every Checkpoint with `sk` under the data directory's
+/// `log_id`, and returns the head.
+pub fn seal_vector_blocks(
+    db: &clave::db::Db,
+    data_dir: &std::path::Path,
+    sk: &wist_core::crypto::SigningKey,
+    blocks: &[serde_json::Value],
+) -> clave::db::BlockRow {
+    let anchor = clave::history::anchor(data_dir).unwrap();
+    rusqlite::Connection::open(data_dir.join("clave.sqlite"))
+        .unwrap()
+        .execute_batch("DELETE FROM blocks; DELETE FROM log_entries; DELETE FROM log_tiles;")
+        .unwrap();
+    let mut head = None;
+    for block in blocks {
+        let checkpoint =
+            wist_core::checkpoint::Checkpoint::parse(block["checkpoint"].as_str().unwrap())
+                .unwrap();
+        let mut entries: Vec<serde_json::Value> =
+            serde_json::from_value(block["entries"].clone()).unwrap();
+        wist_core::block::sort_entries(&mut entries).unwrap();
+        head = Some(
+            db.commit_seal(
+                sk,
+                &anchor.log_id,
+                &[],
+                checkpoint.block_number(),
+                checkpoint.sealed_at(),
+                &entries,
+                wist_core::block::block_octets(&entries).unwrap(),
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap(),
+        );
+    }
+    head.expect("a vector carries at least one Block")
+}
+
+/// The signed note of the Checkpoint the Log's static files publish as
+/// the head.
+pub fn head_checkpoint(data_dir: &std::path::Path) -> wist_core::checkpoint::Checkpoint {
+    let note = fs::read_to_string(data_dir.join("checkpoint")).unwrap();
+    wist_core::checkpoint::Checkpoint::parse(&note).unwrap()
+}
+
+/// The Entries of Block `block_number`, read back from the entry bundles
+/// the Log serves.
+pub fn served_entries(data_dir: &std::path::Path, from: u64, to: u64) -> Vec<serde_json::Value> {
+    let serving = fs::read_to_string(data_dir.join("checkpoint"))
+        .ok()
+        .and_then(|note| wist_core::checkpoint::Checkpoint::parse(&note).ok())
+        .map_or(to, |head| head.tree_size())
+        .max(to);
+    let mut leaves = Vec::new();
+    for bundle in wist_core::tiles::bundles_for_range(from, to, serving) {
+        let bytes = fs::read(data_dir.join(bundle.path().trim_start_matches('/'))).unwrap();
+        let (start, _) = bundle.leaf_range();
+        for (offset, entry) in wist_core::tiles::decode_entry_bundle(&bytes)
+            .unwrap()
+            .into_iter()
+            .enumerate()
+        {
+            let index = start + offset as u64;
+            if (from..to).contains(&index) {
+                leaves.push(entry);
+            }
+        }
+    }
+    wist_core::block::parse_entries(&leaves).unwrap()
+}
+
 pub fn spec_dir() -> std::path::PathBuf {
     std::env::var_os("WIST_SPEC_DIR")
         .map(std::path::PathBuf::from)

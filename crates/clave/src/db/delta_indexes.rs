@@ -27,7 +27,8 @@ impl Db {
         let mut indexes = Chains::default();
         let head = self.last_block()?;
         if head.is_some() {
-            let mut history = History::open(path.parent().unwrap_or_else(|| Path::new(".")), head)?;
+            let mut history =
+                History::open(self, path.parent().unwrap_or_else(|| Path::new(".")), head)?;
             let mut declarations = Declarations::default();
             while let Some(block) = history.next_block()? {
                 declarations.apply(&block)?;

@@ -131,9 +131,7 @@ fn labels_and_disputes_are_pulled_sealed_and_carried() {
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
     let r0 = clave::seal::run(&db, data.path(), &sk, SEAL_START).unwrap();
     assert_eq!((r0.block_number, r0.entry_count), (0, 2));
-    let raw = fs::read(data.path().join("log/blocks/000000000.json.zst")).unwrap();
-    let block: Value = serde_json::from_slice(&zstd::decode_all(&raw[..]).unwrap()).unwrap();
-    assert_eq!(block["entries"][1]["type"], "label");
+    assert_eq!(db.block_entries(0).unwrap()[1]["type"], "label");
     let sealed = db.sealed_labels().unwrap();
     assert_eq!(sealed.len(), 1);
     assert_eq!((sealed[0].height, sealed[0].entry_index), (0, 1));
@@ -231,11 +229,8 @@ fn labels_and_disputes_are_pulled_sealed_and_carried() {
 
     let r1 = clave::seal::run(&db, data.path(), &sk, SEAL_START + 3600).unwrap();
     assert_eq!((r1.block_number, r1.entry_count), (1, 3));
-    let raw = fs::read(data.path().join("log/blocks/000000001.json.zst")).unwrap();
-    let block: Value = serde_json::from_slice(&zstd::decode_all(&raw[..]).unwrap()).unwrap();
-    let types: Vec<&str> = block["entries"]
-        .as_array()
-        .unwrap()
+    let sealed_entries = db.block_entries(1).unwrap();
+    let types: Vec<&str> = sealed_entries
         .iter()
         .map(|e| e["type"].as_str().unwrap())
         .collect();

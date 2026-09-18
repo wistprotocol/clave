@@ -50,7 +50,7 @@ fn spawn_server_with_options(
 fn ingest_endpoint_and_status_and_static() {
     let tmp = tempfile::tempdir().unwrap();
     clave::init::run("127.0.0.1:0", tmp.path()).unwrap();
-    std::fs::write(tmp.path().join("log/checkpoint.json"), b"{}").unwrap();
+    std::fs::write(tmp.path().join("checkpoint"), b"note\n").unwrap();
     let addr = spawn_server(tmp.path());
     let c = reqwest::blocking::Client::new();
     let r = c
@@ -71,7 +71,7 @@ fn ingest_endpoint_and_status_and_static() {
         .send()
         .unwrap();
     assert_eq!(r.status(), 404);
-    let r = c.get(format!("{addr}/log/checkpoint.json")).send().unwrap();
+    let r = c.get(format!("{addr}/checkpoint")).send().unwrap();
     assert_eq!(r.status(), 200);
 }
 
@@ -79,7 +79,7 @@ fn ingest_endpoint_and_status_and_static() {
 fn serve_exposes_only_public_subtrees() {
     let tmp = tempfile::tempdir().unwrap();
     clave::init::run("127.0.0.1:0", tmp.path()).unwrap();
-    std::fs::write(tmp.path().join("log/checkpoint.json"), b"{}").unwrap();
+    std::fs::write(tmp.path().join("checkpoint"), b"note\n").unwrap();
     let addr = spawn_server(tmp.path());
     let c = reqwest::blocking::Client::new();
 
@@ -89,11 +89,82 @@ fn serve_exposes_only_public_subtrees() {
     let r = c.get(format!("{addr}/clave.sqlite")).send().unwrap();
     assert_eq!(r.status(), 404, "aggregator database must not be served");
 
-    let r = c.get(format!("{addr}/log/checkpoint.json")).send().unwrap();
+    let r = c.get(format!("{addr}/checkpoint")).send().unwrap();
     assert_eq!(r.status(), 200);
 
     let r = c.get(format!("{addr}/anchor.json")).send().unwrap();
     assert_eq!(r.status(), 200);
+
+    let r = c.get(format!("{addr}/tile/../keys/seed")).send().unwrap();
+    assert_ne!(
+        r.status(),
+        200,
+        "a tile path must not reach outside the tile directory"
+    );
+}
+
+#[test]
+fn the_log_serves_checkpoints_as_text_and_full_tiles_as_immutable_octets() {
+    let (listener, host, client) = reserve_addr();
+    let p = make_publisher_with_scope(&host, &["example.com"]);
+    let id = add_delta(&p, "https://example.com/a", "alpha body", None);
+    write_feed(&p, &host, std::slice::from_ref(&id), "2026-08-09T12:00:00Z");
+    serve_static(listener, p.dir.path().to_path_buf());
+    let tmp = tempfile::tempdir().unwrap();
+    clave::init::run(&host, tmp.path()).unwrap();
+    let db = clave::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+    db.set_param("block_cadence_seconds", 1).unwrap();
+    clave::ingest::run(&db, &client, tmp.path(), &host, "2026-08-09T12:00:00Z").unwrap();
+    let sk = clave::keys::load(&tmp.path().join("keys/seed")).unwrap();
+    clave::seal::run(&db, tmp.path(), &sk, 1_786_276_800).unwrap();
+    let size = db.last_block().unwrap().unwrap().tree_size;
+    drop(db);
+
+    let addr = spawn_server(tmp.path());
+    let c = reqwest::blocking::Client::new();
+    let header = |response: &reqwest::blocking::Response, name: &str| {
+        response
+            .headers()
+            .get(name)
+            .map(|value| value.to_str().unwrap().to_owned())
+    };
+
+    for path in ["/checkpoint", "/log/checkpoints/000000000"] {
+        let r = c.get(format!("{addr}{path}")).send().unwrap();
+        assert_eq!(r.status(), 200, "{path}");
+        assert_eq!(
+            header(&r, "content-type").as_deref(),
+            Some("text/plain; charset=utf-8"),
+            "{path}"
+        );
+        assert_eq!(
+            header(&r, "cache-control").as_deref(),
+            Some("no-store"),
+            "{path}"
+        );
+    }
+
+    let partial = format!("/tile/entries/000.p/{size}");
+    let r = c.get(format!("{addr}{partial}")).send().unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(
+        header(&r, "content-type").as_deref(),
+        Some("application/octet-stream")
+    );
+    assert_eq!(header(&r, "cache-control").as_deref(), Some("no-store"));
+
+    let full = tmp.path().join("tile/entries/000");
+    std::fs::write(&full, b"full bundle").unwrap();
+    let r = c.get(format!("{addr}/tile/entries/000")).send().unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(
+        header(&r, "content-type").as_deref(),
+        Some("application/octet-stream")
+    );
+    assert_eq!(
+        header(&r, "cache-control").as_deref(),
+        Some("public, max-age=604800, immutable")
+    );
 }
 
 #[test]

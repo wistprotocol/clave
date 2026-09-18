@@ -1,35 +1,33 @@
 use super::prepare::PreparedBlock;
-use super::{SealReport, GENESIS_KEY_ID};
+use super::SealReport;
 use crate::db::Mutation;
 use crate::db::{
     Db, ParamChangeRow, RecordUpsert, SealedDeclarationRow, SealedDisputeRow, SealedLabelRow,
     WithdrawalRow,
 };
 use crate::error::{Error, Result};
-use crate::WIST_VERSION;
 use std::path::Path;
 use wist_core::crypto::SigningKey;
-use wist_core::envelope::sign_envelope;
-use wist_core::jcs;
-use wist_core::objects::Checkpoint;
 
-/// Publishes a prepared Block: writes the Block and Checkpoint files,
-/// commits the seal with its acceptance, schedule, withdrawal and
-/// Declaration rows, records sealed windows, applies withdrawals and
-/// rebuilds the Snapshot.
+/// Commits a prepared Block — the leaves it appends to the tree, its
+/// Checkpoint and the acceptance, schedule, withdrawal and Declaration
+/// rows — then runs the distribution stage: the Entries and the tree's
+/// hashes reach their paths, the Checkpoint is archived and published,
+/// the Witnesses are asked to cosign it and the Snapshot is rebuilt.
 pub(super) fn block(
     db: &Db,
     data_dir: &Path,
     sk: &SigningKey,
+    client: &crate::fetch::Client,
     mutation: Mutation<'_>,
     prepared: PreparedBlock,
 ) -> Result<SealReport> {
     let PreparedBlock {
-        block,
-        block_hash,
+        log_id,
+        entries,
+        octets,
         block_number,
         sealed_at,
-        cap,
         seal_entries,
         sealed_rowids,
         accepted_changes,
@@ -42,23 +40,6 @@ pub(super) fn block(
         windows,
         record_updates,
     } = prepared;
-    let block_bytes = jcs::canonicalize(&serde_json::to_value(&block)?)?;
-    if block_bytes.len() as u64 > cap as u64 {
-        return Err(Error::Seal(
-            "serialized Block exceeds the decompressed cap".into(),
-        ));
-    }
-
-    let checkpoint = Checkpoint {
-        wist_version: WIST_VERSION.into(),
-        block_number,
-        block_hash: block_hash.clone(),
-        sealed_at: sealed_at.clone(),
-    };
-    let checkpoint_value = serde_json::to_value(&checkpoint)?;
-    let checkpoint_envelope = sign_envelope(&checkpoint_value, "checkpoint", GENESIS_KEY_ID, sk)?;
-    let checkpoint_bytes = serde_json::to_vec(&checkpoint_envelope)?;
-
     let records: Vec<RecordUpsert> = record_updates
         .iter()
         .map(|r| RecordUpsert {
@@ -153,11 +134,14 @@ pub(super) fn block(
             declaration_json: json,
         })
         .collect();
-    db.commit_seal(
+    let sealed = db.commit_seal(
+        sk,
+        &log_id,
         &sealed_rowids,
         block_number,
-        &block_hash,
         &sealed_at,
+        &entries,
+        octets,
         &records,
         &param_changes,
         &withdrawal_rows,
@@ -165,9 +149,7 @@ pub(super) fn block(
         &label_rows,
         &dispute_rows,
         &declaration_rows,
-        block_bytes.len() as u64,
     )?;
-    db.record_publication(block_number, &block_bytes, &checkpoint_bytes)?;
 
     for activation in &projection.effects().activations {
         let publisher = crate::declaration::publisher_of(activation.activated.envelope())
@@ -201,8 +183,10 @@ pub(super) fn block(
         )?;
     }
     mutation.commit()?;
-    crate::publication::publish(data_dir, block_number, &block_bytes, &checkpoint_bytes)?;
-    db.mark_published(block_number)?;
+    crate::publication::recover(db, data_dir)?;
+    if let Err(error) = crate::witness::submit_head(db, client, data_dir) {
+        tracing::warn!(%error, "witness submission did not complete");
+    }
 
     if !withdrawals.is_empty() {
         for delta_id in withdrawals.iter().map(|w| &w.delta_id) {
@@ -229,7 +213,8 @@ pub(super) fn block(
         data_dir,
         sk,
         block_number,
-        &block_hash,
+        sealed.tree_size,
+        &sealed.root,
         &snapshot_date,
         projection.domains(),
     )?;

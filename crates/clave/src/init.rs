@@ -8,7 +8,10 @@ use wist_core::objects::{Anchor, GenesisKey};
 
 const GENESIS_KEY_ID: &str = "log1";
 
-pub fn run(log_id: &str, data_dir: &Path) -> Result<()> {
+/// Initializes a data directory and returns the signed-note verifier
+/// key of its genesis Aggregator key, the form in which the key is
+/// configured at a Witness (WIST-3 §3.4).
+pub fn run(log_id: &str, data_dir: &Path) -> Result<String> {
     std::fs::create_dir_all(data_dir)?;
 
     let (seed, sk) = keys::generate();
@@ -37,9 +40,9 @@ pub fn run(log_id: &str, data_dir: &Path) -> Result<()> {
     std::fs::write(data_dir.join("anchor.json"), bytes)?;
 
     for dir in [
-        "log/blocks",
         "log/checkpoints",
         "log/suffix-lists",
+        "tile/entries",
         "payloads",
         "snapshots",
     ] {
@@ -52,8 +55,18 @@ pub fn run(log_id: &str, data_dir: &Path) -> Result<()> {
             db.set_param(spec.name, default)?;
         }
     }
+    let verifier_key = wist_core::checkpoint::verifier_key(log_id, &sk.public());
+    db.admit_aggregator_key(
+        &wist_core::crypto::hex_encode(&wist_core::checkpoint::aggregator_key_id(
+            log_id,
+            &sk.public(),
+        )),
+        GENESIS_KEY_ID,
+        &keys::public_b64u(&seed),
+        0,
+    )?;
 
-    Ok(())
+    Ok(verifier_key)
 }
 
 #[cfg(test)]
@@ -71,7 +84,7 @@ mod tests {
         wist_core::envelope::verify_envelope(&doc, "anchor", &sk.public()).unwrap();
         let parsed: wist_core::objects::LogAnchorEnvelope = serde_json::from_value(doc).unwrap();
         assert_eq!(parsed.anchor.log_id, "127.0.0.1:8080");
-        for d in ["log/blocks", "log/checkpoints", "payloads", "snapshots"] {
+        for d in ["log/checkpoints", "tile/entries", "payloads", "snapshots"] {
             assert!(tmp.path().join(d).is_dir());
         }
         let db = crate::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();

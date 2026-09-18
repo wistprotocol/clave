@@ -158,6 +158,93 @@ struct IngestRequest {
     host: String,
 }
 
+/// WIST-3 §6 and [tlog-tiles]: the head Checkpoint and the archive are
+/// text served without caching, since both are rewritten — the head at
+/// every Block, an archived note whenever a Cosignature is added.
+const NOTE_CONTENT_TYPE: &str = "text/plain; charset=utf-8";
+const NO_CACHE: &str = "no-store";
+/// A full tile or entry bundle never changes once written, so it is
+/// cached as the immutable file it is.
+const TILE_CONTENT_TYPE: &str = "application/octet-stream";
+const IMMUTABLE_CACHE: &str = "public, max-age=604800, immutable";
+
+/// Resolves a served path under `root`, refusing any component that is
+/// not an ordinary name so no request reaches outside the directory.
+fn under(root: &std::path::Path, relative: &str) -> Option<PathBuf> {
+    let mut path = root.to_path_buf();
+    for component in std::path::Path::new(relative).components() {
+        match component {
+            std::path::Component::Normal(name) => path.push(name),
+            _ => return None,
+        }
+    }
+    Some(path)
+}
+
+async fn serve_file(
+    path: Option<PathBuf>,
+    content_type: &'static str,
+    cache_control: &'static str,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Some(path) = path else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => (
+            [
+                (axum::http::header::CONTENT_TYPE, content_type),
+                (axum::http::header::CACHE_CONTROL, cache_control),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn checkpoint_handler(State(state): State<AppState>) -> axum::response::Response {
+    serve_file(
+        Some(crate::publication::head_path(&state.data_dir)),
+        NOTE_CONTENT_TYPE,
+        NO_CACHE,
+    )
+    .await
+}
+
+/// Serves `/tile/<L>/<N>` and `/tile/entries/<N>`, full ones as the
+/// immutable files they are and partial ones — the `.p/<W>` paths a head
+/// size requires — without caching, because they stop being served once
+/// the full tile exists.
+async fn tile_handler(
+    State(state): State<AppState>,
+    Path(rest): Path<String>,
+) -> axum::response::Response {
+    let partial = rest.contains(".p/");
+    serve_file(
+        under(&state.data_dir.join("tile"), &rest),
+        TILE_CONTENT_TYPE,
+        if partial { NO_CACHE } else { IMMUTABLE_CACHE },
+    )
+    .await
+}
+
+async fn log_handler(
+    State(state): State<AppState>,
+    Path(rest): Path<String>,
+) -> axum::response::Response {
+    let path = under(&state.data_dir.join("log"), &rest);
+    if rest.starts_with("checkpoints/") {
+        return serve_file(path, NOTE_CONTENT_TYPE, NO_CACHE).await;
+    }
+    let content_type = if rest.ends_with(".json") {
+        "application/json"
+    } else {
+        TILE_CONTENT_TYPE
+    };
+    serve_file(path, content_type, IMMUTABLE_CACHE).await
+}
+
 fn now_utc() -> String {
     jiff::Timestamp::from_second(jiff::Timestamp::now().as_second())
         .expect("current epoch second is in range")
@@ -316,7 +403,9 @@ pub fn run_with_options(
     let app = Router::new()
         .route("/ingest", post(ingest_handler))
         .route("/status/:domain", get(status_handler))
-        .nest_service("/log", ServeDir::new(data_dir.join("log")))
+        .route("/checkpoint", get(checkpoint_handler))
+        .route("/tile/*path", get(tile_handler))
+        .route("/log/*path", get(log_handler))
         .nest_service("/payloads", ServeDir::new(data_dir.join("payloads")))
         .nest_service("/snapshots", ServeDir::new(data_dir.join("snapshots")))
         .route_service("/anchor.json", ServeFile::new(data_dir.join("anchor.json")))

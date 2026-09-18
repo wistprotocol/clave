@@ -69,8 +69,13 @@ impl PayloadLocations {
 }
 
 impl PayloadSource {
-    pub fn reconstruct(directory: &Path, head: Option<BlockRow>, delta_id: &str) -> Result<Self> {
-        let delta = DeltaSource::reconstruct(directory, head, delta_id)?;
+    pub fn reconstruct(
+        db: &crate::db::Db,
+        directory: &Path,
+        head: Option<BlockRow>,
+        delta_id: &str,
+    ) -> Result<Self> {
+        let delta = DeltaSource::reconstruct(db, directory, head, delta_id)?;
         Self::from_delta(delta)
     }
 

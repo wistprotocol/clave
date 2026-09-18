@@ -245,11 +245,13 @@ fn corrupt_history_after_the_predecessor_stops_admission() {
         "2026-08-09T16:00:00Z",
         || {
             calls.set(calls.get() + 1);
-            std::fs::write(
-                data.path().join("log/blocks/000000001.json.zst"),
-                b"corrupt",
-            )
-            .unwrap();
+            rusqlite::Connection::open(data.path().join("clave.sqlite"))
+                .unwrap()
+                .execute(
+                    "UPDATE log_entries SET entry_json = ?1 WHERE leaf_index = 0",
+                    [br#"{"type":"label","body":{}}"#.as_slice()],
+                )
+                .unwrap();
             "2026-08-09T16:00:00Z".parse().unwrap()
         },
     );
@@ -495,50 +497,41 @@ fn predecessor_retrieval_suspends_without_rejection_and_resumes_after_restart() 
     assert_eq!(db.url_tip(&host, URL).unwrap(), Some(last));
 }
 
-fn replace_blocks(data: &std::path::Path, blocks: &[Value]) {
-    use wist_core::{block, crypto, jcs, merkle};
+/// Reseals the Log from `blocks` — `(sealed_at, Entries)` per height —
+/// so a fixture can replace what the retained history says and still
+/// hold a tree its Checkpoints state.
+fn replace_blocks(data: &std::path::Path, blocks: &[(String, Vec<Value>)]) {
+    use wist_core::block;
     let key = clave::keys::load(&data.join("keys/seed")).unwrap();
-    let connection = rusqlite::Connection::open(data.join("clave.sqlite")).unwrap();
-    let mut previous = "sha256:genesis".to_string();
-    for original in blocks {
-        let mut doc = original.clone();
-        let entries = doc["entries"].as_array_mut().unwrap();
-        entries.sort_by_key(|entry| {
-            (
-                if entry["type"] == "publisher_declaration" {
-                    0
-                } else {
-                    2
-                },
-                merkle::leaf_hash(&jcs::canonicalize(entry).unwrap()),
-            )
-        });
-        let leaves: Vec<_> = entries
-            .iter()
-            .map(|entry| merkle::leaf_hash(&jcs::canonicalize(entry).unwrap()))
-            .collect();
-        let root = if leaves.is_empty() {
-            merkle::leaf_hash(&[])
-        } else {
-            merkle::merkle_root(&leaves).unwrap()
-        };
-        doc["header"]["entry_count"] = json!(entries.len());
-        doc["header"]["merkle_root"] = json!(format!("sha256:{}", crypto::hex_encode(&root)));
-        doc["header"]["prev_block_hash"] = json!(previous);
-        doc["sig"]["value"] = json!(key.sign(&jcs::canonicalize(&doc["header"]).unwrap()));
-        previous = block::block_hash(&doc["header"]).unwrap();
-        let height = doc["header"]["block_number"].as_u64().unwrap();
-        let raw = jcs::canonicalize(&doc).unwrap();
-        std::fs::write(
-            data.join(format!("log/blocks/{height:09}.json.zst")),
-            zstd::bulk::compress(&raw, 1).unwrap(),
+    let anchor = clave::history::anchor(data).unwrap();
+    let database = data.join("clave.sqlite");
+    rusqlite::Connection::open(&database)
+        .unwrap()
+        .execute_batch("DELETE FROM blocks; DELETE FROM log_entries; DELETE FROM log_tiles;")
+        .unwrap();
+    let db = Db::connect(&database).unwrap();
+    for (height, (sealed_at, entries)) in blocks.iter().enumerate() {
+        let mut ordered = entries.clone();
+        block::sort_entries(&mut ordered).unwrap();
+        db.commit_seal(
+            &key,
+            &anchor.log_id,
+            &[],
+            height as u64,
+            sealed_at,
+            &ordered,
+            block::block_octets(&ordered).unwrap(),
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
         )
         .unwrap();
-        connection.execute(
-            "UPDATE blocks SET block_hash = ?1, decompressed_bytes = ?2 WHERE block_number = ?3",
-            (&previous, raw.len() as i64, height as i64),
-        ).unwrap();
     }
+    clave::publication::recover(&db, data).unwrap();
 }
 
 #[test]
@@ -571,16 +564,16 @@ fn sealed_predecessors_require_authored_connected_history_before_admission() {
         let at = NOW.parse::<jiff::Timestamp>().unwrap().as_second();
         clave::seal::run(&db, data.path(), &key, at).unwrap();
         clave::seal::run(&db, data.path(), &key, at + 3600).unwrap();
-        let originals: Vec<Value> = (0..2)
+        let originals: Vec<(String, Vec<Value>)> = (0..2)
             .map(|height| {
-                let raw =
-                    std::fs::read(data.path().join(format!("log/blocks/{height:09}.json.zst")))
-                        .unwrap();
-                serde_json::from_slice(&zstd::stream::decode_all(raw.as_slice()).unwrap()).unwrap()
+                (
+                    db.block_at(height).unwrap().unwrap().sealed_at,
+                    db.block_entries(height).unwrap(),
+                )
             })
             .collect();
         let mut altered = originals.clone();
-        let entries = altered[0]["entries"].as_array_mut().unwrap();
+        let entries = &mut altered[0].1;
         let index = entries
             .iter()
             .position(|entry| {
@@ -619,11 +612,11 @@ fn sealed_predecessors_require_authored_connected_history_before_admission() {
             if fault == "late_signature" {
                 doc["sig"]["value"] = json!(crypto::b64u_encode(&[0; 64]));
             }
-            altered[1]["entries"] = json!([{"type":"publisher_delta", "body":doc}]);
+            altered[1].1 = vec![json!({"type":"publisher_delta", "body":doc})];
         }
         replace_blocks(data.path(), &altered);
         let mut history =
-            clave::history::History::open(data.path(), db.last_block().unwrap()).unwrap();
+            clave::history::History::open(&db, data.path(), db.last_block().unwrap()).unwrap();
         while history.next_block().unwrap().is_some() {}
         drop(db);
         let next = add(&p, Some(&tip), "2026-08-09T12:00:03Z");
@@ -714,6 +707,7 @@ fn sealed_predecessor_keeps_its_historical_authority_after_rotation_and_restart(
     assert!(report.rejected.is_empty());
     assert_eq!(db.url_tip(&host, URL).unwrap(), Some(next));
     let source = clave::history::deltas::DeltaSource::reconstruct(
+        &db,
         data.path(),
         db.last_block().unwrap(),
         &first,

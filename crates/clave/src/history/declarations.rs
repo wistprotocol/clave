@@ -1,5 +1,5 @@
 use super::{History, VerifiedBlock};
-use crate::db::BlockRow;
+use crate::db::{BlockRow, Db};
 use crate::error::Result;
 use std::path::Path;
 
@@ -10,13 +10,13 @@ pub use wist_core::declarations::{
 
 /// Replay over the authenticated Block history the aggregator retains.
 pub trait DeclarationsReplay: Sized {
-    fn reconstruct(directory: &Path, head: Option<BlockRow>) -> Result<Self>;
+    fn reconstruct(db: &Db, directory: &Path, head: Option<BlockRow>) -> Result<Self>;
     fn apply(&mut self, verified: &VerifiedBlock) -> Result<Effects>;
 }
 
 impl DeclarationsReplay for Declarations {
-    fn reconstruct(directory: &Path, head: Option<BlockRow>) -> Result<Self> {
-        let mut history = History::open(directory, head)?;
+    fn reconstruct(db: &Db, directory: &Path, head: Option<BlockRow>) -> Result<Self> {
+        let mut history = History::open(db, directory, head)?;
         let mut state = Self::default();
         while let Some(block) = history.next_block()? {
             state.apply(&block)?;
@@ -25,15 +25,13 @@ impl DeclarationsReplay for Declarations {
     }
 
     fn apply(&mut self, verified: &VerifiedBlock) -> Result<Effects> {
-        let block = verified.block();
         Ok(self.apply_block(
-            block.header.block_number,
-            &block.header.prev_block_hash,
-            verified.hash(),
-            &block.header.sealed_at,
+            verified.block_number(),
+            verified.root(),
+            verified.sealed_at(),
             verified.recovery_window_days,
             verified.declaration_activation_blocks,
-            &block.entries,
+            verified.entries(),
         )?)
     }
 }

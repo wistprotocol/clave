@@ -1,5 +1,4 @@
 mod common;
-use std::path::Path;
 
 const NOW: i64 = 1_800_000_000;
 const DAY: i64 = 86400;
@@ -20,9 +19,8 @@ fn setup() -> (
     (data, db, sk)
 }
 
-fn read_block(data: &Path, number: u64) -> serde_json::Value {
-    let raw = std::fs::read(data.join(format!("log/blocks/{number:09}.json.zst"))).unwrap();
-    serde_json::from_slice(&zstd::decode_all(&raw[..]).unwrap()).unwrap()
+fn read_entries(db: &clave::db::Db, number: u64) -> Vec<serde_json::Value> {
+    db.block_entries(number).unwrap()
 }
 
 #[test]
@@ -34,8 +32,8 @@ fn seal_includes_valid_parameter_change_and_applies_it_at_effective_at() {
     assert_eq!(seal.entry_count, 1);
     assert!(seal.dropped.is_empty());
 
-    let block = read_block(data.path(), 0);
-    let entry = &block["entries"][0];
+    let entries = read_entries(&db, 0);
+    let entry = &entries[0];
     assert_eq!(entry["type"], "registry_update");
     wist_core::envelope::verify_envelope(&entry["body"], "update", &sk.public()).unwrap();
     assert_eq!(
@@ -65,8 +63,7 @@ fn seal_drops_and_reports_parameter_change_gone_stale_in_queue() {
     assert_eq!(seal.dropped.len(), 1);
     assert!(seal.dropped[0].contains("feed_window"));
 
-    let block = read_block(data.path(), 0);
-    assert_eq!(block["header"]["entry_count"], 0);
+    assert!(read_entries(&db, 0).is_empty());
     let (pending, _) = db.peek_pending_entries().unwrap();
     assert!(pending.is_empty());
     assert_eq!(

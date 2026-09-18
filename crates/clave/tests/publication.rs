@@ -1,6 +1,9 @@
 mod common;
 
-use common::{add_delta, make_publisher_with_scope, reserve_addr, serve_static, write_feed};
+use common::{
+    add_delta, head_checkpoint, make_publisher_with_scope, reserve_addr, serve_static,
+    served_entries, write_feed,
+};
 use std::path::Path;
 
 const SEAL_START: i64 = 1_786_276_800;
@@ -11,15 +14,6 @@ fn sealed_store(host: &str, client: &clave::fetch::Client, data: &Path) -> clave
     db.set_param("block_cadence_seconds", 1).unwrap();
     clave::ingest::run(&db, client, data, host, "2026-08-09T12:00:00Z").unwrap();
     db
-}
-
-fn decoded_block(data: &Path, number: u64) -> Vec<u8> {
-    zstd::decode_all(
-        std::fs::read(data.join(format!("log/blocks/{number:09}.json.zst")))
-            .unwrap()
-            .as_slice(),
-    )
-    .unwrap()
 }
 
 fn leftovers(dir: &Path) -> Vec<String> {
@@ -35,7 +29,7 @@ fn leftovers(dir: &Path) -> Vec<String> {
 }
 
 #[test]
-fn a_seal_records_its_bytes_before_publishing_them_durably() {
+fn a_seal_records_its_checkpoint_before_publishing_the_tree_it_states() {
     let (listener, host, client) = reserve_addr();
     let p = make_publisher_with_scope(&host, &["example.com"]);
     let id = add_delta(&p, "https://example.com/a", "alpha body", None);
@@ -47,19 +41,23 @@ fn a_seal_records_its_bytes_before_publishing_them_durably() {
 
     clave::seal::run(&db, data.path(), &sk, SEAL_START).unwrap();
 
-    let (number, block_json, checkpoint_json) = db.head_publication().unwrap().unwrap();
+    let (number, note) = db.head_publication().unwrap().unwrap();
     assert_eq!(number, 0);
-    assert_eq!(decoded_block(data.path(), 0), block_json);
     assert_eq!(
-        std::fs::read(data.path().join("log/checkpoints/000000000.json")).unwrap(),
-        checkpoint_json
+        std::fs::read_to_string(data.path().join("checkpoint")).unwrap(),
+        note
     );
     assert_eq!(
-        std::fs::read(data.path().join("log/checkpoint.json")).unwrap(),
-        checkpoint_json
+        std::fs::read_to_string(data.path().join("log/checkpoints/000000000")).unwrap(),
+        note
+    );
+    let head = head_checkpoint(data.path());
+    assert_eq!(
+        served_entries(data.path(), 0, head.tree_size()),
+        db.block_entries(0).unwrap()
     );
     assert!(db.unpublished_publications().unwrap().is_empty());
-    for dir in ["log", "log/blocks", "log/checkpoints"] {
+    for dir in ["log", "log/checkpoints", "tile/0", "tile/entries"] {
         assert!(leftovers(&data.path().join(dir)).is_empty(), "{dir}");
     }
     assert!(clave::publication::recover(&db, data.path())
@@ -69,7 +67,7 @@ fn a_seal_records_its_bytes_before_publishing_them_durably() {
 
 #[cfg(unix)]
 #[test]
-fn a_publication_interrupted_after_its_commit_is_finished_with_the_recorded_bytes() {
+fn a_publication_interrupted_after_its_commit_is_finished_from_the_stored_checkpoint() {
     use std::os::unix::fs::PermissionsExt;
     let (listener, host, client) = reserve_addr();
     let p = make_publisher_with_scope(&host, &["example.com"]);
@@ -87,43 +85,33 @@ fn a_publication_interrupted_after_its_commit_is_finished_with_the_recorded_byte
     std::fs::set_permissions(&checkpoints, std::fs::Permissions::from_mode(0o700)).unwrap();
     assert!(failed.is_err(), "publication could not complete");
 
-    let (number, block_json, checkpoint_json) = db.head_publication().unwrap().unwrap();
+    let (number, note) = db.head_publication().unwrap().unwrap();
     assert_eq!(number, 0);
     assert_eq!(db.unpublished_publications().unwrap().len(), 1);
+    let head = wist_core::checkpoint::Checkpoint::parse(&note).unwrap();
     assert_eq!(
-        decoded_block(data.path(), 0),
-        block_json,
-        "the Block file is published before its Checkpoint"
+        served_entries(data.path(), 0, head.tree_size()),
+        db.block_entries(0).unwrap(),
+        "the Entries reach their bundles before the Checkpoint is archived"
     );
     assert!(
-        !data.path().join("log/checkpoint.json").exists(),
-        "no Checkpoint is published before its Block and numbered copy are durable"
+        !data.path().join("checkpoint").exists(),
+        "no Checkpoint is published before its archive copy is durable"
     );
     assert_eq!(db.last_block().unwrap().unwrap().block_number, 0);
 
     let report = clave::seal::run(&db, data.path(), &sk, SEAL_START + 3600).unwrap();
     assert_eq!(report.block_number, 1);
-    assert_eq!(decoded_block(data.path(), 0), block_json);
     assert_eq!(
-        std::fs::read(checkpoints.join("000000000.json")).unwrap(),
-        checkpoint_json
+        std::fs::read_to_string(checkpoints.join("000000000")).unwrap(),
+        note
     );
     assert!(db.unpublished_publications().unwrap().is_empty());
-    let head: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(data.path().join("log/checkpoint.json")).unwrap())
-            .unwrap();
-    assert_eq!(head["checkpoint"]["block_number"], 1);
-    let block1: serde_json::Value = serde_json::from_slice(&decoded_block(data.path(), 1)).unwrap();
-    let block0: serde_json::Value = serde_json::from_slice(&block_json).unwrap();
-    wist_core::block::verify_chain_link(
-        &block1["header"],
-        &wist_core::block::block_hash(&block0["header"]).unwrap(),
-    )
-    .unwrap();
+    assert_eq!(head_checkpoint(data.path()).block_number(), 1);
 }
 
 #[test]
-fn a_head_whose_files_went_missing_is_republished_from_the_record() {
+fn a_head_whose_files_went_missing_is_republished_from_the_store() {
     let (listener, host, client) = reserve_addr();
     let p = make_publisher_with_scope(&host, &["example.com"]);
     let id = add_delta(&p, "https://example.com/a", "alpha body", None);
@@ -133,28 +121,29 @@ fn a_head_whose_files_went_missing_is_republished_from_the_record() {
     let db = sealed_store(&host, &client, data.path());
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
     clave::seal::run(&db, data.path(), &sk, SEAL_START).unwrap();
-    let before = std::fs::read(data.path().join("log/checkpoint.json")).unwrap();
-    let block_before = std::fs::read(data.path().join("log/blocks/000000000.json.zst")).unwrap();
+    let head = head_checkpoint(data.path());
+    let note = std::fs::read(data.path().join("checkpoint")).unwrap();
+    let bundle = data
+        .path()
+        .join(format!("tile/entries/000.p/{}", head.tree_size()));
+    let bundle_before = std::fs::read(&bundle).unwrap();
 
-    std::fs::remove_file(data.path().join("log/blocks/000000000.json.zst")).unwrap();
-    std::fs::write(data.path().join("log/checkpoint.json"), b"{}").unwrap();
+    std::fs::remove_file(&bundle).unwrap();
+    std::fs::write(data.path().join("checkpoint"), b"broken").unwrap();
 
     assert_eq!(
         clave::publication::recover(&db, data.path()).unwrap(),
         vec![0]
     );
-    assert_eq!(
-        std::fs::read(data.path().join("log/blocks/000000000.json.zst")).unwrap(),
-        block_before
-    );
-    assert_eq!(
-        std::fs::read(data.path().join("log/checkpoint.json")).unwrap(),
-        before
-    );
+    assert_eq!(std::fs::read(&bundle).unwrap(), bundle_before);
+    assert_eq!(std::fs::read(data.path().join("checkpoint")).unwrap(), note);
+    assert!(clave::publication::recover(&db, data.path())
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
-fn a_torn_head_block_file_is_repaired_but_a_different_block_is_refused() {
+fn a_torn_head_tile_is_repaired_from_the_stored_tree() {
     let (listener, host, client) = reserve_addr();
     let p = make_publisher_with_scope(&host, &["example.com"]);
     let id = add_delta(&p, "https://example.com/a", "alpha body", None);
@@ -164,31 +153,55 @@ fn a_torn_head_block_file_is_repaired_but_a_different_block_is_refused() {
     let db = sealed_store(&host, &client, data.path());
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
     clave::seal::run(&db, data.path(), &sk, SEAL_START).unwrap();
-    clave::seal::run(&db, data.path(), &sk, SEAL_START + 3600).unwrap();
-    let head = data.path().join("log/blocks/000000001.json.zst");
-    let recorded = std::fs::read(&head).unwrap();
+    let head = head_checkpoint(data.path());
+    let tile = data
+        .path()
+        .join(format!("tile/0/000.p/{}", head.tree_size()));
+    let recorded = std::fs::read(&tile).unwrap();
 
-    std::fs::write(&head, &recorded[..recorded.len() / 2]).unwrap();
+    std::fs::write(&tile, &recorded[..recorded.len() / 2]).unwrap();
     assert_eq!(
         clave::publication::recover(&db, data.path()).unwrap(),
-        vec![1]
+        vec![0]
     );
-    assert_eq!(std::fs::read(&head).unwrap(), recorded);
-
-    let mut other: serde_json::Value =
-        serde_json::from_slice(&decoded_block(data.path(), 1)).unwrap();
-    other["header"]["sealed_at"] = serde_json::json!("2026-08-09T13:00:01Z");
-    let encoded = zstd::bulk::compress(
-        &wist_core::jcs::canonicalize(&other).unwrap(),
-        zstd::DEFAULT_COMPRESSION_LEVEL,
-    )
-    .unwrap();
-    std::fs::write(&head, encoded).unwrap();
-    let err = clave::publication::recover(&db, data.path()).unwrap_err();
-    assert!(err.to_string().contains("on disk hashes to"), "{err}");
-    assert!(clave::seal::run(&db, data.path(), &sk, SEAL_START + 7200).is_err());
-    std::fs::write(&head, &recorded).unwrap();
+    assert_eq!(std::fs::read(&tile).unwrap(), recorded);
     assert!(clave::publication::recover(&db, data.path())
         .unwrap()
         .is_empty());
+}
+
+#[test]
+fn the_head_checkpoint_never_names_entries_the_log_does_not_serve() {
+    let (listener, host, client) = reserve_addr();
+    let p = make_publisher_with_scope(&host, &["example.com"]);
+    let ids: Vec<String> = (0..3)
+        .map(|i| add_delta(&p, &format!("https://example.com/p{i}"), "body", None))
+        .collect();
+    write_feed(&p, &host, &ids, "2026-08-09T12:00:00Z");
+    serve_static(listener, p.dir.path().to_path_buf());
+    let data = tempfile::tempdir().unwrap();
+    let db = sealed_store(&host, &client, data.path());
+    let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
+
+    for (index, at) in [SEAL_START, SEAL_START + 3600, SEAL_START + 7200]
+        .into_iter()
+        .enumerate()
+    {
+        clave::seal::run(&db, data.path(), &sk, at).unwrap();
+        let head = head_checkpoint(data.path());
+        assert_eq!(head.block_number(), index as u64);
+        let entries = served_entries(data.path(), 0, head.tree_size());
+        assert_eq!(entries.len() as u64, head.tree_size());
+        let leaves: Vec<[u8; 32]> = entries
+            .iter()
+            .map(|entry| {
+                wist_core::merkle::leaf_hash(&wist_core::jcs::canonicalize(entry).unwrap())
+            })
+            .collect();
+        assert_eq!(
+            wist_core::merkle::merkle_root(&leaves),
+            *head.root(),
+            "the served Entries reproduce the root the head Checkpoint states"
+        );
+    }
 }

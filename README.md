@@ -5,14 +5,19 @@ The signed Delta format targets [WIST specification revision `5eccdedc156c8e13e6
 Delta ingestion checks the signed canonical `publisher` against the logical Feed domain before source selection and duplicate suppression, including fetched predecessors. Chain tips use `(publisher, url)` and persist across reopen; legacy index restoration is described under [Delta index reconciliation](#delta-index-reconciliation). Sealing and recovery settlement reject mismatches between queue ownership and the signed author. Complete authenticated Delta eligibility remains a separate validation requirement.
 
 WIST Protocol aggregator. Clave pulls signed Deltas from Publishers through
-ping + pull, validates them, and seals hourly hash-chained Blocks. It serves
-the Log, Checkpoints and periodic Snapshots over HTTP for Consumer sync.
+ping + pull, validates them, and seals hourly Blocks into one growing
+RFC 6962 Merkle tree. It serves that tree as C2SP tlog-tiles tiles and entry
+bundles, its head and archived Checkpoints as signed notes, and periodic
+Snapshots over HTTP for Consumer sync.
 
-Subcommands: `init` (generate the log's genesis key and local store),
-`serve` (HTTP ingest + read endpoints), `seal` (cut the next Block from
-pending entries and chain it at the wall clock floored to the accepted
-cadence grid, or at `--at <whole-second UTC instant>` for a test Log that
-advances Log time faster than the clock), `snapshot` (build a signed, verifiable
+Subcommands: `init` (generate the log's genesis key and local store, and
+print the signed-note verifier key a Witness is configured with),
+`serve` (HTTP ingest + read endpoints), `seal` (append the next Block's
+Entries to the tree and publish its Checkpoint at the wall clock floored
+to the accepted cadence grid, or at `--at <whole-second UTC instant>` for
+a test Log that advances Log time faster than the clock), `witness`
+(maintain the Witnesses each sealed Checkpoint is submitted to),
+`snapshot` (build a signed, verifiable
 point-in-time index for cold-start sync), `param-change` (queue a signed
 `parameter_change` Registry Update, WIST-4 §5: bounds and combination
 rules checked, `effective_at` held past the grace period, applied to the
@@ -194,24 +199,81 @@ waiting bound is refused with 503 and `Retry-After: 30`, is not queued,
 and counts as neither noise nor a pull, so the Publisher retries later
 under its own backoff. Quota (429) is answered before admission.
 
-## Sealing publication and recovery
+## The tree, its static layout and distribution
 
-A seal commits the Block row, the acceptance records, the schedule and
-governance rows and the exact Block and Checkpoint bytes it signed in one
-store transaction before any file is written (WIST-3 §5). Publication
-then writes each file through a sibling temporary file, syncing the file
-and its directory: the Block file first, then the numbered Checkpoint
-copy, then `/log/checkpoint.json`, so no Checkpoint names a Block that is
-not yet durable and retrievable. The store marks the height published
-only after the last write. `seal` and `serve` start by finishing every
-publication the store committed to that the disk does not hold as
-recorded, republishing the recorded bytes and never sealing or signing
-the height again; a restart therefore honors every Checkpoint it may
-have served. A missing, torn or re-encoded head Block file is repaired
-from the record; a head file holding a different Block is refused, since
-the store and the disk then disagree beyond a torn write. Lower Blocks
-are checked by `verify-history` and reopening, not at every start.
-Snapshot files follow the same seal outside that record.
+The Log is one growing RFC 6962 tree over SHA-256 (WIST-3 §4). The store
+holds it durably: the leaf data of every Entry at its leaf index, and the
+[tlog-tiles] tile hashes, so a Block is appended without rehashing
+history. Block N's row records its number, the tree size and root its
+Checkpoint states, its `sealed_at`, the octets its Entries occupy in
+entry bundles, and the signed note itself with every signature line it
+has obtained.
+
+Sealing (WIST-3 §3.2) and distribution (WIST-3 §5, §6) are separate
+stages. Sealing is one store transaction: it selects the eligible
+Entries, holds out any whose JCS serialization exceeds 65 535 octets
+(reported with the Block's drops), orders them canonically, bounds the
+Block by `block_decompressed_cap_bytes` counted as the sum over its
+Entries of each JCS serialization plus two, appends their leaves at
+`size(N-1)`, and signs Checkpoint N — origin, tree size, root,
+`block_number` and `sealed_at` — with the Aggregator key. An empty Block
+restates the previous size and root.
+
+Distribution runs after the commit, is idempotent and restart-safe, and
+writes each file through a sibling temporary file, syncing the file and
+its directory. For every Block the store committed but has not marked
+published, lowest first: the entry bundles and tiles the Block's leaves
+reach, then `/log/checkpoints/<9-digit block number>`, then `/checkpoint`
+last. No Checkpoint is therefore published before every Entry below its
+tree size is durably stored and retrievable at its path. A full tile or
+bundle is immutable once written, and the partial files at an index are
+removed on the run that first writes the full one. `seal` and `serve`
+start by running distribution, which finishes every interrupted
+publication and restores any file of the head Block the disk has lost or
+left torn; lower Blocks are checked by `verify-history` and reopening,
+not at every start. Snapshot files follow the same seal outside that
+record.
+
+The served layout is:
+
+```
+/checkpoint                       (the head Checkpoint, a signed note)
+/tile/<L>/<N>[.p/<W>]             (tree hashes, 256 per full tile)
+/tile/entries/<N>[.p/<W>]         (entry bundles: the leaf data)
+/log/checkpoints/<block_number>   (every Checkpoint published)
+/log/anchor.json /log/mirrors.json /log/suffix-lists/<hex>.dat
+/payloads/<delta-id-hex>.json
+/snapshots/...
+```
+
+`serve` sends `/checkpoint` and the archive as
+`text/plain; charset=utf-8` with `Cache-Control: no-store`, because both
+are rewritten — the head at every Block and an archived note whenever a
+Cosignature is added. Full tiles and entry bundles are
+`application/octet-stream` with `public, max-age=604800, immutable`;
+partial ones carry the same media type without caching, because they
+stop being served once the full tile exists.
+
+## Witness cosignatures
+
+`clave witness --data <dir> --add <verifier key> --url <base>` records a
+Witness; `--remove <name>` drops one and no argument lists them. The
+verifier key is the signed-note string `<name>+<hex key ID>+<base64 key>`
+of the Ed25519 cosignature/v1 type, and the store keeps the tree size each
+Witness last cosigned. Default: no Witness, and a Log with none behaves
+exactly as before.
+
+After the archive write, each seal submits the head Checkpoint to every
+configured Witness through [tlog-witness]'s `add-checkpoint`: the body is
+`old <size>`, the Consistency Proof from that size one base64 hash per
+line, a blank line, then the note. A 409 answer states the size the
+Witness holds; the submission is retried once from it. Every returned
+Cosignature is verified under the configured key over the note text
+before it is accepted; it is then appended to the stored note, whose text
+never changes, and the archive and `/checkpoint` are rewritten. A Witness
+that refuses, answers with a Cosignature that does not verify, or cannot
+be reached never blocks or fails the seal: the attempt is logged and made
+again at the next distribution run.
 
 ## Concurrency
 
@@ -943,21 +1005,18 @@ would end after 9999-12-31T23:59:59Z is rejected at acceptance (WIST4-E03,
 WIST-4 §5); the signed-history test replays the rejected amendment, the
 largest representable window and an unsealable opening near the range end.
 
-Caps cover the largest complete JCS Block through each amendment's own
-height. Pending reductions constrain packing immediately; deferred Entries
-remain queued. SQLite stores actual Block sizes and canonical Entry
-positions with the sealed changes. Restart replays the accepted schedule
-using each historical size maximum, and rejects a history containing a
-Block that exceeded its accepted schedule. Snapshot parameter tuples
-include pending amendments and omit superseded equal-effective-time values.
+Caps cover the largest Block through each amendment's own height, counted
+in entry-bundle octets. Pending reductions constrain packing immediately;
+deferred Entries remain queued. SQLite stores actual Block sizes and
+canonical Entry positions with the sealed changes. Restart replays the
+accepted schedule using each historical size maximum, and rejects a
+history containing a Block that exceeded its accepted schedule. Snapshot
+parameter tuples include pending amendments and omit superseded
+equal-effective-time values.
 
-Opening an older store reconstructs missing sizes and positions from its
-Block files, checking the stored chain commitments and signatures. Verified
-legacy files are re-encoded as canonical JCS without changing Block objects,
-hashes or signatures. Missing or invalid history stops migration; restore
-the original Blocks before reopening the store. Migration verifies
-signatures against the stored Log Anchor's genesis public key; it requires
-no private key.
+A store written before the Log became one tree keys its Blocks by a
+per-Block hash and holds no leaf data; opening it fails with that reason
+rather than half-migrating it. Start a new data directory.
 
 Schedule validation uses the protocol's Registry defaults. Direct local
 parameter overrides, including the accelerated `--cadence` setting, do not
@@ -965,40 +1024,46 @@ amend that schedule and must not be used to assert protocol conformance.
 
 ## Authenticated history
 
-`clave verify-history --data <directory>` authenticates stored Block files
-from genesis through the database's current head. It needs the public
-`anchor.json`, not the private signing key. The directory's Anchor and
-database head are operator-trusted inputs; this command does not discover
-newer Checkpoints or detect replacement of both trusted inputs.
+`clave verify-history --data <directory>` authenticates the retained Log
+from genesis through the database's current head and reports the tree size
+and root it reaches. It needs the public `anchor.json`, not the private
+signing key. The directory's Anchor and database head are operator-trusted
+inputs; this command does not discover newer Checkpoints or detect
+replacement of both trusted inputs.
 
-The reader checks signatures, Merkle roots, Entry counts and canonical
-positions, chain links, whole-second timestamps, the cadence grid, and
-canonical JCS file bytes. It reconstructs accepted parameter schedules from
-signed Envelopes, independently of the database's parameter summaries and
-local overrides. Each Block's transport bound comes from the verified
-prefix; current and pending caps constrain its actual size. Invalid
-parameter candidates are reported by canonical Entry index and change no
-schedule. Missing or corrupt history stops verification.
+The reader parses each Checkpoint as a signed note, verifies its signature
+under the Anchor's genesis key, checks that it states the Block the store
+records, checks sequential `block_number`s, non-shrinking tree sizes,
+strictly increasing whole-second timestamps on the cadence grid, canonical
+Entry order and each Entry's JCS leaf data, and recomputes the root the
+Checkpoint states from the retained leaves and the stored tree hashes. It
+reconstructs accepted parameter schedules from signed Envelopes,
+independently of the database's parameter summaries and local overrides.
+Each Block's transport bound comes from the verified prefix; current and
+pending caps constrain its actual size. Invalid parameter candidates are
+reported by canonical Entry index and change no schedule. Missing or
+corrupt history stops verification.
 
-Each file must contain exactly one standard Zstandard frame, with no
-skippable frame or trailing data. Replay and legacy size restoration share
-declared-size, frame-window and actual-size checks. Log timestamp parsing
-rejects leap-second spellings without normalization and supports the complete
-four-digit Gregorian range, from year zero through `9999-12-31T23:59:59Z`.
-Conversion uses civil-calendar arithmetic; accepted parameter schedules still
-determine which seconds are eligible sealing instants.
+Log timestamp parsing rejects leap-second spellings without normalization
+and supports the complete four-digit Gregorian range, from year zero
+through `9999-12-31T23:59:59Z`. Conversion uses civil-calendar arithmetic;
+accepted parameter schedules still determine which seconds are eligible
+sealing instants.
 
 The `history::History` API exposes each authenticated Block's complete
-Entries, original Envelopes, height, timestamp and canonical positions, plus
-the accepted parameter schedule. It holds one Block at a time and retains
-the accepted schedule; it currently reads each compressed file into memory.
-Callers must finish iteration successfully before committing a reconstructed
-state: the supplied head's hash binds the complete prefix only when its
-Block is reached. A failed reader cannot resume, and Blocks sealed after
-opening the reader are outside its pinned prefix.
+Entries, original Envelopes, height, timestamp, tree size, root and
+canonical positions, plus the accepted parameter schedule. It holds one
+Block at a time and retains the accepted schedule. Callers must finish
+iteration successfully before committing a reconstructed state: the
+supplied head's root binds the complete prefix only when its Block is
+reached. A failed reader cannot resume, and Blocks sealed after opening
+the reader are outside its pinned prefix.
 
 Supported histories use object version `1.0.0` and the genesis signing key.
-Log key transitions and successor Anchors stop the reader as unsupported.
+Successor Anchors stop the reader as unsupported, and no Aggregator key
+transition is ever sealed: an `aggregator_key_add` is dropped with its
+reason, and one whose note key ID collides with an already admitted key —
+the genesis key included — is dropped as `WIST3-E03` (WIST-3 §3.4).
 Authentication establishes Block inclusion; it does not establish an
 Entry's author or eligibility. Parameter Envelopes receive their own signature and admission
 checks. Other Entry validation and service state reconstruction remain
@@ -1007,8 +1072,8 @@ protocol conformance.
 
 ## Declaration history replay
 
-`history::declarations::Declarations::reconstruct(directory, pinned_head)`
-rebuilds Declaration sequence and author state from authenticated Block files.
+`history::declarations::Declarations::reconstruct(db, directory, pinned_head)`
+rebuilds Declaration sequence and author state from the authenticated Log.
 It returns state only after reaching the trusted head successfully. Streaming
 callers can instead pass each `History` result to `Declarations::apply`.
 
@@ -1111,7 +1176,8 @@ The following transport setting supports integration tests:
   `http` when the host is a loopback address, `localhost` or a name under
   `.localhost` (RFC 6761), which WIST-2 §8 forbids for any `wist`
   resource. Without the flag every fetch is HTTPS, and the flag never
-  relaxes the scheme for a non-loopback host.
+  relaxes the scheme for a non-loopback host. `seal --allow-http` applies
+  the same exception to Witness submission.
 
 Declaration identities are port-free Canonical Hosts. Integration fixtures
 use signed `localhost` identities with an explicit DNS override to each
@@ -1137,5 +1203,5 @@ Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
 ## Spec
 
 Protocol definitions live in the sibling [spec repo](../spec) — WIST-3
-(logbook & distribution: blocks, Merkle proofs, checkpoints, snapshots) is
+(logbook & distribution: the tree, tiles, checkpoints, snapshots) is
 what Clave implements, on top of the WIST-1 deltas it ingests.

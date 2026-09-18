@@ -82,6 +82,7 @@ impl Rig {
             serde_json::to_vec(declaration).unwrap()
         );
         let history = clave::history::declarations::Declarations::reconstruct(
+            &self.db,
             self.data.path(),
             self.db.last_block().unwrap(),
         )

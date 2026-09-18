@@ -1,7 +1,6 @@
 #![forbid(unsafe_code)]
 
 pub mod baseline;
-mod block_file;
 pub mod db;
 pub mod declaration;
 pub mod error;
@@ -23,6 +22,7 @@ pub mod seal;
 pub mod serve;
 pub mod snapshot;
 pub mod suffix_list;
+pub mod witness;
 
 pub use error::Error;
 

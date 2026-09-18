@@ -2,7 +2,7 @@ use super::{
     declarations::{Declaration, Declarations, Position},
     History, VerifiedBlock,
 };
-use crate::db::BlockRow;
+use crate::db::{BlockRow, Db};
 use crate::declaration::{self, delta::SizeCaps};
 use crate::error::{Error, Result};
 use crate::history::declarations::DeclarationsReplay;
@@ -16,7 +16,7 @@ pub struct DeltaSource {
     envelope: Value,
     position: Position,
     sealed_at_s: i64,
-    block_hash: String,
+    block_root: String,
     declaration: Declaration,
     identity_start: Position,
     caps: SizeCaps,
@@ -24,25 +24,31 @@ pub struct DeltaSource {
 }
 
 impl DeltaSource {
-    pub fn reconstruct(directory: &Path, head: Option<BlockRow>, delta_id: &str) -> Result<Self> {
-        Self::reconstruct_matching(directory, head, |id, _| id == delta_id)?
+    pub fn reconstruct(
+        db: &Db,
+        directory: &Path,
+        head: Option<BlockRow>,
+        delta_id: &str,
+    ) -> Result<Self> {
+        Self::reconstruct_matching(db, directory, head, |id, _| id == delta_id)?
             .pop()
             .ok_or_else(|| failure("requested Delta is absent from the pinned history"))
     }
 
     pub(crate) fn reconstruct_matching(
+        db: &Db,
         directory: &Path,
         head: Option<BlockRow>,
         select: impl Fn(&str, &Value) -> bool,
     ) -> Result<Vec<Self>> {
-        let mut history = History::open(directory, head)?;
+        let mut history = History::open(db, directory, head)?;
         let mut declarations = Declarations::default();
         let mut chains = Chains::default();
         let mut found = Vec::new();
         while let Some(block) = history.next_block()? {
             declarations.apply(&block)?;
             chains.apply(&block, &declarations)?;
-            for (entry_index, entry) in block.block().entries.iter().enumerate() {
+            for (entry_index, entry) in block.entries().iter().enumerate() {
                 if entry["type"] != "publisher_delta" {
                     continue;
                 }
@@ -57,11 +63,11 @@ impl DeltaSource {
                     id,
                     envelope: envelope.clone(),
                     position: Position {
-                        block_number: block.block().header.block_number,
+                        block_number: block.block_number(),
                         entry_index,
                     },
                     sealed_at_s: block.sealed_at_s(),
-                    block_hash: block.hash().into(),
+                    block_root: block.root().into(),
                     declaration: domain.delta_sealing_source().unwrap().clone(),
                     identity_start: domain.reset().unwrap_or(domain.first()),
                     caps: block.delta_size_caps().clone(),
@@ -80,8 +86,9 @@ impl DeltaSource {
         self.sealed_at_s
     }
 
-    pub fn block_hash(&self) -> &str {
-        &self.block_hash
+    /// The root of the tree at the Block that sealed this Delta.
+    pub fn block_root(&self) -> &str {
+        &self.block_root
     }
 
     pub fn clock_skew_seconds(&self) -> i64 {
@@ -205,8 +212,7 @@ impl Chains {
             .map_err(|e| failure(&e.to_string()))?;
         let mut deltas = Vec::new();
         for entry in block
-            .block()
-            .entries
+            .entries()
             .iter()
             .filter(|entry| entry["type"] == "publisher_delta")
         {

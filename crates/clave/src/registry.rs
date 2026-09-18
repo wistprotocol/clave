@@ -182,26 +182,17 @@ mod tests {
             effective(&db, "feed_window", "2026-01-01T00:00:00Z").unwrap(),
             700
         );
-        db.commit_seal(
-            &[],
+        crate::db::tests::seal_block(
+            &db,
             0,
-            "sha256:h0",
             "2026-01-01T00:00:00Z",
-            &[],
             &[crate::db::ParamChangeRow {
                 entry_index: 0,
                 parameter: "feed_window",
                 value: 500,
                 effective_at: "2026-01-10T00:00:00Z",
             }],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            0,
-        )
-        .unwrap();
+        );
         assert_eq!(
             effective(&db, "feed_window", "2026-01-09T00:00:00Z").unwrap(),
             700

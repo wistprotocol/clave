@@ -241,6 +241,14 @@ fn read_bounded(
     Ok(body)
 }
 
+/// One posted request's answer: its status, its declared media type and
+/// its body, whether or not the status is a success.
+pub struct PostResponse {
+    pub status: u16,
+    pub content_type: Option<String>,
+    pub body: Vec<u8>,
+}
+
 pub struct Client {
     allow_http: bool,
     inner: reqwest::blocking::Client,
@@ -308,6 +316,33 @@ impl Client {
 
     pub fn get_bytes(&self, url: &str) -> Result<Vec<u8>> {
         self.get_bytes_bounded(url, &[], OBJECT_CAP_BYTES)
+    }
+
+    /// Posts `body` to `url` through the scheme guard and the
+    /// destination policy, following no redirect, and reads at most
+    /// `limit` bytes of the response whatever its status, so a caller
+    /// that acts on a refusal reads what the refusal states.
+    pub fn post_bounded(&self, url: &str, body: Vec<u8>, limit: u64) -> Result<PostResponse> {
+        let parsed =
+            url::Url::parse(url).map_err(|e| Error::Fetch(format!("invalid URL {url}: {e}")))?;
+        guard_target(&parsed, self.allow_http)?;
+        let response = self
+            .inner
+            .post(parsed)
+            .body(body)
+            .send()
+            .map_err(|e| Error::Fetch(describe(e)))?;
+        let status = response.status().as_u16();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        Ok(PostResponse {
+            status,
+            content_type,
+            body: read_bounded(response, limit, url)?,
+        })
     }
 
     /// Fetches `url` through the scheme guard, the destination policy on

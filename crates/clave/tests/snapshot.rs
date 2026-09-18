@@ -42,10 +42,8 @@ fn snapshot_build_produces_verifiable_tier0_state_and_signed_artifacts() {
     let report = clave::seal::run(&db, data.path(), &sk, SEAL_START).unwrap();
     assert_eq!(report.block_number, 0);
 
-    let raw = std::fs::read(data.path().join("log/blocks/000000000.json.zst")).unwrap();
-    let block: serde_json::Value =
-        serde_json::from_slice(&zstd::decode_all(&raw[..]).unwrap()).unwrap();
-    let block_hash = wist_core::block::block_hash(&block["header"]).unwrap();
+    let head = db.last_block().unwrap().unwrap();
+    let block_root = head.root.clone();
 
     let snapdir = data.path().join("snapshots");
     let idx: serde_json::Value =
@@ -55,7 +53,7 @@ fn snapshot_build_produces_verifiable_tier0_state_and_signed_artifacts() {
     assert_eq!(snapshots.len(), 1);
     let entry = &snapshots[0];
     assert_eq!(entry["snapshot_date"], "2026-08-09");
-    assert_eq!(entry["log_position"], 0);
+    assert_eq!(entry["log_position"], head.tree_size);
     assert_eq!(entry["manifest_url"], "/snapshots/2026-08-09/manifest.json");
 
     let man_path = data.path().join(
@@ -70,8 +68,9 @@ fn snapshot_build_produces_verifiable_tier0_state_and_signed_artifacts() {
 
     assert_eq!(man["manifest"]["wist_version"], "1.0.0");
     assert_eq!(man["manifest"]["snapshot_date"], "2026-08-09");
-    assert_eq!(man["manifest"]["log_position"], 0);
-    assert_eq!(man["manifest"]["anchor_block_hash"], block_hash);
+    assert_eq!(man["manifest"]["block_number"], 0);
+    assert_eq!(man["manifest"]["log_position"], head.tree_size);
+    assert_eq!(man["manifest"]["anchor_block_hash"], block_root);
     assert_eq!(man["manifest"]["content_digest"], entry["content_digest"]);
 
     let snapshot_dir = man_path.parent().unwrap();
@@ -128,7 +127,7 @@ fn snapshot_build_produces_verifiable_tier0_state_and_signed_artifacts() {
     let state: wist_core::objects::SnapshotState =
         serde_json::from_value(state_env["state"].clone()).unwrap();
     assert_eq!(state.wist_version, "1.0.0");
-    assert_eq!(state.log_position, 0);
+    assert_eq!(state.log_position, head.tree_size);
 
     let entry_values: Vec<serde_json::Value> = state
         .entries
@@ -218,7 +217,10 @@ fn snapshot_index_replaces_same_date_entry_on_reseal() {
         "same-day reseal must replace, not duplicate, the index entry"
     );
     assert_eq!(snapshots[0]["snapshot_date"], "2026-08-09");
-    assert_eq!(snapshots[0]["log_position"], 1);
+    assert_eq!(
+        snapshots[0]["log_position"],
+        db.last_block().unwrap().unwrap().tree_size
+    );
 }
 
 fn tier1_fixture(shards: Option<i64>) -> (common::TestPub, tempfile::TempDir, String, String) {

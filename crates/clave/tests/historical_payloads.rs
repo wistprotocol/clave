@@ -7,10 +7,11 @@ use clave::history::{
 };
 use common::*;
 use serde_json::{json, Value};
-use wist_core::{block, crypto, envelope, jcs, merkle};
+use wist_core::{crypto, envelope, jcs};
 
 struct Fixture {
     data: tempfile::TempDir,
+    db: clave::db::Db,
     head: Option<BlockRow>,
 }
 
@@ -18,13 +19,58 @@ impl Fixture {
     fn new() -> Self {
         let data = tempfile::tempdir().unwrap();
         clave::init::run("log.example", data.path()).unwrap();
-        Self { data, head: None }
+        let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
+        Self {
+            data,
+            db,
+            head: None,
+        }
     }
 
-    fn path(&self, height: u64) -> std::path::PathBuf {
-        self.data
-            .path()
-            .join(format!("log/blocks/{height:09}.json.zst"))
+    fn connection(&self) -> rusqlite::Connection {
+        rusqlite::Connection::open(self.data.path().join("clave.sqlite")).unwrap()
+    }
+
+    /// The leaf data of the first Entry of Block `height`, which a fault
+    /// injection replaces to corrupt the retained history.
+    fn first_leaf(&self, height: u64) -> (u64, Vec<u8>) {
+        let index = self.db.size_before(height).unwrap();
+        let bytes: Vec<u8> = self
+            .connection()
+            .query_row(
+                "SELECT entry_json FROM log_entries WHERE leaf_index = ?1",
+                [index as i64],
+                |row| row.get(0),
+            )
+            .unwrap();
+        (index, bytes)
+    }
+
+    fn set_leaf(&self, index: u64, bytes: &[u8]) {
+        self.connection()
+            .execute(
+                "UPDATE log_entries SET entry_json = ?2 WHERE leaf_index = ?1",
+                rusqlite::params![index as i64, bytes],
+            )
+            .unwrap();
+    }
+
+    fn drop_leaf(&self, index: u64) {
+        self.connection()
+            .execute(
+                "DELETE FROM log_entries WHERE leaf_index = ?1",
+                [index as i64],
+            )
+            .unwrap();
+    }
+
+    fn restore_leaf(&self, index: u64, bytes: &[u8]) {
+        self.connection()
+            .execute(
+                "INSERT OR REPLACE INTO log_entries(leaf_index, block_number, entry_json) VALUES (?1, 0, ?2)",
+                rusqlite::params![index as i64, bytes],
+            )
+            .unwrap();
     }
 
     fn append(&mut self, entries: Vec<Value>) {
@@ -32,50 +78,23 @@ impl Fixture {
         self.append_at(entries, height as i64 * 3600);
     }
 
-    fn append_at(&mut self, mut entries: Vec<Value>, offset_s: i64) {
-        entries.sort_by_key(|entry| {
-            (
-                match entry["type"].as_str().unwrap() {
-                    "publisher_declaration" => 0,
-                    "registry_update" => 1,
-                    "publisher_delta" => 2,
-                    _ => 3,
-                },
-                merkle::leaf_hash(&jcs::canonicalize(entry).unwrap()),
-            )
-        });
+    fn append_at(&mut self, entries: Vec<Value>, offset_s: i64) {
         let height = self.head.as_ref().map_or(0, |head| head.block_number + 1);
         let at = jiff::Timestamp::from_second(1_800_000_000 + offset_s)
             .unwrap()
             .to_string();
-        let leaves: Vec<_> = entries
-            .iter()
-            .map(|entry| merkle::leaf_hash(&jcs::canonicalize(entry).unwrap()))
-            .collect();
-        let root = if leaves.is_empty() {
-            merkle::leaf_hash(&[])
-        } else {
-            merkle::merkle_root(&leaves).unwrap()
-        };
-        let header = json!({"wist_version":"1.0.0", "block_number":height,
-            "prev_block_hash":self.head.as_ref().map_or("sha256:genesis", |head| &head.block_hash),
-            "sealed_at":at, "entry_count":entries.len(), "merkle_root":format!("sha256:{}", crypto::hex_encode(&root))});
-        let key = clave::keys::load(&self.data.path().join("keys/seed")).unwrap();
-        let doc = json!({"sig":{"key_id":"log1", "alg":"Ed25519", "value":key.sign(&jcs::canonicalize(&header).unwrap())}, "header":header, "entries":entries});
-        std::fs::write(
-            self.path(height),
-            zstd::bulk::compress(&jcs::canonicalize(&doc).unwrap(), 1).unwrap(),
-        )
-        .unwrap();
-        self.head = Some(BlockRow {
-            block_number: height,
-            block_hash: block::block_hash(&header).unwrap(),
-            sealed_at: at,
-        });
+        self.head = Some(seal_fixture_block(
+            &self.db,
+            self.data.path(),
+            height,
+            &at,
+            &entries,
+        ));
     }
 
     fn delta_source(&self, delta: &Value) -> Result<DeltaSource, clave::Error> {
         DeltaSource::reconstruct(
+            &self.db,
             self.data.path(),
             self.head.clone(),
             &wist_core::delta::delta_id(&delta["delta"]).unwrap(),
@@ -84,6 +103,7 @@ impl Fixture {
 
     fn source(&self, delta: &Value) -> Result<PayloadSource, clave::Error> {
         PayloadSource::reconstruct(
+            &self.db,
             self.data.path(),
             self.head.clone(),
             &wist_core::delta::delta_id(&delta["delta"]).unwrap(),
@@ -193,7 +213,7 @@ fn historical_payload_retrieval_retries_independent_copies_without_rewriting_sta
         entry("publisher_declaration", &current_declaration(&p)),
         entry("publisher_delta", &delta),
     ]);
-    let block_bytes = std::fs::read(f.path(0)).unwrap();
+    let block_entries = f.db.block_entries(0).unwrap();
     let copies = tempfile::tempdir().unwrap();
     let (listener, host, client) = reserve_addr();
     serve_static(listener, copies.path().to_owned());
@@ -246,7 +266,7 @@ fn historical_payload_retrieval_retries_independent_copies_without_rewriting_sta
         );
         std::fs::remove_file(copies.path().join("copy.json")).unwrap();
         assert_eq!(copy.raw(), original);
-        assert_eq!(std::fs::read(f.path(0)).unwrap(), block_bytes);
+        assert_eq!(f.db.block_entries(0).unwrap(), block_entries);
     }
 }
 
@@ -259,7 +279,7 @@ fn historical_payload_fallback_preserves_failures_and_the_signed_publisher_locat
         entry("publisher_declaration", &current_declaration(&p)),
         entry("publisher_delta", &delta),
     ]);
-    let block_bytes = std::fs::read(f.path(0)).unwrap();
+    let block_entries = f.db.block_entries(0).unwrap();
     let (listener, host, client) = reserve_addr();
     serve_static(listener, p.dir.path().to_owned());
     let relative = format!(
@@ -326,7 +346,7 @@ fn historical_payload_fallback_preserves_failures_and_the_signed_publisher_locat
         assert_eq!(copy.source().envelope(), &delta);
         assert_eq!(std::fs::read(&retained_path).unwrap(), b"not JSON");
         assert_eq!(std::fs::read(&distributed_path).unwrap(), wrong);
-        assert_eq!(std::fs::read(f.path(0)).unwrap(), block_bytes);
+        assert_eq!(f.db.block_entries(0).unwrap(), block_entries);
         std::fs::write(&retained_path, &original).unwrap();
         let candidates = std::iter::once(locations[0].clone()).chain(std::iter::once_with(|| {
             panic!("a verified retained copy must stop fallback")
@@ -358,7 +378,7 @@ fn historical_payload_discovery_uses_independent_origins_mirror_hints_and_signed
         entry("publisher_declaration", &current_declaration(&p)),
         entry("publisher_delta", &delta),
     ]);
-    let block_bytes = std::fs::read(f.path(0)).unwrap();
+    let block_entries = f.db.block_entries(0).unwrap();
     let (listener, _, client) = reserve_addr();
     serve_static(listener, p.dir.path().to_owned());
     let mirror = tempfile::tempdir().unwrap();
@@ -448,7 +468,7 @@ fn historical_payload_discovery_uses_independent_origins_mirror_hints_and_signed
         assert_eq!(copy.raw(), raw);
         assert!(!retained.exists());
         assert_eq!(std::fs::read(&mirror_file).unwrap(), hint_bytes);
-        assert_eq!(std::fs::read(f.path(0)).unwrap(), block_bytes);
+        assert_eq!(f.db.block_entries(0).unwrap(), block_entries);
     }
 }
 
@@ -518,7 +538,7 @@ fn remote_mirror_hints_preserve_payload_authentication_fallback_and_restart() {
         entry("publisher_declaration", &current_declaration(&p)),
         entry("publisher_delta", &delta),
     ]);
-    let block_bytes = std::fs::read(f.path(0)).unwrap();
+    let block_entries = f.db.block_entries(0).unwrap();
     let (listener, _, client) = reserve_addr();
     serve_static(listener, p.dir.path().to_owned());
     let mirror = tempfile::tempdir().unwrap();
@@ -598,7 +618,7 @@ fn remote_mirror_hints_preserve_payload_authentication_fallback_and_restart() {
             assert_eq!(copy.source().envelope(), &delta);
         }
         assert_eq!(std::fs::read(&list).unwrap(), hints);
-        assert_eq!(std::fs::read(f.path(0)).unwrap(), block_bytes);
+        assert_eq!(f.db.block_entries(0).unwrap(), block_entries);
         assert!(!f.data.path().join(&relative).exists());
     }
     std::fs::write(&list, r#"{"mirrors":{"mirror_urls":[]}}"#).unwrap();
@@ -891,19 +911,18 @@ fn historical_sources_require_the_entire_pinned_prefix_before_returning() {
             _ => vec![],
         };
         f.append(entries);
-        let path = f.path(1);
-        let bytes = std::fs::read(&path).unwrap();
+        let (index, bytes) = f.first_leaf(0);
         let head = f.head.clone();
         match fault {
-            "missing" => std::fs::remove_file(&path).unwrap(),
-            "corrupt" => std::fs::write(&path, b"broken").unwrap(),
-            "head" => f.head.as_mut().unwrap().block_hash = "sha256:wrong".into(),
+            "missing" => f.drop_leaf(index),
+            "corrupt" => f.set_leaf(index, br#"{"type":"label","body":{}}"#),
+            "head" => f.head.as_mut().unwrap().root = "sha256:wrong".into(),
             _ => (),
         }
         for _ in 0..2 {
             assert!(f.source(&delta).is_err(), "{fault}");
         }
-        std::fs::write(path, bytes).unwrap();
+        f.restore_leaf(index, &bytes);
         f.head = if matches!(fault, "declaration" | "duplicate") {
             prefix
         } else {

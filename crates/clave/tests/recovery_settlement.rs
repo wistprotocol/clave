@@ -1,6 +1,8 @@
 use clave::declaration::{evaluate, evaluate_initial, inner_hash, Decision};
 use serde_json::Value;
+use wist_core::checkpoint::{self, AggregatorKey, Checkpoint};
 use wist_core::crypto::PublicKey;
+use wist_core::merkle::LeafHashes;
 
 #[test]
 fn authenticated_settlement_declarations_and_rejection_twins() {
@@ -17,18 +19,39 @@ fn authenticated_settlement_declarations_and_rejection_twins() {
         let mut current: Option<Value> = None;
         let mut chain: Option<Value> = None;
         let mut floor = 0;
-        let mut previous_block = "sha256:genesis".to_string();
+        let mut leaves: Vec<[u8; 32]> = Vec::new();
+        let mut previous_block = String::new();
         let mut prefixes = Vec::new();
         let mut superseded = Vec::new();
         for (height, block) in case["blocks"].as_array().unwrap().iter().enumerate() {
-            wist_core::block::verify_block(block, &key).unwrap();
-            assert_eq!(block["header"]["block_number"], height, "{name}");
-            assert_eq!(block["header"]["prev_block_hash"], previous_block, "{name}");
-            previous_block = wist_core::block::block_hash(&block["header"]).unwrap();
+            let checkpoint = Checkpoint::parse(block["checkpoint"].as_str().unwrap()).unwrap();
+            let log_id = checkpoint.origin().to_owned();
+            checkpoint::verify(
+                &checkpoint,
+                &log_id,
+                &[AggregatorKey {
+                    key_id: log_id.clone(),
+                    public_key: key.clone(),
+                }],
+                &[],
+            )
+            .unwrap();
+            assert_eq!(checkpoint.block_number(), height as u64, "{name}");
+            let entries: Vec<Value> = serde_json::from_value(block["entries"].clone()).unwrap();
+            let summary = wist_core::block::verify_block(
+                leaves.len() as u64,
+                &checkpoint,
+                &entries,
+                &LeafHashes(&leaves),
+                u64::MAX,
+            )
+            .unwrap();
+            leaves.extend(summary.leaf_hashes);
+            previous_block = checkpoint.root_token();
             if height == 169 {
                 current = chain.take();
             }
-            for entry in block["entries"].as_array().unwrap() {
+            for entry in &entries {
                 let incoming = &entry["body"];
                 if current.is_none() {
                     evaluate_initial(incoming).unwrap();

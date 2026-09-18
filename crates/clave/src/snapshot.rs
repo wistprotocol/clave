@@ -381,6 +381,7 @@ fn build_tier0(dir: &Path, records: &[RecordRow]) -> Result<Vec<u8>> {
 fn build_state(
     db: &Db,
     data_dir: &Path,
+    block_number: u64,
     log_position: u64,
     records: &[RecordRow],
     domains: &BTreeMap<String, Domain>,
@@ -409,7 +410,7 @@ fn build_state(
             value,
         }));
     }
-    if let Some((identifier, sealing_height)) = db.suffix_list_at_position(log_position)? {
+    if let Some((identifier, sealing_height)) = db.suffix_list_at_block(block_number)? {
         entries.push(StateEntry::SuffixList(SuffixListEntry {
             identifier,
             sealing_height,
@@ -515,7 +516,7 @@ fn update_index(
         manifest_url: format!("/snapshots/{snapshot_date}/manifest.json"),
         content_digest: content_digest_value.to_string(),
     });
-    snapshots.sort_by_key(|e| std::cmp::Reverse(e.log_position));
+    snapshots.sort_by(|a, b| b.snapshot_date.cmp(&a.snapshot_date));
 
     let updated_at = jiff::Timestamp::from_second(jiff::Timestamp::now().as_second())
         .map_err(|_| Error::Snapshot("current time out of range".into()))?
@@ -586,6 +587,7 @@ pub fn build(
     db: &Db,
     data_dir: &Path,
     sk: &SigningKey,
+    block_number: u64,
     log_position: u64,
     anchor_block_hash: &str,
     snapshot_date: &str,
@@ -668,7 +670,8 @@ pub fn build(
     }
     let records = all_records;
 
-    let (state, state_digest_value) = build_state(db, data_dir, log_position, &records, domains)?;
+    let (state, state_digest_value) =
+        build_state(db, data_dir, block_number, log_position, &records, domains)?;
     let state_value = serde_json::to_value(&state)?;
     let state_envelope = sign_envelope(&state_value, "state", AGGREGATOR_KEY_ID, sk)?;
     let state_bytes = serde_json::to_vec(&state_envelope)?;
@@ -677,6 +680,7 @@ pub fn build(
     let manifest = SnapshotManifest {
         wist_version: WIST_VERSION.to_string(),
         snapshot_date: snapshot_date.to_string(),
+        block_number,
         log_position,
         anchor_block_hash: anchor_block_hash.to_string(),
         content_digest: content_digest_value.clone(),
@@ -736,10 +740,13 @@ mod tests {
             })
             .collect();
         db.commit_seal(
+            &crate::db::tests::signing_key(),
+            crate::db::tests::LOG_ID,
             &[],
             block,
-            &format!("sha256:h{block}"),
             &ts(sealed_epoch),
+            &[],
+            0,
             &[RecordUpsert {
                 url,
                 publisher,
@@ -755,7 +762,6 @@ mod tests {
             &[],
             &[],
             &declarations,
-            0,
         )
         .unwrap();
     }

@@ -387,11 +387,8 @@ fn sealing_preserves_version_diagnostics_and_supported_signed_values() {
     assert_eq!(report.entry_count, 2);
     assert_eq!(report.dropped.len(), 1);
     assert!(report.dropped[0].contains("WIST1-E15"));
-    let bytes = std::fs::read(data.path().join("log/blocks/000000000.json.zst")).unwrap();
-    let block: Value = serde_json::from_slice(&zstd::decode_all(&bytes[..]).unwrap()).unwrap();
     assert_eq!(
-        block["entries"]
-            .as_array()
+        db.block_entries(0)
             .unwrap()
             .iter()
             .find(|entry| entry["type"] == "publisher_delta")
@@ -478,12 +475,11 @@ fn integral_byte_spellings_materialize_fetched_chains_through_restart_and_sealin
             assert_eq!(record.observed_at, "2026-08-09T12:00:01Z");
             assert_eq!(record.title, url);
             let mut history =
-                clave::history::History::open(data.path(), db.last_block().unwrap()).unwrap();
+                clave::history::History::open(&db, data.path(), db.last_block().unwrap()).unwrap();
             let block = history.next_block().unwrap().unwrap();
             for (id, (source, raw, original)) in [&first, &second].into_iter().zip(&originals) {
                 let sealed = block
-                    .block()
-                    .entries
+                    .entries()
                     .iter()
                     .find(|entry| {
                         entry["type"] == "publisher_delta"

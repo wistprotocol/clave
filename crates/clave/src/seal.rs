@@ -28,8 +28,26 @@ pub struct SealReport {
 }
 
 pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_epoch: i64) -> Result<SealReport> {
+    run_with_client(
+        db,
+        data_dir,
+        sk,
+        &crate::fetch::Client::new(false),
+        now_epoch,
+    )
+}
+
+/// Seals the next Block and distributes it, submitting its Checkpoint to
+/// the configured Witnesses through `client`.
+pub fn run_with_client(
+    db: &Db,
+    data_dir: &Path,
+    sk: &SigningKey,
+    client: &crate::fetch::Client,
+    now_epoch: i64,
+) -> Result<SealReport> {
     crate::publication::recover(db, data_dir)?;
     let mutation = db.mutation()?;
     let prepared = prepare::block(db, data_dir, sk, now_epoch)?;
-    publish::block(db, data_dir, sk, mutation, prepared)
+    publish::block(db, data_dir, sk, client, mutation, prepared)
 }

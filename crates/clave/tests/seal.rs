@@ -1,11 +1,20 @@
 mod common;
 
-use common::{add_delta, make_publisher_with_scope, reserve_addr, serve_static, write_feed};
+use common::{
+    add_delta, head_checkpoint, make_publisher_with_scope, reserve_addr, serve_static,
+    served_entries, write_feed,
+};
 
 const SEAL_START: i64 = 1_786_276_800;
 
+/// A URL just under the default `url_cap_bytes`, so a handful of Deltas
+/// fill the smallest Block size cap the Registry admits.
+fn long_url(index: usize) -> String {
+    format!("https://example.com/{index:04}/{}", "p".repeat(2000))
+}
+
 #[test]
-fn seal_produces_verifiable_chain() {
+fn seal_produces_a_verifiable_tree_and_checkpoints() {
     let (listener, host, client) = reserve_addr();
     let p = make_publisher_with_scope(&host, &["example.com"]);
     let id1 = add_delta(&p, "https://example.com/a", "alpha body", None);
@@ -27,16 +36,23 @@ fn seal_produces_verifiable_chain() {
     let r0 = clave::seal::run(&db, data.path(), &sk, SEAL_START).unwrap();
     assert_eq!(r0.block_number, 0);
     assert_eq!(r0.entry_count, 2);
-    let raw = std::fs::read(data.path().join("log/blocks/000000000.json.zst")).unwrap();
-    let block: serde_json::Value =
-        serde_json::from_slice(&zstd::decode_all(&raw[..]).unwrap()).unwrap();
-    wist_core::block::verify_block(&block, &sk.public()).unwrap();
-    wist_core::block::verify_chain_link(&block["header"], "sha256:genesis").unwrap();
-    let cp: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(data.path().join("log/checkpoint.json")).unwrap())
-            .unwrap();
-    wist_core::envelope::verify_envelope(&cp, "checkpoint", &sk.public()).unwrap();
-    wist_core::block::verify_checkpoint_binding(&cp, &block).unwrap();
+    let key = wist_core::checkpoint::AggregatorKey {
+        key_id: "log1".into(),
+        public_key: sk.public(),
+    };
+    let block0 = head_checkpoint(data.path());
+    wist_core::checkpoint::verify(&block0, &host, std::slice::from_ref(&key), &[]).unwrap();
+    assert_eq!(block0.block_number(), 0);
+    assert_eq!(block0.tree_size(), 2);
+    let entries = served_entries(data.path(), 0, block0.tree_size());
+    wist_core::block::verify_block(
+        0,
+        &block0,
+        &entries,
+        &wist_core::merkle::LeafHashes(&[]),
+        u64::MAX,
+    )
+    .unwrap();
 
     let record = db
         .get_record("https://example.com/a", &host)
@@ -50,21 +66,21 @@ fn seal_produces_verifiable_chain() {
     let r1 = clave::seal::run(&db, data.path(), &sk, SEAL_START + 3600).unwrap();
     assert_eq!(r1.block_number, 1);
     assert_eq!(r1.entry_count, 0);
-    let b1: serde_json::Value = serde_json::from_slice(
-        &zstd::decode_all(
-            &std::fs::read(data.path().join("log/blocks/000000001.json.zst")).unwrap()[..],
-        )
-        .unwrap(),
-    )
-    .unwrap();
-    wist_core::block::verify_chain_link(
-        &b1["header"],
-        wist_core::block::block_hash(&block["header"])
+    let block1 = head_checkpoint(data.path());
+    wist_core::checkpoint::verify(&block1, &host, std::slice::from_ref(&key), &[]).unwrap();
+    assert_eq!(block1.block_number(), 1);
+    assert_eq!(
+        (block1.tree_size(), block1.root()),
+        (block0.tree_size(), block0.root()),
+        "an empty Block restates the tree the Block before it states"
+    );
+    let archived = std::fs::read_to_string(data.path().join("log/checkpoints/000000000")).unwrap();
+    assert_eq!(
+        wist_core::checkpoint::Checkpoint::parse(&archived)
             .unwrap()
-            .as_str(),
-    )
-    .unwrap();
-    wist_core::block::verify_block(&b1, &sk.public()).unwrap();
+            .note_text(),
+        block0.note_text()
+    );
 }
 
 #[test]
@@ -93,12 +109,16 @@ fn seal_orders_same_type_entries_by_ascending_leaf_hash() {
     let report = clave::seal::run(&db, data.path(), &sk, SEAL_START).unwrap();
     assert_eq!(report.entry_count, 3);
 
-    let raw = std::fs::read(data.path().join("log/blocks/000000000.json.zst")).unwrap();
-    let block: serde_json::Value =
-        serde_json::from_slice(&zstd::decode_all(&raw[..]).unwrap()).unwrap();
-    wist_core::block::verify_block(&block, &sk.public()).unwrap();
-
-    let entries = block["entries"].as_array().unwrap();
+    let head = head_checkpoint(data.path());
+    let entries = served_entries(data.path(), 0, head.tree_size());
+    wist_core::block::verify_block(
+        0,
+        &head,
+        &entries,
+        &wist_core::merkle::LeafHashes(&[]),
+        u64::MAX,
+    )
+    .unwrap();
     assert_eq!(entries[0]["type"], "publisher_declaration");
     let delta_entries: Vec<&serde_json::Value> = entries[1..].iter().collect();
     assert_eq!(delta_entries.len(), 2);
@@ -177,33 +197,29 @@ fn seal_applies_chained_deltas_in_chain_order_regardless_of_storage_order() {
 }
 
 #[test]
-fn block_frame_declares_decompressed_size() {
+fn an_empty_first_block_states_the_empty_tree_and_serves_no_tile() {
     let data = tempfile::tempdir().unwrap();
     clave::init::run("example-log.test", data.path()).unwrap();
     let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
     db.set_param("block_cadence_seconds", 1).unwrap();
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
     clave::seal::run(&db, data.path(), &sk, 1_800_000_000).unwrap();
-    let raw = std::fs::read(data.path().join("log/blocks/000000000.json.zst")).unwrap();
-    let decompressed = zstd::decode_all(&raw[..]).unwrap();
-    let declared = zstd::zstd_safe::get_frame_content_size(&raw)
-        .expect("frame header must parse")
-        .expect("Frame_Content_Size must be declared (WIST-3 §6)");
-    assert_eq!(declared, decompressed.len() as u64);
+    let head = head_checkpoint(data.path());
+    assert_eq!(head.tree_size(), 0);
+    assert_eq!(head.root(), &wist_core::merkle::EMPTY_ROOT);
+    assert!(wist_core::tiles::required_tiles(0).is_empty());
+    assert!(!data.path().join("tile/0/000").exists());
+    assert!(data.path().join("log/checkpoints/000000000").exists());
 }
 
 #[test]
-fn oversize_block_defers_entries_to_the_next_seal() {
+fn a_block_over_the_entry_bundle_cap_defers_entries_to_the_next_seal() {
     let (listener, host, client) = reserve_addr();
     let p = make_publisher_with_scope(&host, &["example.com"]);
-    let id1 = add_delta(&p, "https://example.com/a", "alpha body", None);
-    let id2 = add_delta(&p, "https://example.com/b", "beta body", None);
-    write_feed(
-        &p,
-        &host,
-        &[id1.clone(), id2.clone()],
-        "2026-08-09T12:00:00Z",
-    );
+    let ids: Vec<String> = (0..40)
+        .map(|i| add_delta(&p, &long_url(i), "body", None))
+        .collect();
+    write_feed(&p, &host, &ids, "2026-08-09T12:00:00Z");
     serve_static(listener, p.dir.path().to_path_buf());
 
     let data = tempfile::tempdir().unwrap();
@@ -212,7 +228,7 @@ fn oversize_block_defers_entries_to_the_next_seal() {
     db.set_param("block_cadence_seconds", 1).unwrap();
     clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
 
-    let cap = 1024;
+    let cap = 65_537;
     db.set_param("block_decompressed_cap_bytes", cap).unwrap();
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
     let mut total = 0u64;
@@ -220,17 +236,13 @@ fn oversize_block_defers_entries_to_the_next_seal() {
     for i in 0..5 {
         let report = clave::seal::run(&db, data.path(), &sk, 1_800_000_000 + i * 3600).unwrap();
         total += report.entry_count;
-        let raw = std::fs::read(
-            data.path()
-                .join(format!("log/blocks/{:09}.json.zst", report.block_number)),
-        )
-        .unwrap();
+        let entries = db.block_entries(report.block_number).unwrap();
         assert!(
-            zstd::decode_all(&raw[..]).unwrap().len() as i64 <= cap,
-            "every emitted Block must respect the decompressed cap"
+            wist_core::block::block_octets(&entries).unwrap() <= cap as u64,
+            "every emitted Block must respect the entry-bundle cap"
         );
         if i == 0 {
-            assert!(report.entry_count < 3, "cap must defer some entries");
+            assert!(report.entry_count < 41, "cap must defer some entries");
         }
         sealed_blocks += 1;
         let (pending, _) = db.peek_pending_entries().unwrap();
@@ -238,16 +250,11 @@ fn oversize_block_defers_entries_to_the_next_seal() {
             break;
         }
     }
-    assert_eq!(total, 3, "deferred entries must seal in later Blocks");
+    assert_eq!(total, 41, "deferred entries must seal in later Blocks");
     assert!(sealed_blocks > 1);
-    assert!(db
-        .get_record("https://example.com/a", &host)
-        .unwrap()
-        .is_some());
-    assert!(db
-        .get_record("https://example.com/b", &host)
-        .unwrap()
-        .is_some());
+    for id in &ids {
+        assert!(db.is_delta_seen(id).unwrap());
+    }
 }
 
 #[test]
@@ -274,15 +281,8 @@ fn the_per_domain_block_cap_defers_the_surplus_in_acceptance_order() {
         .enumerate()
     {
         let report = clave::seal::run(&db, data.path(), &sk, at).unwrap();
-        let raw = std::fs::read(
-            data.path()
-                .join(format!("log/blocks/{:09}.json.zst", report.block_number)),
-        )
-        .unwrap();
-        let block: serde_json::Value =
-            serde_json::from_slice(&zstd::decode_all(&raw[..]).unwrap()).unwrap();
-        let deltas: Vec<String> = block["entries"]
-            .as_array()
+        let deltas: Vec<String> = db
+            .block_entries(report.block_number)
             .unwrap()
             .iter()
             .filter(|e| e["type"] == "publisher_delta")
@@ -310,8 +310,8 @@ fn the_per_domain_block_cap_defers_the_surplus_in_acceptance_order() {
 fn a_delta_held_past_the_inclusion_ceiling_is_reported() {
     let (listener, host, client) = reserve_addr();
     let p = make_publisher_with_scope(&host, &["example.com"]);
-    let ids: Vec<String> = (0..3)
-        .map(|i| add_delta(&p, &format!("https://example.com/p{i}"), "body", None))
+    let ids: Vec<String> = (0..60)
+        .map(|i| add_delta(&p, &long_url(i), "body", None))
         .collect();
     write_feed(&p, &host, &ids, "2026-08-09T12:00:00Z");
     serve_static(listener, p.dir.path().to_path_buf());
@@ -321,7 +321,8 @@ fn a_delta_held_past_the_inclusion_ceiling_is_reported() {
     let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
     db.set_param("block_cadence_seconds", 1).unwrap();
     db.set_param("max_inclusion_blocks", 1).unwrap();
-    db.set_param("block_decompressed_cap_bytes", 1100).unwrap();
+    db.set_param("block_decompressed_cap_bytes", 65_537)
+        .unwrap();
     clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
 

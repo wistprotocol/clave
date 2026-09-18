@@ -42,9 +42,8 @@ fn rig(urls: &[&str]) -> Rig {
     }
 }
 
-fn read_block(data: &std::path::Path, number: u64) -> serde_json::Value {
-    let raw = std::fs::read(data.join(format!("log/blocks/{number:09}.json.zst"))).unwrap();
-    serde_json::from_slice(&zstd::decode_all(&raw[..]).unwrap()).unwrap()
+fn read_entries(db: &clave::db::Db, number: u64) -> Vec<serde_json::Value> {
+    db.block_entries(number).unwrap()
 }
 
 #[test]
@@ -134,10 +133,8 @@ fn a_withdrawal_may_seal_beside_its_delta_but_not_before_it() {
     clave::governance::withdraw(&r.db, &r.sk, &r.host, first, "court order", "DE", NOW).unwrap();
     clave::governance::withdraw(&r.db, &r.sk, &r.host, second, "court order", "DE", NOW).unwrap();
     let seal = clave::seal::run(&r.db, r.data.path(), &r.sk, NOW).unwrap();
-    let block = read_block(r.data.path(), 0);
-    let sealed_delta = block["entries"]
-        .as_array()
-        .unwrap()
+    let entries = read_entries(&r.db, 0);
+    let sealed_delta = entries
         .iter()
         .find(|e| e["type"] == "publisher_delta")
         .map(|e| wist_core::delta::delta_id(&e["body"]["delta"]).unwrap())
