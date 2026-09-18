@@ -332,6 +332,7 @@ impl Db {
         let conn = Connection::open(path)?;
         conn.busy_timeout(std::time::Duration::from_millis(5000))?;
         let _mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
+        conn.pragma_update(None, "synchronous", "FULL")?;
         Ok(Db { conn })
     }
 
@@ -2143,7 +2144,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn open_sets_wal_journal_and_busy_timeout() {
+    fn open_sets_wal_journal_full_synchronous_and_busy_timeout() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
         let mode: String = db
@@ -2151,6 +2152,11 @@ pub(crate) mod tests {
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))
             .unwrap();
         assert_eq!(mode, "wal");
+        let synchronous: i64 = db
+            .conn
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(synchronous, 2);
         let timeout: i64 = db
             .conn
             .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
