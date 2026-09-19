@@ -232,11 +232,32 @@ pub fn submit_head(db: &Db, client: &Client, data_dir: &Path) -> Result<Vec<Stri
             .iter()
             .map(SignatureLine::encode)
             .collect();
+        let mut added = 0usize;
+        let mut dropped = 0usize;
         for line in lines {
             if held.contains(&line.encode()) {
                 continue;
             }
+            // WIST-3 §5: a note carries at most sixteen signature lines,
+            // and the Aggregator MUST NOT publish one carrying more. The
+            // Log's own lines come first and stay; the Cosignatures past
+            // the cap are dropped in the order they were obtained.
+            if updated.signatures().len() >= checkpoint::MAX_SIGNATURE_LINES {
+                dropped += 1;
+                continue;
+            }
             updated.add_signature(line);
+            added += 1;
+        }
+        if dropped > 0 {
+            tracing::warn!(
+                witness = %witness.name,
+                dropped,
+                "the Checkpoint already carries the sixteen signature lines a note admits"
+            );
+        }
+        if added == 0 && dropped > 0 {
+            continue;
         }
         note = updated.encode();
         db.replace_checkpoint_note(epoch_number, &note)?;

@@ -5,8 +5,6 @@ use sha2::{Digest, Sha256};
 use wist_core::crypto::{hex_encode, SigningKey};
 use wist_core::envelope::sign_envelope;
 
-const GENESIS_KEY_ID: &str = "log1";
-
 pub struct ParamChangeReport {
     pub update_id: String,
     pub effective_at: String,
@@ -68,7 +66,7 @@ pub fn run(
         "sha256:{}",
         hex_encode(&Sha256::digest(wist_core::jcs::canonicalize(&update)?))
     );
-    let envelope = sign_envelope(&update, "update", GENESIS_KEY_ID, sk)?;
+    let envelope = sign_envelope(&update, "update", &db.signing_key_id(&sk.public())?, sk)?;
     db.insert_pending_entry("registry_update", "", &envelope, 0)?;
     Ok(ParamChangeReport {
         update_id,

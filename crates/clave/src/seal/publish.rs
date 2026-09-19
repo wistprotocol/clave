@@ -17,13 +17,14 @@ use wist_core::crypto::SigningKey;
 pub(super) fn epoch(
     db: &Db,
     data_dir: &Path,
-    sk: &SigningKey,
     client: &crate::fetch::Client,
     mutation: Mutation<'_>,
     prepared: PreparedEpoch,
 ) -> Result<SealReport> {
     let PreparedEpoch {
         log_id,
+        signers,
+        key_entries,
         entries,
         octets,
         epoch_number,
@@ -134,8 +135,10 @@ pub(super) fn epoch(
             declaration_json: json,
         })
         .collect();
-    let sealed = db.commit_seal(
-        sk,
+    let signer_refs: Vec<&SigningKey> = signers.iter().collect();
+    let sealed = db.commit_seal_under(
+        &signer_refs,
+        Some(&key_entries),
         &log_id,
         &sealed_rowids,
         epoch_number,
@@ -211,7 +214,7 @@ pub(super) fn epoch(
     crate::snapshot::build(
         db,
         data_dir,
-        sk,
+        &signers[0],
         epoch_number,
         sealed.tree_size,
         &sealed.root,

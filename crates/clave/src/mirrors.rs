@@ -4,8 +4,6 @@ use std::path::Path;
 use wist_core::crypto::SigningKey;
 use wist_core::envelope::sign_envelope;
 
-const GENESIS_KEY_ID: &str = "log1";
-
 fn file_path(data_dir: &Path) -> std::path::PathBuf {
     data_dir.join("log/mirrors.json")
 }
@@ -26,7 +24,13 @@ pub fn list(data_dir: &Path) -> Result<Vec<String>> {
         .unwrap_or_default())
 }
 
-fn write(data_dir: &Path, sk: &SigningKey, urls: &[String], now_unix: i64) -> Result<()> {
+fn write(
+    data_dir: &Path,
+    key_id: &str,
+    sk: &SigningKey,
+    urls: &[String],
+    now_unix: i64,
+) -> Result<()> {
     let updated_at = jiff::Timestamp::from_second(now_unix)
         .map_err(|_| Error::Governance("timestamp out of range".into()))?
         .to_string();
@@ -35,13 +39,19 @@ fn write(data_dir: &Path, sk: &SigningKey, urls: &[String], now_unix: i64) -> Re
         "updated_at": updated_at,
         "mirror_urls": urls,
     });
-    let envelope = sign_envelope(&inner, "mirrors", GENESIS_KEY_ID, sk)?;
+    let envelope = sign_envelope(&inner, "mirrors", key_id, sk)?;
     std::fs::create_dir_all(data_dir.join("log"))?;
     std::fs::write(file_path(data_dir), serde_json::to_vec(&envelope)?)?;
     Ok(())
 }
 
-pub fn add(data_dir: &Path, sk: &SigningKey, url: &str, now_unix: i64) -> Result<Vec<String>> {
+pub fn add(
+    data_dir: &Path,
+    key_id: &str,
+    sk: &SigningKey,
+    url: &str,
+    now_unix: i64,
+) -> Result<Vec<String>> {
     let parsed = url::Url::parse(url)
         .map_err(|e| Error::Governance(format!("invalid mirror URL {url:?}: {e}")))?;
     if parsed.scheme() != "https" {
@@ -60,14 +70,20 @@ pub fn add(data_dir: &Path, sk: &SigningKey, url: &str, now_unix: i64) -> Result
     if !urls.iter().any(|u| u == url) {
         urls.push(url.to_string());
     }
-    write(data_dir, sk, &urls, now_unix)?;
+    write(data_dir, key_id, sk, &urls, now_unix)?;
     Ok(urls)
 }
 
-pub fn remove(data_dir: &Path, sk: &SigningKey, url: &str, now_unix: i64) -> Result<Vec<String>> {
+pub fn remove(
+    data_dir: &Path,
+    key_id: &str,
+    sk: &SigningKey,
+    url: &str,
+    now_unix: i64,
+) -> Result<Vec<String>> {
     let mut urls = list(data_dir)?;
     urls.retain(|u| u != url);
-    write(data_dir, sk, &urls, now_unix)?;
+    write(data_dir, key_id, sk, &urls, now_unix)?;
     Ok(urls)
 }
 
@@ -87,8 +103,15 @@ mod tests {
     fn add_remove_list_roundtrip_with_signed_file_under_log() {
         let (tmp, sk) = setup();
         assert!(list(tmp.path()).unwrap().is_empty());
-        add(tmp.path(), &sk, "https://mirror-a.example/", NOW).unwrap();
-        let urls = add(tmp.path(), &sk, "https://mirror-b.example/", NOW + 1).unwrap();
+        add(tmp.path(), "log1", &sk, "https://mirror-a.example/", NOW).unwrap();
+        let urls = add(
+            tmp.path(),
+            "log1",
+            &sk,
+            "https://mirror-b.example/",
+            NOW + 1,
+        )
+        .unwrap();
         assert_eq!(
             urls,
             vec![
@@ -108,7 +131,14 @@ mod tests {
             "https://mirror-a.example/"
         );
 
-        let after = remove(tmp.path(), &sk, "https://mirror-a.example/", NOW + 2).unwrap();
+        let after = remove(
+            tmp.path(),
+            "log1",
+            &sk,
+            "https://mirror-a.example/",
+            NOW + 2,
+        )
+        .unwrap();
         assert_eq!(after, vec!["https://mirror-b.example/".to_string()]);
         assert_eq!(list(tmp.path()).unwrap(), after);
     }
@@ -116,12 +146,19 @@ mod tests {
     #[test]
     fn add_is_idempotent_and_rejects_non_https_urls() {
         let (tmp, sk) = setup();
-        add(tmp.path(), &sk, "https://mirror-a.example/", NOW).unwrap();
-        let urls = add(tmp.path(), &sk, "https://mirror-a.example/", NOW + 1).unwrap();
+        add(tmp.path(), "log1", &sk, "https://mirror-a.example/", NOW).unwrap();
+        let urls = add(
+            tmp.path(),
+            "log1",
+            &sk,
+            "https://mirror-a.example/",
+            NOW + 1,
+        )
+        .unwrap();
         assert_eq!(urls.len(), 1);
-        assert!(add(tmp.path(), &sk, "not a url", NOW).is_err());
-        assert!(add(tmp.path(), &sk, "ftp://mirror.example/", NOW).is_err());
-        assert!(add(tmp.path(), &sk, "https://mirror.example/log/", NOW).is_err());
-        assert!(add(tmp.path(), &sk, "https://mirror.example/?x=1", NOW).is_err());
+        assert!(add(tmp.path(), "log1", &sk, "not a url", NOW).is_err());
+        assert!(add(tmp.path(), "log1", &sk, "ftp://mirror.example/", NOW).is_err());
+        assert!(add(tmp.path(), "log1", &sk, "https://mirror.example/log/", NOW).is_err());
+        assert!(add(tmp.path(), "log1", &sk, "https://mirror.example/?x=1", NOW).is_err());
     }
 }

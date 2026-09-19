@@ -11,6 +11,7 @@ pub mod ingest;
 pub mod init;
 mod json;
 pub mod keys;
+pub mod log_key;
 pub mod mirrors;
 pub mod param_change;
 pub mod payload;

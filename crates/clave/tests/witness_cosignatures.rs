@@ -265,3 +265,49 @@ fn a_verifier_key_string_round_trips_and_rejects_a_mismatched_key_id() {
     assert!(clave::witness::parse_verifier_key(&parts.join("+")).is_err());
     assert!(clave::witness::parse_verifier_key("only+two").is_err());
 }
+
+#[test]
+fn a_cosignature_past_the_sixteenth_signature_line_is_not_published() {
+    let log = sealed_log();
+    clave::seal::run_with_client(&log.db, log.data.path(), &log.sk, &log.client, SEAL_START)
+        .unwrap();
+    let note = head_note(log.data.path());
+    assert_eq!(Checkpoint::parse(&note).unwrap().signatures().len(), 1);
+
+    // WIST-3 §5: a note carries at most sixteen signature lines. Fifteen
+    // Cosignatures from other Witnesses fill the note beside the Log's own
+    // line, leaving no room for another.
+    let mut filled = Checkpoint::parse(&note).unwrap();
+    let text = filled.note_text();
+    for index in 0..(checkpoint::MAX_SIGNATURE_LINES - 1) {
+        filled.add_signature(checkpoint::cosignature_line(
+            &format!("witness-{index:02}.example"),
+            &SigningKey::from_seed(&[index as u8; 32]),
+            &text,
+            1_786_276_800,
+        ));
+    }
+    assert_eq!(
+        filled.signatures().len(),
+        checkpoint::MAX_SIGNATURE_LINES,
+        "the note is full"
+    );
+    let full = filled.encode();
+    log.db.replace_checkpoint_note(0, &full).unwrap();
+    clave::publication::republish_checkpoint(&log.db, log.data.path(), 0, &full).unwrap();
+    let (base, _calls) = spawn_witness(Behavior::Cosign);
+    configure(&log, &base);
+
+    let cosigned = clave::witness::submit_head(&log.db, &log.client, log.data.path()).unwrap();
+    assert!(
+        cosigned.is_empty(),
+        "a Cosignature that does not fit is not carried"
+    );
+    let after = head_note(log.data.path());
+    assert_eq!(after, full, "the published note is unchanged");
+    assert_eq!(
+        Checkpoint::parse(&after).unwrap().signatures().len(),
+        checkpoint::MAX_SIGNATURE_LINES
+    );
+    assert_eq!(log.db.witnesses().unwrap()[0].last_size, 0);
+}

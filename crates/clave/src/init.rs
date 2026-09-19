@@ -6,8 +6,6 @@ use std::path::Path;
 use wist_core::envelope::sign_envelope;
 use wist_core::objects::{Anchor, GenesisKey};
 
-const GENESIS_KEY_ID: &str = "log1";
-
 /// Initializes a data directory and returns the signed-note verifier
 /// key of its genesis Aggregator key, the form in which the key is
 /// configured at a Witness (WIST-3 §3.4).
@@ -26,7 +24,7 @@ pub fn run(log_id: &str, data_dir: &Path) -> Result<String> {
         wist_version: WIST_VERSION.into(),
         log_id: log_id.into(),
         genesis_key: GenesisKey {
-            key_id: GENESIS_KEY_ID.into(),
+            key_id: keys::GENESIS_KEY_ID.into(),
             alg: "Ed25519".into(),
             public_key,
         },
@@ -35,7 +33,7 @@ pub fn run(log_id: &str, data_dir: &Path) -> Result<String> {
     };
 
     let inner = serde_json::to_value(&anchor)?;
-    let envelope = sign_envelope(&inner, "anchor", GENESIS_KEY_ID, &sk)?;
+    let envelope = sign_envelope(&inner, "anchor", keys::GENESIS_KEY_ID, &sk)?;
     let bytes = serde_json::to_vec(&envelope)?;
     std::fs::write(data_dir.join("anchor.json"), bytes)?;
 
@@ -61,7 +59,7 @@ pub fn run(log_id: &str, data_dir: &Path) -> Result<String> {
             log_id,
             &sk.public(),
         )),
-        GENESIS_KEY_ID,
+        keys::GENESIS_KEY_ID,
         &keys::public_b64u(&seed),
         0,
     )?;

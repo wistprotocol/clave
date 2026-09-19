@@ -79,7 +79,7 @@ fn an_aggregator_key_add_that_collides_with_an_admitted_note_key_id_is_refused()
         report
             .dropped
             .iter()
-            .any(|reason| reason.contains("WIST3-E03") && reason.contains("note key ID")),
+            .any(|reason| reason.contains("WIST4-E04") && reason.contains("note key ID")),
         "{:?}",
         report.dropped
     );

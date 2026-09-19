@@ -35,7 +35,8 @@ expiry, and the queued `suffix_list_update` seals in the next Epoch and
 is in force from the Epoch after it; `init --suffix-list <file>` pins
 one for Epoch 0, and without a pinned snapshot every Canonical Host is
 its own accounting unit), `mirror` (maintain the signed
-`/log/mirrors.json`).
+`/log/mirrors.json`), `log-key` (rotate the Log's own Aggregator keys, see
+[Aggregator key rotation](#aggregator-key-rotation)).
 
 Every Feed pull also pulls the domain's Label Feed where it serves one
 (WIST-2 §3.3): `label-feed.json` and its Pages walk under the Feed's
@@ -216,7 +217,9 @@ Entries, holds out any whose JCS serialization exceeds 65 535 octets
 Epoch by `epoch_cap_bytes` counted as the sum over its
 Entries of each JCS serialization plus two, appends their leaves at
 `size(N-1)`, and signs Checkpoint N — origin, tree size, root,
-`epoch_number` and `sealed_at` — with the Aggregator key. An empty Epoch
+`epoch_number` and `sealed_at` — under every held Aggregator key valid at
+its height (WIST-3 §3.4, §5, see
+[Aggregator key rotation](#aggregator-key-rotation)). An empty Epoch
 restates the previous size and root.
 
 Distribution runs after the commit, is idempotent and restart-safe, and
@@ -270,10 +273,66 @@ line, a blank line, then the note. A 409 answer states the size the
 Witness holds; the submission is retried once from it. Every returned
 Cosignature is verified under the configured key over the note text
 before it is accepted; it is then appended to the stored note, whose text
-never changes, and the archive and `/checkpoint` are rewritten. A Witness
+never changes, and the archive and `/checkpoint` are rewritten. A note
+carries at most sixteen signature lines (WIST-3 §5): the Log's own lines
+stay, and a Cosignature that does not fit is logged and dropped rather
+than published, leaving the Witness's recorded size unchanged. A Witness
 that refuses, answers with a Cosignature that does not verify, or cannot
 be reached never blocks or fails the seal: the attempt is logged and made
 again at the next distribution run.
+
+## Aggregator key rotation
+
+`init` writes the Log's genesis Aggregator key — the one the Anchor
+declares — to `keys/seed` in the data directory, readable only by its
+owner. Every later key is admitted in band (WIST-3 §3.4):
+
+- `clave log-key add --data <dir>` generates an Ed25519 key, stores its
+  seed as `keys/<key_id>.seed` under the same protection and format, and
+  queues the `aggregator_key_add` that admits it. The `key_id` is `log<n>`
+  for the least `n` above 1 no admitted key, queued addition or held seed
+  uses; the genesis key's is `log1`. The seed reaches disk before the act
+  is queued, so no sealed act names a key the Aggregator cannot sign with.
+  The command prints the new key's note key ID and its signed-note
+  verifier key, the form a Witness is configured with.
+- `clave log-key remove --data <dir> --key-id <id>` queues the
+  `aggregator_key_remove` that retires a key. Removal is permanent: the
+  same `key_id` is never admitted again.
+- `clave log-key list --data <dir>` prints each key's `key_id`, note key
+  ID, the heights that admitted and retired it and whether the key store
+  holds its private key. A key whose addition is queued and unsealed is
+  listed with an `unsealed` height.
+
+A key act sealed in Epoch N is signed under a key valid at height N−1,
+every other Registry Update and Checkpoint N under a key valid at N. Both
+commands therefore sign under a held key valid at the current head
+height, and so do the Snapshot index, manifest and state file, the mirrors
+list and the `parameter_change`, `payload_withdrawal` and
+`suffix_list_update` acts. Where several held keys are valid, the one
+admitted at the lowest height signs, and `key_id` breaks a tie.
+
+Checkpoint N carries a signature line from every held key valid at N, in
+that same order: the Epoch that seals an addition is signed by the
+admitting key and the new one, and the Epoch that seals a removal is not
+signed by the removed key. The state file carries an `aggregator_key`
+tuple for every key the Log has admitted, removed keys included with their
+removal height (WIST-3 §7), so a resuming Consumer judges every Checkpoint
+at or below the Snapshot under the keys valid at its own height.
+
+No key-act failure is ever sealed (WIST-3 §3.4). `log-key remove` refuses
+at once when the `key_id` is not valid at the height the act authenticates
+at, or when the key acts already queued would leave no key valid at the
+next Epoch — which would leave that Epoch no valid Checkpoint. Sealing
+checks every queued act again against the registry the replayed Log
+establishes and drops what fails, reporting the rule: an addition naming
+an admitted `key_id` or an admitted key's note key ID, and a removal of a
+key not valid at the Epoch below, are `WIST4-E04`; an act no key valid at
+that height signed is `WIST4-E11`. When an Epoch's accepted removals would
+leave no key valid at its height, the removal at the highest canonical
+Entry index is held back first, so the earliest ones still apply. The
+`parameter_change`, `payload_withdrawal` and `suffix_list_update` acts are
+authenticated under the keys valid at the sealing Epoch and dropped as
+`WIST4-E11` otherwise.
 
 ## Concurrency
 
@@ -1033,13 +1092,25 @@ signing key. The directory's Anchor and database head are operator-trusted
 inputs; this command does not discover newer Checkpoints or detect
 replacement of both trusted inputs.
 
-The reader parses each Checkpoint as a signed note, verifies its signature
-under the Anchor's genesis key, checks that it states the Epoch the store
-records, checks sequential `epoch_number`s, non-shrinking tree sizes,
+The reader parses each Checkpoint as a signed note, checks that it states
+the Epoch the store records, checks sequential `epoch_number`s,
+non-shrinking tree sizes,
 strictly increasing whole-second timestamps on the cadence grid, canonical
 Entry order and each Entry's JCS leaf data, and recomputes the root the
-Checkpoint states from the retained leaves and the stored tree hashes. It
-reconstructs accepted parameter schedules from signed Envelopes,
+Checkpoint states from the retained leaves and the stored tree hashes.
+
+It then replays the Epoch's Aggregator key acts — authenticated under the
+keys valid at the height below it — and verifies the Checkpoint's signature
+under the keys valid at the Epoch itself (WIST-3 §3.4, §5). The signature
+is checked in that order because the keys that can speak for Epoch N are
+the ones the Log establishes at N. An Epoch whose Checkpoint verifies under
+no such key stops the reader, and its key acts change nothing: an Epoch
+whose accepted removals leave no valid key has no valid Checkpoint and is
+never applied. The registry the reader reaches is available with the
+`aggregator_key` tuples it produces, and `verify-history` prints the keys
+valid at the head.
+
+The reader reconstructs accepted parameter schedules from signed Envelopes,
 independently of the database's parameter summaries and local overrides.
 Each Epoch's transport bound comes from the verified prefix; current and
 pending caps constrain its actual size. Invalid parameter candidates are
@@ -1061,11 +1132,10 @@ supplied head's root binds the complete prefix only when its Epoch is
 reached. A failed reader cannot resume, and Epochs sealed after opening
 the reader are outside its pinned prefix.
 
-Supported histories use object version `1.0.0` and the genesis signing key.
-Successor Anchors stop the reader as unsupported, and no Aggregator key
-transition is ever sealed: an `aggregator_key_add` is dropped with its
-reason, and one whose note key ID collides with an already admitted key —
-the genesis key included — is dropped as `WIST3-E03` (WIST-3 §3.4).
+Supported histories use object version `1.0.0`. Successor Anchors stop the
+reader as unsupported. A `parameter_change` counts toward the schedule only
+when it authenticates under a key valid at its Epoch; an act no such key
+signed is reported as an ignored candidate.
 Authentication establishes Epoch inclusion; it does not establish an
 Entry's author or eligibility. Parameter Envelopes receive their own signature and admission
 checks. Other Entry validation and service state reconstruction remain

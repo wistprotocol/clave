@@ -67,7 +67,7 @@ CREATE TABLE IF NOT EXISTS log_entries(leaf_index INTEGER PRIMARY KEY, epoch_num
 CREATE INDEX IF NOT EXISTS log_entries_epoch ON log_entries(epoch_number);
 CREATE TABLE IF NOT EXISTS log_tiles(level INTEGER NOT NULL, tile_index INTEGER NOT NULL, hashes BLOB NOT NULL, PRIMARY KEY(level, tile_index));
 CREATE TABLE IF NOT EXISTS witnesses(name TEXT PRIMARY KEY, public_key TEXT NOT NULL, base_url TEXT NOT NULL, last_size INTEGER NOT NULL DEFAULT 0);
-CREATE TABLE IF NOT EXISTS aggregator_keys(note_key_id TEXT PRIMARY KEY, key_id TEXT NOT NULL, public_key TEXT NOT NULL, added_epoch INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS aggregator_keys(note_key_id TEXT PRIMARY KEY, key_id TEXT NOT NULL, public_key TEXT NOT NULL, added_epoch INTEGER NOT NULL, removed_epoch INTEGER);
 CREATE TABLE IF NOT EXISTS rejections(domain TEXT NOT NULL, code TEXT NOT NULL, at TEXT NOT NULL, delta_id TEXT, detail TEXT);
 CREATE TABLE IF NOT EXISTS params(name TEXT PRIMARY KEY, value INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS url_tips(url TEXT NOT NULL, domain TEXT NOT NULL, tip TEXT NOT NULL, PRIMARY KEY(domain, url));
@@ -99,6 +99,7 @@ pub(super) fn add_missing_columns(conn: &Connection) -> Result<()> {
         "ALTER TABLE queued_deltas ADD COLUMN acceptance_order INTEGER",
         "ALTER TABLE param_changes ADD COLUMN entry_index INTEGER",
         "ALTER TABLE recovery_windows ADD COLUMN owner_declaration_json BLOB",
+        "ALTER TABLE aggregator_keys ADD COLUMN removed_epoch INTEGER",
     ] {
         match conn.execute(statement, []) {
             Ok(_) => {}

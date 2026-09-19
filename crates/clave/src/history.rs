@@ -7,9 +7,12 @@ use crate::error::{Error, Result};
 use crate::registry;
 use serde_json::Value;
 use std::path::Path;
+use wist_core::aggregator_keys::Registry;
 use wist_core::checkpoint::{self, AggregatorKey, Checkpoint};
 use wist_core::crypto::PublicKey;
-use wist_core::objects::{LogAnchorEnvelope, RegistryUpdateEnvelope};
+use wist_core::objects::{
+    AggregatorKeyEntry, GenesisKey, LogAnchorEnvelope, RegistryUpdateEnvelope,
+};
 use wist_core::parameters::{Amendment, Schedule};
 
 /// The Log's out-of-band trust root as the data directory holds it.
@@ -115,8 +118,7 @@ pub struct History<'a> {
     db: &'a Db,
     head: Option<EpochRow>,
     log_id: String,
-    key: PublicKey,
-    key_id: String,
+    registry: Registry,
     next_height: u64,
     previous: Option<Checkpoint>,
     prior_at: Option<i64>,
@@ -128,12 +130,16 @@ pub struct History<'a> {
 impl<'a> History<'a> {
     pub fn open(db: &'a Db, directory: &Path, head: Option<EpochRow>) -> Result<Self> {
         let anchor = anchor(directory)?;
+        let genesis = GenesisKey {
+            key_id: anchor.key_id.clone(),
+            alg: "Ed25519".into(),
+            public_key: anchor.key.to_b64u(),
+        };
         Ok(Self {
             db,
             head,
+            registry: Registry::from_genesis(&anchor.log_id, &genesis)?,
             log_id: anchor.log_id,
-            key: anchor.key,
-            key_id: anchor.key_id,
             next_height: 0,
             previous: None,
             prior_at: None,
@@ -151,12 +157,16 @@ impl<'a> History<'a> {
         &self.log_id
     }
 
-    pub fn log_key(&self) -> &PublicKey {
-        &self.key
+    /// The Aggregator key registry the Epochs read so far establish
+    /// (WIST-3 §3.4).
+    pub fn key_registry(&self) -> &Registry {
+        &self.registry
     }
 
-    pub fn log_key_id(&self) -> &str {
-        &self.key_id
+    /// The §7 `aggregator_key` tuples the replayed registry holds, removed
+    /// keys included.
+    pub fn key_entries(&self) -> Vec<AggregatorKeyEntry> {
+        self.registry.entries()
     }
 
     pub fn next_epoch(&mut self) -> Result<Option<VerifiedEpoch>> {
@@ -185,16 +195,6 @@ impl<'a> History<'a> {
             .checkpoint_note(height)?
             .ok_or_else(|| failure("the store is missing an Epoch's Checkpoint"))?;
         let checkpoint = Checkpoint::parse(&note).map_err(|e| failure(&e.to_string()))?;
-        checkpoint::verify(
-            &checkpoint,
-            &self.log_id,
-            &[AggregatorKey {
-                key_id: self.key_id.clone(),
-                public_key: self.key.clone(),
-            }],
-            &[],
-        )
-        .map_err(|e| failure(&e.to_string()))?;
         if checkpoint.epoch_number() != height
             || checkpoint.tree_size() != row.tree_size
             || checkpoint.root_token() != row.root
@@ -233,24 +233,33 @@ impl<'a> History<'a> {
         .map_err(|e| failure(&e.to_string()))?;
 
         let largest = self.largest.max(summary.octets);
+
+        // WIST-3 §5: the keys that can speak for Epoch N are the ones the
+        // Log establishes at N, so this Epoch's key acts are applied to the
+        // registry — under the keys valid at N−1 (§3.4) — before the
+        // Checkpoint's signature is verified under the keys valid at N. An
+        // Epoch whose Checkpoint does not verify is never applied, so the
+        // acts land on a copy until it does.
+        let mut registry = self.registry.clone();
+        registry.apply_epoch(
+            height,
+            entries
+                .iter()
+                .filter(|entry| entry["type"] == "registry_update")
+                .map(|entry| &entry["body"]),
+        );
+        let keys = registry.valid_at(height);
+        checkpoint::verify(&checkpoint, &self.log_id, &keys, &[])
+            .map_err(|e| failure(&e.to_string()))?;
+
         let mut rejected_parameters = Vec::new();
         for (index, entry) in entries.iter().enumerate() {
-            if entry["type"] != "registry_update" {
+            if entry["type"] != "registry_update"
+                || entry["body"]["update"]["action"] != "parameter_change"
+            {
                 continue;
             }
-            let update = &entry["body"]["update"];
-            if matches!(
-                update["action"].as_str(),
-                Some("aggregator_key_add" | "aggregator_key_remove")
-            ) {
-                return Err(Error::History(
-                    "Log key transitions are not supported by this reader".into(),
-                ));
-            }
-            if update["action"] != "parameter_change" {
-                continue;
-            }
-            if !self.accept_parameter(&mut schedule, entry, height, index, at, largest) {
+            if !accept_parameter(&keys, &mut schedule, entry, height, index, at, largest) {
                 rejected_parameters.push(index);
             }
         }
@@ -270,6 +279,7 @@ impl<'a> History<'a> {
         let clock_skew_seconds = schedule.value_at("clock_skew_seconds", at).unwrap();
         self.schedule = Some(schedule);
         self.previous = Some(checkpoint);
+        self.registry = registry;
         Ok(Some(VerifiedEpoch {
             epoch_number: height,
             tree_size: row.tree_size,
@@ -285,53 +295,54 @@ impl<'a> History<'a> {
             clock_skew_seconds,
         }))
     }
+}
 
-    fn accept_parameter(
-        &self,
-        schedule: &mut Schedule,
-        entry: &Value,
-        height: u64,
-        index: usize,
-        at: i64,
-        largest: u64,
-    ) -> bool {
-        let body = &entry["body"];
-        let Ok(parsed) = serde_json::from_value::<RegistryUpdateEnvelope>(body.clone()) else {
-            return false;
-        };
-        if parsed.update.wist_version != crate::WIST_VERSION
-            || parsed.update.subject.chars().count() > 256
-            || body["sig"]["alg"] != "Ed25519"
-            || body["sig"]["key_id"] != self.key_id
-            || wist_core::envelope::verify_envelope(body, "update", &self.key).is_err()
-        {
-            return false;
-        }
-        let update = &body["update"];
-        let (Some(parameter), Some(value), Some(effective_at)) = (
-            update["details"]["parameter"].as_str(),
-            update["details"]["value"].as_i64(),
-            update["effective_at"].as_str(),
-        ) else {
-            return false;
-        };
-        let Ok(effective_at_s) = registry::unix(effective_at) else {
-            return false;
-        };
-        registry::accept(
-            schedule,
-            Amendment {
-                parameter: parameter.into(),
-                value,
-                epoch_number: height,
-                entry_index: index as u64,
-                sealed_at_s: at,
-                effective_at_s,
-            },
-            largest,
-        )
-        .is_ok()
+/// WIST-4 §5.1: a `parameter_change` counts toward the schedule only when
+/// its fields hold and it authenticates under a key valid at its Epoch.
+fn accept_parameter(
+    keys: &[AggregatorKey],
+    schedule: &mut Schedule,
+    entry: &Value,
+    height: u64,
+    index: usize,
+    at: i64,
+    largest: u64,
+) -> bool {
+    let body = &entry["body"];
+    let Ok(parsed) = serde_json::from_value::<RegistryUpdateEnvelope>(body.clone()) else {
+        return false;
+    };
+    if parsed.update.wist_version != crate::WIST_VERSION
+        || parsed.update.subject.chars().count() > 256
+        || body["sig"]["alg"] != "Ed25519"
+        || wist_core::aggregator_keys::authenticate(body, keys).is_err()
+    {
+        return false;
     }
+    let update = &body["update"];
+    let (Some(parameter), Some(value), Some(effective_at)) = (
+        update["details"]["parameter"].as_str(),
+        update["details"]["value"].as_i64(),
+        update["effective_at"].as_str(),
+    ) else {
+        return false;
+    };
+    let Ok(effective_at_s) = registry::unix(effective_at) else {
+        return false;
+    };
+    registry::accept(
+        schedule,
+        Amendment {
+            parameter: parameter.into(),
+            value,
+            epoch_number: height,
+            entry_index: index as u64,
+            sealed_at_s: at,
+            effective_at_s,
+        },
+        largest,
+    )
+    .is_ok()
 }
 
 fn failure(message: &str) -> Error {

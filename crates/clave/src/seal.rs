@@ -8,8 +8,6 @@ mod publish;
 
 pub(crate) use prepare::validate_pending_parameter;
 
-pub(super) const GENESIS_KEY_ID: &str = "log1";
-
 pub(super) const ENTRY_TYPE_ORDER: [&str; 5] = [
     "publisher_declaration",
     "registry_update",
@@ -49,5 +47,5 @@ pub fn run_with_client(
     crate::publication::recover(db, data_dir)?;
     let mutation = db.mutation()?;
     let prepared = prepare::epoch(db, data_dir, sk, now_unix)?;
-    publish::epoch(db, data_dir, sk, client, mutation, prepared)
+    publish::epoch(db, data_dir, client, mutation, prepared)
 }

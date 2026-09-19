@@ -1,4 +1,4 @@
-use super::{ENTRY_TYPE_ORDER, GENESIS_KEY_ID};
+use super::ENTRY_TYPE_ORDER;
 use crate::db::{Db, PendingEntryRow};
 use crate::error::{Error, Result};
 use crate::history::declarations::DeclarationsReplay;
@@ -8,9 +8,10 @@ use crate::registry;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use wist_core::crypto::{hex_encode, SigningKey};
+use wist_core::aggregator_keys::{self, KeyAction, Outcome, Registry};
+use wist_core::crypto::SigningKey;
 use wist_core::envelope::sign_envelope;
-use wist_core::objects::ChangeType;
+use wist_core::objects::{AggregatorKeyEntry, ChangeType};
 use wist_core::{jcs, merkle, tiles};
 
 /// One Epoch prepared for publication: its Checkpoint, the leaves it
@@ -18,6 +19,13 @@ use wist_core::{jcs, merkle, tiles};
 /// publication applies.
 pub(super) struct PreparedEpoch {
     pub(super) log_id: String,
+    /// The held Aggregator keys valid at this Epoch's height, each of which
+    /// signs its Checkpoint (WIST-3 §3.4, §5), the first of which signs the
+    /// Snapshot documents.
+    pub(super) signers: Vec<SigningKey>,
+    /// The §7 `aggregator_key` tuples this Epoch leaves, removed keys
+    /// included.
+    pub(super) key_entries: Vec<AggregatorKeyEntry>,
     pub(super) entries: Vec<Value>,
     pub(super) octets: u64,
     pub(super) epoch_number: u64,
@@ -220,8 +228,7 @@ pub(super) fn epoch(
     let candidate_octets = seal_entries.iter().map(SealEntry::octets).sum();
     let mut outcome = enforce_governance(
         db,
-        &sk.public(),
-        history.log_id(),
+        history.key_registry(),
         seal_entries,
         sealed_unix,
         epoch_number,
@@ -245,7 +252,9 @@ pub(super) fn epoch(
         suffix_lists,
         dropped,
         dropped_rowids,
+        key_registry,
     } = outcome;
+    let signers = held_signers(data_dir, db, sk, &key_registry, epoch_number)?;
     let sealed_rowids: Vec<i64> = seal_entries
         .iter()
         .map(|e| e.rowid)
@@ -287,6 +296,8 @@ pub(super) fn epoch(
 
     Ok(PreparedEpoch {
         log_id: history.log_id().to_owned(),
+        signers,
+        key_entries: key_registry.entries(),
         entries,
         octets,
         epoch_number,
@@ -325,6 +336,9 @@ pub(super) struct GovernanceOutcome {
     pub(super) suffix_lists: Vec<String>,
     pub(super) dropped: Vec<String>,
     pub(super) dropped_rowids: Vec<i64>,
+    /// The Aggregator key registry this Epoch's accepted key acts leave
+    /// (WIST-3 §3.4).
+    pub(super) key_registry: Registry,
 }
 
 pub(super) fn check_param_change(
@@ -377,7 +391,7 @@ pub(crate) fn validate_pending_parameter(
         rowid,
         entry_type: "registry_update".into(),
         domain: String::new(),
-        entry_json: sign_envelope(update, "update", GENESIS_KEY_ID, sk)?,
+        entry_json: sign_envelope(update, "update", &db.signing_key_id(&sk.public())?, sk)?,
         turn_epoch: None,
     });
     for (index, entry) in storage_order(pending)?.iter().enumerate() {
@@ -608,7 +622,7 @@ pub(super) fn revalidate_queued_deltas(
 fn check_withdrawal(
     db: &Db,
     replay: &mut wist_core::withdrawal::WithdrawalReplay,
-    log_key: &wist_core::crypto::PublicKey,
+    public_key_of: impl Fn(&str) -> Option<wist_core::crypto::PublicKey>,
     body: &Value,
     epoch_number: u64,
     epoch_deltas: &HashMap<String, String>,
@@ -631,12 +645,7 @@ fn check_withdrawal(
             _ => SealedDelta::Absent,
         },
     };
-    match replay.apply(
-        epoch_number,
-        body,
-        |key_id| (key_id == GENESIS_KEY_ID).then(|| log_key.clone()),
-        lookup,
-    ) {
+    match replay.apply(epoch_number, body, public_key_of, lookup) {
         Disposition::Accepted {
             delta_id,
             publisher,
@@ -656,40 +665,115 @@ fn check_withdrawal(
     }
 }
 
-/// WIST-3 §3.4: an Aggregator key signs a Checkpoint as a signed-note
-/// signer whose note key ID a Consumer maps back to a `key_id`, so an
-/// `aggregator_key_add` whose note key ID equals that of any key already
-/// admitted — the genesis key included — is never sealed. This Log seals
-/// no key transition at all, because its replay reads every Checkpoint
-/// under the genesis key; the collision is reported separately from that
-/// refusal so the reason a Consumer would reject the act is the reason
-/// the Aggregator gives.
-fn refuse_aggregator_key_add(admitted: &[String], log_id: &str, update: &Value) -> String {
-    let details = &update["details"];
-    let (Some(key_id), Some(public_key)) =
-        (details["key_id"].as_str(), details["public_key"].as_str())
-    else {
-        return "WIST4-E04 aggregator_key_add without a key_id and public_key".into();
-    };
-    let collides = details["alg"] == "Ed25519"
-        && wist_core::crypto::PublicKey::from_b64u(public_key).is_ok_and(|key| {
-            admitted.contains(&hex_encode(&wist_core::checkpoint::aggregator_key_id(
-                log_id, &key,
-            )))
-        });
-    if collides {
-        return format!(
-            "WIST3-E03 aggregator_key_add {key_id} collides with an admitted key's note key ID"
-        );
+/// WIST-3 §3.4 and §5: the held private keys valid at this Epoch's height,
+/// in ascending order of the height that admitted them and then of
+/// `key_id`. Every one of them signs the Epoch's Checkpoint, so an Epoch
+/// that admits a key is signed by the key it replaces and by the new one,
+/// and one that removes a key is not signed by the removed key.
+fn held_signers(
+    data_dir: &Path,
+    db: &Db,
+    sk: &SigningKey,
+    keys: &Registry,
+    epoch_number: u64,
+) -> Result<Vec<SigningKey>> {
+    let store = crate::keys::Store::open(data_dir, db)?;
+    if !store.holds(&sk.public()) {
+        return Err(Error::Seal(
+            "the signing key given is not one the data directory's key store holds".into(),
+        ));
     }
-    format!("aggregator_key_add {key_id} is not sealed: this Log signs every Checkpoint under its genesis key")
+    let mut records: Vec<_> = keys
+        .records()
+        .filter(|record| record.valid_at(epoch_number))
+        .collect();
+    records.sort_by(|a, b| {
+        a.added_height
+            .cmp(&b.added_height)
+            .then_with(|| a.key_id.cmp(&b.key_id))
+    });
+    let signers: Vec<SigningKey> = records
+        .iter()
+        .filter_map(|record| store.signing_for(&record.key_id, &record.public_key))
+        .collect();
+    if signers.is_empty() {
+        return Err(Error::Seal(format!(
+            "no Aggregator key valid at height {epoch_number} is held"
+        )));
+    }
+    Ok(signers)
+}
+
+/// WIST-3 §3.4: evaluates this Epoch's key acts against the registry the
+/// Epochs below it establish, in canonical Entry order, and refuses to
+/// seal what a Consumer would not apply. Returns the registry the accepted
+/// acts produce, one disposition per Registry Update of the Epoch, and the
+/// positions of the removals held back because the Epoch's accepted
+/// removals would otherwise leave no key valid at its height, which gives
+/// the Epoch no valid Checkpoint: the removal at the highest Entry index
+/// is held back first, so the earliest ones still apply.
+fn evaluate_key_acts(
+    base: &Registry,
+    epoch_number: u64,
+    acts: &[Value],
+) -> Result<(Registry, Vec<Outcome>, Vec<usize>)> {
+    let mut refused: Vec<usize> = Vec::new();
+    loop {
+        let mut registry = base.clone();
+        let evaluated: Vec<usize> = (0..acts.len())
+            .filter(|position| !refused.contains(position))
+            .collect();
+        let outcomes = registry.apply_epoch(epoch_number, evaluated.iter().map(|at| &acts[*at]));
+        if !registry.valid_at(epoch_number).is_empty() {
+            let mut dispositions = vec![Outcome::NotKeyAct; acts.len()];
+            for (position, outcome) in evaluated.iter().zip(outcomes) {
+                dispositions[*position] = outcome;
+            }
+            refused.sort_unstable();
+            return Ok((registry, dispositions, refused));
+        }
+        let last_removal = evaluated
+            .iter()
+            .zip(&outcomes)
+            .rev()
+            .find(|(_, outcome)| {
+                matches!(
+                    outcome,
+                    Outcome::Accepted {
+                        action: KeyAction::Remove,
+                        ..
+                    }
+                )
+            })
+            .map(|(position, _)| *position);
+        match last_removal {
+            Some(position) => refused.push(position),
+            None => {
+                return Err(Error::Seal(
+                    "no Aggregator key is valid at this Epoch's height and no removal of it can be held back".into(),
+                ))
+            }
+        }
+    }
+}
+
+/// The reason a key act is not sealed, in the code a Consumer replaying
+/// the Log would give it (WIST-3 §3.4, WIST-4 §5.1).
+fn key_act_refusal(update: &Value, outcome: &Outcome) -> String {
+    let action = update["action"].as_str().unwrap_or("key act");
+    let subject = update["subject"].as_str().unwrap_or("without a subject");
+    let (code, reason) = match outcome {
+        Outcome::Ignored { code, reason } => (*code, *reason),
+        Outcome::Conflict { reason } => (aggregator_keys::KEY_ACT_CONFLICT_CODE, *reason),
+        Outcome::Accepted { .. } | Outcome::NotKeyAct => ("", "the act is not a key act"),
+    };
+    format!("{code} {action} {subject} is not sealed: {reason}")
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn enforce_governance(
     db: &Db,
-    log_key: &wist_core::crypto::PublicKey,
-    log_id: &str,
+    base_keys: &Registry,
     entries: Vec<SealEntry>,
     sealed_unix: i64,
     epoch_number: u64,
@@ -697,12 +781,20 @@ pub(super) fn enforce_governance(
 ) -> Result<GovernanceOutcome> {
     let mut schedule = db.parameter_schedule(sealed_unix)?;
     let largest = db.largest_epoch_bytes()?.max(epoch_bytes);
-    let mut admitted = db.admitted_note_key_ids()?;
-    if admitted.is_empty() {
-        admitted.push(hex_encode(&wist_core::checkpoint::aggregator_key_id(
-            log_id, log_key,
-        )));
-    }
+    let acts: Vec<Value> = entries
+        .iter()
+        .filter(|e| e.entry_type == "registry_update")
+        .map(|e| e.body.clone())
+        .collect();
+    let (key_registry, dispositions, refused_removals) =
+        evaluate_key_acts(base_keys, epoch_number, &acts)?;
+    let sealing_keys = key_registry.valid_at(epoch_number);
+    let public_key_of = |key_id: &str| {
+        sealing_keys
+            .iter()
+            .find(|key| key.key_id == key_id)
+            .map(|key| key.public_key.clone())
+    };
     let mut out = GovernanceOutcome {
         kept: Vec::with_capacity(entries.len()),
         param_changes: Vec::new(),
@@ -710,6 +802,7 @@ pub(super) fn enforce_governance(
         suffix_lists: Vec::new(),
         dropped: Vec::new(),
         dropped_rowids: Vec::new(),
+        key_registry,
     };
     let epoch_deltas: HashMap<String, String> = entries
         .iter()
@@ -729,36 +822,65 @@ pub(super) fn enforce_governance(
     for (height, identifier) in db.suffix_list_acts()? {
         suffix_replay.adopt(&identifier, height);
     }
+    let mut act_position = 0usize;
     for (index, e) in entries.into_iter().enumerate() {
         if e.entry_type != "registry_update" {
             out.kept.push(e);
             continue;
         }
+        let position = act_position;
+        act_position += 1;
         let update = e.body["update"].clone();
         match update["action"].as_str() {
-            Some("parameter_change") => match check_param_change(
-                &mut schedule,
-                &update,
-                sealed_unix,
-                epoch_number,
-                index as u64,
-                largest,
-            ) {
-                Ok(mut change) => {
-                    change.rowid = e.rowid;
-                    out.param_changes.push(change);
+            Some("aggregator_key_add") | Some("aggregator_key_remove") => {
+                if refused_removals.contains(&position) {
+                    out.dropped.push(format!(
+                        "{} {} is not sealed: this Epoch's removals would leave no Aggregator key valid at height {epoch_number}",
+                        update["action"].as_str().unwrap_or("key act"),
+                        update["subject"].as_str().unwrap_or("without a subject")
+                    ));
+                    out.dropped_rowids.push(e.rowid);
+                } else if dispositions[position].is_accepted() {
                     out.kept.push(e);
-                }
-                Err(reason) => {
-                    out.dropped.push(reason);
+                } else {
+                    out.dropped
+                        .push(key_act_refusal(&update, &dispositions[position]));
                     out.dropped_rowids.push(e.rowid);
                 }
-            },
+            }
+            Some("parameter_change") => {
+                if aggregator_keys::authenticate(&e.body, &sealing_keys).is_err() {
+                    out.dropped.push(format!(
+                        "WIST4-E11 parameter_change {} is not sealed: no Aggregator key valid at height {epoch_number} signed it",
+                        update["subject"].as_str().unwrap_or("without a subject")
+                    ));
+                    out.dropped_rowids.push(e.rowid);
+                    continue;
+                }
+                match check_param_change(
+                    &mut schedule,
+                    &update,
+                    sealed_unix,
+                    epoch_number,
+                    index as u64,
+                    largest,
+                ) {
+                    Ok(mut change) => {
+                        change.rowid = e.rowid;
+                        out.param_changes.push(change);
+                        out.kept.push(e);
+                    }
+                    Err(reason) => {
+                        out.dropped.push(reason);
+                        out.dropped_rowids.push(e.rowid);
+                    }
+                }
+            }
             Some("payload_withdrawal") => {
                 match check_withdrawal(
                     db,
                     &mut replay,
-                    log_key,
+                    public_key_of,
                     &e.body,
                     epoch_number,
                     &epoch_deltas,
@@ -776,17 +898,12 @@ pub(super) fn enforce_governance(
             }
             Some("suffix_list_update") => {
                 use wist_core::suffix_list::{Disposition, HeldFile};
-                match suffix_replay.apply(
-                    epoch_number,
-                    &e.body,
-                    |key_id| (key_id == GENESIS_KEY_ID).then(|| log_key.clone()),
-                    |identifier| {
-                        db.suffix_list_bytes(identifier)
-                            .ok()
-                            .flatten()
-                            .map_or(HeldFile::Absent, HeldFile::Bytes)
-                    },
-                ) {
+                match suffix_replay.apply(epoch_number, &e.body, public_key_of, |identifier| {
+                    db.suffix_list_bytes(identifier)
+                        .ok()
+                        .flatten()
+                        .map_or(HeldFile::Absent, HeldFile::Bytes)
+                }) {
                     Disposition::Accepted {
                         identifier,
                         changed: true,
@@ -804,11 +921,6 @@ pub(super) fn enforce_governance(
                         out.dropped_rowids.push(e.rowid);
                     }
                 }
-            }
-            Some("aggregator_key_add") => {
-                out.dropped
-                    .push(refuse_aggregator_key_add(&admitted, log_id, &update));
-                out.dropped_rowids.push(e.rowid);
             }
             _ => out.kept.push(e),
         }
@@ -1113,8 +1225,13 @@ mod tests {
                             rowid: i + 1,
                             entry_type: "registry_update".into(),
                             domain: String::new(),
-                            entry_json: sign_envelope(&update, "update", GENESIS_KEY_ID, &sk)
-                                .unwrap(),
+                            entry_json: sign_envelope(
+                                &update,
+                                "update",
+                                crate::keys::GENESIS_KEY_ID,
+                                &sk,
+                            )
+                            .unwrap(),
                             turn_epoch: None,
                         }
                     })

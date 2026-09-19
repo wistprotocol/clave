@@ -91,6 +91,11 @@ enum Command {
         #[arg(long)]
         remove: Option<String>,
     },
+    /// Rotates the Log's Aggregator keys (WIST-3 §3.4).
+    LogKey {
+        #[command(subcommand)]
+        command: LogKeyCommand,
+    },
     /// Maintains the Witnesses each sealed Checkpoint is submitted to
     /// (WIST-3 §5). Without `--add` or `--remove`, lists them.
     Witness {
@@ -106,6 +111,48 @@ enum Command {
         #[arg(long)]
         remove: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum LogKeyCommand {
+    /// Generates an Aggregator key in the data directory's key store and
+    /// queues the `aggregator_key_add` that admits it. The Epoch that
+    /// seals the act signs its Checkpoint under the new key as well as the
+    /// key that admitted it.
+    Add {
+        #[arg(long)]
+        data: PathBuf,
+    },
+    /// Queues the `aggregator_key_remove` that retires a key. Removal is
+    /// permanent: the same `key_id` is never admitted again.
+    Remove {
+        #[arg(long)]
+        data: PathBuf,
+        #[arg(long = "key-id")]
+        key_id: String,
+    },
+    /// Lists every Aggregator key the Log has admitted with its note key
+    /// ID, the heights that admitted and retired it and whether the key
+    /// store holds its private key.
+    List {
+        #[arg(long)]
+        data: PathBuf,
+    },
+}
+
+/// WIST-3 §3.4: the held Aggregator key a document this Aggregator signs
+/// now is signed with — one valid at the Log's head height, which is also
+/// the height a key act queued now authenticates at.
+fn head_signer(
+    data_dir: &std::path::Path,
+    db: &clave::db::Db,
+) -> Result<(String, wist_core::crypto::SigningKey), clave::Error> {
+    let store = clave::keys::Store::open(data_dir, db)?;
+    let key = store.signer_at(clave::keys::head_height(db)?)?;
+    let signing = key
+        .signing()
+        .ok_or_else(|| clave::Error::Key("the signing key is not held".into()))?;
+    Ok((key.key_id.clone(), signing))
 }
 
 fn main() -> Result<(), clave::Error> {
@@ -143,7 +190,7 @@ fn main() -> Result<(), clave::Error> {
         }
         Command::SuffixList { data, file } => {
             let db = clave::db::Db::open(&data.join("clave.sqlite"))?;
-            let sk = clave::keys::load(&data.join("keys/seed"))?;
+            let (_, sk) = head_signer(&data, &db)?;
             let report = clave::suffix_list::pin(
                 &db,
                 &data,
@@ -170,7 +217,7 @@ fn main() -> Result<(), clave::Error> {
             allow_http,
         } => {
             let db = clave::db::Db::open(&data.join("clave.sqlite"))?;
-            let sk = clave::keys::load(&data.join("keys/seed"))?;
+            let (_, sk) = head_signer(&data, &db)?;
             let now_unix = match at {
                 Some(at) => wist_core::timestamp::log_seconds(&at)?,
                 None => jiff::Timestamp::now().as_second(),
@@ -198,15 +245,27 @@ fn main() -> Result<(), clave::Error> {
             let mut entries = 0;
             let mut rejected = 0;
             let mut head = None;
+            let mut head_height = 0;
             while let Some(epoch) = history.next_epoch()? {
                 epochs += 1;
                 entries += epoch.entries().len();
                 rejected += epoch.rejected_parameters().len();
+                head_height = epoch.epoch_number();
                 head = Some((epoch.tree_size(), epoch.root().to_string()));
             }
             let (tree_size, root) = head.unwrap_or((0, String::from("sha256:")));
+            let valid: Vec<String> = history
+                .key_registry()
+                .valid_at(head_height)
+                .iter()
+                .map(|key| key.key_id.clone())
+                .collect();
             println!(
                 "authenticated {epochs} Checkpoints over a tree of {tree_size} leaves at root {root}, containing {entries} Entries; {rejected} parameter candidates ignored; Entry eligibility and derived state are not verified"
+            );
+            println!(
+                "Aggregator keys valid at height {head_height}: {}",
+                valid.join(", ")
             );
         }
         Command::ParamChange {
@@ -216,7 +275,7 @@ fn main() -> Result<(), clave::Error> {
             effective_at,
         } => {
             let db = clave::db::Db::open(&data.join("clave.sqlite"))?;
-            let sk = clave::keys::load(&data.join("keys/seed"))?;
+            let (_, sk) = head_signer(&data, &db)?;
             let now_unix = jiff::Timestamp::now().as_second();
             let report = clave::param_change::run(
                 &db,
@@ -239,7 +298,7 @@ fn main() -> Result<(), clave::Error> {
             jurisdiction,
         } => {
             let db = clave::db::Db::open(&data.join("clave.sqlite"))?;
-            let sk = clave::keys::load(&data.join("keys/seed"))?;
+            let (_, sk) = head_signer(&data, &db)?;
             let report = clave::governance::withdraw(
                 &db,
                 &sk,
@@ -251,6 +310,51 @@ fn main() -> Result<(), clave::Error> {
             )?;
             println!("queued payload withdrawal {}", report.update_id);
         }
+        Command::LogKey { command } => match command {
+            LogKeyCommand::Add { data } => {
+                let db = clave::db::Db::open(&data.join("clave.sqlite"))?;
+                let report = clave::log_key::add(&db, &data, jiff::Timestamp::now().as_second())?;
+                println!(
+                    "queued aggregator_key_add {} (note key ID {}) as {}",
+                    report.key_id, report.note_key_id, report.update_id
+                );
+                println!("checkpoint verifier key: {}", report.verifier_key);
+            }
+            LogKeyCommand::Remove { data, key_id } => {
+                let db = clave::db::Db::open(&data.join("clave.sqlite"))?;
+                let report = clave::log_key::remove(
+                    &db,
+                    &data,
+                    &key_id,
+                    jiff::Timestamp::now().as_second(),
+                )?;
+                println!(
+                    "queued aggregator_key_remove {} as {}",
+                    report.key_id, report.update_id
+                );
+            }
+            LogKeyCommand::List { data } => {
+                let db = clave::db::Db::open(&data.join("clave.sqlite"))?;
+                for key in clave::log_key::list(&db, &data)? {
+                    let added = match key.added_height {
+                        Some(height) => height.to_string(),
+                        None => "unsealed".to_string(),
+                    };
+                    let removed = match key.removed_height {
+                        Some(height) => height.to_string(),
+                        None => "-".to_string(),
+                    };
+                    println!(
+                        "{} {} added {} removed {} private key {}",
+                        key.key_id,
+                        key.note_key_id,
+                        added,
+                        removed,
+                        if key.held { "held" } else { "absent" }
+                    );
+                }
+            }
+        },
         Command::Witness {
             data,
             add,
@@ -292,12 +396,14 @@ fn main() -> Result<(), clave::Error> {
             let now_unix = jiff::Timestamp::now().as_second();
             let urls = match (add, remove) {
                 (Some(url), None) => {
-                    let sk = clave::keys::load(&data.join("keys/seed"))?;
-                    clave::mirrors::add(&data, &sk, &url, now_unix)?
+                    let db = clave::db::Db::open(&data.join("clave.sqlite"))?;
+                    let (key_id, sk) = head_signer(&data, &db)?;
+                    clave::mirrors::add(&data, &key_id, &sk, &url, now_unix)?
                 }
                 (None, Some(url)) => {
-                    let sk = clave::keys::load(&data.join("keys/seed"))?;
-                    clave::mirrors::remove(&data, &sk, &url, now_unix)?
+                    let db = clave::db::Db::open(&data.join("clave.sqlite"))?;
+                    let (key_id, sk) = head_signer(&data, &db)?;
+                    clave::mirrors::remove(&data, &key_id, &sk, &url, now_unix)?
                 }
                 (None, None) => clave::mirrors::list(&data)?,
                 (Some(_), Some(_)) => {

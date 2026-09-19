@@ -1,7 +1,6 @@
 use crate::db::{Db, RecordRow};
 use crate::error::{Error, Result};
 use crate::history::declarations::Domain;
-use crate::keys;
 use crate::WIST_VERSION;
 use rusqlite::Connection;
 use serde_json::Value;
@@ -18,8 +17,6 @@ use wist_core::objects::{
     SuffixListEntry, WithdrawalEntry,
 };
 use wist_core::snapshot::{content_digest, state_digest};
-
-const AGGREGATOR_KEY_ID: &str = "log1";
 
 fn sha256_hex(bytes: &[u8]) -> String {
     hex_encode(&Sha256::digest(bytes))
@@ -386,23 +383,26 @@ fn build_state(
     records: &[RecordRow],
     domains: &BTreeMap<String, Domain>,
 ) -> Result<(SnapshotState, String)> {
-    let seed_bytes = std::fs::read(data_dir.join("keys/seed"))?;
-    let seed: [u8; 32] = seed_bytes
-        .try_into()
-        .map_err(|_| Error::Key("seed file must be exactly 32 bytes".into()))?;
-    let aggregator_public_key = keys::public_b64u(&seed);
     let head_sealed_at = db
         .last_epoch()?
         .map(|b| b.sealed_at)
         .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
 
     let mut entries = Vec::with_capacity(2 + domains.len() + records.len());
-    entries.push(StateEntry::AggregatorKey(AggregatorKeyEntry {
-        key_id: AGGREGATOR_KEY_ID.to_string(),
-        public_key: aggregator_public_key,
-        added_height: 0,
-        removed_height: None,
-    }));
+    // WIST-3 §7: one `aggregator_key` tuple per key the Log has admitted,
+    // removed keys included, so a resuming Consumer judges a Checkpoint at
+    // or below the Snapshot under the keys valid at its height (§3.4).
+    let mut key_entries = db.aggregator_key_entries()?;
+    if key_entries.is_empty() {
+        let anchor = crate::history::anchor(data_dir)?;
+        key_entries.push(AggregatorKeyEntry {
+            key_id: anchor.key_id,
+            public_key: anchor.key.to_b64u(),
+            added_height: 0,
+            removed_height: None,
+        });
+    }
+    entries.extend(key_entries.into_iter().map(StateEntry::AggregatorKey));
     for (name, value, effective_at) in db.parameter_state(&head_sealed_at)? {
         entries.push(StateEntry::Parameter(ParameterEntry {
             name,
@@ -494,6 +494,7 @@ fn update_index(
     snapshot_date: &str,
     tree_size: u64,
     content_digest_value: &str,
+    key_id: &str,
     sk: &SigningKey,
 ) -> Result<()> {
     let index_path = data_dir.join("snapshots/index.json");
@@ -528,7 +529,7 @@ fn update_index(
         snapshots,
     };
     let index_value = serde_json::to_value(&index)?;
-    let envelope = sign_envelope(&index_value, "index", AGGREGATOR_KEY_ID, sk)?;
+    let envelope = sign_envelope(&index_value, "index", key_id, sk)?;
     if let Some(parent) = index_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -593,6 +594,7 @@ pub fn build(
     snapshot_date: &str,
     domains: &BTreeMap<String, Domain>,
 ) -> Result<()> {
+    let key_id = db.signing_key_id(&sk.public())?;
     let records = prefer_one_publisher(db, db.list_records()?)?;
     let snapshot_dir = data_dir.join("snapshots").join(snapshot_date);
 
@@ -673,7 +675,7 @@ pub fn build(
     let (state, state_digest_value) =
         build_state(db, data_dir, epoch_number, tree_size, &records, domains)?;
     let state_value = serde_json::to_value(&state)?;
-    let state_envelope = sign_envelope(&state_value, "state", AGGREGATOR_KEY_ID, sk)?;
+    let state_envelope = sign_envelope(&state_value, "state", &key_id, sk)?;
     let state_bytes = serde_json::to_vec(&state_envelope)?;
     std::fs::write(snapshot_dir.join("state.json"), &state_bytes)?;
 
@@ -697,7 +699,7 @@ pub fn build(
         files,
     };
     let manifest_value = serde_json::to_value(&manifest)?;
-    let manifest_envelope = sign_envelope(&manifest_value, "manifest", AGGREGATOR_KEY_ID, sk)?;
+    let manifest_envelope = sign_envelope(&manifest_value, "manifest", &key_id, sk)?;
     std::fs::write(
         snapshot_dir.join("manifest.json"),
         serde_json::to_vec(&manifest_envelope)?,
@@ -708,6 +710,7 @@ pub fn build(
         snapshot_date,
         tree_size,
         &content_digest_value,
+        &key_id,
         sk,
     )
 }

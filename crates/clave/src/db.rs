@@ -2,7 +2,7 @@ use crate::error::{Error, Result};
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::Value;
 use std::path::Path;
-use wist_core::objects::{PublisherState, StatusRejection};
+use wist_core::objects::{AggregatorKeyEntry, PublisherState, StatusRejection};
 
 mod delta_history;
 mod delta_indexes;
@@ -1204,11 +1204,43 @@ impl Db {
         Ok(())
     }
 
-    /// Seals Epoch `epoch_number`: appends its Entries' leaves to the
-    /// tree, signs the Checkpoint that states the root they reach and
-    /// writes it with the acceptance, schedule, withdrawal, Label and
-    /// Declaration rows the Epoch carries, all in one transaction
-    /// (WIST-3 §3.2, §5). Returns the Epoch the Checkpoint states.
+    /// WIST-3 §3.4 and §7: the `aggregator_key` tuples the Log has
+    /// established, removed keys included, ordered by `key_id`.
+    pub fn aggregator_key_entries(&self) -> Result<Vec<AggregatorKeyEntry>> {
+        let mut statement = self.conn.prepare(
+            "SELECT key_id, public_key, added_epoch, removed_epoch FROM aggregator_keys ORDER BY key_id",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(AggregatorKeyEntry {
+                    key_id: row.get(0)?,
+                    public_key: row.get(1)?,
+                    added_height: row.get::<_, i64>(2)? as u64,
+                    removed_height: row.get::<_, Option<i64>>(3)?.map(|h| h as u64),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// The `key_id` a document this Aggregator signs names in `sig.key_id`:
+    /// the one the key registry binds to the signing key, or the genesis
+    /// `key_id` for a store whose registry does not carry it.
+    pub fn signing_key_id(&self, public_key: &wist_core::crypto::PublicKey) -> Result<String> {
+        let encoded = public_key.to_b64u();
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT key_id FROM aggregator_keys WHERE public_key = ?1 ORDER BY added_epoch, key_id LIMIT 1",
+                [&encoded],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .unwrap_or_else(|| crate::keys::GENESIS_KEY_ID.to_string()))
+    }
+
+    /// Seals Epoch `epoch_number` under one Aggregator key, leaving the
+    /// key registry as it stands.
     #[allow(clippy::too_many_arguments)]
     pub fn commit_seal(
         &self,
@@ -1227,6 +1259,64 @@ impl Db {
         disputes: &[SealedDisputeRow],
         declarations: &[SealedDeclarationRow],
     ) -> Result<EpochRow> {
+        self.commit_seal_under(
+            &[sk],
+            None,
+            log_id,
+            sealed_rowids,
+            epoch_number,
+            sealed_at,
+            entries,
+            epoch_bytes,
+            records,
+            param_changes,
+            withdrawals,
+            suffix_lists,
+            labels,
+            disputes,
+            declarations,
+        )
+    }
+
+    /// Seals Epoch `epoch_number`: appends its Entries' leaves to the
+    /// tree, signs the Checkpoint that states the root they reach under
+    /// every `signers` key — the held keys valid at this height (WIST-3
+    /// §3.4, §5) — and writes it with the key-registry, acceptance,
+    /// schedule, withdrawal, Label and Declaration rows the Epoch carries,
+    /// all in one transaction (WIST-3 §3.2, §5). `key_entries` replaces
+    /// the stored key registry where the Epoch establishes one. Returns
+    /// the Epoch the Checkpoint states.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_seal_under(
+        &self,
+        signers: &[&wist_core::crypto::SigningKey],
+        key_entries: Option<&[AggregatorKeyEntry]>,
+        log_id: &str,
+        sealed_rowids: &[i64],
+        epoch_number: u64,
+        sealed_at: &str,
+        entries: &[Value],
+        epoch_bytes: u64,
+        records: &[RecordUpsert],
+        param_changes: &[ParamChangeRow],
+        withdrawals: &[WithdrawalRow],
+        suffix_lists: &[String],
+        labels: &[SealedLabelRow],
+        disputes: &[SealedDisputeRow],
+        declarations: &[SealedDeclarationRow],
+    ) -> Result<EpochRow> {
+        if signers.is_empty() {
+            return Err(Error::Seal(
+                "WIST3-E03 no held Aggregator key is valid at this Epoch's height".into(),
+            ));
+        }
+        if signers.len() > wist_core::checkpoint::MAX_SIGNATURE_LINES {
+            return Err(Error::Seal(format!(
+                "a Checkpoint carries at most {} signature lines, and {} held keys are valid at this height",
+                wist_core::checkpoint::MAX_SIGNATURE_LINES,
+                signers.len()
+            )));
+        }
         let tx = self.mutation()?;
         for rowid in sealed_rowids {
             tx.execute("DELETE FROM pending_entries WHERE rowid = ?1", [rowid])?;
@@ -1251,7 +1341,28 @@ impl Db {
             sealed_at,
         )
         .map_err(|e| Error::Seal(e.to_string()))?;
-        checkpoint.sign(sk);
+        for signer in signers {
+            checkpoint.sign(signer);
+        }
+        if let Some(entries) = key_entries {
+            tx.execute("DELETE FROM aggregator_keys", [])?;
+            for entry in entries {
+                let public_key = wist_core::crypto::PublicKey::from_b64u(&entry.public_key)?;
+                tx.execute(
+                    "INSERT INTO aggregator_keys(note_key_id, key_id, public_key, added_epoch, removed_epoch) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    (
+                        wist_core::crypto::hex_encode(&wist_core::checkpoint::aggregator_key_id(
+                            log_id,
+                            &public_key,
+                        )),
+                        &entry.key_id,
+                        &entry.public_key,
+                        entry.added_height as i64,
+                        entry.removed_height.map(|h| h as i64),
+                    ),
+                )?;
+            }
+        }
         let epoch = EpochRow {
             epoch_number,
             tree_size,
