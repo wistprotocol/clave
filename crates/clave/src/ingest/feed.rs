@@ -78,7 +78,7 @@ mod tests {
             if let Ok(parsed) = result {
                 if case["expected"] == "accepted" {
                     let cut = crate::registry::unix(&parsed.feed.generated_at).unwrap();
-                    assert!(super::super::verify_sealed_page(
+                    assert!(super::super::verify::sealed_page(
                         &[(cut, 0, publisher.keys.clone())],
                         &original,
                         &parsed.feed.generated_at,
