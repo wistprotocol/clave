@@ -174,7 +174,11 @@ remainder and by the pull's work limits (64 MiB and 4096 objects per
 pull): an object that would cross the budget or the work limit is not
 read past it, the bytes read are debited, and the walk suspends for a
 later pull to resume from where it stopped, exactly as budget exhaustion
-does; an object above its own cap is a failed fetch. Declaration requests
+does; an object above its own cap is a failed fetch. The bound a request
+is issued under is reserved against the budget before the request and
+settled to the bytes actually read when the response is persisted, so
+neither a pull that stops mid-request nor two hosts pulling one
+Registrable Domain can read past a day's budget. Declaration requests
 stay outside the budget and carry only their own cap.
 
 A fetch connects only to a public unicast address. Loopback addresses are
@@ -348,6 +352,31 @@ No pull holds a process-wide lock. Each pull, Ping check, status request
 and dispatcher pass opens its own store connection (`Db::connect`), so a
 slow origin delays only its own domain while other domains, status
 answers and dispatching proceed; SQLite serializes the writes.
+
+A pull runs in four stages: it is scheduled, it fetches, it verifies what
+it fetched against the references it was issued with, and it admits the
+result. Fetching and verification hold no store connection; every
+admission is one write transaction. Every handoff between the stages is
+persisted under a run of the domain (`pull_runs`, at most one open per
+domain): each request enters `pull_objects` with the bytes it reserved
+before it is issued, and the response, its verification and its admission
+move that row forward; the domain's walk cursor (`pull_walk`) holds the
+pages walked; `pull_attempts` holds the Declaration retry each Delta ID
+spent and the predecessors it retrieved; and the run's phase, queue,
+position, chain position and remaining work advance in the same
+transaction as the admission that moved them.
+
+A pull that stops before its run is closed — a crash, or a partition
+taken over mid-pull — leaves the run open, and the next pull of that
+domain continues it: a response the run already holds is read from the
+run instead of requested again, an admission or rejection it already
+recorded is not repeated, and a reservation left behind is moved to the
+new request rather than debited twice. A run is continued only on the UTC
+day it began and within `baseline_poll_seconds` of its start; otherwise
+its objects are dropped and a fresh run begins, keeping the walk cursor.
+Closing a run rebuilds the pull's report from the objects it admitted and
+rejected in the order it decided them, records whether the walk
+suspended, and drops the run's state.
 
 `serve` schedules pulls durably in the store. `pull_schedule` holds at
 most one due-time row per domain (`due_at` in Unix seconds, `reason`

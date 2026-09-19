@@ -11,6 +11,7 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
     refuse_superseded_layout(conn)?;
     conn.execute_batch(SCHEMA)?;
     super::leases::create(conn)?;
+    super::pull_runs::create(conn)?;
     add_missing_columns(conn)?;
     restore_acceptance_order(conn)?;
     backfill_key_acts(conn)?;

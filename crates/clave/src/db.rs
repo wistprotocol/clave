@@ -7,6 +7,7 @@ use wist_core::objects::{AggregatorKeyEntry, PublisherState, StatusRejection};
 mod delta_history;
 mod delta_indexes;
 mod leases;
+mod pull_runs;
 mod pull_schedule;
 mod restore;
 mod schema;
@@ -15,6 +16,7 @@ mod tree;
 pub use leases::{
     process_owner, Fence, Lease, PARTITIONS, PARTITION_LEASE_SECONDS, SEALER_LEASE_SECONDS,
 };
+pub(crate) use pull_runs::{NewRun, Phase, PullObject, PullRun, Settled, Status, WalkPage};
 pub use pull_schedule::{
     DuePull, PingAdmission, PullLease, PullOutcome, PullTask, Reason, LEASE_SECONDS,
     RETRY_BASE_SECONDS,
@@ -68,7 +70,47 @@ impl<'a> Mutation<'a> {
                 .execute_batch("RELEASE SAVEPOINT clave_mutation")?;
         }
         self.committed = true;
+        #[cfg(test)]
+        if self.top_level {
+            interrupt::committed();
+        }
         Ok(())
+    }
+}
+
+/// A test hook that stops the current thread's work right after a chosen
+/// top-level commit, as a crash there would.
+#[cfg(test)]
+pub(crate) mod interrupt {
+    use std::cell::Cell;
+
+    thread_local! {
+        static REMAINING: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    /// Unwinds with `Interrupted` right after the `commits`-th next
+    /// top-level commit on this thread, counting from zero.
+    pub(crate) fn after(commits: usize) {
+        REMAINING.with(|remaining| remaining.set(Some(commits)));
+    }
+
+    /// Disarms the hook, returning whether it was still armed.
+    pub(crate) fn disarm() -> bool {
+        REMAINING.with(|remaining| remaining.take().is_some())
+    }
+
+    /// The payload the hook unwinds with.
+    pub(crate) struct Interrupted;
+
+    pub(super) fn committed() {
+        REMAINING.with(|remaining| match remaining.get() {
+            Some(0) => {
+                remaining.set(None);
+                std::panic::resume_unwind(Box::new(Interrupted));
+            }
+            Some(n) => remaining.set(Some(n - 1)),
+            None => {}
+        });
     }
 }
 

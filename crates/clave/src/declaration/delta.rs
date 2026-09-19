@@ -4,7 +4,7 @@ pub use wist_core::delta_fields::{
     validate_content_and_prev, validate_fields, validate_static, validate_version,
 };
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SizeCaps {
     pub url_cap_bytes: i64,
     pub extract_cap_bytes: i64,

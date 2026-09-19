@@ -5,11 +5,81 @@ use crate::error::Error;
 use crate::fetch::Client;
 use serde_json::Value;
 
+/// Why a pull requests `publisher.json`: its initial or periodic
+/// discovery, the one retry a failing Feed or Page shares, or the one
+/// retry of a Delta's binding failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Attempt {
+    Periodic,
+    Feed,
+    Delta(String),
+}
+
 /// Which of a domain's two walks a page belongs to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Walk {
     Feed,
     Label,
+}
+
+impl Walk {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Walk::Feed => "feed",
+            Walk::Label => "label",
+        }
+    }
+}
+
+/// The object one request fetches. A Declaration or page is fetched at
+/// most once per pull; a Delta, Payload, Label or dispute once per
+/// attempt of its ID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ObjectKey {
+    Declaration { attempt: Attempt },
+    Page { feed: Walk, index: u32 },
+    Delta { id: String },
+    Payload { delta_id: String },
+    Label { id: String },
+}
+
+impl ObjectKey {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            ObjectKey::Declaration { .. } => "declaration",
+            ObjectKey::Page { .. } => "page",
+            ObjectKey::Delta { .. } => "delta",
+            ObjectKey::Payload { .. } => "payload",
+            ObjectKey::Label { .. } => "label",
+        }
+    }
+
+    /// The key's name within its kind; an item's attempts are numbered
+    /// apart from it.
+    pub fn name(&self) -> String {
+        match self {
+            ObjectKey::Declaration {
+                attempt: Attempt::Periodic,
+            } => "periodic".into(),
+            ObjectKey::Declaration {
+                attempt: Attempt::Feed,
+            } => "feed".into(),
+            ObjectKey::Declaration {
+                attempt: Attempt::Delta(id),
+            } => format!("delta:{id}"),
+            ObjectKey::Page { feed, index } => format!("{}:{index}", feed.as_str()),
+            ObjectKey::Delta { id } | ObjectKey::Label { id } => id.clone(),
+            ObjectKey::Payload { delta_id } => delta_id.clone(),
+        }
+    }
+
+    /// Whether each attempt of the key's ID is a distinct object.
+    pub fn per_attempt(&self) -> bool {
+        matches!(
+            self,
+            ObjectKey::Delta { .. } | ObjectKey::Payload { .. } | ObjectKey::Label { .. }
+        )
+    }
 }
 
 pub(super) struct FetchRequest {
@@ -37,17 +107,6 @@ pub(super) enum Outcome {
     Failed {
         detail: String,
     },
-}
-
-impl Outcome {
-    /// The bytes a metered fetch with this outcome debits.
-    pub fn debited(&self) -> u64 {
-        match self {
-            Outcome::Body { raw, .. } => raw.len() as u64,
-            Outcome::Bounded { debited } => *debited,
-            Outcome::Failed { .. } => 0,
-        }
-    }
 }
 
 pub(super) fn fetch(client: &Client, request: &FetchRequest) -> Outcome {

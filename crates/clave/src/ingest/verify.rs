@@ -14,7 +14,7 @@ pub(super) type SealedSources = [(i64, u64, Vec<PublisherKey>)];
 
 /// A recovery window's version: the hashes of its prior, owner and
 /// chain-head Declarations and the Epoch it opened at, if it has.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) struct WindowRef {
     pub prior: String,
     pub owner: String,
@@ -25,7 +25,7 @@ pub(super) struct WindowRef {
 /// The Declaration version a Delta or Label was verified under: the
 /// hash and `seq` of the domain's accepted Declaration, its recovery
 /// window if one is open, and the admission sources they yield.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(super) struct DeclarationRef {
     pub hash: Option<String>,
     pub seq: Option<u64>,
@@ -50,6 +50,41 @@ pub(super) struct IssuedRefs {
     pub clock: jiff::Timestamp,
     pub clock_skew_seconds: i64,
     pub schedule_at: Option<u64>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredRefs {
+    decl: DeclarationRef,
+    sizes: SizeCaps,
+    clock: String,
+    clock_skew_seconds: i64,
+    schedule_at: Option<u64>,
+}
+
+impl IssuedRefs {
+    pub fn to_json(&self) -> crate::error::Result<String> {
+        Ok(serde_json::to_string(&StoredRefs {
+            decl: self.decl.clone(),
+            sizes: self.sizes.clone(),
+            clock: self.clock.to_string(),
+            clock_skew_seconds: self.clock_skew_seconds,
+            schedule_at: self.schedule_at,
+        })?)
+    }
+
+    pub fn from_json(json: &str) -> crate::error::Result<Self> {
+        let stored: StoredRefs = serde_json::from_str(json)?;
+        Ok(IssuedRefs {
+            decl: stored.decl,
+            sizes: stored.sizes,
+            clock: stored
+                .clock
+                .parse()
+                .map_err(|e: jiff::Error| crate::error::Error::Clock(e.to_string()))?,
+            clock_skew_seconds: stored.clock_skew_seconds,
+            schedule_at: stored.schedule_at,
+        })
+    }
 }
 
 /// A fetched Feed or Label Feed page's field and domain checks, which

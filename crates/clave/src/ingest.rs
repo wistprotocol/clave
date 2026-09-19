@@ -1,10 +1,10 @@
-use crate::db::Db;
+use crate::db::{Db, NewRun, Phase, PullObject, PullRun, Settled, Status, WalkPage};
 use crate::error::Result;
 use crate::fetch::Client;
 use crate::history::declarations::DeclarationsReplay;
 use serde_json::Value;
 use std::path::Path;
-use wist_core::objects::{FeedEnvelope, PublisherEnvelope, PublisherKey};
+use wist_core::objects::{PublisherEnvelope, PublisherKey};
 
 use crate::declaration;
 use crate::registry;
@@ -16,8 +16,7 @@ mod fetch_stage;
 mod stage_tests;
 mod verify;
 
-use admit::{Admission, Step};
-use fetch_stage::{FetchRequest, Outcome, Walk};
+use fetch_stage::{Attempt, FetchRequest, ObjectKey, Outcome, Walk};
 
 #[derive(Debug, Default)]
 pub struct IngestReport {
@@ -75,12 +74,20 @@ pub fn canonical_authority(host: &str) -> Option<String> {
     })
 }
 
+/// The Declarations WIST-2 §3.2 resolves a sealed Page's Key Set
+/// through, as the Log stands at the height `at`, which a run pins so
+/// that resuming it reads the same sources.
 fn page_declarations(
     db: &Db,
     data_dir: &Path,
     host: &str,
+    at: Option<u64>,
 ) -> Result<Vec<(i64, u64, Vec<PublisherKey>)>> {
-    let mut history = crate::history::History::open(db, data_dir, db.last_epoch()?)?;
+    let head = match at {
+        Some(height) => db.epoch_at(height)?,
+        None => None,
+    };
+    let mut history = crate::history::History::open(db, data_dir, head)?;
     let mut state = crate::history::declarations::Declarations::default();
     let mut sources = Vec::new();
     let mut superseded = std::collections::BTreeSet::new();
@@ -308,14 +315,10 @@ impl ObjectCaps {
 }
 
 /// The daily budget of the Registrable Domain a pull is metered on
-/// (WIST-2 §5) and the work the pull has left.
+/// (WIST-2 §5) and the per-object bounds in force at it.
 struct Meter {
-    unit: String,
-    day: String,
     budget: i64,
     caps: ObjectCaps,
-    work_bytes: u64,
-    work_objects: u32,
 }
 
 /// A metered fetch's result as the coordinator applies it.
@@ -359,9 +362,7 @@ pub fn run_with_clock(
     )
 }
 
-/// Pulls `host` once (WIST-2 §5): stage 2 fetches, stage 3 verifies and
-/// stage 4 admits one object at a time, in the order the pull's
-/// diagnostics and budget require.
+/// Pulls `host` once (WIST-2 §5) and closes the run it ran under.
 pub fn run_bounded(
     db: &Db,
     client: &Client,
@@ -371,61 +372,91 @@ pub fn run_bounded(
     clock: impl Fn() -> jiff::Timestamp,
     limits: PullLimits,
 ) -> Result<IngestReport> {
+    match open_pull(db, client, data_dir, host, now, clock, limits)? {
+        Some(run_id) => admit::close_run(db, run_id),
+        None => Ok(IngestReport::default()),
+    }
+}
+
+/// Pulls `host` once and leaves its run open for the caller to close
+/// beside whatever else the pull's completion records. Every handoff
+/// between the pull's stages is persisted under the run, so a pull that
+/// stops before its run is closed is continued by the next pull of the
+/// domain rather than begun again. `None` means `host` is no bare
+/// authority and nothing was pulled.
+pub(crate) fn open_pull(
+    db: &Db,
+    client: &Client,
+    data_dir: &Path,
+    host: &str,
+    now: &str,
+    clock: impl Fn() -> jiff::Timestamp,
+    limits: PullLimits,
+) -> Result<Option<i64>> {
     let Some(host) = canonical_authority(host) else {
-        return Ok(IngestReport::default());
+        return Ok(None);
     };
     let host = host.as_str();
-    crate::recovery::settle(db, data_dir, now)?;
+    let run = db.start_pull_run(
+        &NewRun {
+            domain: host,
+            now,
+            day: now.get(..10).unwrap_or(now),
+            unit: &crate::suffix_list::unit_at(db, host, now)?,
+            work_bytes: limits.work_bytes,
+            work_objects: limits.work_objects,
+            pages_epoch: db.last_epoch()?.map(|epoch| epoch.epoch_number),
+        },
+        registry::unix(now)?,
+        registry::effective(db, "baseline_poll_seconds", now)?,
+    )?;
+    let run_id = run.run_id;
+    let now_unix = registry::unix(&run.now)?;
     let scheme = crate::fetch::scheme_for_host(host, client.allow_http());
-    let now_unix = registry::unix(now)?;
-    let meter = Meter {
-        day: now.get(..10).unwrap_or(now).to_string(),
-        budget: registry::effective(db, "ingest_budget_bytes_day", now)?,
-        unit: crate::suffix_list::unit_at(db, host, now)?,
-        caps: ObjectCaps::from_schedule(&db.parameter_schedule(now_unix)?, now_unix),
-        work_bytes: limits.work_bytes,
-        work_objects: limits.work_objects,
-    };
     let mut pull = Pull {
         db,
         client,
         data_dir,
         host,
         base: format!("{scheme}://{host}/.well-known/wist/"),
-        now,
         now_unix,
         clock,
-        meter,
-        report: IngestReport::default(),
+        meter: Meter {
+            budget: registry::effective(db, "ingest_budget_bytes_day", &run.now)?,
+            caps: ObjectCaps::from_schedule(&db.parameter_schedule(now_unix)?, now_unix),
+        },
+        run,
     };
-    pull.run()?;
-    Ok(pull.report)
-}
-
-/// The walk of a domain's Feed as far as one pull took it.
-struct FeedWalk {
-    pages: Vec<FeedEnvelope>,
-    unseen_any: bool,
-    suspended: bool,
+    match pull.run() {
+        Ok(()) => Ok(Some(run_id)),
+        Err(crate::error::Error::Fenced) => Err(crate::error::Error::Fenced),
+        Err(e) => {
+            db.delete_pull_run(run_id)?;
+            Err(e)
+        }
+    }
 }
 
 /// The coordinator of one pull: it reads the store, issues each fetch,
 /// hands the result to verification and the verified object to
-/// admission.
+/// admission, and persists every handoff under the run.
 struct Pull<'a, C: Fn() -> jiff::Timestamp> {
     db: &'a Db,
     client: &'a Client,
     data_dir: &'a Path,
     host: &'a str,
     base: String,
-    now: &'a str,
     now_unix: i64,
     clock: C,
     meter: Meter,
-    report: IngestReport,
+    run: PullRun,
 }
 
 impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
+    fn now(&self) -> String {
+        self.run.now.clone()
+    }
+
     /// WIST-2 §8: the hosts a redirect may reach are those the Publisher's
     /// Declaration lists at the moment the request is issued, so a
     /// replacement admitted earlier in the pull governs the requests after
@@ -441,309 +472,488 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
             .unwrap_or_default())
     }
 
+    fn settle(&self) -> Result<()> {
+        admit::settle_if_due(self.db, self.data_dir, self.host, &self.clock)
+    }
+
+    /// The run's object ID for `key`: the key's name, and for a listed
+    /// item the attempt of its ID that is still open, or a further one
+    /// once admission is done with the last.
+    fn slot(&self, key: &ObjectKey) -> Result<String> {
+        let name = key.name();
+        if !key.per_attempt() {
+            return Ok(name);
+        }
+        let attempt = match self
+            .db
+            .latest_pull_attempt(self.run.run_id, key.kind(), &name)?
+        {
+            Some((attempt, status)) if status.is_final() => attempt + 1,
+            Some((attempt, _)) => attempt,
+            None => 0,
+        };
+        Ok(format!("{name}#{attempt}"))
+    }
+
+    /// What a persisted object hands the coordinator, so a resumed pull
+    /// and a repeated occurrence read the response the run already holds
+    /// rather than request it again.
+    fn stored(&self, object: &PullObject) -> Result<Got> {
+        if let Some(raw) = &object.raw {
+            let value = crate::json::parse(raw)?;
+            return Ok(Got::Body(raw.to_vec(), value));
+        }
+        Ok(match failure_detail(object) {
+            Some(detail) => Got::Failed(detail),
+            None => Got::Suspend,
+        })
+    }
+
     /// Fetches one content object under the remaining daily budget, the
-    /// pull's work limits and the object's own cap, and debits what it
-    /// read. The walk suspends when the budget or the work is spent, or
-    /// the object would cross the budget, in which case the bytes read up
-    /// to the bound are debited. An object above its own cap is a failed
-    /// fetch.
-    fn get(&mut self, url: &str, object: Object) -> Result<Got> {
-        let spent = self.db.ingest_bytes(&self.meter.unit, &self.meter.day)?;
-        let (work_bytes, work_objects) = (self.meter.work_bytes, self.meter.work_objects);
+    /// pull's work limits and the object's own cap, reserving the bound
+    /// against the budget before the request and settling it to the bytes
+    /// read when the response persists. The walk suspends when the budget
+    /// or the work is spent, or the object would cross the budget, in
+    /// which case the bytes read up to the bound are debited. An object
+    /// above its own cap is a failed fetch.
+    fn get(&mut self, key: &ObjectKey, slot: &str, url: &str, object: Object) -> Result<Got> {
+        let (db, kind) = (self.db, key.kind());
+        let held = db.pull_object(self.run.run_id, kind, slot)?;
+        let reserved = match &held {
+            Some(object) if object.status == Status::Issued => object.debited,
+            Some(object) => return self.stored(object),
+            None => 0,
+        };
+        let spent = db.ingest_bytes(&self.run.unit, &self.run.day)? - reserved as i64;
+        let (work_bytes, work_objects) = (self.run.work_bytes, self.run.work_objects);
         if spent >= self.meter.budget || work_bytes == 0 || work_objects == 0 {
+            if held.is_some() {
+                let run = self.run.clone();
+                db.settle_pull_object(&run, kind, slot, Settled::Bounded(0))?;
+            }
             return Ok(Got::Suspend);
         }
         let cap = self.meter.caps.of(object);
         let limit = cap.min((self.meter.budget - spent) as u64).min(work_bytes);
-        let request = FetchRequest {
-            url: url.to_string(),
-            scope: self.scope()?,
+        db.reserve_pull_object(
+            self.run.run_id,
+            kind,
+            slot,
+            url,
+            &self.run.unit,
+            &self.run.day,
             limit,
-            cap,
-            metered: true,
+        )?;
+        let outcome = fetch_stage::fetch(
+            self.client,
+            &FetchRequest {
+                url: url.to_string(),
+                scope: self.scope()?,
+                limit,
+                cap,
+                metered: true,
+            },
+        );
+        let mut run = self.run.clone();
+        let settled = match &outcome {
+            Outcome::Body { raw, .. } => {
+                run.work_bytes = work_bytes.saturating_sub(raw.len() as u64);
+                run.work_objects = work_objects.saturating_sub(1);
+                Settled::Body(raw)
+            }
+            Outcome::Bounded { debited } => {
+                run.work_bytes = work_bytes.saturating_sub(*debited);
+                Settled::Bounded(*debited)
+            }
+            Outcome::Failed { detail } => Settled::Failed(detail),
         };
-        let outcome = fetch_stage::fetch(self.client, &request);
-        let debited = outcome.debited();
+        db.settle_pull_object(&run, kind, slot, settled)?;
+        self.run = run;
         Ok(match outcome {
-            Outcome::Body { raw, value } => {
-                admit::debit(self.db, &self.meter.unit, &self.meter.day, debited)?;
-                self.meter.work_bytes = work_bytes - debited;
-                self.meter.work_objects = work_objects - 1;
-                Got::Body(raw, value)
-            }
-            Outcome::Bounded { .. } => {
-                admit::debit(self.db, &self.meter.unit, &self.meter.day, debited)?;
-                self.meter.work_bytes = work_bytes - debited;
-                Got::Suspend
-            }
+            Outcome::Body { raw, value } => Got::Body(raw, value),
+            Outcome::Bounded { .. } => Got::Suspend,
             Outcome::Failed { detail } => Got::Failed(detail),
         })
     }
 
     /// Requests `publisher.json` outside the budget under the redirect
-    /// scope `scope`.
-    fn get_declaration(&self, scope: Vec<String>) -> std::result::Result<(Vec<u8>, Value), String> {
-        let request = FetchRequest {
-            url: format!("{}publisher.json", self.base),
-            scope,
-            limit: crate::fetch::OBJECT_CAP_BYTES,
-            cap: crate::fetch::OBJECT_CAP_BYTES,
-            metered: false,
-        };
-        match fetch_stage::fetch(self.client, &request) {
-            Outcome::Body { raw, value } => Ok((raw, value)),
-            Outcome::Failed { detail } => Err(detail),
-            Outcome::Bounded { .. } => Err("unmetered request stopped at a bound".into()),
+    /// scope `scope`, unless the run already holds the response.
+    fn get_declaration(
+        &self,
+        key: &ObjectKey,
+        scope: Vec<String>,
+        checks: Option<&str>,
+    ) -> Result<std::result::Result<(Vec<u8>, Value), String>> {
+        let (kind, slot) = (key.kind(), key.name());
+        if let Some(object) = self.db.pull_object(self.run.run_id, kind, &slot)? {
+            return Ok(match self.stored(&object)? {
+                Got::Body(raw, value) => Ok((raw, value)),
+                Got::Failed(detail) => Err(detail),
+                Got::Suspend => Err(String::new()),
+            });
         }
+        let url = format!("{}publisher.json", self.base);
+        let outcome = fetch_stage::fetch(
+            self.client,
+            &FetchRequest {
+                url: url.clone(),
+                scope,
+                limit: crate::fetch::OBJECT_CAP_BYTES,
+                cap: crate::fetch::OBJECT_CAP_BYTES,
+                metered: false,
+            },
+        );
+        Ok(match outcome {
+            Outcome::Body { raw, value } => {
+                self.db.record_pull_object(
+                    self.run.run_id,
+                    kind,
+                    &slot,
+                    &url,
+                    Status::Fetched,
+                    Some(&raw),
+                    checks,
+                )?;
+                Ok((raw, value))
+            }
+            Outcome::Bounded { .. } | Outcome::Failed { .. } => {
+                let detail = match outcome {
+                    Outcome::Failed { detail } => detail,
+                    _ => String::new(),
+                };
+                let mut record = serde_json::json!({ "detail": detail });
+                if let Some(checks) = checks {
+                    let checks: Value = serde_json::from_str(checks)?;
+                    if let (Some(record), Some(checks)) =
+                        (record.as_object_mut(), checks.as_object())
+                    {
+                        record.extend(checks.clone());
+                    }
+                }
+                self.db.record_pull_object(
+                    self.run.run_id,
+                    kind,
+                    &slot,
+                    &url,
+                    Status::Failed,
+                    None,
+                    Some(&record.to_string()),
+                )?;
+                Err(detail)
+            }
+        })
     }
 
-    fn reject(&self, code: &str, detail: &str) -> Result<()> {
-        admit::reject(self.db, self.host, code, self.now, None, detail)
-    }
-
-    /// Rejects one listed Delta, Label or dispute and reports it.
-    fn reject_item(&mut self, id: &str, code: &str, detail: &str) -> Result<()> {
-        admit::reject(self.db, self.host, code, self.now, Some(id), detail)?;
-        self.report
-            .rejected
-            .push((id.to_string(), code.to_string()));
+    /// Requests `publisher.json` for the retry `key` carries and admits
+    /// what it returns, spending the retry either way.
+    fn refresh(&mut self, key: &ObjectKey, scope: Vec<String>) -> Result<()> {
+        match self.get_declaration(key, scope, None)? {
+            Ok((raw, value)) => {
+                self.admit_declaration(key, &raw, value)?;
+            }
+            Err(_) => admit::consume_attempt(self.db, &mut self.run, key)?,
+        }
         Ok(())
     }
 
-    fn settle(&self) -> Result<()> {
-        admit::settle_if_due(self.db, self.data_dir, self.host, &self.clock)
-    }
-
-    fn admit_declaration(&self, raw: &[u8], value: Value) -> Result<Value> {
+    fn admit_declaration(&mut self, key: &ObjectKey, raw: &[u8], value: Value) -> Result<Value> {
+        let clock = &self.clock;
         admit::admit_declaration(
             self.db,
             self.data_dir,
+            &mut self.run,
             self.host,
-            self.now,
-            &self.clock,
+            clock,
+            key,
             raw,
             value,
         )
     }
 
+    fn abort(
+        &mut self,
+        key: Option<&ObjectKey>,
+        code: &str,
+        detail: &str,
+        noise: bool,
+    ) -> Result<()> {
+        admit::abort(self.db, &mut self.run, self.host, key, code, detail, noise)
+    }
+
+    /// Records the run's phase and its queue, with the position the next
+    /// item of that queue stands at.
+    fn enter(&mut self, phase: Phase, queue: Vec<String>) -> Result<()> {
+        self.run.phase = phase;
+        self.run.queue = queue;
+        self.run.position = 0;
+        self.db.update_pull_run(&self.run)
+    }
+
+    /// Ends the pull's work, suspended or complete, leaving the run to be
+    /// closed.
+    fn finish(&mut self, suspended: bool) -> Result<()> {
+        self.run.phase = Phase::Closing;
+        self.run.suspended = suspended;
+        self.db.update_pull_run(&self.run)
+    }
+
     fn run(&mut self) -> Result<()> {
-        let (db, host, now) = (self.db, self.host, self.now);
-        let known = db.get_publisher(host)?.is_some();
-        if !known {
+        crate::recovery::settle(self.db, self.data_dir, &self.now())?;
+        if self.run.phase == Phase::Walk && self.discover()? {
+            self.walk_feed()?;
+        }
+        if self.run.phase == Phase::Deltas {
+            self.process_deltas()?;
+        }
+        if self.run.phase == Phase::Labels {
+            self.walk_labels()?;
+        }
+        if self.run.phase == Phase::LabelItems {
+            self.process_labels()?;
+        }
+        Ok(())
+    }
+
+    /// WIST-2 §5 step 0 and ADR-0031: the domain's first-contact or
+    /// periodic `publisher.json`, then the Key Set cache's age. `false`
+    /// ends the pull.
+    fn discover(&mut self) -> Result<bool> {
+        let (db, host) = (self.db, self.host);
+        let key = ObjectKey::Declaration {
+            attempt: Attempt::Periodic,
+        };
+        let held = db.pull_object(self.run.run_id, key.kind(), &key.name())?;
+        let first_contact = match &held {
+            Some(object) => checks_flag(object, "first_contact"),
+            None => db.get_publisher(host)?.is_none(),
+        };
+        let discovered = held.is_some_and(|object| object.status == Status::Admitted);
+        let checks = serde_json::json!({ "first_contact": first_contact }).to_string();
+        if first_contact && !discovered {
             let first = self
-                .get_declaration(self.scope()?)
+                .get_declaration(&key, self.scope()?, Some(&checks))?
                 .and_then(|(raw, value)| {
                     let publisher = verify::initial_declaration(&value, host)?;
                     Ok((raw, value, publisher))
                 });
             match first {
                 Ok((raw, value, publisher)) => {
-                    admit::onboard(db, host, now, &raw, &value, &publisher)?
+                    admit::onboard(db, &mut self.run, host, &key, &raw, &value, &publisher)?
                 }
                 Err(detail) => {
-                    self.reject("WIST2-E04", &detail)?;
-                    self.report.noise = Some("WIST2-E04");
-                    return Ok(());
+                    self.abort(Some(&key), "WIST2-E04", &detail, true)?;
+                    return Ok(false);
                 }
             }
         }
-
         let stored_raw = db
             .get_publisher_declaration(host)?
             .ok_or_else(|| crate::error::Error::Fetch("publisher row lost mid-ingest".into()))?;
         let mut current_doc: Value = crate::json::parse(&stored_raw)?;
-        if known {
-            match self.get_declaration(self.scope()?) {
-                Ok((raw, value)) => current_doc = self.admit_declaration(&raw, value)?,
+        if !first_contact && !discovered {
+            match self.get_declaration(&key, self.scope()?, Some(&checks))? {
+                Ok((raw, value)) => current_doc = self.admit_declaration(&key, &raw, value)?,
                 Err(e) => {
-                    if key_set_cache_expired(db, host, now)? {
-                        self.reject(
+                    if key_set_cache_expired(db, host, &self.now())? {
+                        self.abort(
+                            None,
                             "WIST1-E02",
                             &format!("Key Set cache expired and rediscovery failed: {e}"),
+                            false,
                         )?;
-                        return Ok(());
+                        return Ok(false);
                     }
                 }
             }
         }
-        if known && key_set_cache_expired(db, host, now)? {
-            self.reject(
+        if !first_contact && key_set_cache_expired(db, host, &self.now())? {
+            self.abort(
+                None,
                 "WIST1-E02",
                 "Key Set cache expired without an accepted Declaration refresh",
+                false,
             )?;
-            return Ok(());
+            return Ok(false);
         }
         if let Err(e) = declaration::publisher_of(&current_doc) {
-            self.reject("WIST2-E04", &e)?;
-            self.report.noise = Some("WIST2-E04");
-            return Ok(());
+            self.abort(None, "WIST2-E04", &e, true)?;
+            return Ok(false);
         }
+        Ok(true)
+    }
 
-        let Some(walk) = self.walk_feed()? else {
-            return Ok(());
-        };
-        let mut suspended = walk.suspended;
-        if !suspended {
-            suspended = self.process_deltas(&walk.pages)?;
+    /// The page at `index` of `walk` as the run's cursor holds it, once
+    /// its admission recorded it.
+    fn walked(&self, key: &ObjectKey, walk: Walk, index: u32) -> Result<Option<WalkPage>> {
+        let object = self
+            .db
+            .pull_object(self.run.run_id, key.kind(), &key.name())?;
+        match object.map(|object| object.status) {
+            Some(Status::Admitted) => self.db.walk_page(self.host, walk.as_str(), index),
+            _ => Ok(None),
         }
-        if !suspended {
-            let sizes = declaration::delta::SizeCaps::from_schedule(
-                &db.parameter_schedule(self.now_unix)?,
-                self.now_unix,
-            );
-            suspended = self.pull_labels(sizes.url_cap_bytes)?;
-        }
-        self.report.suspended = suspended;
-        if !suspended
-            && !walk.unseen_any
-            && self.report.accepted.is_empty()
-            && self.report.queued.is_empty()
-            && self.report.rejected.is_empty()
-            && self.report.labels.is_empty()
-        {
-            self.report.noise = Some("WIST2-E02");
-        }
-        admit::close_run(db, host, now, suspended)
     }
 
     /// Walks the Feed from `feed.json` through its sealed Pages (WIST-2
     /// §3.2, §5 step 1) until a page lists no unseen ID, `next` ends or
-    /// fails the target rule, or the walk suspends. `None` ends the pull.
-    fn walk_feed(&mut self) -> Result<Option<FeedWalk>> {
+    /// fails the target rule, or the walk suspends.
+    fn walk_feed(&mut self) -> Result<()> {
         let (db, host) = (self.db, self.host);
-        let mut page_key_sets = None;
-        let mut refresh_used = false;
-        let mut pages: Vec<FeedEnvelope> = Vec::new();
-        let mut page_url = format!("{}feed.json", self.base);
-        let mut unseen_any = false;
+        let mut pages: Vec<Vec<String>> = Vec::new();
+        let mut url = format!("{}feed.json", self.base);
+        let mut sealed_sources = None;
         loop {
-            let value = match self.get(&page_url, Object::Page)? {
-                Got::Body(_, value) => value,
-                Got::Suspend => {
-                    return Ok(Some(FeedWalk {
-                        pages,
-                        unseen_any,
-                        suspended: true,
-                    }))
+            let index = pages.len() as u32;
+            let key = ObjectKey::Page {
+                feed: Walk::Feed,
+                index,
+            };
+            let admitted = match self.walked(&key, Walk::Feed, index)? {
+                Some(page) => {
+                    let unseen = admit::unseen(db, host, Walk::Feed, &page.ids)?;
+                    Some((page, unseen))
                 }
-                Got::Failed(detail) => {
-                    self.reject("WIST2-E01", &detail)?;
-                    return Ok(None);
+                None => {
+                    let value = match self.get(&key, &key.name(), &url, Object::Page)? {
+                        Got::Body(_, value) => value,
+                        Got::Suspend => return self.finish(true),
+                        Got::Failed(detail) => {
+                            return self.abort(Some(&key), "WIST2-E01", &detail, false)
+                        }
+                    };
+                    let checks = verify::page(&value, host);
+                    let parsed = match checks.fields {
+                        Ok(parsed) => parsed,
+                        Err(detail) => {
+                            return self.abort(Some(&key), "WIST2-E01", detail, false);
+                        }
+                    };
+                    if !checks.domain_matches {
+                        return self.abort(
+                            Some(&key),
+                            "WIST2-E04",
+                            "feed domain does not match the host it was fetched from",
+                            true,
+                        );
+                    }
+                    self.settle()?;
+                    let live = index == 0;
+                    if !live && sealed_sources.is_none() {
+                        sealed_sources = Some(page_declarations(
+                            db,
+                            self.data_dir,
+                            host,
+                            self.run.pages_epoch,
+                        )?);
+                    }
+                    let verified = |pull: &Self| -> Result<bool> {
+                        Ok(match &sealed_sources {
+                            Some(sources) if !live => {
+                                verify::sealed_page(sources, &value, &parsed.feed.generated_at)
+                            }
+                            _ => verify::live_page(&live_page_keys(pull.db, host)?, &value),
+                        })
+                    };
+                    let mut passed = verified(self)?;
+                    if !passed && !self.run.feed_retry_used {
+                        let retry = ObjectKey::Declaration {
+                            attempt: Attempt::Feed,
+                        };
+                        self.refresh(&retry, self.scope()?)?;
+                        self.settle()?;
+                        passed = verified(self)?;
+                    }
+                    if !passed {
+                        return self.abort(
+                            Some(&key),
+                            "WIST2-E04",
+                            "feed signature does not verify against the domain's Key Set",
+                            true,
+                        );
+                    }
+                    let next =
+                        parsed.feed.next.as_deref().map(|next| {
+                            verify::next_page_url(next, host, self.client.allow_http())
+                        });
+                    admit::admit_page(
+                        db,
+                        &mut self.run,
+                        host,
+                        &key,
+                        Walk::Feed,
+                        live,
+                        index,
+                        &url,
+                        &parsed,
+                        next,
+                    )?
                 }
             };
-            let checks = verify::page(&value, host);
-            let parsed = match checks.fields {
-                Ok(parsed) => parsed,
-                Err(detail) => {
-                    self.reject("WIST2-E01", detail)?;
-                    return Ok(None);
-                }
+            let Some((page, unseen)) = admitted else {
+                return Ok(());
             };
-            if !checks.domain_matches {
-                self.reject(
-                    "WIST2-E04",
-                    "feed domain does not match the host it was fetched from",
-                )?;
-                self.report.noise = Some("WIST2-E04");
-                return Ok(None);
-            }
-            self.settle()?;
-            let live = pages.is_empty();
-            let generated_at = parsed.feed.generated_at.as_str();
-            if !live && page_key_sets.is_none() {
-                page_key_sets = Some(page_declarations(db, self.data_dir, host)?);
-            }
-            let verify = |pull: &Self| -> Result<bool> {
-                Ok(match &page_key_sets {
-                    Some(sources) if !live => verify::sealed_page(sources, &value, generated_at),
-                    _ => verify::live_page(&live_page_keys(pull.db, host)?, &value),
-                })
-            };
-            let mut verified = verify(self)?;
-            if !verified && !refresh_used {
-                refresh_used = true;
-                if let Ok((raw, fetched)) = self.get_declaration(self.scope()?) {
-                    self.admit_declaration(&raw, fetched)?;
-                }
-                self.settle()?;
-                verified = verify(self)?;
-            }
-            if !verified {
-                self.reject(
-                    "WIST2-E04",
-                    "feed signature does not verify against the domain's Key Set",
-                )?;
-                self.report.noise = Some("WIST2-E04");
-                return Ok(None);
-            }
-            let next = parsed
-                .feed
-                .next
-                .as_deref()
-                .map(|next| verify::next_page_url(next, host, self.client.allow_http()));
-            let admission = admit::admit_page(db, host, self.now, Walk::Feed, live, &parsed, next)?;
-            if let Step::Refused = admission.step {
-                return Ok(None);
-            }
-            unseen_any |= admission.unseen;
-            pages.push(parsed);
-            match admission.step {
-                Step::Continue(url) => page_url = url,
+            pages.push(page.ids);
+            match (unseen, page.next_url) {
+                (true, Some(next)) => url = next,
                 _ => break,
             }
         }
-        Ok(Some(FeedWalk {
-            pages,
-            unseen_any,
-            suspended: false,
-        }))
+        let queue = pages.into_iter().rev().flatten().collect();
+        self.enter(Phase::Deltas, queue)
     }
 
     /// WIST-2 §5 steps 2–4 over the walked pages' Delta IDs, oldest page
-    /// first. Returns whether the walk suspended.
-    fn process_deltas(&mut self, pages: &[FeedEnvelope]) -> Result<bool> {
-        use std::collections::{HashMap, HashSet};
+    /// first.
+    fn process_deltas(&mut self) -> Result<()> {
         let (db, host, data_dir) = (self.db, self.host, self.data_dir);
-        let mut ids: Vec<String> = pages
-            .iter()
-            .rev()
-            .flat_map(|page| page.feed.deltas.iter().cloned())
-            .collect();
-        let mut chain_pos: i64 = 0;
-        let mut prefetched: HashMap<String, Value> = HashMap::new();
-        let mut issued = HashMap::<String, verify::IssuedRefs>::new();
-        let mut verified_payloads = HashMap::<String, (Vec<u8>, Value)>::new();
-        let mut resolved_prev: HashSet<String> = HashSet::new();
-        let mut refreshed = HashSet::new();
-        let mut position = 0usize;
-        while position < ids.len() {
-            let id = ids[position].clone();
-            position += 1;
+        while self.run.position < self.run.queue.len() {
+            let index = self.run.position;
+            let id = self.run.queue[index].clone();
             self.settle()?;
             if db.is_delta_seen_for(&id, host)? {
+                self.run.position = index + 1;
                 continue;
             }
+            let key = ObjectKey::Delta { id: id.clone() };
+            let slot = self.slot(&key)?;
+            let mut refusal = admit::Refusal {
+                index,
+                id: &id,
+                kind: "delta",
+                slot: &slot,
+                consumed: None,
+                resolved_prev: false,
+            };
             let Some(hex) = id.strip_prefix("sha256:") else {
-                self.reject_item(&id, "WIST2-E03", "malformed delta id")?;
+                admit::reject_item(
+                    db,
+                    &mut self.run,
+                    host,
+                    &refusal,
+                    "WIST2-E03",
+                    "malformed delta id",
+                )?;
                 continue;
             };
-            let doc = match prefetched.remove(&id) {
-                Some(doc) => doc,
-                None => {
-                    let url = format!("{}deltas/{hex}.json", self.base);
-                    match self.get(&url, Object::Delta)? {
-                        Got::Body(_, doc) => doc,
-                        Got::Suspend => return Ok(true),
-                        Got::Failed(detail) => {
-                            self.reject_item(&id, "WIST2-E03", &detail)?;
-                            continue;
-                        }
-                    }
+            let url = format!("{}deltas/{hex}.json", self.base);
+            let doc = match self.get(&key, &slot, &url, Object::Delta)? {
+                Got::Body(_, doc) => doc,
+                Got::Suspend => return self.finish(true),
+                Got::Failed(detail) => {
+                    admit::reject_item(db, &mut self.run, host, &refusal, "WIST2-E03", &detail)?;
+                    continue;
                 }
             };
-            let mut attempt = match issued.remove(&id) {
-                Some(refs) => refs,
-                None => issue_refs(db, data_dir, host, (self.clock)())?,
+            let mut attempt = match db
+                .pull_object(self.run.run_id, "delta", &slot)?
+                .and_then(|object| object.refs_json)
+            {
+                Some(stored) => verify::IssuedRefs::from_json(&stored)?,
+                None => {
+                    let refs = issue_refs(db, data_dir, host, (self.clock)())?;
+                    db.set_pull_object_refs(self.run.run_id, "delta", &slot, &refs.to_json()?)?;
+                    refs
+                }
             };
             let checks = verify::delta(
                 &doc,
@@ -754,20 +964,44 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
                 attempt.clock_skew_seconds,
             );
             if let Err(code) = checks.association {
-                self.reject_item(&id, code, "Delta Publisher does not match the logical Feed")?;
+                admit::reject_item(
+                    db,
+                    &mut self.run,
+                    host,
+                    &refusal,
+                    code,
+                    "Delta Publisher does not match the logical Feed",
+                )?;
                 continue;
             }
-            if let Err(code) = self.authority(&id, &doc, &mut refreshed, &mut attempt)? {
-                self.reject_item(&id, code, "Delta signing and scope authority failed")?;
+            if let Err(code) = self.authority(&id, &doc, &mut attempt)? {
+                admit::reject_item(
+                    db,
+                    &mut self.run,
+                    host,
+                    &refusal,
+                    code,
+                    "Delta signing and scope authority failed",
+                )?;
                 continue;
             }
             if let Err(code) = checks.static_fields {
-                self.reject_item(&id, code, "Delta static validation failed")?;
+                admit::reject_item(
+                    db,
+                    &mut self.run,
+                    host,
+                    &refusal,
+                    code,
+                    "Delta static validation failed",
+                )?;
                 continue;
             }
             if let Err(code) = checks.clock {
-                self.reject_item(
-                    &id,
+                admit::reject_item(
+                    db,
+                    &mut self.run,
+                    host,
+                    &refusal,
                     code,
                     "observed_at exceeds the clock_skew_seconds allowance",
                 )?;
@@ -777,38 +1011,56 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
                 Ok(verified) => verified.envelope,
                 Err(verify::Undecoded::Canonical(e)) => return Err(e.into()),
                 Err(verify::Undecoded::Envelope(detail)) => {
-                    self.reject_item(&id, "WIST2-E03", &detail)?;
+                    admit::reject_item(db, &mut self.run, host, &refusal, "WIST2-E03", &detail)?;
                     continue;
                 }
             };
             if let Err(detail) = checks.id {
-                self.reject_item(&id, "WIST2-E03", &detail)?;
+                admit::reject_item(db, &mut self.run, host, &refusal, "WIST2-E03", &detail)?;
                 continue;
             }
+            let facts = serde_json::json!({
+                "url": envelope.delta.url,
+                "prev": envelope.delta.prev,
+                "observed_at": envelope.delta.observed_at,
+            })
+            .to_string();
+            db.advance_pull_object(
+                self.run.run_id,
+                "delta",
+                &slot,
+                &[Status::Fetched],
+                Status::Verified,
+                Some(&facts),
+            )?;
 
             if envelope.delta.prev != db.url_tip(host, &envelope.delta.url)? {
-                if resolved_prev.insert(id.clone()) {
+                let retrievable = !db.pull_attempted(self.run.run_id, "resolved_prev", &id)?;
+                let mut consumed = None;
+                if retrievable {
                     if let Some(prev) = envelope.delta.prev.as_deref() {
                         if !db.is_delta_seen_for(prev, host)? {
+                            let key = ObjectKey::Delta { id: prev.into() };
+                            let slot = self.slot(&key)?;
                             let url = format!("{}deltas/{}.json", self.base, &prev[7..]);
-                            match self.get(&url, Object::Delta)? {
-                                Got::Body(_, predecessor) => {
-                                    let at = position - 1;
-                                    issued.insert(id.clone(), attempt);
-                                    prefetched.insert(id.clone(), doc);
-                                    prefetched.insert(prev.into(), predecessor);
-                                    ids.insert(at, prev.into());
-                                    position = at;
+                            match self.get(&key, &slot, &url, Object::Delta)? {
+                                Got::Body(..) => {
+                                    admit::splice_predecessor(db, &mut self.run, &id, prev, index)?;
                                     continue;
                                 }
-                                Got::Suspend => return Ok(true),
-                                Got::Failed(_) => {}
+                                Got::Suspend => return self.finish(true),
+                                Got::Failed(_) => consumed = Some(("delta", slot)),
                             }
                         }
                     }
                 }
-                self.reject_item(
-                    &id,
+                refusal.consumed = consumed;
+                refusal.resolved_prev = retrievable;
+                admit::reject_item(
+                    db,
+                    &mut self.run,
+                    host,
+                    &refusal,
                     "WIST1-E07",
                     "prev does not match the chain tip and could not be retrieved",
                 )?;
@@ -818,8 +1070,11 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
             if let Some(prev) = &envelope.delta.prev {
                 let predecessor = db.accepted_delta(data_dir, host, prev)?;
                 if let Err(code) = declaration::verify_delta_predecessor(&doc, &predecessor) {
-                    self.reject_item(
-                        &id,
+                    admit::reject_item(
+                        db,
+                        &mut self.run,
+                        host,
+                        &refusal,
                         code,
                         "Delta does not strictly follow its predecessor observation",
                     )?;
@@ -828,61 +1083,83 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
             }
 
             let payload = if envelope.delta.payload.is_some() {
-                let (raw, value) = match verified_payloads.remove(&id) {
-                    Some(stored) => stored,
-                    None => {
-                        let url = format!("{}payloads/{hex}.json", self.base);
-                        match self.get(&url, Object::Payload)? {
-                            Got::Body(raw, value) => (raw, value),
-                            Got::Suspend => return Ok(true),
-                            Got::Failed(detail) => {
-                                self.reject_item(&id, "WIST2-E03", &detail)?;
-                                continue;
-                            }
-                        }
+                let key = ObjectKey::Payload {
+                    delta_id: id.clone(),
+                };
+                let payload_slot = self.slot(&key)?;
+                let url = format!("{}payloads/{hex}.json", self.base);
+                let (raw, value) = match self.get(&key, &payload_slot, &url, Object::Payload)? {
+                    Got::Body(raw, value) => (raw, value),
+                    Got::Suspend => return self.finish(true),
+                    Got::Failed(detail) => {
+                        refusal.consumed = Some(("payload", payload_slot));
+                        admit::reject_item(
+                            db,
+                            &mut self.run,
+                            host,
+                            &refusal,
+                            "WIST2-E03",
+                            &detail,
+                        )?;
+                        continue;
                     }
                 };
                 if let Err(code) = verify::payload(&value, &envelope, &attempt.sizes) {
-                    self.reject_item(&id, "WIST2-E03", code)?;
+                    refusal.consumed = Some(("payload", payload_slot));
+                    admit::reject_item(db, &mut self.run, host, &refusal, "WIST2-E03", code)?;
                     continue;
                 }
-                Some((raw, value))
+                db.advance_pull_object(
+                    self.run.run_id,
+                    "payload",
+                    &payload_slot,
+                    &[Status::Fetched],
+                    Status::Verified,
+                    None,
+                )?;
+                Some((raw, payload_slot))
             } else {
                 None
             };
 
-            if let Err(code) = self.authority(&id, &doc, &mut refreshed, &mut attempt)? {
-                self.reject_item(&id, code, "Delta authority changed before admission")?;
+            if let Err(code) = self.authority(&id, &doc, &mut attempt)? {
+                refusal.consumed = payload.as_ref().map(|(_, slot)| ("payload", slot.clone()));
+                admit::reject_item(
+                    db,
+                    &mut self.run,
+                    host,
+                    &refusal,
+                    code,
+                    "Delta authority changed before admission",
+                )?;
                 continue;
             }
+            let item = admit::DeltaItem {
+                index,
+                id: &id,
+                slot: &slot,
+                payload_slot: payload.as_ref().map(|(_, slot)| slot.as_str()),
+            };
             match admit::admit_delta(
                 db,
                 data_dir,
+                &mut self.run,
                 host,
-                &id,
+                &item,
                 &doc,
                 &envelope,
                 payload.as_ref().map(|(raw, _)| raw.as_slice()),
-                chain_pos,
                 &attempt,
             )? {
-                Admission::Stale(stale) => {
+                admit::Admission::Stale(stale) => {
                     tracing::debug!(domain = host, delta = %id, ?stale, "re-issuing a stale Delta admission");
-                    resolved_prev.remove(&id);
-                    issued.insert(id.clone(), self.reissue(attempt)?);
-                    prefetched.insert(id.clone(), doc);
-                    if let Some(payload) = payload {
-                        verified_payloads.insert(id.clone(), payload);
-                    }
-                    position -= 1;
-                    continue;
+                    let refs = self.reissue(attempt)?;
+                    admit::reissue(db, &self.run, &id, &slot, &refs)?;
                 }
-                Admission::Queued => self.report.queued.push(id.clone()),
-                Admission::Accepted => self.report.accepted.push(id.clone()),
+                _ => continue,
             }
-            chain_pos += 1;
         }
-        Ok(false)
+        self.enter(Phase::Labels, Vec::new())
     }
 
     /// WIST-1 §5.1 authority of a Delta under the admission sources after
@@ -890,20 +1167,24 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
     /// each Delta ID per pull on a binding failure. The attempt's
     /// Declaration reference becomes the version the check read.
     fn authority(
-        &self,
+        &mut self,
         id: &str,
         doc: &Value,
-        refreshed: &mut std::collections::HashSet<String>,
         attempt: &mut verify::IssuedRefs,
     ) -> Result<std::result::Result<(), &'static str>> {
         let scope = self.scope()?;
         self.settle()?;
         attempt.decl = declaration_ref(self.db, self.host)?;
         let mut authority = verify::delta_authority(&attempt.decl.sources, doc);
-        if matches!(authority, Err("WIST1-E01" | "WIST1-E02")) && refreshed.insert(id.into()) {
-            if let Ok((raw, value)) = self.get_declaration(scope) {
-                self.admit_declaration(&raw, value)?;
-            }
+        if matches!(authority, Err("WIST1-E01" | "WIST1-E02"))
+            && !self
+                .db
+                .pull_attempted(self.run.run_id, "delta_refresh", id)?
+        {
+            let key = ObjectKey::Declaration {
+                attempt: Attempt::Delta(id.to_string()),
+            };
+            self.refresh(&key, scope)?;
             self.settle()?;
             attempt.decl = declaration_ref(self.db, self.host)?;
             authority = verify::delta_authority(&attempt.decl.sources, doc);
@@ -925,144 +1206,250 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
         })
     }
 
-    /// WIST-2 §3.3: pulls the domain's Label Feed beside its Feed, walking
-    /// it under §3.2's rules and the ingest budget, validates each unseen
-    /// Label or dispute under the accepted Declaration and queues it as a
-    /// `label` or `dispute` Entry; a failure is `WIST2-E06` at the status
-    /// endpoint. Returns whether the walk suspended under the budget: a
-    /// Label walk that cannot begin under a spent budget waits for the
-    /// next pull without suspending the Feed walk that completed before
-    /// it.
-    fn pull_labels(&mut self, url_cap_bytes: i64) -> Result<bool> {
+    /// WIST-2 §3.3: walks the domain's Label Feed beside its Feed, under
+    /// §3.2's rules and the ingest budget. A Label walk that cannot begin
+    /// under a spent budget waits for the next pull without suspending the
+    /// Feed walk that completed before it.
+    fn walk_labels(&mut self) -> Result<()> {
         let (db, host) = (self.db, self.host);
-        let Some(mut declaration) = label_declaration(db, host)? else {
-            return Ok(false);
-        };
-        let mut page_url = format!("{}label-feed.json", self.base);
+        if label_declaration(db, host)?.is_none() {
+            return self.finish(false);
+        }
         let mut pages: Vec<Vec<String>> = Vec::new();
-        let mut page_key_sets = None;
+        let mut url = format!("{}label-feed.json", self.base);
+        let mut sealed_sources = None;
         loop {
-            let live = pages.is_empty();
-            let value = match self.get(&page_url, Object::Page)? {
-                Got::Body(_, value) => value,
-                Got::Suspend => return Ok(!live),
-                Got::Failed(detail) => {
-                    if !live {
-                        self.reject("WIST2-E01", &detail)?;
+            let index = pages.len() as u32;
+            let live = index == 0;
+            let key = ObjectKey::Page {
+                feed: Walk::Label,
+                index,
+            };
+            if db
+                .pull_object(self.run.run_id, key.kind(), &key.name())?
+                .is_some_and(|object| object.status == Status::Rejected)
+            {
+                break;
+            }
+            let admitted = match self.walked(&key, Walk::Label, index)? {
+                Some(page) => {
+                    let unseen = admit::unseen(db, host, Walk::Label, &page.ids)?;
+                    Some((page, unseen))
+                }
+                None => {
+                    let value = match self.get(&key, &key.name(), &url, Object::Page)? {
+                        Got::Body(_, value) => value,
+                        Got::Suspend => return self.finish(!live),
+                        Got::Failed(detail) => {
+                            if !live {
+                                admit::reject_page(
+                                    db,
+                                    &self.run,
+                                    host,
+                                    &key,
+                                    "WIST2-E01",
+                                    &detail,
+                                )?;
+                            }
+                            break;
+                        }
+                    };
+                    let checks = verify::page(&value, host);
+                    let parsed = match checks.fields {
+                        Ok(parsed) => parsed,
+                        Err(detail) => {
+                            admit::reject_page(db, &self.run, host, &key, "WIST2-E06", detail)?;
+                            break;
+                        }
+                    };
+                    if !checks.domain_matches {
+                        admit::reject_page(
+                            db,
+                            &self.run,
+                            host,
+                            &key,
+                            "WIST2-E06",
+                            "label feed domain does not match the host it was fetched from",
+                        )?;
+                        break;
                     }
-                    break;
+                    let verified = if live {
+                        verify::live_page(&live_page_keys(db, host)?, &value)
+                    } else {
+                        if sealed_sources.is_none() {
+                            sealed_sources = Some(page_declarations(
+                                db,
+                                self.data_dir,
+                                host,
+                                self.run.pages_epoch,
+                            )?);
+                        }
+                        verify::sealed_page(
+                            sealed_sources.as_ref().unwrap(),
+                            &value,
+                            &parsed.feed.generated_at,
+                        )
+                    };
+                    if !verified {
+                        admit::reject_page(
+                            db,
+                            &self.run,
+                            host,
+                            &key,
+                            "WIST2-E06",
+                            "label feed signature does not verify against the domain's Key Set",
+                        )?;
+                        break;
+                    }
+                    let next =
+                        parsed.feed.next.as_deref().map(|next| {
+                            verify::next_page_url(next, host, self.client.allow_http())
+                        });
+                    admit::admit_page(
+                        db,
+                        &mut self.run,
+                        host,
+                        &key,
+                        Walk::Label,
+                        live,
+                        index,
+                        &url,
+                        &parsed,
+                        next,
+                    )?
                 }
             };
-            let checks = verify::page(&value, host);
-            let parsed = match checks.fields {
-                Ok(parsed) => parsed,
-                Err(detail) => {
-                    self.reject("WIST2-E06", detail)?;
-                    break;
-                }
+            let Some((page, unseen)) = admitted else {
+                break;
             };
-            if !checks.domain_matches {
-                self.reject(
-                    "WIST2-E06",
-                    "label feed domain does not match the host it was fetched from",
-                )?;
-                break;
-            }
-            let verified = if live {
-                verify::live_page(&live_page_keys(db, host)?, &value)
-            } else {
-                if page_key_sets.is_none() {
-                    page_key_sets = Some(page_declarations(db, self.data_dir, host)?);
-                }
-                verify::sealed_page(
-                    page_key_sets.as_ref().unwrap(),
-                    &value,
-                    &parsed.feed.generated_at,
-                )
-            };
-            if !verified {
-                self.reject(
-                    "WIST2-E06",
-                    "label feed signature does not verify against the domain's Key Set",
-                )?;
-                break;
-            }
-            let next = parsed
-                .feed
-                .next
-                .as_deref()
-                .map(|next| verify::next_page_url(next, host, self.client.allow_http()));
-            let admission =
-                admit::admit_page(db, host, self.now, Walk::Label, live, &parsed, next)?;
-            if let Step::Refused = admission.step {
-                break;
-            }
-            pages.push(parsed.feed.deltas);
-            match admission.step {
-                Step::Continue(url) => page_url = url,
+            pages.push(page.ids);
+            match (unseen, page.next_url) {
+                (true, Some(next)) => url = next,
                 _ => break,
             }
         }
-        let ids: Vec<String> = pages.iter().rev().flatten().cloned().collect();
-        for id in ids {
+        let queue = pages.into_iter().rev().flatten().collect();
+        self.enter(Phase::LabelItems, queue)
+    }
+
+    /// Fetches each unseen Label or dispute of the walked Label Feed
+    /// pages, validates it under the accepted Declaration and queues it as
+    /// a `label` or `dispute` Entry; a failure is `WIST2-E06` at the
+    /// status endpoint.
+    fn process_labels(&mut self) -> Result<()> {
+        let (db, host) = (self.db, self.host);
+        let Some(mut declaration) = label_declaration(db, host)? else {
+            return self.finish(false);
+        };
+        let url_cap_bytes = declaration::delta::SizeCaps::from_schedule(
+            &db.parameter_schedule(self.now_unix)?,
+            self.now_unix,
+        )
+        .url_cap_bytes;
+        while self.run.position < self.run.queue.len() {
+            let index = self.run.position;
+            let id = self.run.queue[index].clone();
             if db.is_label_seen_for(&id, host)? {
+                self.run.position = index + 1;
                 continue;
             }
+            let key = ObjectKey::Label { id: id.clone() };
+            let slot = self.slot(&key)?;
+            let refusal = admit::Refusal {
+                index,
+                id: &id,
+                kind: "label",
+                slot: &slot,
+                consumed: None,
+                resolved_prev: false,
+            };
             let Some(hex) = id.strip_prefix("sha256:") else {
-                self.reject_item(&id, "WIST2-E06", "malformed Label ID")?;
+                admit::reject_item(
+                    db,
+                    &mut self.run,
+                    host,
+                    &refusal,
+                    "WIST2-E06",
+                    "malformed Label ID",
+                )?;
                 continue;
             };
             let url = format!("{}labels/{hex}.json", self.base);
-            let doc = match self.get(&url, Object::Label)? {
+            let doc = match self.get(&key, &slot, &url, Object::Label)? {
                 Got::Body(_, doc) => doc,
-                Got::Suspend => return Ok(true),
+                Got::Suspend => return self.finish(true),
                 Got::Failed(detail) => {
-                    self.reject_item(&id, "WIST2-E06", &detail)?;
+                    admit::reject_item(db, &mut self.run, host, &refusal, "WIST2-E06", &detail)?;
                     continue;
                 }
             };
             loop {
                 let checks = verify::label(&doc, &id, &declaration.0, url_cap_bytes);
                 let Some(kind) = checks.kind else {
-                    self.reject_item(
-                        &id,
+                    admit::reject_item(
+                        db,
+                        &mut self.run,
+                        host,
+                        &refusal,
                         "WIST2-E06",
                         "file carries neither a Label nor a dispute",
                     )?;
                     break;
                 };
                 if !checks.id_matches {
-                    self.reject_item(&id, "WIST2-E06", "file does not carry the listed ID")?;
+                    admit::reject_item(
+                        db,
+                        &mut self.run,
+                        host,
+                        &refusal,
+                        "WIST2-E06",
+                        "file does not carry the listed ID",
+                    )?;
                     break;
                 }
-                match admit::admit_label(
+                if let admit::LabelAdmission::Stale = admit::admit_label(
                     db,
+                    &mut self.run,
                     host,
-                    self.now,
+                    index,
                     &id,
+                    &slot,
                     kind,
                     &doc,
                     &declaration,
                     checks.label,
                 )? {
-                    admit::LabelAdmission::Admitted => self.report.labels.push(id),
-                    admit::LabelAdmission::Rejected(code) => {
-                        self.report.rejected.push((id, code.into()))
-                    }
-                    admit::LabelAdmission::Stale => {
-                        declaration = label_declaration(db, host)?.ok_or_else(|| {
-                            crate::error::Error::History(
-                                "Label admission Declaration lost mid-pull".into(),
-                            )
-                        })?;
-                        continue;
-                    }
+                    declaration = label_declaration(db, host)?.ok_or_else(|| {
+                        crate::error::Error::History(
+                            "the Label admission Declaration was lost mid-pull".into(),
+                        )
+                    })?;
+                    continue;
                 }
                 break;
             }
         }
-        Ok(false)
+        self.finish(false)
     }
+}
+
+/// A recorded flag of an object's checks.
+fn checks_flag(object: &PullObject, name: &str) -> bool {
+    object
+        .checks_json
+        .as_deref()
+        .and_then(|checks| serde_json::from_str::<Value>(checks).ok())
+        .is_some_and(|checks| checks[name] == true)
+}
+
+/// The failure a fetch recorded, if it failed rather than suspended the
+/// walk at a bound.
+fn failure_detail(object: &PullObject) -> Option<String> {
+    object
+        .checks_json
+        .as_deref()
+        .and_then(|checks| serde_json::from_str::<Value>(checks).ok())
+        .and_then(|checks| checks["detail"].as_str().map(str::to_string))
 }
 
 #[cfg(test)]
