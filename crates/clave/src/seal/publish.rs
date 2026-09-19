@@ -214,7 +214,6 @@ pub(super) fn epoch(
     crate::snapshot::build(
         db,
         data_dir,
-        &signers[0],
         epoch_number,
         sealed.tree_size,
         &sealed.root,

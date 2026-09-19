@@ -122,6 +122,8 @@ impl Store {
                 public_key: anchor.key.to_b64u(),
                 added_height: 0,
                 removed_height: None,
+                adding_act: None,
+                removing_act: None,
             });
         }
         let mut seeds = Vec::new();
@@ -250,6 +252,19 @@ impl Store {
 /// the genesis key alone is valid (WIST-3 §3.4).
 pub fn head_height(db: &Db) -> Result<u64> {
     Ok(db.last_epoch()?.map_or(0, |head| head.epoch_number))
+}
+
+/// WIST-3 §3.4: the held Aggregator key a document this Aggregator signs
+/// now is signed with, and the `key_id` that document names — one valid at
+/// the Log's head height, the height at which a Consumer verifies every
+/// unsealed document and the height a key act queued now authenticates at.
+pub fn head_signer(data_dir: &Path, db: &Db) -> Result<(String, SigningKey)> {
+    let store = Store::open(data_dir, db)?;
+    let key = store.signer_at(head_height(db)?)?;
+    let signing = key
+        .signing()
+        .ok_or_else(|| Error::Key("the signing key is not held".into()))?;
+    Ok((key.key_id.clone(), signing))
 }
 
 #[cfg(test)]

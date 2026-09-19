@@ -140,21 +140,6 @@ enum LogKeyCommand {
     },
 }
 
-/// WIST-3 §3.4: the held Aggregator key a document this Aggregator signs
-/// now is signed with — one valid at the Log's head height, which is also
-/// the height a key act queued now authenticates at.
-fn head_signer(
-    data_dir: &std::path::Path,
-    db: &clave::db::Db,
-) -> Result<(String, wist_core::crypto::SigningKey), clave::Error> {
-    let store = clave::keys::Store::open(data_dir, db)?;
-    let key = store.signer_at(clave::keys::head_height(db)?)?;
-    let signing = key
-        .signing()
-        .ok_or_else(|| clave::Error::Key("the signing key is not held".into()))?;
-    Ok((key.key_id.clone(), signing))
-}
-
 fn main() -> Result<(), clave::Error> {
     let cli = Cli::parse();
     match cli.command {
@@ -190,7 +175,7 @@ fn main() -> Result<(), clave::Error> {
         }
         Command::SuffixList { data, file } => {
             let db = clave::db::Db::open(&data.join("clave.sqlite"))?;
-            let (_, sk) = head_signer(&data, &db)?;
+            let (_, sk) = clave::keys::head_signer(&data, &db)?;
             let report = clave::suffix_list::pin(
                 &db,
                 &data,
@@ -217,7 +202,7 @@ fn main() -> Result<(), clave::Error> {
             allow_http,
         } => {
             let db = clave::db::Db::open(&data.join("clave.sqlite"))?;
-            let (_, sk) = head_signer(&data, &db)?;
+            let (_, sk) = clave::keys::head_signer(&data, &db)?;
             let now_unix = match at {
                 Some(at) => wist_core::timestamp::log_seconds(&at)?,
                 None => jiff::Timestamp::now().as_second(),
@@ -275,7 +260,7 @@ fn main() -> Result<(), clave::Error> {
             effective_at,
         } => {
             let db = clave::db::Db::open(&data.join("clave.sqlite"))?;
-            let (_, sk) = head_signer(&data, &db)?;
+            let (_, sk) = clave::keys::head_signer(&data, &db)?;
             let now_unix = jiff::Timestamp::now().as_second();
             let report = clave::param_change::run(
                 &db,
@@ -298,7 +283,7 @@ fn main() -> Result<(), clave::Error> {
             jurisdiction,
         } => {
             let db = clave::db::Db::open(&data.join("clave.sqlite"))?;
-            let (_, sk) = head_signer(&data, &db)?;
+            let (_, sk) = clave::keys::head_signer(&data, &db)?;
             let report = clave::governance::withdraw(
                 &db,
                 &sk,
@@ -397,12 +382,12 @@ fn main() -> Result<(), clave::Error> {
             let urls = match (add, remove) {
                 (Some(url), None) => {
                     let db = clave::db::Db::open(&data.join("clave.sqlite"))?;
-                    let (key_id, sk) = head_signer(&data, &db)?;
+                    let (key_id, sk) = clave::keys::head_signer(&data, &db)?;
                     clave::mirrors::add(&data, &key_id, &sk, &url, now_unix)?
                 }
                 (None, Some(url)) => {
                     let db = clave::db::Db::open(&data.join("clave.sqlite"))?;
-                    let (key_id, sk) = head_signer(&data, &db)?;
+                    let (key_id, sk) = clave::keys::head_signer(&data, &db)?;
                     clave::mirrors::remove(&data, &key_id, &sk, &url, now_unix)?
                 }
                 (None, None) => clave::mirrors::list(&data)?,

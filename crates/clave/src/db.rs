@@ -1205,22 +1205,37 @@ impl Db {
     }
 
     /// WIST-3 §3.4 and §7: the `aggregator_key` tuples the Log has
-    /// established, removed keys included, ordered by `key_id`.
+    /// established, removed keys included, ordered by `key_id`, each
+    /// carrying the accepted acts that admitted and retired its key.
     pub fn aggregator_key_entries(&self) -> Result<Vec<AggregatorKeyEntry>> {
         let mut statement = self.conn.prepare(
-            "SELECT key_id, public_key, added_epoch, removed_epoch FROM aggregator_keys ORDER BY key_id",
+            "SELECT key_id, public_key, added_epoch, removed_epoch, adding_act, removing_act FROM aggregator_keys ORDER BY key_id",
         )?;
         let rows = statement
             .query_map([], |row| {
-                Ok(AggregatorKeyEntry {
-                    key_id: row.get(0)?,
-                    public_key: row.get(1)?,
-                    added_height: row.get::<_, i64>(2)? as u64,
-                    removed_height: row.get::<_, Option<i64>>(3)?.map(|h| h as u64),
-                })
+                Ok((
+                    AggregatorKeyEntry {
+                        key_id: row.get(0)?,
+                        public_key: row.get(1)?,
+                        added_height: row.get::<_, i64>(2)? as u64,
+                        removed_height: row.get::<_, Option<i64>>(3)?.map(|h| h as u64),
+                        adding_act: None,
+                        removing_act: None,
+                    },
+                    row.get::<_, Option<Vec<u8>>>(4)?,
+                    row.get::<_, Option<Vec<u8>>>(5)?,
+                ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
+        rows.into_iter()
+            .map(|(entry, adding, removing)| {
+                Ok(AggregatorKeyEntry {
+                    adding_act: adding.map(|act| crate::json::parse(&act)).transpose()?,
+                    removing_act: removing.map(|act| crate::json::parse(&act)).transpose()?,
+                    ..entry
+                })
+            })
+            .collect()
     }
 
     /// The `key_id` a document this Aggregator signs names in `sig.key_id`:
@@ -1349,7 +1364,7 @@ impl Db {
             for entry in entries {
                 let public_key = wist_core::crypto::PublicKey::from_b64u(&entry.public_key)?;
                 tx.execute(
-                    "INSERT INTO aggregator_keys(note_key_id, key_id, public_key, added_epoch, removed_epoch) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    "INSERT INTO aggregator_keys(note_key_id, key_id, public_key, added_epoch, removed_epoch, adding_act, removing_act) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     (
                         wist_core::crypto::hex_encode(&wist_core::checkpoint::aggregator_key_id(
                             log_id,
@@ -1359,6 +1374,16 @@ impl Db {
                         &entry.public_key,
                         entry.added_height as i64,
                         entry.removed_height.map(|h| h as i64),
+                        entry
+                            .adding_act
+                            .as_ref()
+                            .map(serde_json::to_vec)
+                            .transpose()?,
+                        entry
+                            .removing_act
+                            .as_ref()
+                            .map(serde_json::to_vec)
+                            .transpose()?,
                     ),
                 )?;
             }

@@ -145,25 +145,25 @@ fn publish_epoch(db: &Db, data_dir: &Path, epoch_number: u64, note: &str) -> Res
     Ok(wrote)
 }
 
-/// Finishes every publication the store committed to that the disk does
-/// not hold, lowest height first, then restores any file of the head
-/// Epoch a crash, a torn write or a deletion left wrong. Returns the
-/// heights it wrote for.
+/// Re-signs every unsealed document a key removed at or below the store's
+/// head signed (WIST-3 §3.4), before a Checkpoint at that head is served
+/// to verify them against, then finishes every publication the store
+/// committed to that the disk does not hold, lowest height first, then
+/// restores any file of the head Epoch a crash, a torn write or a deletion
+/// left wrong. Returns the heights it wrote Epoch files for.
 pub fn recover(db: &Db, data_dir: &Path) -> Result<Vec<u64>> {
+    crate::snapshot::resign_unsealed(db, data_dir)?;
     let mut republished = Vec::new();
     for (epoch_number, note) in db.unpublished_publications()? {
         publish_epoch(db, data_dir, epoch_number, &note)?;
         db.mark_published(epoch_number)?;
         republished.push(epoch_number);
     }
-    let Some((epoch_number, note)) = db.head_publication()? else {
-        return Ok(republished);
-    };
-    if republished.contains(&epoch_number) {
-        return Ok(republished);
-    }
-    if publish_epoch(db, data_dir, epoch_number, &note)? {
-        republished.push(epoch_number);
+    if let Some((epoch_number, note)) = db.head_publication()? {
+        if !republished.contains(&epoch_number) && publish_epoch(db, data_dir, epoch_number, &note)?
+        {
+            republished.push(epoch_number);
+        }
     }
     Ok(republished)
 }

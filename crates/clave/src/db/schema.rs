@@ -2,15 +2,17 @@
 //! any routine operation reads it.
 use super::Mutation;
 use crate::error::{Error, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
-/// Applies the schema, the added columns, the acceptance-order clock and
-/// the url_tips key migration, each idempotent on a current store.
+/// Applies the schema, the added columns, the acceptance-order clock, the
+/// key-act backfill and the url_tips key migration, each idempotent on a
+/// current store.
 pub(super) fn migrate(conn: &Connection) -> Result<()> {
     refuse_superseded_layout(conn)?;
     conn.execute_batch(SCHEMA)?;
     add_missing_columns(conn)?;
     restore_acceptance_order(conn)?;
+    backfill_key_acts(conn)?;
     let old_tips: bool = conn.query_row(
         "SELECT pk = 0 FROM pragma_table_info('url_tips') WHERE name = 'domain'",
         [],
@@ -67,7 +69,7 @@ CREATE TABLE IF NOT EXISTS log_entries(leaf_index INTEGER PRIMARY KEY, epoch_num
 CREATE INDEX IF NOT EXISTS log_entries_epoch ON log_entries(epoch_number);
 CREATE TABLE IF NOT EXISTS log_tiles(level INTEGER NOT NULL, tile_index INTEGER NOT NULL, hashes BLOB NOT NULL, PRIMARY KEY(level, tile_index));
 CREATE TABLE IF NOT EXISTS witnesses(name TEXT PRIMARY KEY, public_key TEXT NOT NULL, base_url TEXT NOT NULL, last_size INTEGER NOT NULL DEFAULT 0);
-CREATE TABLE IF NOT EXISTS aggregator_keys(note_key_id TEXT PRIMARY KEY, key_id TEXT NOT NULL, public_key TEXT NOT NULL, added_epoch INTEGER NOT NULL, removed_epoch INTEGER);
+CREATE TABLE IF NOT EXISTS aggregator_keys(note_key_id TEXT PRIMARY KEY, key_id TEXT NOT NULL, public_key TEXT NOT NULL, added_epoch INTEGER NOT NULL, removed_epoch INTEGER, adding_act BLOB, removing_act BLOB);
 CREATE TABLE IF NOT EXISTS rejections(domain TEXT NOT NULL, code TEXT NOT NULL, at TEXT NOT NULL, delta_id TEXT, detail TEXT);
 CREATE TABLE IF NOT EXISTS params(name TEXT PRIMARY KEY, value INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS url_tips(url TEXT NOT NULL, domain TEXT NOT NULL, tip TEXT NOT NULL, PRIMARY KEY(domain, url));
@@ -100,6 +102,8 @@ pub(super) fn add_missing_columns(conn: &Connection) -> Result<()> {
         "ALTER TABLE param_changes ADD COLUMN entry_index INTEGER",
         "ALTER TABLE recovery_windows ADD COLUMN owner_declaration_json BLOB",
         "ALTER TABLE aggregator_keys ADD COLUMN removed_epoch INTEGER",
+        "ALTER TABLE aggregator_keys ADD COLUMN adding_act BLOB",
+        "ALTER TABLE aggregator_keys ADD COLUMN removing_act BLOB",
     ] {
         match conn.execute(statement, []) {
             Ok(_) => {}
@@ -109,6 +113,145 @@ pub(super) fn add_missing_columns(conn: &Connection) -> Result<()> {
         }
     }
     Ok(())
+}
+
+struct KeyRow {
+    key_id: String,
+    public_key: String,
+    added_epoch: u64,
+    removed_epoch: Option<u64>,
+    holds_adding_act: bool,
+    holds_removing_act: bool,
+}
+
+/// WIST-3 §7: every `aggregator_key` tuple but the genesis key's carries
+/// the accepted `aggregator_key_add` that admitted it, and every removed
+/// key's carries the accepted `aggregator_key_remove` that retired it. A
+/// store written before the key table held the acts recovers both by
+/// replaying the Entries it has sealed from the one key of its table that
+/// no sealed act admits; a table that replay does not reproduce is refused
+/// rather than served as tuples without acts.
+fn backfill_key_acts(conn: &Connection) -> Result<()> {
+    let mut statement = conn.prepare(
+        "SELECT key_id, public_key, added_epoch, removed_epoch, adding_act IS NOT NULL, removing_act IS NOT NULL FROM aggregator_keys ORDER BY key_id",
+    )?;
+    let rows: Vec<KeyRow> = statement
+        .query_map([], |row| {
+            Ok(KeyRow {
+                key_id: row.get(0)?,
+                public_key: row.get(1)?,
+                added_epoch: row.get::<_, i64>(2)?.max(0) as u64,
+                removed_epoch: row.get::<_, Option<i64>>(3)?.map(|h| h.max(0) as u64),
+                holds_adding_act: row.get(4)?,
+                holds_removing_act: row.get(5)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    let rootless = rows.iter().filter(|row| !row.holds_adding_act).count();
+    let unrecorded_removal = rows
+        .iter()
+        .any(|row| row.removed_epoch.is_some() && !row.holds_removing_act);
+    if rootless <= 1 && !unrecorded_removal {
+        return Ok(());
+    }
+
+    let recovered = replay_key_acts(conn, &rows)?;
+    let tx = Mutation::new(conn)?;
+    for entry in &recovered {
+        tx.execute(
+            "UPDATE aggregator_keys SET adding_act = ?2, removing_act = ?3 WHERE key_id = ?1",
+            (
+                &entry.key_id,
+                entry
+                    .adding_act
+                    .as_ref()
+                    .map(serde_json::to_vec)
+                    .transpose()?,
+                entry
+                    .removing_act
+                    .as_ref()
+                    .map(serde_json::to_vec)
+                    .transpose()?,
+            ),
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn replay_key_acts(
+    conn: &Connection,
+    rows: &[KeyRow],
+) -> Result<Vec<wist_core::objects::AggregatorKeyEntry>> {
+    let note: Option<String> = conn
+        .query_row(
+            "SELECT note FROM epochs ORDER BY epoch_number LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let log_id = match note {
+        Some(note) => wist_core::checkpoint::Checkpoint::parse(&note)
+            .map_err(|e| Error::History(e.to_string()))?
+            .origin()
+            .to_owned(),
+        None => return Err(unrecoverable_key_acts()),
+    };
+
+    let mut statement =
+        conn.prepare("SELECT epoch_number, entry_json FROM log_entries ORDER BY leaf_index")?;
+    let sealed = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?.max(0) as u64,
+                row.get::<_, Vec<u8>>(1)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    let mut acts: std::collections::BTreeMap<u64, Vec<serde_json::Value>> =
+        std::collections::BTreeMap::new();
+    for (height, entry_json) in sealed {
+        let entry: serde_json::Value = serde_json::from_slice(&entry_json)?;
+        if entry["type"] == "registry_update" {
+            acts.entry(height).or_default().push(entry["body"].clone());
+        }
+    }
+
+    for candidate in rows.iter().filter(|row| row.added_epoch == 0) {
+        let genesis = wist_core::objects::GenesisKey {
+            key_id: candidate.key_id.clone(),
+            alg: "Ed25519".into(),
+            public_key: candidate.public_key.clone(),
+        };
+        let Ok(mut registry) =
+            wist_core::aggregator_keys::Registry::from_genesis(&log_id, &genesis)
+        else {
+            continue;
+        };
+        for (height, epoch_acts) in &acts {
+            registry.apply_epoch(*height, epoch_acts.iter());
+        }
+        let replayed = registry.entries();
+        let reproduces = replayed.len() == rows.len()
+            && replayed.iter().zip(rows).all(|(entry, row)| {
+                entry.key_id == row.key_id
+                    && entry.public_key == row.public_key
+                    && entry.added_height == row.added_epoch
+                    && entry.removed_height == row.removed_epoch
+            });
+        if reproduces {
+            return Ok(replayed);
+        }
+    }
+    Err(unrecoverable_key_acts())
+}
+
+fn unrecoverable_key_acts() -> Error {
+    Error::History(
+        "the Entries this store retains do not reproduce the Aggregator key registry it records, so the key acts each aggregator_key tuple carries cannot be recovered; start from a data directory whose Log replays".into(),
+    )
 }
 
 pub(super) fn restore_acceptance_order(conn: &Connection) -> Result<()> {

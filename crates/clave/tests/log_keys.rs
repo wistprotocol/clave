@@ -5,6 +5,7 @@ mod common;
 
 use common::spec_dir;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::path::Path;
 use wist_core::checkpoint::{self, AggregatorKey, Checkpoint};
 use wist_core::crypto::{PublicKey, SigningKey};
@@ -36,19 +37,18 @@ impl Log {
     }
 
     fn seal(&self, height: u64) -> clave::seal::SealReport {
-        let signer = clave::keys::Store::open(self.path(), &self.db)
-            .unwrap()
-            .signer_at(clave::keys::head_height(&self.db).unwrap())
-            .unwrap()
-            .signing()
-            .unwrap();
-        clave::seal::run(
-            &self.db,
-            self.path(),
-            &signer,
-            SEAL_START + height as i64 * 3600,
-        )
-        .unwrap()
+        self.seal_at(SEAL_START + height as i64 * 3600)
+    }
+
+    /// Seals at a whole day past `SEAL_START`, so each Epoch lands under a
+    /// Snapshot date of its own.
+    fn seal_on_day(&self, day: i64) -> clave::seal::SealReport {
+        self.seal_at(SEAL_START + day * 86_400)
+    }
+
+    fn seal_at(&self, now_unix: i64) -> clave::seal::SealReport {
+        let (_, signer) = clave::keys::head_signer(self.path(), &self.db).unwrap();
+        clave::seal::run(&self.db, self.path(), &signer, now_unix).unwrap()
     }
 
     fn reopen(&mut self) {
@@ -108,13 +108,40 @@ impl Log {
     }
 
     fn state(&self, snapshot_date: &str) -> Value {
-        let bytes = std::fs::read(
-            self.path()
-                .join(format!("snapshots/{snapshot_date}/state.json")),
-        )
-        .unwrap();
-        serde_json::from_slice(&bytes).unwrap()
+        self.document(&format!("snapshots/{snapshot_date}/state.json"))
     }
+
+    fn document(&self, path: &str) -> Value {
+        serde_json::from_slice(&std::fs::read(self.path().join(path)).unwrap()).unwrap()
+    }
+
+    fn anchor(&self) -> wist_core::objects::Anchor {
+        let doc: wist_core::objects::LogAnchorEnvelope =
+            serde_json::from_value(self.document("anchor.json")).unwrap();
+        doc.anchor
+    }
+
+    fn signing_key(&self, key_id: &str) -> SigningKey {
+        clave::keys::Store::open(self.path(), &self.db)
+            .unwrap()
+            .keys()
+            .iter()
+            .find(|key| key.key_id == key_id)
+            .and_then(|key| key.signing())
+            .unwrap_or_else(|| panic!("{key_id} is not a held key"))
+    }
+}
+
+fn state_key_entries(state: &Value) -> Vec<AggregatorKeyEntry> {
+    let entries: Vec<StateEntry> =
+        serde_json::from_value(state["state"]["entries"].clone()).unwrap();
+    entries
+        .into_iter()
+        .filter_map(|entry| match entry {
+            StateEntry::AggregatorKey(key) => Some(key),
+            _ => None,
+        })
+        .collect()
 }
 
 fn signed(update: Value, key_id: &str, sk: &SigningKey) -> Value {
@@ -294,6 +321,323 @@ fn removing_the_genesis_key_leaves_every_later_document_verifiable_under_the_rem
             .map(|key| key.key_id.clone())
             .collect::<Vec<_>>(),
         vec!["log2".to_string()]
+    );
+}
+
+#[test]
+fn the_state_file_key_tuples_authenticate_from_the_anchor_and_carry_the_accepted_acts() {
+    let log = Log::new();
+    log.seal(0);
+    clave::log_key::add(&log.db, log.path(), SEAL_START).unwrap();
+    log.seal(1);
+    clave::log_key::remove(&log.db, log.path(), "log1", SEAL_START + 3600).unwrap();
+    log.seal(2);
+    clave::log_key::add(&log.db, log.path(), SEAL_START + 2 * 3600).unwrap();
+    log.seal(3);
+
+    let second = log.signing_key("log2");
+    let third = log.signing_key("log3");
+    log.queue(&signed(remove_act("log3"), "log2", &second));
+    log.queue(&signed(remove_act("log3"), "log3", &third));
+    let sealed = log.seal(4);
+    assert_eq!(
+        sealed.entry_count, 2,
+        "both removals of log3 are accepted in Epoch 4: {:?}",
+        sealed.dropped
+    );
+
+    let entries = state_key_entries(&log.state("2026-08-09"));
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| (
+                entry.key_id.as_str(),
+                entry.added_height,
+                entry.removed_height
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            ("log1", 0, Some(2)),
+            ("log2", 1, None),
+            ("log3", 3, Some(4))
+        ]
+    );
+    assert!(
+        entries[0].adding_act.is_none(),
+        "the genesis key adds itself"
+    );
+    assert_eq!(
+        entries[0].removing_act.as_ref().unwrap()["update"]["details"]["key_id"],
+        "log1"
+    );
+    assert_eq!(
+        entries[1].adding_act.as_ref().unwrap()["update"]["details"]["key_id"],
+        "log2"
+    );
+    assert!(
+        entries[1].removing_act.is_none(),
+        "log2 is valid at the head"
+    );
+
+    // WIST-3 §7: of two removals of one key accepted in one Epoch, the
+    // tuple carries the one at the lower Entry index.
+    let removals: Vec<Value> = log
+        .db
+        .epoch_entries(4)
+        .unwrap()
+        .iter()
+        .filter(|entry| entry["body"]["update"]["action"] == "aggregator_key_remove")
+        .map(|entry| entry["body"].clone())
+        .collect();
+    assert_eq!(removals.len(), 2);
+    assert_ne!(removals[0], removals[1]);
+    assert_eq!(entries[2].removing_act.as_ref().unwrap(), &removals[0]);
+
+    let registry =
+        wist_core::aggregator_keys::Registry::from_state_tuples(&log.anchor(), 4, &entries)
+            .unwrap();
+    assert_eq!(
+        registry
+            .valid_at(4)
+            .iter()
+            .map(|key| key.key_id.clone())
+            .collect::<Vec<_>>(),
+        vec!["log2".to_string()]
+    );
+    assert_eq!(
+        registry
+            .valid_at(1)
+            .iter()
+            .map(|key| key.key_id.clone())
+            .collect::<Vec<_>>(),
+        vec!["log1".to_string(), "log2".to_string()]
+    );
+}
+
+/// Leaves the key table as a store written before it carried the acts
+/// each `aggregator_key` tuple states (WIST-3 §7).
+fn forget_key_acts(log: &Log) {
+    rusqlite::Connection::open(log.path().join("clave.sqlite"))
+        .unwrap()
+        .execute(
+            "UPDATE aggregator_keys SET adding_act = NULL, removing_act = NULL",
+            [],
+        )
+        .unwrap();
+}
+
+#[test]
+fn a_store_without_the_key_acts_recovers_them_from_the_entries_it_has_sealed() {
+    let mut log = Log::new();
+    log.seal(0);
+    clave::log_key::add(&log.db, log.path(), SEAL_START).unwrap();
+    log.seal(1);
+    clave::log_key::remove(&log.db, log.path(), "log1", SEAL_START + 3600).unwrap();
+    log.seal(2);
+    let sealed = state_tuples(&log.keys());
+
+    forget_key_acts(&log);
+    log.reopen();
+    assert_eq!(state_tuples(&log.keys()), sealed);
+}
+
+#[test]
+fn a_store_whose_entries_do_not_reproduce_its_key_registry_is_refused() {
+    let log = Log::new();
+    log.seal(0);
+    clave::log_key::add(&log.db, log.path(), SEAL_START).unwrap();
+    log.seal(1);
+
+    forget_key_acts(&log);
+    let connection = rusqlite::Connection::open(log.path().join("clave.sqlite")).unwrap();
+    connection
+        .execute("DELETE FROM log_entries WHERE epoch_number = 1", [])
+        .unwrap();
+    drop(connection);
+    let refusal = match clave::db::Db::open(&log.path().join("clave.sqlite")) {
+        Ok(_) => panic!("a store missing the Entries its key registry records reopened"),
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        refusal.contains("do not reproduce the Aggregator key registry"),
+        "{refusal}"
+    );
+}
+
+/// Every unsealed Aggregator-signed document the data directory serves,
+/// paired with the envelope member its signature covers (WIST-3 §3.4).
+fn unsealed_documents(data_dir: &Path) -> Vec<(String, &'static str)> {
+    let mut documents = vec![
+        ("snapshots/index.json".to_string(), "index"),
+        ("log/mirrors.json".to_string(), "mirrors"),
+    ];
+    let mut dates: Vec<String> = std::fs::read_dir(data_dir.join("snapshots"))
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    dates.sort();
+    for date in dates {
+        documents.push((format!("snapshots/{date}/state.json"), "state"));
+        documents.push((format!("snapshots/{date}/manifest.json"), "manifest"));
+    }
+    documents
+}
+
+#[test]
+fn removing_a_key_re_signs_every_unsealed_document_it_signed_and_still_serves() {
+    let log = Log::new();
+    log.seal_on_day(0);
+    let (genesis_key_id, genesis) = clave::keys::head_signer(log.path(), &log.db).unwrap();
+    assert_eq!(genesis_key_id, "log1");
+    clave::mirrors::add(
+        log.path(),
+        &genesis_key_id,
+        &genesis,
+        "https://mirror.example/",
+        SEAL_START,
+    )
+    .unwrap();
+
+    clave::log_key::add(&log.db, log.path(), SEAL_START).unwrap();
+    log.seal_on_day(1);
+    for (path, _) in unsealed_documents(log.path()) {
+        assert_eq!(
+            log.document(&path)["sig"]["key_id"],
+            "log1",
+            "{path} is signed by the genesis key before its removal"
+        );
+    }
+    let before = log.document("snapshots/2026-08-09/manifest.json")["manifest"].clone();
+    let mirror_urls = log.document("log/mirrors.json")["mirrors"].clone();
+
+    clave::log_key::remove(&log.db, log.path(), "log1", SEAL_START + 86_400).unwrap();
+    log.seal_on_day(2);
+
+    let remaining = log.public_key("log2");
+    for (path, inner) in unsealed_documents(log.path()) {
+        let document = log.document(&path);
+        assert_eq!(document["sig"]["key_id"], "log2", "{path}");
+        wist_core::envelope::verify_envelope(&document, inner, &remaining)
+            .unwrap_or_else(|error| panic!("{path}: {error}"));
+    }
+    let after = log.document("snapshots/2026-08-09/manifest.json")["manifest"].clone();
+    assert_eq!(after["content_digest"], before["content_digest"]);
+    assert_eq!(
+        after["state"]["state_digest"],
+        before["state"]["state_digest"]
+    );
+    assert_eq!(after["epoch_number"], before["epoch_number"]);
+    assert_eq!(
+        log.document("log/mirrors.json")["mirrors"],
+        mirror_urls,
+        "re-signing states no new Mirror list"
+    );
+    for date in ["2026-08-09", "2026-08-10", "2026-08-11"] {
+        let manifest = log.document(&format!("snapshots/{date}/manifest.json"));
+        let state = std::fs::read(log.path().join(format!("snapshots/{date}/state.json"))).unwrap();
+        assert_eq!(
+            manifest["manifest"]["state"]["sha256"],
+            wist_core::crypto::hex_encode(&Sha256::digest(&state)),
+            "{date}"
+        );
+        assert_eq!(
+            manifest["manifest"]["state"]["bytes"].as_u64().unwrap(),
+            state.len() as u64,
+            "{date}"
+        );
+    }
+
+    let served: Vec<Vec<u8>> = unsealed_documents(log.path())
+        .iter()
+        .map(|(path, _)| std::fs::read(log.path().join(path)).unwrap())
+        .collect();
+    assert!(clave::publication::recover(&log.db, log.path())
+        .unwrap()
+        .is_empty());
+    let again: Vec<Vec<u8>> = unsealed_documents(log.path())
+        .iter()
+        .map(|(path, _)| std::fs::read(log.path().join(path)).unwrap())
+        .collect();
+    assert_eq!(served, again, "a second pass rewrites nothing");
+    assert_eq!(log.verify_history().unwrap(), 3);
+}
+
+#[test]
+fn a_pass_interrupted_between_documents_is_finished_by_the_next_publication_repair() {
+    let log = Log::new();
+    log.seal_on_day(0);
+    let (genesis_key_id, genesis) = clave::keys::head_signer(log.path(), &log.db).unwrap();
+    clave::mirrors::add(
+        log.path(),
+        &genesis_key_id,
+        &genesis,
+        "https://mirror.example/",
+        SEAL_START,
+    )
+    .unwrap();
+    clave::log_key::add(&log.db, log.path(), SEAL_START).unwrap();
+    log.seal_on_day(1);
+    let stale_state = std::fs::read(log.path().join("snapshots/2026-08-09/state.json")).unwrap();
+    let stale_manifest =
+        std::fs::read(log.path().join("snapshots/2026-08-09/manifest.json")).unwrap();
+    let stale_index = std::fs::read(log.path().join("snapshots/index.json")).unwrap();
+
+    clave::log_key::remove(&log.db, log.path(), "log1", SEAL_START + 86_400).unwrap();
+    log.seal_on_day(2);
+    let settled = std::fs::read(log.path().join("snapshots/2026-08-09/state.json")).unwrap();
+
+    // A pass that stopped after the state file, before the manifest that
+    // carries its sha256, and before the index.
+    std::fs::write(
+        log.path().join("snapshots/2026-08-09/manifest.json"),
+        &stale_manifest,
+    )
+    .unwrap();
+    std::fs::write(log.path().join("snapshots/index.json"), &stale_index).unwrap();
+    clave::publication::recover(&log.db, log.path()).unwrap();
+    let remaining = log.public_key("log2");
+    for (path, inner) in [
+        ("snapshots/2026-08-09/manifest.json", "manifest"),
+        ("snapshots/index.json", "index"),
+    ] {
+        let document = log.document(path);
+        assert_eq!(document["sig"]["key_id"], "log2", "{path}");
+        wist_core::envelope::verify_envelope(&document, inner, &remaining).unwrap();
+    }
+    assert_eq!(
+        log.document("snapshots/2026-08-09/manifest.json")["manifest"]["state"]["sha256"],
+        wist_core::crypto::hex_encode(&Sha256::digest(&settled))
+    );
+
+    // A pass that stopped before the state file, leaving a manifest the
+    // head signs and the state file it describes re-signed away from it.
+    std::fs::write(
+        log.path().join("snapshots/2026-08-09/state.json"),
+        &stale_state,
+    )
+    .unwrap();
+    let mut manifest = log.document("snapshots/2026-08-09/manifest.json");
+    manifest["manifest"]["state"]["sha256"] = json!("0".repeat(64));
+    let second = log.signing_key("log2");
+    std::fs::write(
+        log.path().join("snapshots/2026-08-09/manifest.json"),
+        serde_json::to_vec(
+            &wist_core::envelope::sign_envelope(&manifest["manifest"], "manifest", "log2", &second)
+                .unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    clave::publication::recover(&log.db, log.path()).unwrap();
+    assert_eq!(
+        std::fs::read(log.path().join("snapshots/2026-08-09/state.json")).unwrap(),
+        settled
+    );
+    assert_eq!(
+        log.document("snapshots/2026-08-09/manifest.json")["manifest"]["state"]["sha256"],
+        wist_core::crypto::hex_encode(&Sha256::digest(&settled))
     );
 }
 
@@ -546,15 +890,7 @@ fn replay_vector_history(history: &Value) -> (tempfile::TempDir, clave::db::Db, 
 fn state_tuples(entries: &[AggregatorKeyEntry]) -> Vec<Value> {
     entries
         .iter()
-        .map(|entry| {
-            json!([
-                "aggregator_key",
-                entry.key_id,
-                entry.public_key,
-                entry.added_height,
-                entry.removed_height
-            ])
-        })
+        .map(|entry| serde_json::to_value(StateEntry::AggregatorKey(entry.clone())).unwrap())
         .collect()
 }
 

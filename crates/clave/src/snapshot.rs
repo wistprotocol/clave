@@ -6,7 +6,7 @@ use rusqlite::Connection;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use wist_core::crypto::{hex_encode, SigningKey};
 use wist_core::envelope::sign_envelope;
 use wist_core::label::{self, LabelerRow, SealedLabelCount};
@@ -390,8 +390,10 @@ fn build_state(
 
     let mut entries = Vec::with_capacity(2 + domains.len() + records.len());
     // WIST-3 §7: one `aggregator_key` tuple per key the Log has admitted,
-    // removed keys included, so a resuming Consumer judges a Checkpoint at
-    // or below the Snapshot under the keys valid at its height (§3.4).
+    // removed keys included, each carrying the accepted acts that admitted
+    // and retired its key, so a resuming Consumer authenticates the tuples
+    // from the Anchor and judges a Checkpoint at or below the Snapshot
+    // under the keys valid at its height (§3.4).
     let mut key_entries = db.aggregator_key_entries()?;
     if key_entries.is_empty() {
         let anchor = crate::history::anchor(data_dir)?;
@@ -400,6 +402,8 @@ fn build_state(
             public_key: anchor.key.to_b64u(),
             added_height: 0,
             removed_height: None,
+            adding_act: None,
+            removing_act: None,
         });
     }
     entries.extend(key_entries.into_iter().map(StateEntry::AggregatorKey));
@@ -537,6 +541,139 @@ fn update_index(
     Ok(())
 }
 
+fn snapshot_directories(data_dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(data_dir.join("snapshots")) else {
+        return Vec::new();
+    };
+    let mut directories: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    directories.sort();
+    directories
+}
+
+fn served_document(path: &Path) -> Result<Option<Value>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(crate::json::parse(&bytes)?)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn signed_off_the_head(document: &Value, valid: &[String]) -> bool {
+    match document.pointer("/sig/key_id").and_then(Value::as_str) {
+        Some(key_id) => !valid.iter().any(|valid| valid == key_id),
+        None => true,
+    }
+}
+
+fn signer_at_head<'a>(
+    db: &Db,
+    data_dir: &Path,
+    held: &'a mut Option<(String, SigningKey)>,
+) -> Result<&'a (String, SigningKey)> {
+    if held.is_none() {
+        *held = Some(crate::keys::head_signer(data_dir, db)?);
+    }
+    Ok(held.as_ref().expect("the head signer is loaded"))
+}
+
+fn resigned(document: &Value, inner_key: &str, key_id: &str, sk: &SigningKey) -> Result<Vec<u8>> {
+    let inner = document
+        .get(inner_key)
+        .cloned()
+        .ok_or_else(|| Error::Snapshot(format!("a served document carries no {inner_key:?}")))?;
+    Ok(serde_json::to_vec(&sign_envelope(
+        &inner, inner_key, key_id, sk,
+    )?)?)
+}
+
+fn served_name(data_dir: &Path, path: &Path) -> String {
+    path.strip_prefix(data_dir)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// WIST-3 §3.4: an unsealed Aggregator-signed document — the Snapshot
+/// index, every manifest and state file, the Mirror list — verifies under
+/// the keys valid at the height of the Checkpoint a Consumer adopts, so a
+/// removed key's signature on one this Aggregator still serves is re-made
+/// under a key valid at the head. Every state file comes first, then the
+/// manifest that carries its `sha256` and `bytes`, then the index and the
+/// Mirror list; `content_digest` and `state_digest` are carried verbatim.
+/// Each document is judged alone, on its `sig.key_id` and, for a manifest,
+/// on the state file it describes, so an interrupted pass is finished by
+/// the next one.
+pub fn resign_unsealed(db: &Db, data_dir: &Path) -> Result<Vec<String>> {
+    let head = crate::keys::head_height(db)?;
+    let registry = db.aggregator_key_entries()?;
+    if registry.is_empty() {
+        return Ok(Vec::new());
+    }
+    let valid: Vec<String> = registry
+        .iter()
+        .filter(|entry| {
+            entry.added_height <= head && entry.removed_height.is_none_or(|removed| removed > head)
+        })
+        .map(|entry| entry.key_id.clone())
+        .collect();
+
+    let mut signer: Option<(String, SigningKey)> = None;
+    let mut rewritten = Vec::new();
+    for directory in snapshot_directories(data_dir) {
+        let state_path = directory.join("state.json");
+        if let Some(state) = served_document(&state_path)? {
+            if signed_off_the_head(&state, &valid) {
+                let (key_id, sk) = signer_at_head(db, data_dir, &mut signer)?;
+                let bytes = resigned(&state, "state", key_id, sk)?;
+                crate::publication::write_durable(&state_path, &bytes)?;
+                rewritten.push(served_name(data_dir, &state_path));
+            }
+        }
+        let manifest_path = directory.join("manifest.json");
+        let Some(mut manifest) = served_document(&manifest_path)? else {
+            continue;
+        };
+        let described = std::fs::read(&state_path)
+            .ok()
+            .map(|bytes| (sha256_hex(&bytes), bytes.len() as u64));
+        let restates = described.as_ref().is_some_and(|(sha256, bytes)| {
+            manifest["manifest"]["state"]["sha256"] != *sha256.as_str()
+                || manifest["manifest"]["state"]["bytes"] != *bytes
+        });
+        if !restates && !signed_off_the_head(&manifest, &valid) {
+            continue;
+        }
+        if let Some((sha256, bytes)) = described {
+            manifest["manifest"]["state"]["sha256"] = Value::from(sha256);
+            manifest["manifest"]["state"]["bytes"] = Value::from(bytes);
+        }
+        let (key_id, sk) = signer_at_head(db, data_dir, &mut signer)?;
+        let bytes = resigned(&manifest, "manifest", key_id, sk)?;
+        crate::publication::write_durable(&manifest_path, &bytes)?;
+        rewritten.push(served_name(data_dir, &manifest_path));
+    }
+    for (path, inner_key) in [
+        (data_dir.join("snapshots/index.json"), "index"),
+        (data_dir.join("log/mirrors.json"), "mirrors"),
+    ] {
+        let Some(document) = served_document(&path)? else {
+            continue;
+        };
+        if !signed_off_the_head(&document, &valid) {
+            continue;
+        }
+        let (key_id, sk) = signer_at_head(db, data_dir, &mut signer)?;
+        let bytes = resigned(&document, inner_key, key_id, sk)?;
+        crate::publication::write_durable(&path, &bytes)?;
+        rewritten.push(served_name(data_dir, &path));
+    }
+    Ok(rewritten)
+}
+
 /// WIST-3 §7, one URL, one Publisher: a self-declared host's own record,
 /// else the nearest ancestor Publisher's, else the least non-ancestor
 /// domain in ascending octet order; the other records are excluded.
@@ -587,14 +724,14 @@ fn prefer_one_publisher(db: &Db, records: Vec<RecordRow>) -> Result<Vec<RecordRo
 pub fn build(
     db: &Db,
     data_dir: &Path,
-    sk: &SigningKey,
     epoch_number: u64,
     tree_size: u64,
     root_hash: &str,
     snapshot_date: &str,
     domains: &BTreeMap<String, Domain>,
 ) -> Result<()> {
-    let key_id = db.signing_key_id(&sk.public())?;
+    let (key_id, sk) = crate::keys::head_signer(data_dir, db)?;
+    let sk = &sk;
     let records = prefer_one_publisher(db, db.list_records()?)?;
     let snapshot_dir = data_dir.join("snapshots").join(snapshot_date);
 
