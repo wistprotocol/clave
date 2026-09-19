@@ -34,6 +34,8 @@ pub enum Error {
     Seal(String),
     #[error("snapshot: {0}")]
     Snapshot(String),
+    #[error("the lease this work ran under was taken over; nothing was written")]
+    Fenced,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

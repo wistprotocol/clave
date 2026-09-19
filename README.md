@@ -353,7 +353,8 @@ answers and dispatching proceed; SQLite serializes the writes.
 most one due-time row per domain (`due_at` in Unix seconds, `reason`
 `ping`, `baseline`, `resume` or `retry`, and the count of consecutive
 failed pulls); `pull_tasks` holds each pull in flight with its owning
-process and lease. Opening a store without the schedule gives every
+process, its lease and the partition token it was claimed under.
+Opening a store without the schedule gives every
 known publisher a row: `resume` due at once for a suspended walk,
 otherwise `baseline` due `baseline_poll_seconds` after its last pull,
 or at once if it was never pulled. A publisher recorded later is due at
@@ -375,16 +376,50 @@ time is the earlier one; `retry` outranks every other reason and
 `resume` outranks `ping` and `baseline`; between `ping` and `baseline`
 the strictly earlier row's reason stays.
 
+Every domain belongs to one of the store's `PARTITIONS` (16) pull
+partitions: the first eight bytes of the SHA-256 of its canonical host,
+read big-endian, modulo the partition count, which a store fixes when it
+is created. Both schedule tables carry the partition. `pull_partitions`
+holds each partition's lease: its owner, `lease_until` and a token that
+every takeover increments.
+
 A dispatcher runs at most `max_concurrent_ingests` pulls at once. It
 wakes on every Ping, every finished pull and at least once a second, and
-in one write transaction returns lapsed leases to the schedule and
-claims up to the free slots of due rows whose domain has no pull in
-flight, leasing each for `LEASE_SECONDS` (600) under its process's
-owner ID; it renews its running pulls' leases while they run. Claims
-alternate between the oldest due `ping` row and the oldest due row of
-any other reason, and a class with nothing due yields its turn, so
-neither Pings nor scheduled pulls wait behind the other's backlog.
-Claiming searches the `due_at` indexes and never scans the publishers.
+in one write transaction:
+
+1. renews every partition lease it holds to `PARTITION_LEASE_SECONDS`
+   (30) from now;
+2. takes over unowned or lapsed partitions, lowest first, until it holds
+   `max_partitions` (all by default), incrementing each one's token and
+   returning every task claimed there under an older token to the
+   schedule as `retry` due at once;
+3. returns every task of a held partition whose lease lapsed to the
+   schedule the same way, which recovers a pull that ended without
+   completing;
+4. claims up to the free slots of due rows of the partitions it holds
+   whose domain has no pull in flight, leasing each for `LEASE_SECONDS`
+   (600) under its process's owner ID and recording the partition's
+   token.
+
+It renews its running pulls' leases while they run. Claims alternate
+between the oldest due `ping` row and the oldest due row of any other
+reason, and a class with nothing due yields its turn, so neither Pings
+nor scheduled pulls wait behind the other's backlog. Claiming searches
+each held partition's `due_at` indexes and never scans the publishers.
+Two dispatchers on one store never hold the same partition and so never
+claim the same domain; a restarted process has a new owner ID and takes
+over its predecessor's partitions once their leases lapse.
+
+A pull runs fenced by its partition and token. Every write transaction
+it begins, including its completion, first checks under the write lock
+that the partition's token is unchanged; once another dispatcher has
+taken the partition over, the transaction writes nothing and fails with
+`Error::Fenced`, and the pull is abandoned without a completion, since
+the takeover already returned the domain to the schedule. A Payload
+file is written inside its Delta's admission transaction, after that
+check, and is named by the Delta ID and holds the bytes the Delta
+commits to, so a fenced-out pull writes none and a repeated admission
+writes the same file.
 
 A finished pull, in one write transaction, drops its task and schedules
 the next pull, combined with any Ping row that arrived meanwhile:
@@ -399,18 +434,39 @@ the next pull, combined with any Ping row that arrived meanwhile:
   `baseline_poll_seconds`; a successful pull resets the count.
 
 A domain that is still no known publisher after its pull gets no next
-pull. At start `serve` returns every pull in flight owned by another
-process ID, or whose lease lapsed, to the schedule as `retry` due at
-once; running the pull again is safe because admission is transactional
-and deduplicates by Delta ID. One pull runs per domain at a time.
+pull. Running a returned pull again is safe because admission is
+transactional and deduplicates by Delta ID. One pull runs per domain at
+a time.
 Fetching and state-independent verification happen outside any write
 transaction; each Delta's persistence is one immediate write transaction
 that first re-reads the admission Declarations and the URL's chain tip,
 re-verifying the Delta if its authority or predecessor changed, so a
 concurrent seal or admission cannot be bypassed. Every
 top-level write transaction begins immediately, taking the write lock
-before its reads. Durable publication and partitioned ingestion remain
-separate requirements.
+before its reads.
+
+Sealing is exclusive to the holder of the Log's sealer lease
+(`sealer_lease`: owner, `lease_until`, token). `serve`'s sealing
+scheduler renews or takes the lease every `SEALER_LEASE_SECONDS` / 3
+(10) seconds, holding it for `SEALER_LEASE_SECONDS` (30), and seals a
+grid instant only while it holds the lease. While a seal runs, a
+separate thread on its own connection renews the lease at the same
+cadence and token, so a seal longer than the lease keeps it. A seal
+runs fenced by the lease's token: its transaction begins by checking
+the token under the write lock, and every file-writing stage after the
+commit (distribution, Witness submission, withdrawal removal, the
+Snapshot) checks it again, so a sealer whose lease was taken over
+commits no Epoch, or publishes no further file after its commit.
+`clave seal` takes the lease when it is unowned or lapsed, seals under
+it with the same renewal and releases it; while another process holds
+a live lease it fails, naming the holder and the lease's end. On Ctrl-C
+or SIGTERM `serve` stops accepting requests, finishes those in flight
+and releases its partition and sealer leases, so another process takes
+them over at once; a partition's next holder still increments its
+token, fencing out any pull left running. Recovering
+the publication of Epochs already committed needs no lease, since it
+rewrites byte-identical files. Durable publication remains a separate
+requirement.
 
 ## JSON input eligibility
 

@@ -187,10 +187,12 @@ pub(super) fn epoch(
     }
     mutation.commit()?;
     crate::publication::recover(db, data_dir)?;
+    db.check_fence()?;
     if let Err(error) = crate::witness::submit_head(db, client, data_dir) {
         tracing::warn!(%error, "witness submission did not complete");
     }
 
+    db.check_fence()?;
     if !withdrawals.is_empty() {
         for delta_id in withdrawals.iter().map(|w| &w.delta_id) {
             let hex = delta_id.strip_prefix("sha256:").unwrap_or(delta_id);
@@ -210,6 +212,7 @@ pub(super) fn epoch(
         }
     }
 
+    db.check_fence()?;
     let snapshot_date = sealed_at.get(..10).unwrap_or(&sealed_at).to_string();
     crate::snapshot::build(
         db,

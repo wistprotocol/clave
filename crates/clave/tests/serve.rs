@@ -375,6 +375,7 @@ fn pings_beyond_the_pending_bound_are_refused_with_retry_after() {
         clave::serve::ServeOptions {
             max_concurrent_ingests: 0,
             max_pending_ingests: 2,
+            max_partitions: 0,
             ..unsealed()
         },
     );
@@ -413,6 +414,8 @@ fn store(data_dir: &Path) -> clave::db::Db {
     clave::db::Db::connect(&data_dir.join("clave.sqlite")).unwrap()
 }
 
+const ALL: usize = clave::db::PARTITIONS as usize;
+
 fn unix_now() -> i64 {
     jiff::Timestamp::now().as_second()
 }
@@ -430,10 +433,10 @@ fn a_pull_in_flight_at_restart_is_dispatched_once_and_rescheduled_one_baseline_l
     {
         let db = clave::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
         db.set_param("baseline_poll_seconds", 3600).unwrap();
-        let now = unix_now();
-        db.schedule_ping(&host, now, 4).unwrap();
+        let crashed_at = unix_now() - clave::db::PARTITION_LEASE_SECONDS;
+        db.schedule_ping(&host, crashed_at, 4).unwrap();
         let claimed = db
-            .claim_pulls(now, 1, "crashed-process", &mut true)
+            .claim_pulls(crashed_at, 1, "crashed-process", ALL, &mut true)
             .unwrap();
         assert_eq!(claimed.len(), 1);
         assert_eq!(
@@ -499,7 +502,13 @@ fn a_ping_moves_a_scheduled_pull_earlier_never_later_and_takes_no_new_slot() {
         db.set_param("baseline_poll_seconds", 3600).unwrap();
         let now = unix_now();
         let task = db
-            .claim_pulls(now, 1, "earlier-process", &mut false)
+            .claim_pulls(
+                now - clave::db::PARTITION_LEASE_SECONDS,
+                1,
+                "earlier-process",
+                ALL,
+                &mut false,
+            )
             .unwrap()
             .remove(0);
         db.complete_pull(
@@ -518,6 +527,7 @@ fn a_ping_moves_a_scheduled_pull_earlier_never_later_and_takes_no_new_slot() {
         clave::serve::ServeOptions {
             max_concurrent_ingests: 0,
             max_pending_ingests: 2,
+            max_partitions: 0,
             ..unsealed()
         },
     );
@@ -551,7 +561,7 @@ fn a_ping_moves_a_scheduled_pull_earlier_never_later_and_takes_no_new_slot() {
 
     let db = store(tmp.path());
     let claimed = db
-        .claim_pulls(unix_now(), 1, "elsewhere", &mut true)
+        .claim_pulls(unix_now(), 1, "elsewhere", ALL, &mut true)
         .unwrap();
     assert_eq!(claimed[0].domain, domain);
     assert_eq!(ping(domain), 202, "a domain in flight takes no new slot");
@@ -752,4 +762,35 @@ fn serve_without_sealing_seals_nothing() {
     spawn_server_with_options(tmp.path(), clave::fetch::Client::new(true), unsealed());
     std::thread::sleep(Duration::from_millis(2500));
     assert_eq!(sealed_epochs(tmp.path()).len(), 2);
+}
+
+#[test]
+fn two_serving_processes_on_one_store_seal_each_grid_instant_once_under_one_sealer_lease() {
+    let cadence = 2;
+    let tmp = tempfile::tempdir().unwrap();
+    init_with_cadence(tmp.path(), cadence);
+    for _ in 0..2 {
+        spawn_server_with_options(
+            tmp.path(),
+            clave::fetch::Client::new(true),
+            clave::serve::ServeOptions::default(),
+        );
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut epochs = sealed_epochs(tmp.path());
+    while epochs.len() < 6 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+        epochs = sealed_epochs(tmp.path());
+    }
+    assert!(epochs.len() >= 6, "sealed {} Epochs", epochs.len());
+    let instants: Vec<i64> = epochs[2..]
+        .iter()
+        .map(|epoch| wist_core::timestamp::log_seconds(&epoch.sealed_at).unwrap())
+        .collect();
+    for pair in instants.windows(2) {
+        assert_eq!(pair[1] - pair[0], cadence, "{instants:?}");
+    }
+    let lease = store(tmp.path()).sealer_lease().unwrap();
+    assert!(lease.owner.is_some());
+    assert_eq!(lease.token, 1, "the sealer lease changed hands");
 }

@@ -1,4 +1,4 @@
-use crate::db::Db;
+use crate::db::{Db, Fence, SEALER_LEASE_SECONDS};
 use crate::error::{Error, Result};
 use crate::fetch::Client;
 use std::io::Write;
@@ -8,6 +8,9 @@ use std::time::Duration;
 
 const MAX_GRACE_SECONDS: i64 = 60;
 const RETRY_AFTER_READ_FAILURE: Duration = Duration::from_secs(1);
+/// How often the sealer lease's holder renews it and another process
+/// looks whether it has lapsed.
+const LEASE_RENEWAL_SECONDS: i64 = SEALER_LEASE_SECONDS / 3;
 
 /// What the sealing scheduler does next, as a Unix second on the cadence
 /// grid.
@@ -51,10 +54,23 @@ fn grid(db: &Db, now_unix: i64) -> Result<(Option<i64>, i64)> {
     Ok((last, cadence))
 }
 
-fn seal_at(db_path: &Path, data_dir: &Path, client: &Client, instant: i64) -> Result<()> {
-    let db = Db::connect(db_path)?;
+fn seal_at(
+    db_path: &Path,
+    data_dir: &Path,
+    client: &Client,
+    instant: i64,
+    owner: &str,
+    token: i64,
+) -> Result<()> {
+    let db = Db::connect(db_path)?.fenced(Fence::Sealer { token });
     let (_, sk) = crate::keys::head_signer(data_dir, &db)?;
-    let report = crate::seal::run_with_client(&db, data_dir, &sk, client, instant)?;
+    let report = crate::seal::under_renewed_lease(
+        db_path,
+        owner,
+        token,
+        crate::seal::LeaseTerms::default(),
+        || crate::seal::run_with_client(&db, data_dir, &sk, client, instant),
+    )?;
     let mut out = std::io::stdout().lock();
     let _ = writeln!(
         out,
@@ -86,21 +102,33 @@ async fn sleep_until(instant: i64) {
     }
 }
 
-/// Seals an Epoch at every grid instant reached while serving, re-reading
-/// the last Epoch and the cadence before each decision. An instant is
-/// attempted once: a failed seal is reported and the next instant awaited.
-pub async fn run(db_path: PathBuf, data_dir: PathBuf, client: Arc<Client>) {
+/// Seals an Epoch at every grid instant reached while serving and holding
+/// the Log's sealer lease as `owner`, re-reading the lease, the last Epoch
+/// and the cadence before each decision and at least every
+/// `LEASE_RENEWAL_SECONDS`. Each seal is fenced by the lease's token, so a
+/// seal begun after another process took the lease over commits nothing.
+/// An instant is attempted once: a failed seal is reported and the next
+/// instant awaited.
+pub async fn run(db_path: PathBuf, data_dir: PathBuf, client: Arc<Client>, owner: Arc<str>) {
     let mut attempted: Option<i64> = None;
     loop {
         let read_path = db_path.clone();
+        let holder = owner.clone();
         let read = tokio::task::spawn_blocking(move || {
             let now_unix = jiff::Timestamp::now().as_second();
             let db = Db::connect(&read_path)?;
-            grid(&db, now_unix).map(|(last, cadence)| (last, cadence, now_unix))
+            let Some(token) = db.hold_sealer_lease(&holder, now_unix)? else {
+                return Ok(None);
+            };
+            grid(&db, now_unix).map(|(last, cadence)| Some((token, last, cadence, now_unix)))
         })
         .await;
-        let (last, cadence, now_unix) = match read {
-            Ok(Ok(state)) => state,
+        let (token, last, cadence, now_unix) = match read {
+            Ok(Ok(Some(state))) => state,
+            Ok(Ok(None)) => {
+                tokio::time::sleep(Duration::from_secs(LEASE_RENEWAL_SECONDS as u64)).await;
+                continue;
+            }
             Ok(Err(err)) => {
                 report_failure("sealing schedule", err);
                 tokio::time::sleep(RETRY_AFTER_READ_FAILURE).await;
@@ -113,13 +141,19 @@ pub async fn run(db_path: PathBuf, data_dir: PathBuf, client: Arc<Client>) {
             }
         };
         match next_seal(last.max(attempted), cadence, now_unix) {
-            Decision::SleepUntil(instant) => sleep_until(instant).await,
+            Decision::SleepUntil(instant) => {
+                sleep_until(instant.min(now_unix + LEASE_RENEWAL_SECONDS)).await
+            }
             Decision::SealNow(instant) => {
                 attempted = Some(instant);
-                let (db_path, data_dir, client) =
-                    (db_path.clone(), data_dir.clone(), client.clone());
+                let (db_path, data_dir, client, holder) = (
+                    db_path.clone(),
+                    data_dir.clone(),
+                    client.clone(),
+                    owner.clone(),
+                );
                 let sealed = tokio::task::spawn_blocking(move || {
-                    seal_at(&db_path, &data_dir, &client, instant)
+                    seal_at(&db_path, &data_dir, &client, instant, &holder, token)
                 })
                 .await;
                 let what = format!("seal at Unix second {instant}");

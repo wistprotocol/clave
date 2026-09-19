@@ -1,6 +1,8 @@
-use crate::db::Db;
-use crate::error::Result;
+use crate::db::{Db, Fence, SEALER_LEASE_SECONDS};
+use crate::error::{Error, Result};
 use std::path::Path;
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::Duration;
 use wist_core::crypto::SigningKey;
 
 mod prepare;
@@ -33,6 +35,106 @@ pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_unix: i64) -> Result<S
         &crate::fetch::Client::new(false),
         now_unix,
     )
+}
+
+/// How long a sealer's lease lasts and how often the sealer renews it
+/// while a seal runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeaseTerms {
+    pub lease_seconds: i64,
+    pub renewal: Duration,
+}
+
+impl Default for LeaseTerms {
+    fn default() -> Self {
+        LeaseTerms {
+            lease_seconds: SEALER_LEASE_SECONDS,
+            renewal: Duration::from_secs((SEALER_LEASE_SECONDS / 3) as u64),
+        }
+    }
+}
+
+/// Runs `work` while a separate thread, on its own connection, renews
+/// `owner`'s sealer lease at `token` every `terms.renewal`, so a seal
+/// longer than the lease keeps it. Renewal stops when `work` returns or
+/// finds the lease taken over, after which the seal's fenced writes and
+/// file publication fail.
+pub(crate) fn under_renewed_lease<T>(
+    db_path: &Path,
+    owner: &str,
+    token: i64,
+    terms: LeaseTerms,
+    work: impl FnOnce() -> T,
+) -> T {
+    let (stop, stopped) = mpsc::channel::<()>();
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let Ok(db) = Db::connect(db_path) else {
+                return;
+            };
+            while let Err(RecvTimeoutError::Timeout) = stopped.recv_timeout(terms.renewal) {
+                let now = jiff::Timestamp::now().as_second();
+                if let Ok(false) = db.renew_sealer_lease(owner, token, now, terms.lease_seconds) {
+                    return;
+                }
+            }
+        });
+        let done = work();
+        drop(stop);
+        done
+    })
+}
+
+/// Seals the next Epoch at `now_unix` as `owner` under the Log's sealer
+/// lease: takes the lease unless another process holds it live, seals and
+/// distributes fenced by it while renewing it, then releases it. While
+/// another holder's lease is live nothing is sealed and an error names
+/// the holder.
+pub fn run_leased(
+    db_path: &Path,
+    data_dir: &Path,
+    sk: &SigningKey,
+    client: &crate::fetch::Client,
+    now_unix: i64,
+    owner: &str,
+) -> Result<SealReport> {
+    run_leased_with(
+        db_path,
+        data_dir,
+        sk,
+        client,
+        now_unix,
+        owner,
+        LeaseTerms::default(),
+    )
+}
+
+/// `run_leased` under the lease length and renewal cadence of `terms`.
+pub fn run_leased_with(
+    db_path: &Path,
+    data_dir: &Path,
+    sk: &SigningKey,
+    client: &crate::fetch::Client,
+    now_unix: i64,
+    owner: &str,
+    terms: LeaseTerms,
+) -> Result<SealReport> {
+    let db = Db::connect(db_path)?;
+    let now = jiff::Timestamp::now().as_second();
+    let Some(token) = db.hold_sealer_lease_for(owner, now, terms.lease_seconds)? else {
+        let lease = db.sealer_lease()?;
+        return Err(Error::Seal(format!(
+            "the sealer lease is held by {} until {}; stop that process or wait for its lease to lapse",
+            lease.owner.as_deref().unwrap_or("another process"),
+            crate::registry::instant(lease.lease_until)?
+        )));
+    };
+    let db = db.fenced(Fence::Sealer { token });
+    let sealed = under_renewed_lease(db_path, owner, token, terms, || {
+        run_with_client(&db, data_dir, sk, client, now_unix)
+    });
+    let _ = db.release_sealer_lease(owner);
+    sealed
 }
 
 /// Seals the next Epoch and distributes it, submitting its Checkpoint to

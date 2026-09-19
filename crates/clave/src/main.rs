@@ -206,14 +206,22 @@ fn main() -> Result<(), clave::Error> {
             at,
             allow_http,
         } => {
-            let db = clave::db::Db::open(&data.join("clave.sqlite"))?;
+            let db_path = data.join("clave.sqlite");
+            let db = clave::db::Db::open(&db_path)?;
             let (_, sk) = clave::keys::head_signer(&data, &db)?;
             let now_unix = match at {
                 Some(at) => wist_core::timestamp::log_seconds(&at)?,
                 None => jiff::Timestamp::now().as_second(),
             };
             let client = clave::fetch::Client::new(allow_http);
-            let report = clave::seal::run_with_client(&db, &data, &sk, &client, now_unix)?;
+            let report = clave::seal::run_leased(
+                &db_path,
+                &data,
+                &sk,
+                &client,
+                now_unix,
+                &clave::db::process_owner(),
+            )?;
             let head = db
                 .last_epoch()?
                 .ok_or_else(|| clave::Error::Seal("the sealed Epoch is absent".into()))?;

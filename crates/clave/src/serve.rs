@@ -25,12 +25,15 @@ pub const OVERLOAD_RETRY_AFTER_SECS: u64 = 30;
 /// `max_concurrent_ingests` pulls run at once and at most
 /// `max_pending_ingests` Pings wait in the pull schedule; a Ping for a
 /// domain neither waiting nor being pulled beyond that bound is refused
-/// with 503 and a Retry-After, never queued. With `seal` set, an Epoch is
-/// sealed at every grid instant reached while serving.
+/// with 503 and a Retry-After, never queued. The dispatcher holds at most
+/// `max_partitions` pull partitions and pulls only their domains. With
+/// `seal` set, an Epoch is sealed at every grid instant reached while
+/// serving and holding the Log's sealer lease.
 #[derive(Debug, Clone, Copy)]
 pub struct ServeOptions {
     pub max_concurrent_ingests: usize,
     pub max_pending_ingests: usize,
+    pub max_partitions: usize,
     pub seal: bool,
 }
 
@@ -39,6 +42,7 @@ impl Default for ServeOptions {
         ServeOptions {
             max_concurrent_ingests: MAX_CONCURRENT_INGESTS,
             max_pending_ingests: MAX_PENDING_INGESTS,
+            max_partitions: crate::db::PARTITIONS as usize,
             seal: true,
         }
     }
@@ -240,11 +244,15 @@ async fn ingest_handler(State(state): State<AppState>, body: Bytes) -> axum::res
     }
 }
 
-/// Runs `task` to completion and schedules the domain's next pull.
+/// Runs `task` to completion and schedules the domain's next pull, every
+/// write fenced by the partition token the task was claimed under: once
+/// another dispatcher has taken the partition over, the pull writes
+/// nothing more and leaves the domain to the new holder.
 fn pull(state: &AppState, owner: &str, task: &PullTask) {
     let Ok(db) = Db::connect(&state.db_path) else {
         return;
     };
+    let db = db.fenced(task.fence());
     let started_at = jiff::Timestamp::now().as_second();
     let now = utc(started_at);
     let report = ingest::run_with_clock(
@@ -279,9 +287,11 @@ fn pull(state: &AppState, owner: &str, task: &PullTask) {
 }
 
 /// Claims due pulls whenever a worker slot is free, woken by each Ping,
-/// each finished pull and at least every `DISPATCH_INTERVAL`; renews the
-/// leases of the pulls it runs and returns lapsed ones to the schedule.
-async fn dispatch(state: AppState, owner: Arc<str>, slots: usize) {
+/// each finished pull and at least every `DISPATCH_INTERVAL`; renews its
+/// partition leases and the leases of the pulls it runs, takes over
+/// lapsed partitions up to `max_partitions` and returns lapsed pulls to
+/// the schedule.
+async fn dispatch(state: AppState, owner: Arc<str>, slots: usize, max_partitions: usize) {
     let running = Arc::new(Mutex::new(HashSet::<String>::new()));
     let mut ping_next = true;
     loop {
@@ -302,7 +312,7 @@ async fn dispatch(state: AppState, owner: Arc<str>, slots: usize) {
                 if !held.is_empty() {
                     db.renew_pull_leases(&held, &owner, now)?;
                 }
-                let tasks = db.claim_pulls(now, free, &owner, &mut next)?;
+                let tasks = db.claim_pulls(now, free, &owner, max_partitions, &mut next)?;
                 Ok::<_, Error>((tasks, next))
             })
             .await
@@ -387,15 +397,9 @@ pub fn run_with_options(
     client: Client,
     options: ServeOptions,
 ) -> Result<()> {
-    let owner: Arc<str> = format!(
-        "{}-{}",
-        std::process::id(),
-        jiff::Timestamp::now().as_nanosecond()
-    )
-    .into();
+    let owner: Arc<str> = crate::db::process_owner().into();
     let db = Db::open(&db_path)?;
     crate::publication::recover(&db, &data_dir)?;
-    db.reclaim_pulls(&owner, jiff::Timestamp::now().as_second())?;
     drop(db);
     let state = AppState {
         db_path,
@@ -420,6 +424,7 @@ pub fn run_with_options(
         .with_state(state);
 
     let bg_data = data_dir.clone();
+    let release_path = bg_state.db_path.clone();
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
@@ -428,14 +433,45 @@ pub fn run_with_options(
                 bg_state.db_path.clone(),
                 bg_data.clone(),
                 bg_state.client.clone(),
+                owner.clone(),
             ));
         }
-        tokio::spawn(dispatch(bg_state, owner, options.max_concurrent_ingests));
+        tokio::spawn(dispatch(
+            bg_state,
+            owner.clone(),
+            options.max_concurrent_ingests,
+            options.max_partitions,
+        ));
         let listener = tokio::net::TcpListener::bind(bind).await?;
         let local_addr = listener.local_addr()?;
         println!("listening on http://{local_addr}");
         std::io::stdout().flush().ok();
-        axum::serve(listener, app).await?;
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal())
+            .await?;
+        tokio::task::spawn_blocking(move || {
+            let db = Db::connect(&release_path)?;
+            db.release_partitions(&owner)?;
+            db.release_sealer_lease(&owner)
+        })
+        .await
+        .map_err(|e| Error::Io(std::io::Error::other(e)))??;
         Ok::<(), Error>(())
     })
+}
+
+/// Resolves on Ctrl-C and, on Unix, on SIGTERM.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        if let Ok(mut terminate) = signal(SignalKind::terminate()) {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = terminate.recv() => {}
+            }
+            return;
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
 }

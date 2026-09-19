@@ -4,12 +4,13 @@ use super::Mutation;
 use crate::error::{Error, Result};
 use rusqlite::{Connection, OptionalExtension};
 
-/// Applies the schema, the added columns, the acceptance-order clock, the
+/// Applies the schema, the lease tables, the added columns, the acceptance-order clock, the
 /// key-act backfill and the url_tips key migration, each idempotent on a
 /// current store.
 pub(super) fn migrate(conn: &Connection) -> Result<()> {
     refuse_superseded_layout(conn)?;
     conn.execute_batch(SCHEMA)?;
+    super::leases::create(conn)?;
     add_missing_columns(conn)?;
     restore_acceptance_order(conn)?;
     backfill_key_acts(conn)?;

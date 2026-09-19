@@ -1,28 +1,44 @@
 //! The durable pull schedule: one due-time row per domain waiting for a
 //! pull and one leased task per pull in flight, both in Unix seconds.
+//! Each domain belongs to one partition; a dispatcher claims due rows only
+//! from partitions it holds, and each task records the partition token it
+//! was claimed under.
+use super::leases::{fence_holds, partition_of, Fence, PARTITION_LEASE_SECONDS};
 use super::Db;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ValueRef};
 use rusqlite::{Connection, OptionalExtension};
 
-/// How long a claimed pull stays owned before another dispatcher pass may
-/// return it to the schedule; a running pull's lease is renewed while it
-/// runs.
+/// How long a claimed pull stays owned before a pass of the dispatcher
+/// holding its partition may return it to the schedule; a running pull's
+/// lease is renewed while it runs.
 pub const LEASE_SECONDS: i64 = 600;
 /// The delay after a pull's first consecutive failure; each further
 /// failure doubles it, up to `baseline_poll_seconds`.
 pub const RETRY_BASE_SECONDS: i64 = 60;
 
 const SCHEMA: &str = "
-CREATE TABLE pull_schedule(domain TEXT PRIMARY KEY, due_at INTEGER NOT NULL, reason TEXT NOT NULL CHECK(reason IN ('ping','baseline','resume','retry')), attempts INTEGER NOT NULL DEFAULT 0);
-CREATE INDEX pull_schedule_due ON pull_schedule(due_at, domain);
-CREATE INDEX pull_schedule_reason ON pull_schedule(reason, due_at, domain);
-CREATE TABLE pull_tasks(domain TEXT PRIMARY KEY, reason TEXT NOT NULL CHECK(reason IN ('ping','baseline','resume','retry')), owner TEXT NOT NULL, lease_until INTEGER NOT NULL, issued_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0);
-CREATE INDEX pull_tasks_lease ON pull_tasks(lease_until);
+CREATE TABLE pull_schedule(domain TEXT PRIMARY KEY, partition INTEGER NOT NULL, due_at INTEGER NOT NULL, reason TEXT NOT NULL CHECK(reason IN ('ping','baseline','resume','retry')), attempts INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE pull_tasks(domain TEXT PRIMARY KEY, partition INTEGER NOT NULL, token INTEGER NOT NULL, reason TEXT NOT NULL CHECK(reason IN ('ping','baseline','resume','retry')), owner TEXT NOT NULL, lease_until INTEGER NOT NULL, issued_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0);
 ";
 
-const OLDEST_DUE_PING: &str = "SELECT domain, due_at, reason, attempts FROM pull_schedule WHERE reason = 'ping' AND due_at <= ?1 AND NOT EXISTS (SELECT 1 FROM pull_tasks WHERE pull_tasks.domain = pull_schedule.domain) ORDER BY due_at, domain LIMIT 1";
-const OLDEST_DUE_DUTY: &str = "SELECT domain, due_at, reason, attempts FROM pull_schedule WHERE reason != 'ping' AND due_at <= ?1 AND NOT EXISTS (SELECT 1 FROM pull_tasks WHERE pull_tasks.domain = pull_schedule.domain) ORDER BY due_at, domain LIMIT 1";
+const PARTITION_COLUMNS: &str = "
+ALTER TABLE pull_schedule ADD COLUMN partition INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE pull_tasks ADD COLUMN partition INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE pull_tasks ADD COLUMN token INTEGER NOT NULL DEFAULT 0;
+DROP INDEX IF EXISTS pull_schedule_due;
+DROP INDEX IF EXISTS pull_tasks_lease;
+";
+
+const INDEXES: &str = "
+CREATE INDEX IF NOT EXISTS pull_schedule_reason ON pull_schedule(reason, due_at, domain);
+CREATE INDEX IF NOT EXISTS pull_schedule_partition_due ON pull_schedule(partition, due_at, domain);
+CREATE INDEX IF NOT EXISTS pull_schedule_partition_reason ON pull_schedule(partition, reason, due_at, domain);
+CREATE INDEX IF NOT EXISTS pull_tasks_partition ON pull_tasks(partition, lease_until);
+";
+
+const OLDEST_DUE_PING: &str = "SELECT domain, due_at, reason, attempts FROM pull_schedule WHERE partition = ?2 AND reason = 'ping' AND due_at <= ?1 AND NOT EXISTS (SELECT 1 FROM pull_tasks WHERE pull_tasks.domain = pull_schedule.domain) ORDER BY due_at, domain LIMIT 1";
+const OLDEST_DUE_DUTY: &str = "SELECT domain, due_at, reason, attempts FROM pull_schedule WHERE partition = ?2 AND reason != 'ping' AND due_at <= ?1 AND NOT EXISTS (SELECT 1 FROM pull_tasks WHERE pull_tasks.domain = pull_schedule.domain) ORDER BY due_at, domain LIMIT 1";
 
 /// Why a domain is due for a pull.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,20 +82,35 @@ pub struct DuePull {
     pub attempts: i64,
 }
 
-/// A pull claimed for one dispatcher to run.
+/// A pull claimed for one dispatcher to run under its hold on
+/// `partition` at `token`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PullTask {
     pub domain: String,
     pub reason: Reason,
     pub attempts: i64,
+    pub partition: i64,
+    pub token: i64,
 }
 
-/// A pull in flight: its owner and the instant its lease lapses.
+impl PullTask {
+    /// The fence every write of this pull must pass.
+    pub fn fence(&self) -> Fence {
+        Fence::Partition {
+            partition: self.partition,
+            token: self.token,
+        }
+    }
+}
+
+/// A pull in flight: its owner, the instant its lease lapses and the
+/// partition token it was claimed under.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PullLease {
     pub owner: String,
     pub lease_until: i64,
     pub attempts: i64,
+    pub token: i64,
 }
 
 /// What a Ping's domain was admitted to.
@@ -162,8 +193,14 @@ fn schedule(conn: &Connection, incoming: &DuePull) -> Result<()> {
         None => incoming.clone(),
     };
     conn.execute(
-        "INSERT INTO pull_schedule(domain, due_at, reason, attempts) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(domain) DO UPDATE SET due_at = excluded.due_at, reason = excluded.reason, attempts = excluded.attempts",
-        (&row.domain, row.due_at, row.reason.as_str(), row.attempts),
+        "INSERT INTO pull_schedule(domain, partition, due_at, reason, attempts) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(domain) DO UPDATE SET due_at = excluded.due_at, reason = excluded.reason, attempts = excluded.attempts",
+        (
+            &row.domain,
+            partition_of(conn, &row.domain)?,
+            row.due_at,
+            row.reason.as_str(),
+            row.attempts,
+        ),
     )?;
     Ok(())
 }
@@ -172,8 +209,8 @@ fn schedule(conn: &Connection, incoming: &DuePull) -> Result<()> {
 /// the domain already waits or is being pulled.
 pub(super) fn exec_schedule_new_publisher(conn: &Connection, domain: &str) -> Result<()> {
     conn.execute(
-        "INSERT OR IGNORE INTO pull_schedule(domain, due_at, reason, attempts) SELECT ?1, 0, 'baseline', 0 WHERE NOT EXISTS (SELECT 1 FROM pull_tasks WHERE domain = ?1)",
-        [domain],
+        "INSERT OR IGNORE INTO pull_schedule(domain, partition, due_at, reason, attempts) SELECT ?1, ?2, 0, 'baseline', 0 WHERE NOT EXISTS (SELECT 1 FROM pull_tasks WHERE domain = ?1)",
+        (domain, partition_of(conn, domain)?),
     )?;
     Ok(())
 }
@@ -207,6 +244,71 @@ fn return_tasks(
     Ok(tasks.len())
 }
 
+/// Renews every partition lease `owner` holds to `PARTITION_LEASE_SECONDS`
+/// past `now`, then takes over unheld or lapsed partitions, lowest first,
+/// until `owner` holds `max_partitions`. A takeover increments the
+/// partition's token and returns every task claimed under an older one to
+/// the schedule as `retry` due at `now`. Returns the partitions `owner`
+/// holds with their tokens.
+fn hold_partitions(
+    conn: &Connection,
+    owner: &str,
+    max_partitions: usize,
+    now: i64,
+) -> Result<Vec<(i64, i64)>> {
+    let until = now.saturating_add(PARTITION_LEASE_SECONDS);
+    let renewed = conn.execute(
+        "UPDATE pull_partitions SET lease_until = ?2 WHERE owner = ?1",
+        (owner, until),
+    )?;
+    let room = max_partitions.saturating_sub(renewed);
+    let free = conn
+        .prepare("SELECT partition FROM pull_partitions WHERE owner IS NULL OR lease_until <= ?1 ORDER BY partition LIMIT ?2")?
+        .query_map((now, room as i64), |row| row.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for partition in free {
+        let token: i64 = conn.query_row(
+            "UPDATE pull_partitions SET owner = ?2, lease_until = ?3, token = token + 1 WHERE partition = ?1 RETURNING token",
+            (partition, owner, until),
+            |row| row.get(0),
+        )?;
+        return_tasks(
+            conn,
+            "partition = ?1 AND token < ?2",
+            (partition, token),
+            now,
+        )?;
+    }
+    Ok(conn
+        .prepare("SELECT partition, token FROM pull_partitions WHERE owner = ?1 AND lease_until > ?2 ORDER BY partition")?
+        .query_map((owner, now), |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// The oldest row `query` finds due at `now` in any of `partitions`,
+/// ordered by due time and then domain.
+fn oldest_due(
+    conn: &Connection,
+    query: &str,
+    partitions: &[(i64, i64)],
+    now: i64,
+) -> Result<Option<(DuePull, i64, i64)>> {
+    let mut statement = conn.prepare_cached(query)?;
+    let mut oldest: Option<(DuePull, i64, i64)> = None;
+    for &(partition, token) in partitions {
+        let Some(due) = statement.query_row((now, partition), due_row).optional()? else {
+            continue;
+        };
+        if oldest
+            .as_ref()
+            .is_none_or(|(o, _, _)| (due.due_at, &due.domain) < (o.due_at, &o.domain))
+        {
+            oldest = Some((due, partition, token));
+        }
+    }
+    Ok(oldest)
+}
+
 fn baseline_interval(db: &Db, now: i64) -> Result<i64> {
     crate::registry::effective(db, "baseline_poll_seconds", &crate::registry::instant(now)?)
 }
@@ -215,7 +317,10 @@ impl Db {
     /// Creates the schedule on a store that lacks it and gives every
     /// known publisher its row: `resume` due at once for a suspended
     /// walk, otherwise `baseline` due `baseline_poll_seconds` after its
-    /// last pull, or at once if it was never pulled.
+    /// last pull, or at once if it was never pulled. A schedule without
+    /// partitions has each row assigned its domain's partition; its tasks
+    /// carry token 0 and return to the schedule when their partition is
+    /// first taken.
     pub(super) fn restore_pull_schedule(&self) -> Result<()> {
         let tx = self.mutation()?;
         let present: bool = tx.query_row(
@@ -224,9 +329,31 @@ impl Db {
             |row| row.get(0),
         )?;
         if present {
+            let partitioned: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('pull_schedule') WHERE name = 'partition')",
+                [],
+                |row| row.get(0),
+            )?;
+            if !partitioned {
+                tx.execute_batch(PARTITION_COLUMNS)?;
+                for table in ["pull_schedule", "pull_tasks"] {
+                    let domains = tx
+                        .prepare(&format!("SELECT domain FROM {table}"))?
+                        .query_map([], |row| row.get::<_, String>(0))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    for domain in domains {
+                        tx.execute(
+                            &format!("UPDATE {table} SET partition = ?2 WHERE domain = ?1"),
+                            (&domain, partition_of(&tx, &domain)?),
+                        )?;
+                    }
+                }
+            }
+            tx.execute_batch(INDEXES)?;
             return tx.commit();
         }
         tx.execute_batch(SCHEMA)?;
+        tx.execute_batch(INDEXES)?;
         let now = jiff::Timestamp::now().as_second();
         let interval = baseline_interval(self, now)?;
         let publishers = tx
@@ -295,22 +422,34 @@ impl Db {
         Ok(admission)
     }
 
-    /// Claims up to `slots` due pulls for `owner` at `now`, leasing each
-    /// for `LEASE_SECONDS`, after returning every lapsed lease to the
-    /// schedule. Claims alternate between the oldest due Ping row and the
-    /// oldest due row of any other reason, starting with Pings when
-    /// `ping_next` is set; a class with nothing due yields its turn. On
-    /// return `ping_next` names the class the next claim starts with, so
-    /// neither Pings nor scheduled duties wait behind the other.
+    /// Claims up to `slots` due pulls for `owner` at `now`. First renews
+    /// the partition leases `owner` holds and takes over unheld or lapsed
+    /// ones up to `max_partitions`, returning the tasks a takeover fences
+    /// out and every lapsed task of a held partition to the schedule.
+    /// Claims come only from partitions `owner` holds and alternate
+    /// between the oldest due Ping row and the oldest due row of any other
+    /// reason, starting with Pings when `ping_next` is set; a class with
+    /// nothing due yields its turn. On return `ping_next` names the class
+    /// the next claim starts with, so neither Pings nor scheduled duties
+    /// wait behind the other.
     pub fn claim_pulls(
         &self,
         now: i64,
         slots: usize,
         owner: &str,
+        max_partitions: usize,
         ping_next: &mut bool,
     ) -> Result<Vec<PullTask>> {
         let tx = self.mutation()?;
-        return_tasks(&tx, "lease_until <= ?1", [now], now)?;
+        let held = hold_partitions(&tx, owner, max_partitions, now)?;
+        for &(partition, _) in &held {
+            return_tasks(
+                &tx,
+                "partition = ?1 AND lease_until <= ?2",
+                (partition, now),
+                now,
+            )?;
+        }
         let mut claimed = Vec::new();
         while claimed.len() < slots {
             let order = if *ping_next {
@@ -320,24 +459,26 @@ impl Db {
             };
             let mut next = None;
             for query in order {
-                next = tx.query_row(query, [now], due_row).optional()?;
+                next = oldest_due(&tx, query, &held, now)?;
                 if next.is_some() {
                     break;
                 }
             }
-            let Some(due) = next else {
+            let Some((due, partition, token)) = next else {
                 break;
             };
             *ping_next = due.reason != Reason::Ping;
             tx.execute("DELETE FROM pull_schedule WHERE domain = ?1", [&due.domain])?;
             tx.execute(
-                "INSERT INTO pull_tasks(domain, reason, owner, lease_until, issued_at, attempts) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                (&due.domain, due.reason.as_str(), owner, now + LEASE_SECONDS, now, due.attempts),
+                "INSERT INTO pull_tasks(domain, partition, token, reason, owner, lease_until, issued_at, attempts) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                (&due.domain, partition, token, due.reason.as_str(), owner, now + LEASE_SECONDS, now, due.attempts),
             )?;
             claimed.push(PullTask {
                 domain: due.domain,
                 reason: due.reason,
                 attempts: due.attempts,
+                partition,
+                token,
             });
         }
         tx.commit()?;
@@ -357,17 +498,6 @@ impl Db {
         tx.commit()
     }
 
-    /// Returns to the schedule, as `retry` due at `now`, every pull in
-    /// flight that another owner holds or whose lease has lapsed; the
-    /// pull is safe to run again because admission is transactional and
-    /// deduplicates by Delta ID. Returns how many were returned.
-    pub fn reclaim_pulls(&self, owner: &str, now: i64) -> Result<usize> {
-        let tx = self.mutation()?;
-        let returned = return_tasks(&tx, "owner != ?1 OR lease_until <= ?2", (owner, now), now)?;
-        tx.commit()?;
-        Ok(returned)
-    }
-
     /// Ends `owner`'s pull of `task`, which started at `started_at`, and
     /// schedules the domain's next pull at `now`: after a failure `retry`
     /// with one more attempt, due after `RETRY_BASE_SECONDS` doubled per
@@ -376,7 +506,10 @@ impl Db {
     /// daily ingest budget has room and at the next UTC day otherwise;
     /// after a completed walk `baseline`, due `baseline_poll_seconds`
     /// after `started_at`. A Ping row that arrived meanwhile is merged
-    /// in. A domain that is no known publisher gets no next pull.
+    /// in. A domain that is no known publisher gets no next pull. Once the
+    /// task's partition has been taken over the pull is fenced out:
+    /// nothing is written and `Error::Fenced` is returned, since the new
+    /// holder has already scheduled the domain again.
     pub fn complete_pull(
         &self,
         task: &PullTask,
@@ -386,9 +519,12 @@ impl Db {
         now: i64,
     ) -> Result<()> {
         let tx = self.mutation()?;
+        if !fence_holds(&tx, task.fence())? {
+            return Err(Error::Fenced);
+        }
         tx.execute(
-            "DELETE FROM pull_tasks WHERE domain = ?1 AND owner = ?2",
-            (&task.domain, owner),
+            "DELETE FROM pull_tasks WHERE domain = ?1 AND owner = ?2 AND token = ?3",
+            (&task.domain, owner, task.token),
         )?;
         if self.get_publisher(&task.domain)?.is_none() {
             return tx.commit();
@@ -443,13 +579,14 @@ impl Db {
         Ok(self
             .conn
             .query_row(
-                "SELECT owner, lease_until, attempts FROM pull_tasks WHERE domain = ?1",
+                "SELECT owner, lease_until, attempts, token FROM pull_tasks WHERE domain = ?1",
                 [domain],
                 |row| {
                     Ok(PullLease {
                         owner: row.get(0)?,
                         lease_until: row.get(1)?,
                         attempts: row.get(2)?,
+                        token: row.get(3)?,
                     })
                 },
             )
@@ -460,8 +597,10 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::leases::PARTITIONS;
 
     const NOW: i64 = 1_800_000_000;
+    const ALL: usize = PARTITIONS as usize;
 
     fn ts(unix: i64) -> String {
         jiff::Timestamp::from_second(unix).unwrap().to_string()
@@ -488,7 +627,7 @@ mod tests {
             .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
             .unwrap();
         statement
-            .query_map([NOW], |row| row.get::<_, String>(3))
+            .query_map((NOW, 0), |row| row.get::<_, String>(3))
             .unwrap()
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap()
@@ -496,7 +635,7 @@ mod tests {
     }
 
     fn claim(db: &Db, slots: usize, ping_next: &mut bool) -> Vec<String> {
-        db.claim_pulls(NOW, slots, "me", ping_next)
+        db.claim_pulls(NOW, slots, "me", ALL, ping_next)
             .unwrap()
             .into_iter()
             .map(|task| task.domain)
@@ -504,17 +643,19 @@ mod tests {
     }
 
     #[test]
-    fn claim_queries_search_the_due_indexes_instead_of_scanning() {
+    fn claim_queries_search_a_partitions_due_indexes_instead_of_scanning() {
         let (_tmp, db) = open_db();
         let duty = plan(&db, OLDEST_DUE_DUTY);
         assert!(
-            duty.contains("SEARCH pull_schedule USING INDEX pull_schedule_due (due_at<?)"),
+            duty.contains(
+                "SEARCH pull_schedule USING INDEX pull_schedule_partition_due (partition=? AND due_at<?)"
+            ),
             "{duty}"
         );
         let ping = plan(&db, OLDEST_DUE_PING);
         assert!(
             ping.contains(
-                "SEARCH pull_schedule USING INDEX pull_schedule_reason (reason=? AND due_at<?)"
+                "SEARCH pull_schedule USING INDEX pull_schedule_partition_reason (partition=? AND reason=? AND due_at<?)"
             ),
             "{ping}"
         );
@@ -596,7 +737,7 @@ mod tests {
         );
         let mut ping_next = false;
         let mut claimed = db
-            .claim_pulls(now, 10, "me", &mut ping_next)
+            .claim_pulls(now, 10, "me", ALL, &mut ping_next)
             .unwrap()
             .into_iter()
             .map(|task| task.domain)
@@ -722,7 +863,10 @@ mod tests {
         let (_tmp, db) = open_db();
         db.set_param("baseline_poll_seconds", 3600).unwrap();
         db.insert_publisher("a.example", b"{}", "k", "p").unwrap();
-        let task = db.claim_pulls(NOW, 1, "me", &mut false).unwrap().remove(0);
+        let task = db
+            .claim_pulls(NOW, 1, "me", ALL, &mut false)
+            .unwrap()
+            .remove(0);
         db.complete_pull(
             &task,
             "me",
@@ -742,7 +886,10 @@ mod tests {
     fn a_ping_during_a_pull_wins_when_earlier_than_the_next_baseline() {
         let (_tmp, db) = open_db();
         db.insert_publisher("a.example", b"{}", "k", "p").unwrap();
-        let task = db.claim_pulls(NOW, 1, "me", &mut false).unwrap().remove(0);
+        let task = db
+            .claim_pulls(NOW, 1, "me", ALL, &mut false)
+            .unwrap()
+            .remove(0);
         assert_eq!(
             db.schedule_ping("a.example", NOW + 5, 0).unwrap(),
             PingAdmission::Duplicate
@@ -765,7 +912,10 @@ mod tests {
     fn a_suspended_walk_is_due_at_once_as_resume_while_budget_remains() {
         let (_tmp, db) = open_db();
         db.insert_publisher("a.example", b"{}", "k", "p").unwrap();
-        let task = db.claim_pulls(NOW, 1, "me", &mut false).unwrap().remove(0);
+        let task = db
+            .claim_pulls(NOW, 1, "me", ALL, &mut false)
+            .unwrap()
+            .remove(0);
         db.complete_pull(
             &task,
             "me",
@@ -787,7 +937,10 @@ mod tests {
         db.insert_publisher("a.example", b"{}", "k", "p").unwrap();
         db.add_ingest_bytes("a.example", &ts(NOW)[..10], 10)
             .unwrap();
-        let task = db.claim_pulls(NOW, 1, "me", &mut false).unwrap().remove(0);
+        let task = db
+            .claim_pulls(NOW, 1, "me", ALL, &mut false)
+            .unwrap()
+            .remove(0);
         db.complete_pull(
             &task,
             "me",
@@ -810,7 +963,10 @@ mod tests {
         db.insert_publisher("a.example", b"{}", "k", "p").unwrap();
         let mut now = NOW;
         for (attempts, backoff) in [(1, 60), (2, 120), (3, 240), (4, 480), (5, 600)] {
-            let task = db.claim_pulls(now, 1, "me", &mut false).unwrap().remove(0);
+            let task = db
+                .claim_pulls(now, 1, "me", ALL, &mut false)
+                .unwrap()
+                .remove(0);
             db.complete_pull(&task, "me", now, PullOutcome::Failed, now)
                 .unwrap();
             assert_eq!(
@@ -818,12 +974,15 @@ mod tests {
                 Some(due("a.example", now + backoff, Reason::Retry, attempts))
             );
             assert!(db
-                .claim_pulls(now + backoff - 1, 1, "me", &mut false)
+                .claim_pulls(now + backoff - 1, 1, "me", ALL, &mut false)
                 .unwrap()
                 .is_empty());
             now += backoff;
         }
-        let task = db.claim_pulls(now, 1, "me", &mut false).unwrap().remove(0);
+        let task = db
+            .claim_pulls(now, 1, "me", ALL, &mut false)
+            .unwrap()
+            .remove(0);
         db.complete_pull(
             &task,
             "me",
@@ -842,7 +1001,10 @@ mod tests {
     fn a_pull_of_an_unknown_domain_schedules_nothing_after_it() {
         let (_tmp, db) = open_db();
         db.schedule_ping("unknown.example", NOW, 4).unwrap();
-        let task = db.claim_pulls(NOW, 1, "me", &mut true).unwrap().remove(0);
+        let task = db
+            .claim_pulls(NOW, 1, "me", ALL, &mut true)
+            .unwrap()
+            .remove(0);
         db.complete_pull(
             &task,
             "me",
@@ -855,35 +1017,274 @@ mod tests {
         assert_eq!(db.pull_lease("unknown.example").unwrap(), None);
     }
 
+    fn owners(db: &Db) -> Vec<Option<String>> {
+        db.partition_leases()
+            .unwrap()
+            .into_iter()
+            .map(|(_, lease)| lease.owner)
+            .collect()
+    }
+
     #[test]
-    fn foreign_and_lapsed_leases_return_as_retry_due_at_once() {
+    fn a_domains_partition_is_the_sha256_prefix_of_its_host_modulo_the_stores_count() {
+        use sha2::{Digest, Sha256};
+        let (_tmp, db) = open_db();
+        assert_eq!(db.partition_leases().unwrap().len(), PARTITIONS as usize);
+        for n in 0..64 {
+            let domain = format!("{n}.example");
+            let digest = Sha256::digest(domain.as_bytes());
+            let prefix = u64::from_be_bytes(digest[..8].try_into().unwrap());
+            assert_eq!(
+                db.partition_of(&domain).unwrap(),
+                (prefix % PARTITIONS as u64) as i64
+            );
+        }
+    }
+
+    #[test]
+    fn two_dispatchers_split_the_partitions_and_never_claim_the_same_domain() {
+        let (_tmp, db) = open_db();
+        for n in 0..64 {
+            db.schedule_ping(&format!("{n}.example"), NOW, 64).unwrap();
+        }
+        let half = ALL / 2;
+        let mut claimed: std::collections::BTreeMap<String, &str> = Default::default();
+        let (mut a_next, mut b_next) = (true, true);
+        loop {
+            let a = db.claim_pulls(NOW, 3, "a", half, &mut a_next).unwrap();
+            let b = db.claim_pulls(NOW, 3, "b", half, &mut b_next).unwrap();
+            if a.is_empty() && b.is_empty() {
+                break;
+            }
+            for (owner, tasks) in [("a", a), ("b", b)] {
+                for task in tasks {
+                    let (partition, lease) = db
+                        .partition_leases()
+                        .unwrap()
+                        .remove(task.partition as usize);
+                    assert_eq!(partition, db.partition_of(&task.domain).unwrap());
+                    assert_eq!(lease.owner.as_deref(), Some(owner));
+                    assert_eq!(lease.token, task.token);
+                    assert!(
+                        claimed.insert(task.domain.clone(), owner).is_none(),
+                        "{} was claimed twice",
+                        task.domain
+                    );
+                }
+            }
+        }
+        assert_eq!(claimed.len(), 64);
+        let held = owners(&db);
+        assert_eq!(
+            held.iter().filter(|o| o.as_deref() == Some("a")).count(),
+            half
+        );
+        assert_eq!(
+            held.iter().filter(|o| o.as_deref() == Some("b")).count(),
+            half
+        );
+        assert!(db
+            .claim_pulls(NOW + 1, 1, "c", ALL, &mut true)
+            .unwrap()
+            .is_empty());
+        assert!(owners(&db).iter().all(|o| o.as_deref() != Some("c")));
+    }
+
+    #[test]
+    fn a_dispatcher_takes_over_only_lapsed_partitions_and_returns_their_tasks_as_retry() {
+        let (_tmp, db) = open_db();
+        db.insert_publisher("a.example", b"{}", "k", "p").unwrap();
+        let old = db
+            .claim_pulls(NOW, 1, "old", ALL, &mut false)
+            .unwrap()
+            .remove(0);
+        let live = NOW + PARTITION_LEASE_SECONDS - 1;
+        assert!(db
+            .claim_pulls(live, 0, "new", ALL, &mut false)
+            .unwrap()
+            .is_empty());
+        assert!(owners(&db).iter().all(|o| o.as_deref() == Some("old")));
+        assert_eq!(db.pull_lease("a.example").unwrap().unwrap().owner, "old");
+
+        let lapsed = NOW + PARTITION_LEASE_SECONDS;
+        db.claim_pulls(lapsed, 0, "new", ALL, &mut false).unwrap();
+        assert!(owners(&db).iter().all(|o| o.as_deref() == Some("new")));
+        assert_eq!(db.pull_lease("a.example").unwrap(), None);
+        assert_eq!(
+            db.scheduled_pull("a.example").unwrap(),
+            Some(due("a.example", lapsed, Reason::Retry, 0))
+        );
+        let new = db
+            .claim_pulls(lapsed, 1, "new", ALL, &mut false)
+            .unwrap()
+            .remove(0);
+        assert_eq!(new.domain, "a.example");
+        assert_eq!(new.token, old.token + 1);
+    }
+
+    #[test]
+    fn a_stale_owners_completion_is_fenced_and_schedules_nothing() {
+        let (_tmp, db) = open_db();
+        db.insert_publisher("a.example", b"{}", "k", "p").unwrap();
+        let old = db
+            .claim_pulls(NOW, 1, "old", ALL, &mut false)
+            .unwrap()
+            .remove(0);
+        let lapsed = NOW + PARTITION_LEASE_SECONDS;
+        db.claim_pulls(lapsed, 0, "new", ALL, &mut false).unwrap();
+        let retry = db.scheduled_pull("a.example").unwrap();
+        assert!(matches!(
+            db.complete_pull(
+                &old,
+                "old",
+                NOW,
+                PullOutcome::Pulled { suspended: false },
+                lapsed
+            ),
+            Err(Error::Fenced)
+        ));
+        assert_eq!(db.scheduled_pull("a.example").unwrap(), retry);
+
+        let new = db
+            .claim_pulls(lapsed, 1, "new", ALL, &mut false)
+            .unwrap()
+            .remove(0);
+        assert!(matches!(
+            db.complete_pull(&old, "old", NOW, PullOutcome::Failed, lapsed),
+            Err(Error::Fenced)
+        ));
+        assert_eq!(db.scheduled_pull("a.example").unwrap(), None);
+        assert_eq!(db.pull_lease("a.example").unwrap().unwrap().owner, "new");
+        db.complete_pull(&new, "new", lapsed, PullOutcome::Failed, lapsed)
+            .unwrap();
+        assert_eq!(
+            db.scheduled_pull("a.example").unwrap(),
+            Some(due(
+                "a.example",
+                lapsed + RETRY_BASE_SECONDS,
+                Reason::Retry,
+                1
+            ))
+        );
+    }
+
+    #[test]
+    fn a_fenced_connection_writes_only_while_its_partition_token_holds() {
+        let (tmp, db) = open_db();
+        db.insert_publisher("a.example", b"{}", "k", "p").unwrap();
+        let task = db
+            .claim_pulls(NOW, 1, "old", ALL, &mut false)
+            .unwrap()
+            .remove(0);
+        let pull = Db::connect(&tmp.path().join("clave.sqlite"))
+            .unwrap()
+            .fenced(task.fence());
+        pull.set_walk_suspended("a.example", true).unwrap();
+        db.claim_pulls(NOW + PARTITION_LEASE_SECONDS, 0, "new", ALL, &mut false)
+            .unwrap();
+        assert!(matches!(
+            pull.set_walk_suspended("a.example", false),
+            Err(Error::Fenced)
+        ));
+        assert!(matches!(
+            pull.set_publisher_pulled("a.example", &ts(NOW)),
+            Err(Error::Fenced)
+        ));
+        assert!(db.walk_suspended("a.example").unwrap());
+        assert!(db
+            .get_publisher_status("a.example")
+            .unwrap()
+            .unwrap()
+            .last_pull_at
+            .is_none());
+    }
+
+    #[test]
+    fn a_lapsed_task_of_a_held_partition_returns_as_retry_and_a_renewed_one_stays() {
         let (_tmp, db) = open_db();
         db.insert_publisher("mine.example", b"{}", "k", "p")
             .unwrap();
-        db.insert_publisher("theirs.example", b"{}", "k", "p")
-            .unwrap();
         claim(&db, 1, &mut false);
-        db.claim_pulls(NOW, 1, "gone", &mut false).unwrap();
-        assert_eq!(db.reclaim_pulls("me", NOW + 1).unwrap(), 1);
-        assert_eq!(
-            db.scheduled_pull("theirs.example").unwrap(),
-            Some(due("theirs.example", NOW + 1, Reason::Retry, 0))
-        );
-        assert!(db.pull_lease("mine.example").unwrap().is_some());
-
         db.renew_pull_leases(&["mine.example".into()], "me", NOW + LEASE_SECONDS / 2 + 1)
             .unwrap();
         assert_eq!(
             db.pull_lease("mine.example").unwrap().unwrap().lease_until,
             NOW + LEASE_SECONDS + LEASE_SECONDS / 2 + 1
         );
+        let renewed = NOW + LEASE_SECONDS + 1;
+        db.claim_pulls(renewed, 0, "me", ALL, &mut false).unwrap();
+        assert!(db.pull_lease("mine.example").unwrap().is_some());
         let lapsed = NOW + LEASE_SECONDS * 2;
-        let claimed = db.claim_pulls(lapsed, 0, "me", &mut false).unwrap();
+        let claimed = db.claim_pulls(lapsed, 0, "me", ALL, &mut false).unwrap();
         assert!(claimed.is_empty());
         assert_eq!(db.pull_lease("mine.example").unwrap(), None);
         assert_eq!(
             db.scheduled_pull("mine.example").unwrap(),
             Some(due("mine.example", lapsed, Reason::Retry, 0))
         );
+    }
+
+    #[test]
+    fn a_schedule_without_partitions_is_migrated_and_its_tasks_return_on_first_takeover() {
+        let (tmp, db) = open_db();
+        db.conn
+            .execute_batch(
+                "DROP TABLE pull_schedule; DROP TABLE pull_tasks;
+                CREATE TABLE pull_schedule(domain TEXT PRIMARY KEY, due_at INTEGER NOT NULL, reason TEXT NOT NULL CHECK(reason IN ('ping','baseline','resume','retry')), attempts INTEGER NOT NULL DEFAULT 0);
+                CREATE INDEX pull_schedule_due ON pull_schedule(due_at, domain);
+                CREATE INDEX pull_schedule_reason ON pull_schedule(reason, due_at, domain);
+                CREATE TABLE pull_tasks(domain TEXT PRIMARY KEY, reason TEXT NOT NULL CHECK(reason IN ('ping','baseline','resume','retry')), owner TEXT NOT NULL, lease_until INTEGER NOT NULL, issued_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0);
+                CREATE INDEX pull_tasks_lease ON pull_tasks(lease_until);
+                INSERT INTO pull_schedule VALUES ('waiting.example', 5, 'baseline', 0);
+                INSERT INTO pull_tasks VALUES ('running.example', 'ping', 'earlier', 9999999999, 1, 2);",
+            )
+            .unwrap();
+        drop(db);
+        let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+        for (table, domain) in [
+            ("pull_schedule", "waiting.example"),
+            ("pull_tasks", "running.example"),
+        ] {
+            let partition: i64 = db
+                .conn
+                .query_row(
+                    &format!("SELECT partition FROM {table} WHERE domain = ?1"),
+                    [domain],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(partition, db.partition_of(domain).unwrap());
+        }
+        assert_eq!(db.pull_lease("running.example").unwrap().unwrap().token, 0);
+        let plan = plan(&db, OLDEST_DUE_DUTY);
+        assert!(plan.contains("pull_schedule_partition_due"), "{plan}");
+
+        let mut claimed = claim(&db, 2, &mut false);
+        claimed.sort();
+        assert_eq!(claimed, vec!["running.example", "waiting.example"]);
+        let lease = db.pull_lease("running.example").unwrap().unwrap();
+        assert_eq!((lease.owner.as_str(), lease.attempts), ("me", 2));
+    }
+
+    #[test]
+    fn released_partitions_are_taken_at_once_and_fence_the_releasers_pulls() {
+        let (_tmp, db) = open_db();
+        db.insert_publisher("a.example", b"{}", "k", "p").unwrap();
+        let old = db
+            .claim_pulls(NOW, 1, "old", ALL, &mut false)
+            .unwrap()
+            .remove(0);
+        db.release_partitions("old").unwrap();
+        assert!(owners(&db).iter().all(Option::is_none));
+        let new = db
+            .claim_pulls(NOW + 1, 1, "new", ALL, &mut false)
+            .unwrap()
+            .remove(0);
+        assert_eq!(new.domain, "a.example");
+        assert_eq!(new.token, old.token + 1);
+        assert!(matches!(
+            db.complete_pull(&old, "old", NOW, PullOutcome::Failed, NOW + 1),
+            Err(Error::Fenced)
+        ));
     }
 }

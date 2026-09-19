@@ -150,16 +150,20 @@ fn publish_epoch(db: &Db, data_dir: &Path, epoch_number: u64, note: &str) -> Res
 /// to verify them against, then finishes every publication the store
 /// committed to that the disk does not hold, lowest height first, then
 /// restores any file of the head Epoch a crash, a torn write or a deletion
-/// left wrong. Returns the heights it wrote Epoch files for.
+/// left wrong. Returns the heights it wrote Epoch files for. On a
+/// connection fenced by a lease that was taken over it writes no file.
 pub fn recover(db: &Db, data_dir: &Path) -> Result<Vec<u64>> {
+    db.check_fence()?;
     crate::snapshot::resign_unsealed(db, data_dir)?;
     let mut republished = Vec::new();
     for (epoch_number, note) in db.unpublished_publications()? {
+        db.check_fence()?;
         publish_epoch(db, data_dir, epoch_number, &note)?;
         db.mark_published(epoch_number)?;
         republished.push(epoch_number);
     }
     if let Some((epoch_number, note)) = db.head_publication()? {
+        db.check_fence()?;
         if !republished.contains(&epoch_number) && publish_epoch(db, data_dir, epoch_number, &note)?
         {
             republished.push(epoch_number);
@@ -172,6 +176,7 @@ pub fn recover(db: &Db, data_dir: &Path) -> Result<Vec<u64>> {
 /// changed: the archive copy and, where it is the head, `/checkpoint`.
 /// The note text is untouched (WIST-3 §6).
 pub fn republish_checkpoint(db: &Db, data_dir: &Path, epoch_number: u64, note: &str) -> Result<()> {
+    db.check_fence()?;
     write_durable(&archive_path(data_dir, epoch_number), note.as_bytes())?;
     if db
         .head_publication()?

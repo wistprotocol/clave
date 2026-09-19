@@ -6,11 +6,15 @@ use wist_core::objects::{AggregatorKeyEntry, PublisherState, StatusRejection};
 
 mod delta_history;
 mod delta_indexes;
+mod leases;
 mod pull_schedule;
 mod restore;
 mod schema;
 mod tree;
 
+pub use leases::{
+    process_owner, Fence, Lease, PARTITIONS, PARTITION_LEASE_SECONDS, SEALER_LEASE_SECONDS,
+};
 pub use pull_schedule::{
     DuePull, PingAdmission, PullLease, PullOutcome, PullTask, Reason, LEASE_SECONDS,
     RETRY_BASE_SECONDS,
@@ -29,17 +33,31 @@ pub(crate) struct Mutation<'a> {
 
 impl<'a> Mutation<'a> {
     pub(super) fn new(conn: &'a Connection) -> Result<Self> {
+        Self::fenced(conn, None)
+    }
+
+    /// Begins a write transaction that proceeds only while `fence`, when
+    /// set, still holds: at the top level its token is compared under the
+    /// write lock, which no takeover can change before the transaction
+    /// ends; a nested one inherits the enclosing transaction's check.
+    fn fenced(conn: &'a Connection, fence: Option<Fence>) -> Result<Self> {
         let top_level = conn.is_autocommit();
         if top_level {
             conn.execute_batch("BEGIN IMMEDIATE")?;
         } else {
             conn.execute_batch("SAVEPOINT clave_mutation")?;
         }
-        Ok(Self {
+        let mutation = Self {
             conn,
             committed: false,
             top_level,
-        })
+        };
+        if let (true, Some(fence)) = (top_level, fence) {
+            if !leases::fence_holds(conn, fence)? {
+                return Err(Error::Fenced);
+            }
+        }
+        Ok(mutation)
     }
 
     pub(crate) fn commit(mut self) -> Result<()> {
@@ -299,27 +317,50 @@ pub struct WitnessRow {
 
 pub struct Db {
     conn: Connection,
+    fence: Option<Fence>,
 }
 
 impl Db {
     pub(crate) fn observe_feed_generated_at(&self, domain: &str, at: &str) -> Result<bool> {
         let at = crate::registry::unix(at)?;
-        Ok(self
-            .conn
-            .query_row(
-                "INSERT INTO feed_observations(domain, generated_at_s) VALUES (?1, ?2)
-                 ON CONFLICT(domain) DO UPDATE SET generated_at_s = excluded.generated_at_s
-                 WHERE excluded.generated_at_s >= feed_observations.generated_at_s
-                 RETURNING generated_at_s",
-                rusqlite::params![domain, at],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()?
-            .is_some())
+        self.write(|conn| {
+            Ok(conn
+                .query_row(
+                    "INSERT INTO feed_observations(domain, generated_at_s) VALUES (?1, ?2)
+                     ON CONFLICT(domain) DO UPDATE SET generated_at_s = excluded.generated_at_s
+                     WHERE excluded.generated_at_s >= feed_observations.generated_at_s
+                     RETURNING generated_at_s",
+                    rusqlite::params![domain, at],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+                .is_some())
+        })
     }
 
     pub(crate) fn mutation(&self) -> Result<Mutation<'_>> {
-        Mutation::new(&self.conn)
+        Mutation::fenced(&self.conn, self.fence)
+    }
+
+    fn write<T>(&self, change: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        let tx = self.mutation()?;
+        let changed = change(&tx)?;
+        tx.commit()?;
+        Ok(changed)
+    }
+
+    fn execute(&self, sql: &str, params: impl rusqlite::Params) -> Result<usize> {
+        self.write(|conn| Ok(conn.execute(sql, params)?))
+    }
+
+    /// This connection with every write transaction it begins fenced by
+    /// `fence`: once another holder has taken the lease over, each fails
+    /// with `Error::Fenced` and writes nothing.
+    pub fn fenced(self, fence: Fence) -> Db {
+        Db {
+            fence: Some(fence),
+            ..self
+        }
     }
 
     pub fn open(path: &Path) -> Result<Db> {
@@ -338,7 +379,7 @@ impl Db {
         conn.busy_timeout(std::time::Duration::from_millis(5000))?;
         let _mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
         conn.pragma_update(None, "synchronous", "FULL")?;
-        Ok(Db { conn })
+        Ok(Db { conn, fence: None })
     }
 
     pub fn highest_accepted_declaration_seq(&self, domain: &str) -> Result<Option<u64>> {
@@ -364,7 +405,7 @@ impl Db {
     }
 
     pub fn set_param(&self, name: &str, value: i64) -> Result<()> {
-        self.conn.execute(
+        self.execute(
             "INSERT INTO params(name, value) VALUES (?1, ?2) ON CONFLICT(name) DO UPDATE SET value = excluded.value",
             (name, value),
         )?;
@@ -489,8 +530,7 @@ impl Db {
     }
 
     pub fn clear_pending_identity(&self, domain: &str) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM pending_identities WHERE domain = ?1", [domain])?;
+        self.execute("DELETE FROM pending_identities WHERE domain = ?1", [domain])?;
         Ok(())
     }
 
@@ -501,7 +541,7 @@ impl Db {
         key_id: &str,
         public_key: &str,
     ) -> Result<()> {
-        self.conn.execute(
+        self.execute(
             "UPDATE publishers SET declaration_json = ?2, key_id = ?3, public_key = ?4 WHERE domain = ?1",
             (domain, declaration_json, key_id, public_key),
         )?;
@@ -517,7 +557,7 @@ impl Db {
         opened_epoch: u64,
         window_end: &str,
     ) -> Result<()> {
-        self.conn.execute(
+        self.execute(
             "INSERT INTO recovery_windows(domain, declaration_json, prior_declaration_json, owner_declaration_json, opened_epoch, window_end) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(domain) DO UPDATE SET declaration_json = excluded.declaration_json, prior_declaration_json = excluded.prior_declaration_json, owner_declaration_json = excluded.owner_declaration_json, opened_epoch = excluded.opened_epoch, window_end = excluded.window_end",
             (domain, head, before, owner, opened_epoch, window_end),
@@ -540,7 +580,7 @@ impl Db {
     }
 
     pub fn mark_declaration_fetched(&self, domain: &str, at: &str) -> Result<()> {
-        self.conn.execute(
+        self.execute(
             "UPDATE publishers SET declaration_fetched_at = ?2 WHERE domain = ?1",
             (domain, at),
         )?;
@@ -568,7 +608,7 @@ impl Db {
     }
 
     pub fn set_turn_epoch(&self, rowid: i64, epoch_number: u64) -> Result<()> {
-        self.conn.execute(
+        self.execute(
             "UPDATE pending_entries SET turn_epoch = ?2 WHERE rowid = ?1 AND turn_epoch IS NULL",
             (rowid, epoch_number as i64),
         )?;
@@ -592,7 +632,7 @@ impl Db {
         declaration_json: &[u8],
         prior_declaration_json: &[u8],
     ) -> Result<()> {
-        self.conn.execute(
+        self.execute(
             "INSERT INTO recovery_windows(domain, declaration_json, prior_declaration_json, owner_declaration_json) VALUES (?1, ?2, ?3, ?2)",
             (domain, declaration_json, prior_declaration_json),
         )?;
@@ -622,7 +662,7 @@ impl Db {
     /// the newest Declaration that legitimately follows it. Settlement
     /// revalidates against this and the domain resumes under it.
     pub fn update_recovery_chain_head(&self, domain: &str, declaration_json: &[u8]) -> Result<()> {
-        self.conn.execute(
+        self.execute(
             "UPDATE recovery_windows SET declaration_json = ?2 WHERE domain = ?1",
             (domain, declaration_json),
         )?;
@@ -644,7 +684,7 @@ impl Db {
         opened_epoch: i64,
         window_end: &str,
     ) -> Result<()> {
-        self.conn.execute(
+        self.execute(
             "UPDATE recovery_windows SET opened_epoch = ?2, window_end = ?3 WHERE domain = ?1 AND opened_epoch IS NULL",
             (domain, opened_epoch, window_end),
         )?;
@@ -678,7 +718,7 @@ impl Db {
     }
 
     pub(crate) fn mark_recovery_settled(&self, domain: &str, owner_hash: &str) -> Result<()> {
-        self.conn.execute(
+        self.execute(
             "INSERT INTO recovery_settlements(domain, owner_hash) VALUES (?1, ?2)",
             (domain, owner_hash),
         )?;
@@ -686,7 +726,7 @@ impl Db {
     }
 
     pub(crate) fn remove_pending_declaration(&self, rowid: i64) -> Result<()> {
-        self.conn.execute(
+        self.execute(
             "DELETE FROM pending_entries WHERE rowid = ?1 AND entry_type = 'publisher_declaration'",
             [rowid],
         )?;
@@ -694,8 +734,7 @@ impl Db {
     }
 
     pub fn close_recovery_window(&self, domain: &str) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM recovery_windows WHERE domain = ?1", [domain])?;
+        self.execute("DELETE FROM recovery_windows WHERE domain = ?1", [domain])?;
         Ok(())
     }
 
@@ -887,7 +926,7 @@ impl Db {
     }
 
     pub(crate) fn release_queued_delta(&self, domain: &str, delta: &QueuedDeltaRow) -> Result<()> {
-        self.conn.execute(
+        self.execute(
             "INSERT INTO pending_entries(entry_type, domain, entry_json, chain_pos, acceptance_order) VALUES ('publisher_delta', ?1, ?2, ?3, ?4)",
             (domain, serde_json::to_vec(&delta.entry_json)?, delta.chain_pos, delta.acceptance_order),
         )?;
@@ -895,7 +934,7 @@ impl Db {
     }
 
     pub fn set_publisher_pulled(&self, domain: &str, now: &str) -> Result<()> {
-        self.conn.execute(
+        self.execute(
             "UPDATE publishers SET last_pull_at = ?2, state = 'active' WHERE domain = ?1",
             (domain, now),
         )?;
@@ -927,7 +966,7 @@ impl Db {
     }
 
     pub fn insert_seen_delta(&self, delta_id: &str, domain: &str) -> Result<()> {
-        exec_insert_seen_delta(&self.conn, delta_id, domain)
+        self.write(|conn| exec_insert_seen_delta(conn, delta_id, domain))
     }
 
     pub fn insert_pending_entry(
@@ -937,7 +976,9 @@ impl Db {
         entry_json: &Value,
         chain_pos: i64,
     ) -> Result<()> {
-        exec_insert_pending_entry(&self.conn, entry_type, domain, entry_json, chain_pos)
+        self.write(|conn| {
+            exec_insert_pending_entry(conn, entry_type, domain, entry_json, chain_pos)
+        })
     }
 
     pub fn count_pending_entries(&self, entry_type: &str) -> Result<i64> {
@@ -1092,7 +1133,7 @@ impl Db {
     }
 
     pub fn mark_published(&self, epoch_number: u64) -> Result<()> {
-        self.conn.execute(
+        self.execute(
             "UPDATE epochs SET published = 1 WHERE epoch_number = ?1",
             [epoch_number as i64],
         )?;
@@ -1138,7 +1179,7 @@ impl Db {
     /// Replaces a Checkpoint's stored note with one carrying a further
     /// signature line; the note text itself never changes (WIST-3 §6).
     pub fn replace_checkpoint_note(&self, epoch_number: u64, note: &str) -> Result<()> {
-        self.conn.execute(
+        self.execute(
             "UPDATE epochs SET note = ?2 WHERE epoch_number = ?1",
             (epoch_number as i64, note),
         )?;
@@ -1163,7 +1204,7 @@ impl Db {
     }
 
     pub fn add_witness(&self, name: &str, public_key: &str, base_url: &str) -> Result<()> {
-        self.conn.execute(
+        self.execute(
             "INSERT INTO witnesses(name, public_key, base_url, last_size) VALUES (?1, ?2, ?3, 0)
              ON CONFLICT(name) DO UPDATE SET public_key = excluded.public_key, base_url = excluded.base_url",
             (name, public_key, base_url),
@@ -1172,13 +1213,12 @@ impl Db {
     }
 
     pub fn remove_witness(&self, name: &str) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM witnesses WHERE name = ?1", [name])?;
+        self.execute("DELETE FROM witnesses WHERE name = ?1", [name])?;
         Ok(())
     }
 
     pub fn set_witness_size(&self, name: &str, size: u64) -> Result<()> {
-        self.conn.execute(
+        self.execute(
             "UPDATE witnesses SET last_size = ?2 WHERE name = ?1",
             (name, size as i64),
         )?;
@@ -1204,7 +1244,7 @@ impl Db {
         public_key: &str,
         added_epoch: u64,
     ) -> Result<()> {
-        self.conn.execute(
+        self.execute(
             "INSERT OR IGNORE INTO aggregator_keys(note_key_id, key_id, public_key, added_epoch) VALUES (?1, ?2, ?3, ?4)",
             (note_key_id, key_id, public_key, added_epoch as i64),
         )?;
@@ -1509,7 +1549,7 @@ impl Db {
     }
 
     pub fn insert_seen_label(&self, id: &str, domain: &str) -> Result<()> {
-        self.conn.execute(
+        self.execute(
             "INSERT OR IGNORE INTO seen_labels(id, domain) VALUES (?1, ?2)",
             (id, domain),
         )?;
@@ -1532,18 +1572,19 @@ impl Db {
     /// under §3.2's rules): accepted when `at` does not regress it.
     pub(crate) fn observe_label_feed_generated_at(&self, domain: &str, at: &str) -> Result<bool> {
         let at = crate::registry::unix(at)?;
-        Ok(self
-            .conn
-            .query_row(
-                "INSERT INTO label_feed_observations(domain, generated_at_s) VALUES (?1, ?2)
-                 ON CONFLICT(domain) DO UPDATE SET generated_at_s = excluded.generated_at_s
-                 WHERE excluded.generated_at_s >= label_feed_observations.generated_at_s
-                 RETURNING generated_at_s",
-                rusqlite::params![domain, at],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()?
-            .is_some())
+        self.write(|conn| {
+            Ok(conn
+                .query_row(
+                    "INSERT INTO label_feed_observations(domain, generated_at_s) VALUES (?1, ?2)
+                     ON CONFLICT(domain) DO UPDATE SET generated_at_s = excluded.generated_at_s
+                     WHERE excluded.generated_at_s >= label_feed_observations.generated_at_s
+                     RETURNING generated_at_s",
+                    rusqlite::params![domain, at],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+                .is_some())
+        })
     }
 
     /// Every sealed `label` Entry in Log order.
@@ -1601,7 +1642,7 @@ impl Db {
     }
 
     pub fn store_suffix_list(&self, identifier: &str, octets: &[u8]) -> Result<()> {
-        self.conn.execute(
+        self.execute(
             "INSERT OR IGNORE INTO suffix_lists(sha256, octets) VALUES (?1, ?2)",
             (identifier, octets),
         )?;
@@ -1736,7 +1777,7 @@ impl Db {
     }
 
     pub fn bump_noise_ping(&self, domain: &str, day: &str) -> Result<()> {
-        self.conn.execute(
+        self.execute(
             "INSERT INTO noise_pings(domain, day, count) VALUES (?1, ?2, 1) ON CONFLICT(domain, day) DO UPDATE SET count = count + 1",
             (domain, day),
         )?;
@@ -1756,7 +1797,7 @@ impl Db {
     }
 
     pub fn add_ingest_bytes(&self, domain: &str, day: &str, bytes: i64) -> Result<()> {
-        self.conn.execute(
+        self.execute(
             "INSERT INTO ingest_meter(domain, day, bytes) VALUES (?1, ?2, ?3) ON CONFLICT(domain, day) DO UPDATE SET bytes = bytes + excluded.bytes",
             (domain, day, bytes),
         )?;
@@ -1776,7 +1817,7 @@ impl Db {
     }
 
     pub fn set_walk_suspended(&self, domain: &str, suspended: bool) -> Result<()> {
-        self.conn.execute(
+        self.execute(
             "INSERT INTO walk_state(domain, suspended) VALUES (?1, ?2) ON CONFLICT(domain) DO UPDATE SET suspended = excluded.suspended",
             (domain, suspended as i64),
         )?;
@@ -1796,8 +1837,7 @@ impl Db {
     }
 
     pub fn delete_record_by_delta(&self, delta_id: &str) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM records WHERE delta_id = ?1", [delta_id])?;
+        self.execute("DELETE FROM records WHERE delta_id = ?1", [delta_id])?;
         Ok(())
     }
 
@@ -1992,7 +2032,7 @@ impl Db {
     }
 
     pub fn set_url_tip(&self, url: &str, domain: &str, tip: &str) -> Result<()> {
-        exec_set_url_tip(&self.conn, url, domain, tip)
+        self.write(|conn| exec_set_url_tip(conn, url, domain, tip))
     }
 
     pub fn record_accepted_delta(
@@ -2056,7 +2096,7 @@ impl Db {
         delta_id: Option<&str>,
         detail: Option<&str>,
     ) -> Result<()> {
-        self.conn.execute(
+        self.execute(
             "INSERT INTO rejections(domain, code, at, delta_id, detail) VALUES (?1, ?2, ?3, ?4, ?5)",
             (domain, code, at, delta_id, detail),
         )?;
