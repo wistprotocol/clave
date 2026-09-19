@@ -247,7 +247,8 @@ async fn ingest_handler(State(state): State<AppState>, body: Bytes) -> axum::res
 /// Runs `task` to completion and schedules the domain's next pull, every
 /// write fenced by the partition token the task was claimed under: once
 /// another dispatcher has taken the partition over, the pull writes
-/// nothing more and leaves the domain to the new holder.
+/// nothing more and leaves the domain, and whatever its run committed, to
+/// the new holder.
 fn pull(state: &AppState, owner: &str, task: &PullTask) {
     let Ok(db) = Db::connect(&state.db_path) else {
         return;
@@ -255,35 +256,37 @@ fn pull(state: &AppState, owner: &str, task: &PullTask) {
     let db = db.fenced(task.fence());
     let started_at = jiff::Timestamp::now().as_second();
     let now = utc(started_at);
-    let report = ingest::run_with_clock(
+    let run = ingest::open_pull(
         &db,
         &state.client,
         &state.data_dir,
         &task.domain,
         &now,
         jiff::Timestamp::now,
+        ingest::PullLimits::default(),
     );
-    let outcome = match report {
-        Ok(report) => {
-            if report.noise.is_some() {
-                let day = now.get(..10).unwrap_or(&now);
-                if let Ok(unit) = crate::suffix_list::unit_at(&db, &task.domain, &now) {
-                    let _ = db.bump_noise_ping(&unit, day);
-                }
-            }
-            PullOutcome::Pulled {
-                suspended: report.suspended,
-            }
+    match run {
+        Ok(run) => {
+            let _ = ingest::finish_pull(
+                &db,
+                task,
+                owner,
+                started_at,
+                run,
+                jiff::Timestamp::now().as_second(),
+            );
         }
-        Err(_) => PullOutcome::Failed,
-    };
-    let _ = db.complete_pull(
-        task,
-        owner,
-        started_at,
-        outcome,
-        jiff::Timestamp::now().as_second(),
-    );
+        Err(Error::Fenced) => {}
+        Err(_) => {
+            let _ = db.complete_pull(
+                task,
+                owner,
+                started_at,
+                PullOutcome::Failed,
+                jiff::Timestamp::now().as_second(),
+            );
+        }
+    }
 }
 
 /// Claims due pulls whenever a worker slot is free, woken by each Ping,

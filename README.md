@@ -444,14 +444,20 @@ it begins, including its completion, first checks under the write lock
 that the partition's token is unchanged; once another dispatcher has
 taken the partition over, the transaction writes nothing and fails with
 `Error::Fenced`, and the pull is abandoned without a completion, since
-the takeover already returned the domain to the schedule. A Payload
+the takeover already returned the domain to the schedule. What its run
+committed before that stays: the new holder continues that run instead of
+pulling the domain from the start. A Payload
 file is written inside its Delta's admission transaction, after that
 check, and is named by the Delta ID and holds the bytes the Delta
 commits to, so a fenced-out pull writes none and a repeated admission
 writes the same file.
 
-A finished pull, in one write transaction, drops its task and schedules
-the next pull, combined with any Ping row that arrived meanwhile:
+A finished pull, in one write transaction, closes its run — which
+rebuilds its report, records the walk's suspension and, for a completed
+walk, the pull instant — drops its task and schedules the next pull,
+combined with any Ping row that arrived meanwhile. A takeover between the
+pull's last admission and that transaction writes none of it, so the new
+holder closes the run itself:
 
 - after a completed walk, `baseline` due `baseline_poll_seconds` after
   the pull started;

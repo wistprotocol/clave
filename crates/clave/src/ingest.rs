@@ -378,13 +378,49 @@ pub fn run_bounded(
     }
 }
 
+/// Closes the run of a finished pull, schedules the domain's next pull
+/// and records the pull's noise disposition, all in one transaction: a
+/// takeover between a pull's end and its completion leaves the run for
+/// the new holder rather than a closed run with no next pull. `run` is
+/// `None` where no run was opened, which schedules nothing further.
+pub fn finish_pull(
+    db: &Db,
+    task: &crate::db::PullTask,
+    owner: &str,
+    started_at: i64,
+    run: Option<i64>,
+    now: i64,
+) -> Result<IngestReport> {
+    let mutation = db.mutation()?;
+    let report = match run {
+        Some(run_id) => admit::close_run(db, run_id)?,
+        None => IngestReport::default(),
+    };
+    if report.noise.is_some() {
+        let at = registry::instant(started_at)?;
+        let unit = crate::suffix_list::unit_at(db, &task.domain, &at)?;
+        db.bump_noise_ping(&unit, at.get(..10).unwrap_or(&at))?;
+    }
+    db.complete_pull(
+        task,
+        owner,
+        started_at,
+        crate::db::PullOutcome::Pulled {
+            suspended: report.suspended,
+        },
+        now,
+    )?;
+    mutation.commit()?;
+    Ok(report)
+}
+
 /// Pulls `host` once and leaves its run open for the caller to close
 /// beside whatever else the pull's completion records. Every handoff
 /// between the pull's stages is persisted under the run, so a pull that
 /// stops before its run is closed is continued by the next pull of the
 /// domain rather than begun again. `None` means `host` is no bare
 /// authority and nothing was pulled.
-pub(crate) fn open_pull(
+pub fn open_pull(
     db: &Db,
     client: &Client,
     data_dir: &Path,
