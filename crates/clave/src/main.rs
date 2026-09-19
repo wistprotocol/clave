@@ -43,6 +43,10 @@ enum Command {
         bind: SocketAddr,
         #[arg(long = "allow-http")]
         allow_http: bool,
+        /// Leave sealing to `seal` instead of sealing an Epoch at every
+        /// cadence grid instant reached while serving.
+        #[arg(long = "no-seal")]
+        no_seal: bool,
     },
     Seal {
         #[arg(long)]
@@ -192,9 +196,10 @@ fn main() -> Result<(), clave::Error> {
             data,
             bind,
             allow_http,
+            no_seal,
         } => {
             let db_path = data.join("clave.sqlite");
-            clave::serve::run(data, db_path, bind, allow_http)?;
+            clave::serve::run(data, db_path, bind, allow_http, !no_seal)?;
         }
         Command::Seal {
             data,

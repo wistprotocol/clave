@@ -12,7 +12,8 @@ Snapshots over HTTP for Consumer sync.
 
 Subcommands: `init` (generate the log's genesis key and local store, and
 print the signed-note verifier key a Witness is configured with),
-`serve` (HTTP ingest + read endpoints), `seal` (append the next Epoch's
+`serve` (HTTP ingest + read endpoints; seals an Epoch at every cadence
+grid instant unless `--no-seal`), `seal` (append the next Epoch's
 Entries to the tree and publish its Checkpoint at the wall clock floored
 to the accepted cadence grid, or at `--at <whole-second UTC instant>` for
 a test Log that advances Log time faster than the clock), `witness`
@@ -221,6 +222,13 @@ Entries of each JCS serialization plus two, appends their leaves at
 its height (WIST-3 §3.4, §5, see
 [Aggregator key rotation](#aggregator-key-rotation)). An empty Epoch
 restates the previous size and root.
+
+`serve` seals at every instant of the cadence grid in force at the last
+Epoch's `sealed_at` (at the current time before the first Epoch), an
+empty Epoch when nothing is eligible. An instant is sealed within its
+grace of `min(60, cadence / 2)` seconds after it, with `sealed_at` equal
+to the instant; one missed by more, or whose seal failed, is skipped and
+never sealed late. `serve --no-seal` leaves sealing to `seal`.
 
 Distribution runs after the commit, is idempotent and restart-safe, and
 writes each file through a sibling temporary file, syncing the file and

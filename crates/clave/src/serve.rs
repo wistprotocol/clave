@@ -23,11 +23,13 @@ pub const OVERLOAD_RETRY_AFTER_SECS: u64 = 30;
 /// The admission bounds `serve` applies to Pings: at most
 /// `max_concurrent_ingests` pulls run at once and at most
 /// `max_pending_ingests` accepted Pings wait for a slot; a Ping beyond
-/// both is refused with 503 and a Retry-After, never queued.
+/// both is refused with 503 and a Retry-After, never queued. With `seal`
+/// set, an Epoch is sealed at every grid instant reached while serving.
 #[derive(Debug, Clone, Copy)]
 pub struct ServeOptions {
     pub max_concurrent_ingests: usize,
     pub max_pending_ingests: usize,
+    pub seal: bool,
 }
 
 impl Default for ServeOptions {
@@ -35,6 +37,7 @@ impl Default for ServeOptions {
         ServeOptions {
             max_concurrent_ingests: MAX_CONCURRENT_INGESTS,
             max_pending_ingests: MAX_PENDING_INGESTS,
+            seal: true,
         }
     }
 }
@@ -372,8 +375,23 @@ async fn status_handler(
     outcome.map(Json).ok_or(StatusCode::NOT_FOUND)
 }
 
-pub fn run(data_dir: PathBuf, db_path: PathBuf, bind: SocketAddr, allow_http: bool) -> Result<()> {
-    run_with_client(data_dir, db_path, bind, Client::new(allow_http))
+pub fn run(
+    data_dir: PathBuf,
+    db_path: PathBuf,
+    bind: SocketAddr,
+    allow_http: bool,
+    seal: bool,
+) -> Result<()> {
+    run_with_options(
+        data_dir,
+        db_path,
+        bind,
+        Client::new(allow_http),
+        ServeOptions {
+            seal,
+            ..ServeOptions::default()
+        },
+    )
 }
 
 pub fn run_with_client(
@@ -418,6 +436,13 @@ pub fn run_with_options(
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
+        if options.seal {
+            tokio::spawn(crate::scheduler::run(
+                bg_state.db_path.clone(),
+                bg_data.clone(),
+                bg_state.client.clone(),
+            ));
+        }
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
             loop {

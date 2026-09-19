@@ -17,7 +17,14 @@ fn spawn_server(data_dir: &Path) -> String {
 }
 
 fn spawn_server_with_client(data_dir: &Path, transport: clave::fetch::Client) -> String {
-    spawn_server_with_options(data_dir, transport, clave::serve::ServeOptions::default())
+    spawn_server_with_options(data_dir, transport, unsealed())
+}
+
+fn unsealed() -> clave::serve::ServeOptions {
+    clave::serve::ServeOptions {
+        seal: false,
+        ..clave::serve::ServeOptions::default()
+    }
 }
 
 fn spawn_server_with_options(
@@ -366,6 +373,7 @@ fn pings_beyond_the_pending_bound_are_refused_with_retry_after() {
         clave::serve::ServeOptions {
             max_concurrent_ingests: 0,
             max_pending_ingests: 2,
+            ..unsealed()
         },
     );
     let c = reqwest::blocking::Client::new();
@@ -512,4 +520,85 @@ fn a_slow_domain_blocks_neither_other_domains_nor_status() {
         );
         std::thread::sleep(Duration::from_millis(200));
     }
+}
+
+fn sealed_epochs(data_dir: &Path) -> Vec<clave::db::EpochRow> {
+    let db = clave::db::Db::connect(&data_dir.join("clave.sqlite")).unwrap();
+    (0..).map_while(|n| db.epoch_at(n).unwrap()).collect()
+}
+
+/// A Log whose sealed history put `cadence` in force: Epoch 0 seals the
+/// `parameter_change` eight days ago and Epoch 1 seals at its effective
+/// instant a day ago, both on the prior hourly grid.
+fn init_with_cadence(data_dir: &Path, cadence: i64) {
+    clave::init::run("127.0.0.1:0", data_dir).unwrap();
+    let db = clave::db::Db::open(&data_dir.join("clave.sqlite")).unwrap();
+    let sk = clave::keys::load(&data_dir.join("keys/seed")).unwrap();
+    let day = 86_400;
+    let now = jiff::Timestamp::now().as_second();
+    let start = now.div_euclid(3600) * 3600 - 8 * day;
+    let effective_at = start + 7 * day;
+    let effective = clave::registry::instant(effective_at).unwrap();
+    clave::param_change::run(
+        &db,
+        &sk,
+        "epoch_cadence_seconds",
+        cadence,
+        Some(&effective),
+        start,
+    )
+    .unwrap();
+    clave::seal::run(&db, data_dir, &sk, start).unwrap();
+    clave::seal::run(&db, data_dir, &sk, effective_at).unwrap();
+    assert_eq!(
+        clave::registry::effective(&db, "epoch_cadence_seconds", &effective).unwrap(),
+        cadence
+    );
+}
+
+#[test]
+fn serve_seals_consecutive_grid_instants_as_consecutive_empty_epochs() {
+    let cadence = 2;
+    let tmp = tempfile::tempdir().unwrap();
+    init_with_cadence(tmp.path(), cadence);
+    spawn_server_with_options(
+        tmp.path(),
+        clave::fetch::Client::new(true),
+        clave::serve::ServeOptions::default(),
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut epochs = sealed_epochs(tmp.path());
+    while epochs.len() < 5 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+        epochs = sealed_epochs(tmp.path());
+    }
+    assert!(epochs.len() >= 5, "sealed {} Epochs", epochs.len());
+    let scheduled = &epochs[2..];
+    let instants: Vec<i64> = scheduled
+        .iter()
+        .map(|epoch| wist_core::timestamp::log_seconds(&epoch.sealed_at).unwrap())
+        .collect();
+    let tree_size = epochs[1].tree_size;
+    for (n, (epoch, instant)) in (2..).zip(scheduled.iter().zip(&instants)) {
+        assert_eq!(epoch.epoch_number, n);
+        assert_eq!(epoch.tree_size, tree_size, "Epoch {n} is not empty");
+        assert_eq!(
+            instant.rem_euclid(cadence),
+            0,
+            "{} is off the grid",
+            epoch.sealed_at
+        );
+    }
+    for pair in instants.windows(2) {
+        assert_eq!(pair[1] - pair[0], cadence, "{instants:?}");
+    }
+}
+
+#[test]
+fn serve_without_sealing_seals_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_with_cadence(tmp.path(), 1);
+    spawn_server_with_options(tmp.path(), clave::fetch::Client::new(true), unsealed());
+    std::thread::sleep(Duration::from_millis(2500));
+    assert_eq!(sealed_epochs(tmp.path()).len(), 2);
 }
