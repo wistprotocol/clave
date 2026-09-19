@@ -438,10 +438,17 @@ pull. Running a returned pull again is safe because admission is
 transactional and deduplicates by Delta ID. One pull runs per domain at
 a time.
 Fetching and state-independent verification happen outside any write
-transaction; each Delta's persistence is one immediate write transaction
-that first re-reads the admission Declarations and the URL's chain tip,
-re-verifying the Delta if its authority or predecessor changed, so a
-concurrent seal or admission cannot be bypassed. Every
+transaction. Each Delta attempt is issued, at its one clock sample, with
+references to the state it is verified under: the hash of the domain's
+accepted Declaration and of its recovery window's Declarations with the
+window's opening Epoch, and the size caps and clock allowance of the
+parameter schedule at the sampled clock with the height that schedule was
+read at. Each Delta's persistence is one immediate write transaction that
+first revalidates those references and the URL's chain tip, the caps only
+when an Epoch was sealed since; on any change it writes nothing, and the
+stored Delta and its verified Payload are verified again under fresh
+references at the same clock, so a concurrent seal or admission cannot be
+bypassed. A Label or dispute revalidates its Declaration the same way. Every
 top-level write transaction begins immediately, taking the write lock
 before its reads.
 

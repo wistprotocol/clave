@@ -12,6 +12,46 @@ use super::feed;
 /// Declaration's sealing instant, `seq` and keys.
 pub(super) type SealedSources = [(i64, u64, Vec<PublisherKey>)];
 
+/// A recovery window's version: the hashes of its prior, owner and
+/// chain-head Declarations and the Epoch it opened at, if it has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct WindowRef {
+    pub prior: String,
+    pub owner: String,
+    pub head: String,
+    pub opened_epoch: Option<i64>,
+}
+
+/// The Declaration version a Delta or Label was verified under: the
+/// hash and `seq` of the domain's accepted Declaration, its recovery
+/// window if one is open, and the admission sources they yield.
+#[derive(Debug, Clone)]
+pub(super) struct DeclarationRef {
+    pub hash: Option<String>,
+    pub seq: Option<u64>,
+    pub window: Option<WindowRef>,
+    pub sources: Vec<Publisher>,
+}
+
+impl DeclarationRef {
+    /// Whether `other` names the same Declaration version.
+    pub fn same_version(&self, other: &DeclarationRef) -> bool {
+        self.hash == other.hash && self.seq == other.seq && self.window == other.window
+    }
+}
+
+/// The references one Delta attempt is issued with: the Declaration
+/// version, the size caps and clock allowance of the parameter schedule
+/// at the attempt's one clock sample, and the height that schedule was
+/// read at.
+pub(super) struct IssuedRefs {
+    pub decl: DeclarationRef,
+    pub sizes: SizeCaps,
+    pub clock: jiff::Timestamp,
+    pub clock_skew_seconds: i64,
+    pub schedule_at: Option<u64>,
+}
+
 /// A fetched Feed or Label Feed page's field and domain checks, which
 /// precede any signature check.
 pub(super) struct PageChecks {

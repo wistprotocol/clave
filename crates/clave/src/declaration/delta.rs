@@ -69,7 +69,6 @@ impl SizeCaps {
 
 pub(crate) struct AdmissionProfile {
     pub sizes: SizeCaps,
-    pub clock: jiff::Timestamp,
     pub clock_skew_seconds: i64,
 }
 
@@ -86,7 +85,6 @@ impl AdmissionProfile {
         let schedule = history.schedule().unwrap_or(&initial);
         Ok(Self {
             sizes: SizeCaps::from_schedule(schedule, at),
-            clock,
             clock_skew_seconds: schedule.value_at("clock_skew_seconds", at).unwrap(),
         })
     }

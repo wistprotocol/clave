@@ -4,7 +4,7 @@ use crate::fetch::Client;
 use crate::history::declarations::DeclarationsReplay;
 use serde_json::Value;
 use std::path::Path;
-use wist_core::objects::{FeedEnvelope, Publisher, PublisherEnvelope, PublisherKey};
+use wist_core::objects::{FeedEnvelope, PublisherEnvelope, PublisherKey};
 
 use crate::declaration;
 use crate::registry;
@@ -12,6 +12,8 @@ use crate::registry;
 mod admit;
 mod feed;
 mod fetch_stage;
+#[cfg(test)]
+mod stage_tests;
 mod verify;
 
 use admit::{Admission, Step};
@@ -156,14 +158,23 @@ fn key_set_cache_expired(db: &Db, host: &str, now: &str) -> Result<bool> {
     Ok(now_ts.as_second() - fetched.as_second() > ttl)
 }
 
-fn delta_admission_sources(db: &Db, host: &str) -> Result<(bool, Vec<Publisher>)> {
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    wist_core::crypto::hex_encode(&sha2::Sha256::digest(bytes))
+}
+
+/// The version of the domain's accepted Declaration and recovery window
+/// with the admission sources they yield: the window's prior and owner
+/// Declarations while one is open, the accepted Declaration otherwise.
+fn declaration_ref(db: &Db, host: &str) -> Result<verify::DeclarationRef> {
     let window = db.get_recovery_window(host)?;
+    let stored = db.get_publisher_declaration(host)?;
     let raw = match &window {
         Some(window) => vec![
             window.prior_declaration_json.clone(),
             window.owner_declaration_json.clone(),
         ],
-        None => vec![db.get_publisher_declaration(host)?.ok_or_else(|| {
+        None => vec![stored.clone().ok_or_else(|| {
             crate::error::Error::History("missing Delta admission Declaration".into())
         })?],
     };
@@ -174,7 +185,59 @@ fn delta_admission_sources(db: &Db, host: &str) -> Result<(bool, Vec<Publisher>)
             declaration::publisher_of(&doc).map_err(crate::error::Error::History)
         })
         .collect::<Result<Vec<_>>>()?;
-    Ok((window.is_some(), sources))
+    let seq = stored
+        .as_deref()
+        .and_then(|raw| crate::json::parse(raw).ok())
+        .and_then(|doc| declaration::publisher_of(&doc).ok())
+        .map(|publisher| publisher.seq);
+    Ok(verify::DeclarationRef {
+        hash: stored.as_deref().map(sha256_hex),
+        seq,
+        window: window.map(|window| verify::WindowRef {
+            prior: sha256_hex(&window.prior_declaration_json),
+            owner: sha256_hex(&window.owner_declaration_json),
+            head: sha256_hex(&window.declaration_json),
+            opened_epoch: window.opened_epoch,
+        }),
+        sources,
+    })
+}
+
+/// Issues the references of one Delta attempt at its clock sample. The
+/// schedule's height is read before the schedule, so a seal that lands
+/// between them makes admission recheck the caps rather than miss them.
+fn issue_refs(
+    db: &Db,
+    data_dir: &Path,
+    host: &str,
+    clock: jiff::Timestamp,
+) -> Result<verify::IssuedRefs> {
+    let schedule_at = db.last_epoch()?.map(|epoch| epoch.epoch_number);
+    let profile = declaration::delta::AdmissionProfile::start(db, data_dir, clock)?;
+    Ok(verify::IssuedRefs {
+        decl: declaration_ref(db, host)?,
+        sizes: profile.sizes,
+        clock,
+        clock_skew_seconds: profile.clock_skew_seconds,
+        schedule_at,
+    })
+}
+
+/// The domain's accepted Declaration, which Labels and disputes validate
+/// under, with its version.
+fn label_declaration(
+    db: &Db,
+    host: &str,
+) -> Result<Option<(PublisherEnvelope, verify::DeclarationRef)>> {
+    let Some(raw) = db.get_publisher_declaration(host)? else {
+        return Ok(None);
+    };
+    let doc = crate::json::parse(&raw)?;
+    let declaration = PublisherEnvelope {
+        publisher: declaration::publisher_of(&doc).map_err(crate::error::Error::History)?,
+        sig: serde_json::from_value(doc["sig"].clone())?,
+    };
+    Ok(Some((declaration, declaration_ref(db, host)?)))
 }
 
 /// The keys of the Declaration the domain holds, which a live Feed or
@@ -648,7 +711,8 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
             .collect();
         let mut chain_pos: i64 = 0;
         let mut prefetched: HashMap<String, Value> = HashMap::new();
-        let mut profiles = HashMap::<String, declaration::delta::AdmissionProfile>::new();
+        let mut issued = HashMap::<String, verify::IssuedRefs>::new();
+        let mut verified_payloads = HashMap::<String, (Vec<u8>, Value)>::new();
         let mut resolved_prev: HashSet<String> = HashSet::new();
         let mut refreshed = HashSet::new();
         let mut position = 0usize;
@@ -677,9 +741,9 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
                     }
                 }
             };
-            let attempt = match profiles.remove(&id) {
-                Some(profile) => profile,
-                None => declaration::delta::AdmissionProfile::start(db, data_dir, (self.clock)())?,
+            let mut attempt = match issued.remove(&id) {
+                Some(refs) => refs,
+                None => issue_refs(db, data_dir, host, (self.clock)())?,
             };
             let checks = verify::delta(
                 &doc,
@@ -693,7 +757,7 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
                 self.reject_item(&id, code, "Delta Publisher does not match the logical Feed")?;
                 continue;
             }
-            if let Err(code) = self.authority(&id, &doc, &mut refreshed)? {
+            if let Err(code) = self.authority(&id, &doc, &mut refreshed, &mut attempt)? {
                 self.reject_item(&id, code, "Delta signing and scope authority failed")?;
                 continue;
             }
@@ -730,7 +794,7 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
                             match self.get(&url, Object::Delta)? {
                                 Got::Body(_, predecessor) => {
                                     let at = position - 1;
-                                    profiles.insert(id.clone(), attempt);
+                                    issued.insert(id.clone(), attempt);
                                     prefetched.insert(id.clone(), doc);
                                     prefetched.insert(prev.into(), predecessor);
                                     ids.insert(at, prev.into());
@@ -763,26 +827,31 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
                 }
             }
 
-            let payload_raw = if envelope.delta.payload.is_some() {
-                let url = format!("{}payloads/{hex}.json", self.base);
-                let (raw, value) = match self.get(&url, Object::Payload)? {
-                    Got::Body(raw, value) => (raw, value),
-                    Got::Suspend => return Ok(true),
-                    Got::Failed(detail) => {
-                        self.reject_item(&id, "WIST2-E03", &detail)?;
-                        continue;
+            let payload = if envelope.delta.payload.is_some() {
+                let (raw, value) = match verified_payloads.remove(&id) {
+                    Some(stored) => stored,
+                    None => {
+                        let url = format!("{}payloads/{hex}.json", self.base);
+                        match self.get(&url, Object::Payload)? {
+                            Got::Body(raw, value) => (raw, value),
+                            Got::Suspend => return Ok(true),
+                            Got::Failed(detail) => {
+                                self.reject_item(&id, "WIST2-E03", &detail)?;
+                                continue;
+                            }
+                        }
                     }
                 };
                 if let Err(code) = verify::payload(&value, &envelope, &attempt.sizes) {
                     self.reject_item(&id, "WIST2-E03", code)?;
                     continue;
                 }
-                Some(raw)
+                Some((raw, value))
             } else {
                 None
             };
 
-            if let Err(code) = self.authority(&id, &doc, &mut refreshed)? {
+            if let Err(code) = self.authority(&id, &doc, &mut refreshed, &mut attempt)? {
                 self.reject_item(&id, code, "Delta authority changed before admission")?;
                 continue;
             }
@@ -793,13 +862,18 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
                 &id,
                 &doc,
                 &envelope,
-                payload_raw.as_deref(),
+                payload.as_ref().map(|(raw, _)| raw.as_slice()),
                 chain_pos,
+                &attempt,
             )? {
-                Admission::Stale => {
+                Admission::Stale(stale) => {
+                    tracing::debug!(domain = host, delta = %id, ?stale, "re-issuing a stale Delta admission");
                     resolved_prev.remove(&id);
-                    profiles.insert(id.clone(), attempt);
+                    issued.insert(id.clone(), self.reissue(attempt)?);
                     prefetched.insert(id.clone(), doc);
+                    if let Some(payload) = payload {
+                        verified_payloads.insert(id.clone(), payload);
+                    }
                     position -= 1;
                     continue;
                 }
@@ -813,26 +887,42 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
 
     /// WIST-1 §5.1 authority of a Delta under the admission sources after
     /// any settlement due, with the one Declaration retry WIST-2 §5 allows
-    /// each Delta ID per pull on a binding failure.
+    /// each Delta ID per pull on a binding failure. The attempt's
+    /// Declaration reference becomes the version the check read.
     fn authority(
         &self,
         id: &str,
         doc: &Value,
         refreshed: &mut std::collections::HashSet<String>,
+        attempt: &mut verify::IssuedRefs,
     ) -> Result<std::result::Result<(), &'static str>> {
         let scope = self.scope()?;
         self.settle()?;
-        let (_, sources) = delta_admission_sources(self.db, self.host)?;
-        let mut authority = verify::delta_authority(&sources, doc);
+        attempt.decl = declaration_ref(self.db, self.host)?;
+        let mut authority = verify::delta_authority(&attempt.decl.sources, doc);
         if matches!(authority, Err("WIST1-E01" | "WIST1-E02")) && refreshed.insert(id.into()) {
             if let Ok((raw, value)) = self.get_declaration(scope) {
                 self.admit_declaration(&raw, value)?;
             }
             self.settle()?;
-            let (_, sources) = delta_admission_sources(self.db, self.host)?;
-            authority = verify::delta_authority(&sources, doc);
+            attempt.decl = declaration_ref(self.db, self.host)?;
+            authority = verify::delta_authority(&attempt.decl.sources, doc);
         }
         Ok(authority)
+    }
+
+    /// Re-issues a stale attempt's references at its frozen clock: the
+    /// current Declaration version and, when an Epoch was sealed since,
+    /// the caps of the schedule it extended.
+    fn reissue(&self, refs: verify::IssuedRefs) -> Result<verify::IssuedRefs> {
+        let schedule_at = self.db.last_epoch()?.map(|epoch| epoch.epoch_number);
+        if schedule_at != refs.schedule_at {
+            return issue_refs(self.db, self.data_dir, self.host, refs.clock);
+        }
+        Ok(verify::IssuedRefs {
+            decl: declaration_ref(self.db, self.host)?,
+            ..refs
+        })
     }
 
     /// WIST-2 §3.3: pulls the domain's Label Feed beside its Feed, walking
@@ -845,14 +935,8 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
     /// it.
     fn pull_labels(&mut self, url_cap_bytes: i64) -> Result<bool> {
         let (db, host) = (self.db, self.host);
-        let Some(raw) = db.get_publisher_declaration(host)? else {
+        let Some(mut declaration) = label_declaration(db, host)? else {
             return Ok(false);
-        };
-        let declaration_doc = crate::json::parse(&raw)?;
-        let declaration = PublisherEnvelope {
-            publisher: declaration::publisher_of(&declaration_doc)
-                .map_err(crate::error::Error::History)?,
-            sig: serde_json::from_value(declaration_doc["sig"].clone())?,
         };
         let mut page_url = format!("{}label-feed.json", self.base);
         let mut pages: Vec<Vec<String>> = Vec::new();
@@ -937,31 +1021,44 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
                     continue;
                 }
             };
-            let checks = verify::label(&doc, &id, &declaration, url_cap_bytes);
-            let Some(kind) = checks.kind else {
-                self.reject_item(
+            loop {
+                let checks = verify::label(&doc, &id, &declaration.0, url_cap_bytes);
+                let Some(kind) = checks.kind else {
+                    self.reject_item(
+                        &id,
+                        "WIST2-E06",
+                        "file carries neither a Label nor a dispute",
+                    )?;
+                    break;
+                };
+                if !checks.id_matches {
+                    self.reject_item(&id, "WIST2-E06", "file does not carry the listed ID")?;
+                    break;
+                }
+                match admit::admit_label(
+                    db,
+                    host,
+                    self.now,
                     &id,
-                    "WIST2-E06",
-                    "file carries neither a Label nor a dispute",
-                )?;
-                continue;
-            };
-            if !checks.id_matches {
-                self.reject_item(&id, "WIST2-E06", "file does not carry the listed ID")?;
-                continue;
-            }
-            match admit::admit_label(
-                db,
-                host,
-                self.now,
-                &id,
-                kind,
-                &doc,
-                &declaration,
-                checks.label,
-            )? {
-                None => self.report.labels.push(id),
-                Some(rejection) => self.report.rejected.push((id, rejection.code().into())),
+                    kind,
+                    &doc,
+                    &declaration,
+                    checks.label,
+                )? {
+                    admit::LabelAdmission::Admitted => self.report.labels.push(id),
+                    admit::LabelAdmission::Rejected(code) => {
+                        self.report.rejected.push((id, code.into()))
+                    }
+                    admit::LabelAdmission::Stale => {
+                        declaration = label_declaration(db, host)?.ok_or_else(|| {
+                            crate::error::Error::History(
+                                "Label admission Declaration lost mid-pull".into(),
+                            )
+                        })?;
+                        continue;
+                    }
+                }
+                break;
             }
         }
         Ok(false)

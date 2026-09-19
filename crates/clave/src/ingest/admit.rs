@@ -8,7 +8,7 @@ use std::path::Path;
 use wist_core::objects::{DeltaEnvelope, FeedEnvelope, Publisher, PublisherEnvelope};
 
 use super::fetch_stage::Walk;
-use super::verify::{self, LabelKind};
+use super::verify::{DeclarationRef, IssuedRefs, LabelKind};
 
 /// Records a rejection at the domain's status endpoint.
 pub(super) fn reject(
@@ -302,18 +302,29 @@ pub(super) fn admit_page(
     Ok(PageAdmission { unseen, step })
 }
 
+/// Which reference a Delta attempt was issued with no longer holds at
+/// admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Staleness {
+    Declaration,
+    ChainTip,
+    Schedule,
+}
+
 /// How a verified Delta's admission ended.
 pub(super) enum Admission {
     Accepted,
     /// Accepted for sealing under an open recovery window.
     Queued,
-    /// The admission sources or the URL's chain tip changed since the
-    /// Delta was verified; nothing was written.
-    Stale,
+    /// A reference the Delta was verified under changed; nothing was
+    /// written and the attempt is re-issued.
+    Stale(Staleness),
 }
 
-/// Accepts a verified Delta, with its Payload file, after re-reading the
-/// admission sources and the URL's chain tip in the same transaction.
+/// Accepts a verified Delta, with its Payload file, after revalidating in
+/// the same transaction the references it was verified under: the
+/// Declaration version, the URL's chain tip and, when an Epoch was sealed
+/// since, the size caps and clock allowance at the attempt's clock.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn admit_delta(
     db: &Db,
@@ -324,13 +335,21 @@ pub(super) fn admit_delta(
     envelope: &DeltaEnvelope,
     payload_raw: Option<&[u8]>,
     chain_pos: i64,
+    refs: &IssuedRefs,
 ) -> Result<Admission> {
     let admission = db.mutation()?;
-    let (window_open, sources) = super::delta_admission_sources(db, host)?;
-    if verify::delta_authority(&sources, doc).is_err()
-        || envelope.delta.prev != db.url_tip(host, &envelope.delta.url)?
-    {
-        return Ok(Admission::Stale);
+    let current = super::declaration_ref(db, host)?;
+    if !current.same_version(&refs.decl) {
+        return Ok(Admission::Stale(Staleness::Declaration));
+    }
+    if envelope.delta.prev != db.url_tip(host, &envelope.delta.url)? {
+        return Ok(Admission::Stale(Staleness::ChainTip));
+    }
+    if db.last_epoch()?.map(|epoch| epoch.epoch_number) != refs.schedule_at {
+        let profile = crate::declaration::delta::AdmissionProfile::start(db, data_dir, refs.clock)?;
+        if profile.sizes != refs.sizes || profile.clock_skew_seconds != refs.clock_skew_seconds {
+            return Ok(Admission::Stale(Staleness::Schedule));
+        }
     }
     if let Some(raw) = payload_raw {
         let payloads_dir = data_dir.join("payloads");
@@ -338,7 +357,7 @@ pub(super) fn admit_delta(
         std::fs::write(payloads_dir.join(format!("{}.json", &id[7..])), raw)?;
     }
     let url = &envelope.delta.url;
-    let outcome = if window_open {
+    let outcome = if current.window.is_some() {
         db.queue_delta(host, id, doc, url, id, chain_pos)?;
         Admission::Queued
     } else {
@@ -349,9 +368,20 @@ pub(super) fn admit_delta(
     Ok(outcome)
 }
 
+/// How a Label or dispute's admission ended.
+pub(super) enum LabelAdmission {
+    Admitted,
+    /// Rejected with this code, and the rejection recorded.
+    Rejected(&'static str),
+    /// The Declaration it was validated under changed; nothing was
+    /// written.
+    Stale,
+}
+
 /// Queues a Label or dispute that passed its checks for sealing, or
-/// records its rejection; a dispute is validated here against the sealed
-/// Labels. Returns the rejection, if any.
+/// records its rejection, after revalidating the Declaration version it
+/// was checked under; a dispute is validated here against the sealed
+/// Labels.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn admit_label(
     db: &Db,
@@ -360,11 +390,14 @@ pub(super) fn admit_label(
     id: &str,
     kind: LabelKind,
     doc: &Value,
-    declaration: &PublisherEnvelope,
+    (declaration, decl): &(PublisherEnvelope, DeclarationRef),
     label: Option<std::result::Result<(), wist_core::label::Rejection>>,
-) -> Result<Option<wist_core::label::Rejection>> {
+) -> Result<LabelAdmission> {
     use wist_core::label::{self, LabelLookup};
     let mutation = db.mutation()?;
+    if !super::declaration_ref(db, host)?.same_version(decl) {
+        return Ok(LabelAdmission::Stale);
+    }
     let outcome = match label {
         Some(outcome) => outcome,
         None => label::validate_dispute(doc, declaration, |label_id| {
@@ -377,11 +410,11 @@ pub(super) fn admit_label(
         })
         .map(|_| ()),
     };
-    let rejection = match outcome {
+    let admission = match outcome {
         Ok(()) => {
             db.insert_pending_entry(kind.as_str(), host, doc, 0)?;
             db.insert_seen_label(id, host)?;
-            None
+            LabelAdmission::Admitted
         }
         Err(rejection) => {
             reject(
@@ -392,11 +425,11 @@ pub(super) fn admit_label(
                 Some(id),
                 &format!("{} rejected: {rejection:?}", kind.as_str()),
             )?;
-            Some(rejection)
+            LabelAdmission::Rejected(rejection.code())
         }
     };
     mutation.commit()?;
-    Ok(rejection)
+    Ok(admission)
 }
 
 /// Ends a pull that ran its walk: records whether the walk suspended and,
