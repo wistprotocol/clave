@@ -366,6 +366,92 @@ fn a_pull_suspends_at_its_work_limit_and_a_later_pull_resumes() {
     assert!(!db.walk_suspended(&host).unwrap());
 }
 
+#[test]
+fn a_page_chain_longer_than_a_pulls_work_limit_is_walked_and_admitted_across_pulls() {
+    let (listener, host, client) = reserve_addr();
+    let p = make_publisher_with_scope(&host, &["example.com"]);
+    let ids: Vec<String> = (0..4)
+        .map(|n| add_delta(&p, &format!("https://example.com/{n}"), "content", None))
+        .collect();
+    for page in 0..3u64 {
+        common::write_feed_page(
+            &p,
+            &host,
+            page,
+            std::slice::from_ref(&ids[page as usize]),
+            &format!("2026-08-09T1{page}:00:00Z"),
+            page.checked_sub(1)
+                .map(|older| common::page_url(&host, older))
+                .as_deref(),
+        );
+    }
+    common::write_feed_with_next(
+        &p,
+        &host,
+        std::slice::from_ref(&ids[3]),
+        "2026-08-09T13:00:00Z",
+        Some(&common::page_url(&host, 2)),
+    );
+    let requests = common::serve_recording(listener, p.dir.path().to_path_buf());
+
+    let tmp = tempfile::tempdir().unwrap();
+    clave::init::run(&host, tmp.path()).unwrap();
+    let db = clave::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+    seal_page_authority(&db, &client, tmp.path(), &p);
+
+    let mut admitted = Vec::new();
+    for pull in 0..16 {
+        let at = format!("2026-08-09T14:{pull:02}:05Z");
+        let report = clave::ingest::run_bounded(
+            &db,
+            &client,
+            tmp.path(),
+            &host,
+            &at,
+            || at.parse::<jiff::Timestamp>().unwrap(),
+            clave::ingest::PullLimits {
+                work_bytes: u64::MAX,
+                work_objects: 3,
+            },
+        )
+        .unwrap();
+        admitted.extend(report.accepted);
+        if !report.suspended {
+            break;
+        }
+    }
+    admitted.sort();
+    let mut expected = ids.clone();
+    expected.sort();
+    assert_eq!(
+        admitted, expected,
+        "a page chain longer than one pull's work limit is walked from where the last pull stopped"
+    );
+    for id in &ids {
+        assert!(db.is_delta_seen_for(id, &host).unwrap());
+    }
+    for page in 0..3 {
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|path| path.ends_with(&format!("/feed/{page}.json")))
+                .count(),
+            1,
+            "a sealed page the walk holds is not fetched again"
+        );
+    }
+    let cursor: i64 = rusqlite::Connection::open(tmp.path().join("clave.sqlite"))
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM pull_walk", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        cursor, 0,
+        "the cursor is dropped once the Delta walk it fed completes"
+    );
+}
+
 fn seal_page_authority(
     db: &clave::db::Db,
     client: &clave::fetch::Client,

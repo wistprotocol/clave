@@ -59,7 +59,9 @@ as the shared remainder at every host's status endpoint, and re-pulls
 every known publisher `baseline_poll_seconds` after its last pull
 without a Ping, as [Concurrency](#concurrency) describes. Ingest
 follows feed pages (WIST-2 §3.2) under the daily byte budget of the
-host's Registrable Domain, suspending and resuming across days. The
+host's Registrable Domain, suspending the walk when the budget or the
+pull's own limits are spent and resuming it from the pages already
+walked. The
 seal's per-domain Epoch capacity counts Entries per Registrable Domain
 under the snapshot in force at the Epoch, and the Snapshot state carries
 the `suffix_list` tuple (WIST-3 §7). Ping admission and every fetch are
@@ -377,6 +379,19 @@ its objects are dropped and a fresh run begins, keeping the walk cursor.
 Closing a run rebuilds the pull's report from the objects it admitted and
 rejected in the order it decided them, records whether the walk
 suspended, and drops the run's state.
+
+The pages a walk reads are the domain's walk cursor, which outlives the
+pull that walked them. A pull whose walk suspended keeps them; the next
+pull fetches the live `feed.json` again, since the Publisher rewrites it,
+and wherever the chain it reads names a page the cursor already holds it
+takes that page — a sealed Page is immutable — instead of fetching it,
+then continues from where the cursor stopped. A held page is read under
+the same rules as a fetched one: the walk stops at the first page listing
+no unseen ID, and at a `next` that is absent or fails the target rule.
+The cursor is dropped once the Delta walk it fed completes, and the Label
+Feed's once its Labels have been processed, so a page chain longer than
+one pull's byte or object limit is walked across pulls instead of
+restarted at the head each time.
 
 `serve` schedules pulls durably in the store. `pull_schedule` holds at
 most one due-time row per domain (`due_at` in Unix seconds, `reason`

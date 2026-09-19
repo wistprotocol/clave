@@ -229,7 +229,8 @@ impl Db {
     /// one exists for the same UTC day and began less than `max_age`
     /// seconds before `now`, with this connection's fence token recorded,
     /// and otherwise a fresh run, after the stale one's objects are
-    /// dropped. A fresh run starts with an empty Feed and Label walk.
+    /// dropped. The domain's walk cursor outlives either, since a walk
+    /// suspended under the budget resumes from where it stopped.
     pub(crate) fn start_pull_run(
         &self,
         run: &NewRun<'_>,
@@ -252,7 +253,6 @@ impl Db {
             }
             delete_run(&tx, open.run_id)?;
         }
-        tx.execute("DELETE FROM pull_walk WHERE domain = ?1", [run.domain])?;
         tx.execute(
             "INSERT INTO pull_runs(domain, token, now, day, unit, phase, work_bytes, work_objects, pages_epoch) VALUES (?1, ?2, ?3, ?4, ?5, 'walk', ?6, ?7, ?8)",
             (
@@ -630,9 +630,48 @@ impl Db {
         Ok(())
     }
 
-    /// Drops `domain`'s walk cursor.
-    pub(crate) fn clear_walk(&self, domain: &str) -> Result<()> {
-        self.execute("DELETE FROM pull_walk WHERE domain = ?1", [domain])?;
+    /// The pages `domain`'s `feed` walk holds, in walk order.
+    pub(crate) fn walk_pages(&self, domain: &str, feed: &str) -> Result<Vec<WalkPage>> {
+        let rows = self
+            .conn
+            .prepare("SELECT url, generated_at, ids_json, next_url FROM pull_walk WHERE domain = ?1 AND feed = ?2 ORDER BY idx")?
+            .query_map((domain, feed), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter()
+            .map(|(url, generated_at, ids, next_url)| {
+                Ok(WalkPage {
+                    url,
+                    generated_at,
+                    ids: serde_json::from_slice(&ids)?,
+                    next_url,
+                })
+            })
+            .collect()
+    }
+
+    /// Drops the pages a walk that ended before `pages` left behind.
+    pub(crate) fn trim_walk(&self, domain: &str, feed: &str, pages: u32) -> Result<()> {
+        self.execute(
+            "DELETE FROM pull_walk WHERE domain = ?1 AND feed = ?2 AND idx >= ?3",
+            (domain, feed, pages),
+        )?;
+        Ok(())
+    }
+
+    /// Drops `domain`'s cursor for one walk, once the items it fed have
+    /// been processed.
+    pub(crate) fn clear_walk(&self, domain: &str, feed: &str) -> Result<()> {
+        self.execute(
+            "DELETE FROM pull_walk WHERE domain = ?1 AND feed = ?2",
+            (domain, feed),
+        )?;
         Ok(())
     }
 }

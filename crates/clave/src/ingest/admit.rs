@@ -695,6 +695,31 @@ pub(super) fn admit_label(
     Ok(admission)
 }
 
+/// Ends a walk and enters `phase` with the items the walk yielded, in
+/// one transaction. `keep` is how many pages the walk read, beyond which
+/// an earlier walk's pages are dropped; `None` drops the whole cursor,
+/// which the items it fed no longer need.
+pub(super) fn end_walk(
+    db: &Db,
+    run: &mut PullRun,
+    host: &str,
+    walk: Walk,
+    keep: Option<u32>,
+    phase: Phase,
+    queue: Vec<String>,
+) -> Result<()> {
+    let mutation = db.mutation()?;
+    match keep {
+        Some(pages) => db.trim_walk(host, walk.as_str(), pages)?,
+        None => db.clear_walk(host, walk.as_str())?,
+    }
+    run.phase = phase;
+    run.queue = queue;
+    run.position = 0;
+    db.update_pull_run(run)?;
+    mutation.commit()
+}
+
 /// Closes run `run_id`: rebuilds its report from the objects it admitted
 /// and rejected, records whether the walk suspended and, when the pull
 /// ran to its end, the pull instant and WIST-2 §7's noise disposition,
@@ -744,7 +769,6 @@ pub(super) fn close_run(db: &Db, run_id: i64) -> Result<IngestReport> {
             ))
         }
     }
-    db.clear_walk(&run.domain)?;
     db.delete_pull_run(run_id)?;
     mutation.commit()?;
     Ok(report)

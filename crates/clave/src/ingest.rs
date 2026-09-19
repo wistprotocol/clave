@@ -716,15 +716,6 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
         admit::abort(self.db, &mut self.run, self.host, key, code, detail, noise)
     }
 
-    /// Records the run's phase and its queue, with the position the next
-    /// item of that queue stands at.
-    fn enter(&mut self, phase: Phase, queue: Vec<String>) -> Result<()> {
-        self.run.phase = phase;
-        self.run.queue = queue;
-        self.run.position = 0;
-        self.db.update_pull_run(&self.run)
-    }
-
     /// Ends the pull's work, suspended or complete, leaving the run to be
     /// closed.
     fn finish(&mut self, suspended: bool) -> Result<()> {
@@ -818,6 +809,39 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
         Ok(true)
     }
 
+    /// The pages of `walk` an earlier pull left in the domain's cursor,
+    /// by URL. The live page at `live_url` is never among them: it is
+    /// always re-fetched, since the Publisher rewrites it, while a sealed
+    /// Page is immutable and the walk resumes over the ones it holds
+    /// (WIST-2 §5's resumption from where the walk stopped).
+    fn cursor(
+        &self,
+        walk: Walk,
+        live_url: &str,
+    ) -> Result<std::collections::HashMap<String, WalkPage>> {
+        Ok(self
+            .db
+            .walk_pages(self.host, walk.as_str())?
+            .into_iter()
+            .filter(|page| page.url != live_url)
+            .map(|page| (page.url.clone(), page))
+            .collect())
+    }
+
+    /// Takes a page the cursor holds into this walk at `index`, with the
+    /// diff of its IDs against those seen now.
+    fn resume_page(
+        &self,
+        walk: Walk,
+        index: u32,
+        page: &WalkPage,
+    ) -> Result<Option<(WalkPage, bool)>> {
+        self.db
+            .record_walk_page(self.host, walk.as_str(), index, page)?;
+        let unseen = admit::unseen(self.db, self.host, walk, &page.ids)?;
+        Ok(Some((page.clone(), unseen)))
+    }
+
     /// The page at `index` of `walk` as the run's cursor holds it, once
     /// its admission recorded it.
     fn walked(&self, key: &ObjectKey, walk: Walk, index: u32) -> Result<Option<WalkPage>> {
@@ -837,6 +861,7 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
         let (db, host) = (self.db, self.host);
         let mut pages: Vec<Vec<String>> = Vec::new();
         let mut url = format!("{}feed.json", self.base);
+        let cursor = self.cursor(Walk::Feed, &url)?;
         let mut sealed_sources = None;
         loop {
             let index = pages.len() as u32;
@@ -848,6 +873,9 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
                 Some(page) => {
                     let unseen = admit::unseen(db, host, Walk::Feed, &page.ids)?;
                     Some((page, unseen))
+                }
+                None if cursor.contains_key(&url) => {
+                    self.resume_page(Walk::Feed, index, &cursor[&url])?
                 }
                 None => {
                     let value = match self.get(&key, &key.name(), &url, Object::Page)? {
@@ -934,8 +962,17 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
                 _ => break,
             }
         }
+        let walked = pages.len() as u32;
         let queue = pages.into_iter().rev().flatten().collect();
-        self.enter(Phase::Deltas, queue)
+        admit::end_walk(
+            db,
+            &mut self.run,
+            host,
+            Walk::Feed,
+            Some(walked),
+            Phase::Deltas,
+            queue,
+        )
     }
 
     /// WIST-2 §5 steps 2–4 over the walked pages' Delta IDs, oldest page
@@ -1195,7 +1232,15 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
                 _ => continue,
             }
         }
-        self.enter(Phase::Labels, Vec::new())
+        admit::end_walk(
+            db,
+            &mut self.run,
+            host,
+            Walk::Feed,
+            None,
+            Phase::Labels,
+            Vec::new(),
+        )
     }
 
     /// WIST-1 §5.1 authority of a Delta under the admission sources after
@@ -1253,6 +1298,7 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
         }
         let mut pages: Vec<Vec<String>> = Vec::new();
         let mut url = format!("{}label-feed.json", self.base);
+        let cursor = self.cursor(Walk::Label, &url)?;
         let mut sealed_sources = None;
         loop {
             let index = pages.len() as u32;
@@ -1271,6 +1317,9 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
                 Some(page) => {
                     let unseen = admit::unseen(db, host, Walk::Label, &page.ids)?;
                     Some((page, unseen))
+                }
+                None if cursor.contains_key(&url) => {
+                    self.resume_page(Walk::Label, index, &cursor[&url])?
                 }
                 None => {
                     let value = match self.get(&key, &key.name(), &url, Object::Page)? {
@@ -1364,8 +1413,17 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
                 _ => break,
             }
         }
+        let walked = pages.len() as u32;
         let queue = pages.into_iter().rev().flatten().collect();
-        self.enter(Phase::LabelItems, queue)
+        admit::end_walk(
+            db,
+            &mut self.run,
+            host,
+            Walk::Label,
+            Some(walked),
+            Phase::LabelItems,
+            queue,
+        )
     }
 
     /// Fetches each unseen Label or dispute of the walked Label Feed
@@ -1465,6 +1523,7 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
                 break;
             }
         }
+        db.clear_walk(host, Walk::Label.as_str())?;
         self.finish(false)
     }
 }
