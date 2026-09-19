@@ -1,6 +1,8 @@
 mod common;
 
-use common::{add_delta, make_publisher_with_scope, reserve_addr, serve_static, write_feed};
+use common::{
+    add_delta, make_publisher_with_scope, reserve_addr, serve_recording, serve_static, write_feed,
+};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
@@ -405,6 +407,155 @@ fn pings_beyond_the_pending_bound_are_refused_with_retry_after() {
         404,
         "status answers while the gate is saturated"
     );
+}
+
+fn store(data_dir: &Path) -> clave::db::Db {
+    clave::db::Db::connect(&data_dir.join("clave.sqlite")).unwrap()
+}
+
+fn unix_now() -> i64 {
+    jiff::Timestamp::now().as_second()
+}
+
+#[test]
+fn a_pull_in_flight_at_restart_is_dispatched_once_and_rescheduled_one_baseline_later() {
+    let (listener, host, client) = reserve_addr();
+    let p = make_publisher_with_scope(&host, &["example.com"]);
+    let id = add_delta(&p, "https://example.com/a", "alpha body", None);
+    write_feed(&p, &host, std::slice::from_ref(&id), "2026-08-09T12:00:00Z");
+    let requests = serve_recording(listener, p.dir.path().to_path_buf());
+
+    let tmp = tempfile::tempdir().unwrap();
+    clave::init::run("127.0.0.1:0", tmp.path()).unwrap();
+    {
+        let db = clave::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+        db.set_param("baseline_poll_seconds", 3600).unwrap();
+        let now = unix_now();
+        db.schedule_ping(&host, now, 4).unwrap();
+        let claimed = db
+            .claim_pulls(now, 1, "crashed-process", &mut true)
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(
+            db.pull_lease(&host).unwrap().unwrap().owner,
+            "crashed-process"
+        );
+    }
+    spawn_server_with_client(tmp.path(), client);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let last_pull = loop {
+        let db = store(tmp.path());
+        if let Some(row) = db.get_publisher_status(&host).unwrap() {
+            if let Some(at) = row.last_pull_at {
+                if db.pull_lease(&host).unwrap().is_none() {
+                    break at;
+                }
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the reclaimed pull never completed"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let last_pull = wist_core::timestamp::log_seconds(&last_pull).unwrap();
+    assert_eq!(
+        store(tmp.path()).scheduled_pull(&host).unwrap(),
+        Some(clave::db::DuePull {
+            domain: host.clone(),
+            due_at: last_pull + 3600,
+            reason: clave::db::Reason::Baseline,
+            attempts: 0,
+        })
+    );
+    std::thread::sleep(Duration::from_millis(2500));
+    let feeds = requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|uri| uri.ends_with("/feed.json"))
+        .count();
+    assert_eq!(feeds, 1, "the reclaimed pull ran more than once");
+}
+
+#[test]
+fn a_ping_moves_a_scheduled_pull_earlier_never_later_and_takes_no_new_slot() {
+    let tmp = tempfile::tempdir().unwrap();
+    clave::init::run("127.0.0.1:0", tmp.path()).unwrap();
+    let domain = "example.com";
+    let baseline_due = {
+        let db = clave::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+        let publisher = common::make_publisher(domain);
+        let doc = common::current_declaration(&publisher);
+        db.record_publisher_declaration(
+            domain,
+            &serde_json::to_vec(&doc).unwrap(),
+            &publisher.kid,
+            doc["publisher"]["keys"][0]["x"].as_str().unwrap(),
+            &doc,
+        )
+        .unwrap();
+        db.set_param("baseline_poll_seconds", 3600).unwrap();
+        let now = unix_now();
+        let task = db
+            .claim_pulls(now, 1, "earlier-process", &mut false)
+            .unwrap()
+            .remove(0);
+        db.complete_pull(
+            &task,
+            "earlier-process",
+            now,
+            clave::db::PullOutcome::Pulled { suspended: false },
+            now,
+        )
+        .unwrap();
+        db.scheduled_pull(domain).unwrap().unwrap().due_at
+    };
+    let addr = spawn_server_with_options(
+        tmp.path(),
+        clave::fetch::Client::new(true),
+        clave::serve::ServeOptions {
+            max_concurrent_ingests: 0,
+            max_pending_ingests: 2,
+            ..unsealed()
+        },
+    );
+    let c = reqwest::blocking::Client::new();
+    let ping = |host: &str| {
+        c.post(format!("{addr}/ingest"))
+            .json(&serde_json::json!({"host": host}))
+            .send()
+            .unwrap()
+            .status()
+            .as_u16()
+    };
+
+    let before = unix_now();
+    assert_eq!(ping(domain), 202);
+    let pinged = store(tmp.path()).scheduled_pull(domain).unwrap().unwrap();
+    assert_eq!(pinged.reason, clave::db::Reason::Ping);
+    assert!(pinged.due_at >= before && pinged.due_at < baseline_due);
+
+    std::thread::sleep(Duration::from_millis(1100));
+    assert_eq!(ping(domain), 202);
+    assert_eq!(
+        store(tmp.path()).scheduled_pull(domain).unwrap(),
+        Some(pinged.clone()),
+        "a later Ping moved the due time later"
+    );
+
+    assert_eq!(ping("other.example"), 202);
+    assert_eq!(ping("third.example"), 503);
+    assert_eq!(ping(domain), 202, "a waiting domain takes no new slot");
+
+    let db = store(tmp.path());
+    let claimed = db
+        .claim_pulls(unix_now(), 1, "elsewhere", &mut true)
+        .unwrap();
+    assert_eq!(claimed[0].domain, domain);
+    assert_eq!(ping(domain), 202, "a domain in flight takes no new slot");
+    assert_eq!(ping("third.example"), 503);
 }
 
 /// Serves `dir` after `delay` on every request.

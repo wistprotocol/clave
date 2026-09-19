@@ -55,9 +55,9 @@ tuples, and tier 1 carries `labels.parquet`, `disputes.parquet` and
 `serve` additionally enforces the flat `quota_base` ping quota (429 +
 Retry-After; only WIST2-E02/E04 pings count as noise), accounted per
 Registrable Domain under the snapshot in force at the Ping and reported
-as the shared remainder at every host's status endpoint, and runs a
-baseline pass every minute that
-re-pulls stale or budget-suspended publishers without a Ping. Ingest
+as the shared remainder at every host's status endpoint, and re-pulls
+every known publisher `baseline_poll_seconds` after its last pull
+without a Ping, as [Concurrency](#concurrency) describes. Ingest
 follows feed pages (WIST-2 §3.2) under the daily byte budget of the
 host's Registrable Domain, suspending and resuming across days. The
 seal's per-domain Epoch capacity counts Entries per Registrable Domain
@@ -345,10 +345,64 @@ authenticated under the keys valid at the sealing Epoch and dropped as
 ## Concurrency
 
 No pull holds a process-wide lock. Each pull, Ping check, status request
-and baseline pass opens its own store connection (`Db::connect`), so a
+and dispatcher pass opens its own store connection (`Db::connect`), so a
 slow origin delays only its own domain while other domains, status
-answers and background passes proceed; SQLite serializes the writes.
-One pull runs per host at a time across Pings and the baseline pass.
+answers and dispatching proceed; SQLite serializes the writes.
+
+`serve` schedules pulls durably in the store. `pull_schedule` holds at
+most one due-time row per domain (`due_at` in Unix seconds, `reason`
+`ping`, `baseline`, `resume` or `retry`, and the count of consecutive
+failed pulls); `pull_tasks` holds each pull in flight with its owning
+process and lease. Opening a store without the schedule gives every
+known publisher a row: `resume` due at once for a suspended walk,
+otherwise `baseline` due `baseline_poll_seconds` after its last pull,
+or at once if it was never pulled. A publisher recorded later is due at
+once unless its pull is in flight.
+
+A Ping passes the host and quota checks, then one write transaction
+schedules it, and 202 answers only after that commits:
+
+- a domain that already has a row keeps it, its due time moved to the
+  Ping's instant when that is earlier;
+- a domain being pulled gets a `ping` row, which the next pull after the
+  running one starts from;
+- any other domain gets a `ping` row due at once, unless
+  `max_pending_ingests` `ping` rows already wait, which answers 503 with
+  a Retry-After of `OVERLOAD_RETRY_AFTER_SECS`.
+
+The first two take no backlog slot. Rows combine as follows: the due
+time is the earlier one; `retry` outranks every other reason and
+`resume` outranks `ping` and `baseline`; between `ping` and `baseline`
+the strictly earlier row's reason stays.
+
+A dispatcher runs at most `max_concurrent_ingests` pulls at once. It
+wakes on every Ping, every finished pull and at least once a second, and
+in one write transaction returns lapsed leases to the schedule and
+claims up to the free slots of due rows whose domain has no pull in
+flight, leasing each for `LEASE_SECONDS` (600) under its process's
+owner ID; it renews its running pulls' leases while they run. Claims
+alternate between the oldest due `ping` row and the oldest due row of
+any other reason, and a class with nothing due yields its turn, so
+neither Pings nor scheduled pulls wait behind the other's backlog.
+Claiming searches the `due_at` indexes and never scans the publishers.
+
+A finished pull, in one write transaction, drops its task and schedules
+the next pull, combined with any Ping row that arrived meanwhile:
+
+- after a completed walk, `baseline` due `baseline_poll_seconds` after
+  the pull started;
+- after a walk suspended at the pull's work limits, `resume` due at
+  once, or at the next UTC day while the domain's daily ingest budget is
+  spent;
+- after a failed pull, `retry` due after `RETRY_BASE_SECONDS` (60)
+  doubled for every earlier consecutive failure, at most
+  `baseline_poll_seconds`; a successful pull resets the count.
+
+A domain that is still no known publisher after its pull gets no next
+pull. At start `serve` returns every pull in flight owned by another
+process ID, or whose lease lapsed, to the schedule as `retry` due at
+once; running the pull again is safe because admission is transactional
+and deduplicates by Delta ID. One pull runs per domain at a time.
 Fetching and state-independent verification happen outside any write
 transaction; each Delta's persistence is one immediate write transaction
 that first re-reads the admission Declarations and the URL's chain tip,

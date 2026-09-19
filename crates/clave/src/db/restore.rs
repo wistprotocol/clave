@@ -8,13 +8,14 @@ use serde_json::Value;
 use std::path::Path;
 
 /// Runs every restoration in dependency order: the parameter schedule
-/// first, then recovery owners, Declaration floors and Delta indexes.
+/// first, then recovery owners, Declaration floors, Delta indexes and the
+/// pull schedule.
 pub(super) fn run(db: &Db, path: &Path) -> Result<()> {
     db.parameter_schedule(0)?;
     db.restore_recovery_owners(path)?;
     db.restore_declaration_floors(path)?;
     db.restore_delta_indexes(path)?;
-    Ok(())
+    db.restore_pull_schedule()
 }
 
 impl Db {

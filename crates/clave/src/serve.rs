@@ -1,4 +1,4 @@
-use crate::db::Db;
+use crate::db::{Db, PingAdmission, PullOutcome, PullTask};
 use crate::error::{Error, Result};
 use crate::fetch::Client;
 use crate::ingest::{self, canonical_authority};
@@ -9,6 +9,7 @@ use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -20,11 +21,12 @@ pub const MAX_CONCURRENT_INGESTS: usize = 4;
 pub const MAX_PENDING_INGESTS: usize = 64;
 pub const OVERLOAD_RETRY_AFTER_SECS: u64 = 30;
 
-/// The admission bounds `serve` applies to Pings: at most
+/// The bounds `serve` applies to pulls and Pings: at most
 /// `max_concurrent_ingests` pulls run at once and at most
-/// `max_pending_ingests` accepted Pings wait for a slot; a Ping beyond
-/// both is refused with 503 and a Retry-After, never queued. With `seal`
-/// set, an Epoch is sealed at every grid instant reached while serving.
+/// `max_pending_ingests` Pings wait in the pull schedule; a Ping for a
+/// domain neither waiting nor being pulled beyond that bound is refused
+/// with 503 and a Retry-After, never queued. With `seal` set, an Epoch is
+/// sealed at every grid instant reached while serving.
 #[derive(Debug, Clone, Copy)]
 pub struct ServeOptions {
     pub max_concurrent_ingests: usize,
@@ -42,117 +44,17 @@ impl Default for ServeOptions {
     }
 }
 
-pub struct IngestGate {
-    inflight: Mutex<std::collections::HashSet<String>>,
-    pending: Mutex<usize>,
-    max_pending: usize,
-    pub semaphore: Arc<tokio::sync::Semaphore>,
-}
-
-/// What a Ping's host was admitted to.
-pub enum Admission {
-    /// The host has no pull in flight or waiting; the caller owns the
-    /// pending slot until it starts the pull.
-    Queued(InflightGuard),
-    /// A pull for the host is already running or waiting.
-    Duplicate,
-    /// Every pending slot is taken.
-    Overloaded,
-}
-
-pub struct InflightGuard {
-    gate: Arc<IngestGate>,
-    host: String,
-    pending: bool,
-}
-
-impl IngestGate {
-    pub fn new(max_concurrent: usize) -> Arc<IngestGate> {
-        Self::with_pending(max_concurrent, MAX_PENDING_INGESTS)
-    }
-
-    pub fn with_pending(max_concurrent: usize, max_pending: usize) -> Arc<IngestGate> {
-        Arc::new(IngestGate {
-            inflight: Mutex::new(std::collections::HashSet::new()),
-            pending: Mutex::new(0),
-            max_pending,
-            semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
-        })
-    }
-
-    pub fn begin(self: &Arc<Self>, host: &str) -> Admission {
-        let mut set = self.inflight.lock().unwrap_or_else(PoisonError::into_inner);
-        if set.contains(host) {
-            return Admission::Duplicate;
-        }
-        let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
-        if *pending >= self.max_pending {
-            return Admission::Overloaded;
-        }
-        *pending += 1;
-        set.insert(host.to_string());
-        Admission::Queued(InflightGuard {
-            gate: self.clone(),
-            host: host.to_string(),
-            pending: true,
-        })
-    }
-
-    pub fn pending(&self) -> usize {
-        *self.pending.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    fn release_pending(&self) {
-        let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
-        *pending = pending.saturating_sub(1);
-    }
-}
-
-impl IngestGate {
-    /// Admits a background pull for `host` unless a pull for it is
-    /// already running or waiting; background work takes no pending slot.
-    pub fn begin_background(self: &Arc<Self>, host: &str) -> Option<InflightGuard> {
-        let mut set = self.inflight.lock().unwrap_or_else(PoisonError::into_inner);
-        if !set.insert(host.to_string()) {
-            return None;
-        }
-        Some(InflightGuard {
-            gate: self.clone(),
-            host: host.to_string(),
-            pending: false,
-        })
-    }
-}
-
-impl InflightGuard {
-    /// Marks the pull as running: its pending slot frees for another Ping
-    /// while the host stays in flight until the guard drops.
-    pub fn started(&mut self) {
-        if std::mem::take(&mut self.pending) {
-            self.gate.release_pending();
-        }
-    }
-}
-
-impl Drop for InflightGuard {
-    fn drop(&mut self) {
-        if self.pending {
-            self.gate.release_pending();
-        }
-        self.gate
-            .inflight
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&self.host);
-    }
-}
+/// The longest the dispatcher sleeps before it looks for due pulls again
+/// when nothing wakes it.
+const DISPATCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[derive(Clone)]
 struct AppState {
     db_path: PathBuf,
     client: Arc<Client>,
     data_dir: PathBuf,
-    gate: Arc<IngestGate>,
+    max_pending: usize,
+    wake: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Deserialize)]
@@ -248,10 +150,14 @@ async fn log_handler(
     serve_file(path, content_type, IMMUTABLE_CACHE).await
 }
 
-fn now_utc() -> String {
-    jiff::Timestamp::from_second(jiff::Timestamp::now().as_second())
+fn utc(second: i64) -> String {
+    jiff::Timestamp::from_second(second)
         .expect("current Unix second is in range")
         .to_string()
+}
+
+fn now_utc() -> String {
+    utc(jiff::Timestamp::now().as_second())
 }
 
 fn load_status(db: &Db, domain: &str) -> Result<Option<Status>> {
@@ -286,12 +192,12 @@ async fn ingest_handler(State(state): State<AppState>, body: Bytes) -> axum::res
     let Some(host) = canonical_authority(&payload.host) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    let payload = IngestRequest { host };
-    let now = now_utc();
+    let now_unix = jiff::Timestamp::now().as_second();
+    let now = utc(now_unix);
 
     let quota = {
         let db_path = state.db_path.clone();
-        let host = payload.host.clone();
+        let host = host.clone();
         let at = now.clone();
         tokio::task::spawn_blocking(move || {
             let db = Db::connect(&db_path)?;
@@ -312,51 +218,122 @@ async fn ingest_handler(State(state): State<AppState>, body: Bytes) -> axum::res
         _ => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 
-    let mut guard = match state.gate.begin(&payload.host) {
-        Admission::Queued(guard) => guard,
-        Admission::Duplicate => return StatusCode::ACCEPTED.into_response(),
-        Admission::Overloaded => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                [("Retry-After", OVERLOAD_RETRY_AFTER_SECS.to_string())],
-            )
-                .into_response()
-        }
+    let admission = {
+        let db_path = state.db_path.clone();
+        let max_pending = state.max_pending;
+        tokio::task::spawn_blocking(move || {
+            Db::connect(&db_path)?.schedule_ping(&host, now_unix, max_pending)
+        })
+        .await
     };
-    let semaphore = state.gate.semaphore.clone();
-    let db_path = state.db_path.clone();
-    let client = state.client.clone();
-    let data_dir = state.data_dir.clone();
-    tokio::spawn(async move {
-        let Ok(_permit) = semaphore.acquire_owned().await else {
-            return;
-        };
-        guard.started();
-        let _guard = guard;
-        let _ = tokio::task::spawn_blocking(move || {
-            let Ok(db) = Db::connect(&db_path) else {
-                return;
-            };
-            let report = ingest::run_with_clock(
-                &db,
-                &client,
-                &data_dir,
-                &payload.host,
-                &now,
-                jiff::Timestamp::now,
-            );
-            if let Ok(report) = report {
-                if report.noise.is_some() {
-                    let day = now.get(..10).unwrap_or(&now);
-                    if let Ok(unit) = crate::suffix_list::unit_at(&db, &payload.host, &now) {
-                        let _ = db.bump_noise_ping(&unit, day);
-                    }
+    match admission {
+        Ok(Ok(PingAdmission::Overloaded)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [("Retry-After", OVERLOAD_RETRY_AFTER_SECS.to_string())],
+        )
+            .into_response(),
+        Ok(Ok(_)) => {
+            state.wake.notify_one();
+            StatusCode::ACCEPTED.into_response()
+        }
+        _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// Runs `task` to completion and schedules the domain's next pull.
+fn pull(state: &AppState, owner: &str, task: &PullTask) {
+    let Ok(db) = Db::connect(&state.db_path) else {
+        return;
+    };
+    let started_at = jiff::Timestamp::now().as_second();
+    let now = utc(started_at);
+    let report = ingest::run_with_clock(
+        &db,
+        &state.client,
+        &state.data_dir,
+        &task.domain,
+        &now,
+        jiff::Timestamp::now,
+    );
+    let outcome = match report {
+        Ok(report) => {
+            if report.noise.is_some() {
+                let day = now.get(..10).unwrap_or(&now);
+                if let Ok(unit) = crate::suffix_list::unit_at(&db, &task.domain, &now) {
+                    let _ = db.bump_noise_ping(&unit, day);
                 }
             }
-        })
-        .await;
-    });
-    StatusCode::ACCEPTED.into_response()
+            PullOutcome::Pulled {
+                suspended: report.suspended,
+            }
+        }
+        Err(_) => PullOutcome::Failed,
+    };
+    let _ = db.complete_pull(
+        task,
+        owner,
+        started_at,
+        outcome,
+        jiff::Timestamp::now().as_second(),
+    );
+}
+
+/// Claims due pulls whenever a worker slot is free, woken by each Ping,
+/// each finished pull and at least every `DISPATCH_INTERVAL`; renews the
+/// leases of the pulls it runs and returns lapsed ones to the schedule.
+async fn dispatch(state: AppState, owner: Arc<str>, slots: usize) {
+    let running = Arc::new(Mutex::new(HashSet::<String>::new()));
+    let mut ping_next = true;
+    loop {
+        let held: Vec<String> = running
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect();
+        let free = slots.saturating_sub(held.len());
+        let pass = {
+            let db_path = state.db_path.clone();
+            let owner = owner.clone();
+            let mut next = ping_next;
+            tokio::task::spawn_blocking(move || {
+                let db = Db::connect(&db_path)?;
+                let now = jiff::Timestamp::now().as_second();
+                if !held.is_empty() {
+                    db.renew_pull_leases(&held, &owner, now)?;
+                }
+                let tasks = db.claim_pulls(now, free, &owner, &mut next)?;
+                Ok::<_, Error>((tasks, next))
+            })
+            .await
+        };
+        if let Ok(Ok((tasks, next))) = pass {
+            ping_next = next;
+            for task in tasks {
+                running
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(task.domain.clone());
+                let state = state.clone();
+                let owner = owner.clone();
+                let running = running.clone();
+                tokio::spawn(async move {
+                    let worker = state.clone();
+                    let domain = task.domain.clone();
+                    let _ = tokio::task::spawn_blocking(move || pull(&worker, &owner, &task)).await;
+                    running
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .remove(&domain);
+                    state.wake.notify_one();
+                });
+            }
+        }
+        tokio::select! {
+            _ = state.wake.notified() => {}
+            _ = tokio::time::sleep(DISPATCH_INTERVAL) => {}
+        }
+    }
 }
 
 async fn status_handler(
@@ -410,12 +387,22 @@ pub fn run_with_options(
     client: Client,
     options: ServeOptions,
 ) -> Result<()> {
-    crate::publication::recover(&Db::open(&db_path)?, &data_dir)?;
+    let owner: Arc<str> = format!(
+        "{}-{}",
+        std::process::id(),
+        jiff::Timestamp::now().as_nanosecond()
+    )
+    .into();
+    let db = Db::open(&db_path)?;
+    crate::publication::recover(&db, &data_dir)?;
+    db.reclaim_pulls(&owner, jiff::Timestamp::now().as_second())?;
+    drop(db);
     let state = AppState {
         db_path,
         client: Arc::new(client),
         data_dir: data_dir.clone(),
-        gate: IngestGate::with_pending(options.max_concurrent_ingests, options.max_pending_ingests),
+        max_pending: options.max_pending_ingests,
+        wake: Arc::new(tokio::sync::Notify::new()),
     };
     let bg_state = state.clone();
     let app = Router::new()
@@ -443,24 +430,7 @@ pub fn run_with_options(
                 bg_state.client.clone(),
             ));
         }
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
-            loop {
-                ticker.tick().await;
-                let db_path = bg_state.db_path.clone();
-                let client = bg_state.client.clone();
-                let data = bg_data.clone();
-                let gate = bg_state.gate.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    let Ok(db) = Db::connect(&db_path) else {
-                        return;
-                    };
-                    let now_unix = jiff::Timestamp::now().as_second();
-                    let _ = crate::baseline::run_pass_gated(&db, &client, &data, now_unix, &gate);
-                })
-                .await;
-            }
-        });
+        tokio::spawn(dispatch(bg_state, owner, options.max_concurrent_ingests));
         let listener = tokio::net::TcpListener::bind(bind).await?;
         let local_addr = listener.local_addr()?;
         println!("listening on http://{local_addr}");
@@ -468,58 +438,4 @@ pub fn run_with_options(
         axum::serve(listener, app).await?;
         Ok::<(), Error>(())
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn queued(admission: Admission) -> Option<InflightGuard> {
-        match admission {
-            Admission::Queued(guard) => Some(guard),
-            _ => None,
-        }
-    }
-
-    #[test]
-    fn gate_dedups_inflight_hosts_and_releases_on_drop() {
-        let gate = IngestGate::new(4);
-        let guard = queued(gate.begin("example.com")).unwrap();
-        assert!(matches!(gate.begin("example.com"), Admission::Duplicate));
-        assert!(queued(gate.begin("other.example")).is_some());
-        drop(guard);
-        assert!(queued(gate.begin("example.com")).is_some());
-    }
-
-    #[test]
-    fn gate_refuses_pings_beyond_the_pending_bound_until_a_pull_starts_or_ends() {
-        let gate = IngestGate::with_pending(1, 2);
-        let mut first = queued(gate.begin("a.example")).unwrap();
-        let second = queued(gate.begin("b.example")).unwrap();
-        assert!(matches!(gate.begin("c.example"), Admission::Overloaded));
-        assert!(matches!(gate.begin("a.example"), Admission::Duplicate));
-        assert_eq!(gate.pending(), 2);
-        first.started();
-        assert_eq!(gate.pending(), 1);
-        let third = queued(gate.begin("c.example")).unwrap();
-        assert!(matches!(gate.begin("d.example"), Admission::Overloaded));
-        drop(second);
-        let fourth = queued(gate.begin("d.example")).unwrap();
-        assert_eq!(gate.pending(), 2);
-        drop(first);
-        assert_eq!(gate.pending(), 2);
-        drop(third);
-        drop(fourth);
-        assert_eq!(gate.pending(), 0);
-    }
-
-    #[test]
-    fn gate_semaphore_caps_concurrency() {
-        let gate = IngestGate::new(2);
-        let p1 = gate.semaphore.clone().try_acquire_owned().unwrap();
-        let _p2 = gate.semaphore.clone().try_acquire_owned().unwrap();
-        assert!(gate.semaphore.clone().try_acquire_owned().is_err());
-        drop(p1);
-        assert!(gate.semaphore.clone().try_acquire_owned().is_ok());
-    }
 }

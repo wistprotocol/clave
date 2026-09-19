@@ -6,10 +6,15 @@ use wist_core::objects::{AggregatorKeyEntry, PublisherState, StatusRejection};
 
 mod delta_history;
 mod delta_indexes;
+mod pull_schedule;
 mod restore;
 mod schema;
 mod tree;
 
+pub use pull_schedule::{
+    DuePull, PingAdmission, PullLease, PullOutcome, PullTask, Reason, LEASE_SECONDS,
+    RETRY_BASE_SECONDS,
+};
 pub use tree::StoredTree;
 
 /// A write transaction: at the top level it begins immediately, taking
@@ -207,7 +212,7 @@ fn exec_insert_publisher(
         "INSERT INTO publishers(domain, declaration_json, key_id, public_key) VALUES (?1, ?2, ?3, ?4)",
         (domain, declaration_json, key_id, public_key),
     )?;
-    Ok(())
+    pull_schedule::exec_schedule_new_publisher(conn, domain)
 }
 
 fn exec_insert_pending_entry(
@@ -409,7 +414,9 @@ impl Db {
         key_id: &str,
         public_key: &str,
     ) -> Result<()> {
-        exec_insert_publisher(&self.conn, domain, declaration_json, key_id, public_key)
+        let tx = self.mutation()?;
+        exec_insert_publisher(&tx, domain, declaration_json, key_id, public_key)?;
+        tx.commit()
     }
 
     pub fn record_publisher_declaration(
@@ -1786,16 +1793,6 @@ impl Db {
             .optional()
             .map(|v| v.unwrap_or(0) != 0)
             .map_err(Error::Db)
-    }
-
-    pub fn list_publisher_pull_times(&self) -> Result<Vec<(String, Option<String>)>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT domain, last_pull_at FROM publishers ORDER BY domain")?;
-        let rows = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
     }
 
     pub fn delete_record_by_delta(&self, delta_id: &str) -> Result<()> {
