@@ -481,15 +481,15 @@ pub fn run_with_options(
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
-        if options.seal {
+        let sealing = options.seal.then(|| {
             tokio::spawn(crate::scheduler::run(
                 bg_state.db_path.clone(),
                 bg_data.clone(),
                 bg_state.client.clone(),
                 owner.clone(),
-            ));
-        }
-        tokio::spawn(dispatch(
+            ))
+        });
+        let dispatching = tokio::spawn(dispatch(
             bg_state,
             owner.clone(),
             options.max_concurrent_ingests,
@@ -502,6 +502,11 @@ pub fn run_with_options(
         axum::serve(listener, app)
             .with_graceful_shutdown(shutdown_signal())
             .await?;
+        // The leases are released only once no pass can take them again.
+        for task in sealing.into_iter().chain([dispatching]) {
+            task.abort();
+            let _ = task.await;
+        }
         tokio::task::spawn_blocking(move || {
             let db = Db::connect(&release_path)?;
             db.release_partitions(&owner)?;

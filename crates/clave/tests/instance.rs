@@ -25,6 +25,14 @@ impl Served {
         self.0.wait().unwrap();
         std::mem::forget(self);
     }
+
+    fn terminate(mut self) {
+        let pid = rustix::process::Pid::from_raw(self.0.id() as i32).unwrap();
+        rustix::process::kill_process(pid, rustix::process::Signal::TERM).unwrap();
+        let status = self.0.wait().unwrap();
+        assert!(status.success(), "clave serve exited with {status}");
+        std::mem::forget(self);
+    }
 }
 
 /// Starts the `clave` executable serving `data` under `instance` and
@@ -196,4 +204,37 @@ fn an_instance_name_outside_one_path_component_is_refused() {
             "{name:?}: {refused:?}"
         );
     }
+}
+
+#[test]
+fn a_graceful_shutdown_releases_every_lease_after_its_passes_have_stopped() {
+    let data = tempfile::tempdir().unwrap();
+    clave::init::run("127.0.0.1:0", data.path()).unwrap();
+    let (served, base) = serve(data.path(), INSTANCE, true);
+    let host = unreachable_host();
+    assert_eq!(ping(&base, &host), 202);
+    poll_until(
+        "the instance takes its leases",
+        Duration::from_secs(10),
+        || {
+            let db = store(data.path());
+            db.sealer_lease().unwrap().owner.as_deref() == Some(INSTANCE)
+                && db
+                    .partition_leases()
+                    .unwrap()
+                    .iter()
+                    .all(|(_, lease)| lease.owner.as_deref() == Some(INSTANCE))
+        },
+    );
+    served.terminate();
+
+    let db = store(data.path());
+    assert_eq!(db.sealer_lease().unwrap().owner, None);
+    let held: Vec<_> = db
+        .partition_leases()
+        .unwrap()
+        .into_iter()
+        .filter(|(_, lease)| lease.owner.is_some())
+        .collect();
+    assert!(held.is_empty(), "{held:?} stayed held after the shutdown");
 }
