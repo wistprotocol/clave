@@ -769,11 +769,14 @@ fn two_serving_processes_on_one_store_seal_each_grid_instant_once_under_one_seal
     let cadence = 2;
     let tmp = tempfile::tempdir().unwrap();
     init_with_cadence(tmp.path(), cadence);
-    for _ in 0..2 {
+    for instance in ["first", "second"] {
         spawn_server_with_options(
             tmp.path(),
             clave::fetch::Client::new(true),
-            clave::serve::ServeOptions::default(),
+            clave::serve::ServeOptions {
+                instance: instance.to_string(),
+                ..clave::serve::ServeOptions::default()
+            },
         );
     }
     let deadline = std::time::Instant::now() + Duration::from_secs(20);

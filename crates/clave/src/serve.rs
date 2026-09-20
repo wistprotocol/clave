@@ -20,6 +20,8 @@ use wist_core::objects::Status;
 pub const MAX_CONCURRENT_INGESTS: usize = 4;
 pub const MAX_PENDING_INGESTS: usize = 64;
 pub const OVERLOAD_RETRY_AFTER_SECS: u64 = 30;
+/// The instance name a `serve` without `--instance` runs under.
+pub const DEFAULT_INSTANCE: &str = "primary";
 
 /// The bounds `serve` applies to pulls and Pings: at most
 /// `max_concurrent_ingests` pulls run at once and at most
@@ -28,9 +30,14 @@ pub const OVERLOAD_RETRY_AFTER_SECS: u64 = 30;
 /// with 503 and a Retry-After, never queued. The dispatcher holds at most
 /// `max_partitions` pull partitions and pulls only their domains. With
 /// `seal` set, an Epoch is sealed at every grid instant reached while
-/// serving and holding the Log's sealer lease.
-#[derive(Debug, Clone, Copy)]
+/// serving and holding the Log's sealer lease. `instance` names this
+/// process's place in the store: it owns the leases recorded under that
+/// name and holds an exclusive file lock on it for its lifetime, so a
+/// restart resumes its predecessor's place instead of waiting for the
+/// leases to lapse, and two processes on one store take distinct names.
+#[derive(Debug, Clone)]
 pub struct ServeOptions {
+    pub instance: String,
     pub max_concurrent_ingests: usize,
     pub max_pending_ingests: usize,
     pub max_partitions: usize,
@@ -40,12 +47,51 @@ pub struct ServeOptions {
 impl Default for ServeOptions {
     fn default() -> Self {
         ServeOptions {
+            instance: DEFAULT_INSTANCE.to_string(),
             max_concurrent_ingests: MAX_CONCURRENT_INGESTS,
             max_pending_ingests: MAX_PENDING_INGESTS,
             max_partitions: crate::db::PARTITIONS as usize,
             seal: true,
         }
     }
+}
+
+/// One `serve` process's exclusive hold on its instance name, an OS file
+/// lock on `<data_dir>/instance-<name>.lock` released when the process
+/// ends however it ends.
+struct InstanceLock(#[allow(dead_code)] std::fs::File);
+
+/// Takes `instance`'s file lock under `data_dir`, failing at once while
+/// another process holds it. The name is restricted to a single path
+/// component of ASCII letters, digits, `-`, `_` and `.` so it names one
+/// file inside the data directory.
+fn lock_instance(data_dir: &std::path::Path, instance: &str) -> Result<InstanceLock> {
+    let named = !instance.is_empty()
+        && instance != "."
+        && instance != ".."
+        && instance
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if !named {
+        return Err(Error::Instance(format!(
+            "{instance:?} is no instance name: use ASCII letters, digits, '-', '_' or '.'"
+        )));
+    }
+    std::fs::create_dir_all(data_dir)?;
+    let path = data_dir.join(format!("instance-{instance}.lock"));
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)?;
+    rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive).map_err(|_| {
+        Error::Instance(format!(
+            "another process is already serving this store as instance {instance} ({} is locked); pass --instance <name> to serve it under another name",
+            path.display()
+        ))
+    })?;
+    Ok(InstanceLock(file))
 }
 
 /// The longest the dispatcher sleeps before it looks for due pulls again
@@ -371,6 +417,7 @@ pub fn run(
     bind: SocketAddr,
     allow_http: bool,
     seal: bool,
+    instance: String,
 ) -> Result<()> {
     run_with_options(
         data_dir,
@@ -378,6 +425,7 @@ pub fn run(
         bind,
         Client::new(allow_http),
         ServeOptions {
+            instance,
             seal,
             ..ServeOptions::default()
         },
@@ -400,8 +448,10 @@ pub fn run_with_options(
     client: Client,
     options: ServeOptions,
 ) -> Result<()> {
-    let owner: Arc<str> = crate::db::process_owner().into();
+    let _instance = lock_instance(&data_dir, &options.instance)?;
+    let owner: Arc<str> = options.instance.as_str().into();
     let db = Db::open(&db_path)?;
+    db.reclaim_instance_leases(&owner, jiff::Timestamp::now().as_second())?;
     crate::publication::recover(&db, &data_dir)?;
     drop(db);
     let state = AppState {

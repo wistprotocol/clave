@@ -47,6 +47,12 @@ enum Command {
         /// cadence grid instant reached while serving.
         #[arg(long = "no-seal")]
         no_seal: bool,
+        /// This process's name in the store: it owns the pull partitions
+        /// and the sealer lease recorded under that name, re-taking them
+        /// at startup, and holds an exclusive lock on it while it runs.
+        /// A second process serving the same store takes another name.
+        #[arg(long, default_value = clave::serve::DEFAULT_INSTANCE)]
+        instance: String,
     },
     Seal {
         #[arg(long)]
@@ -197,9 +203,10 @@ fn main() -> Result<(), clave::Error> {
             bind,
             allow_http,
             no_seal,
+            instance,
         } => {
             let db_path = data.join("clave.sqlite");
-            clave::serve::run(data, db_path, bind, allow_http, !no_seal)?;
+            clave::serve::run(data, db_path, bind, allow_http, !no_seal, instance)?;
         }
         Command::Seal {
             data,

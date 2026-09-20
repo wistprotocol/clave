@@ -3,7 +3,9 @@
 //! Each domain belongs to one partition; a dispatcher claims due rows only
 //! from partitions it holds, and each task records the partition token it
 //! was claimed under.
-use super::leases::{fence_holds, partition_of, Fence, PARTITION_LEASE_SECONDS};
+use super::leases::{
+    fence_holds, partition_of, Fence, PARTITION_LEASE_SECONDS, SEALER_LEASE_SECONDS,
+};
 use super::Db;
 use crate::error::{Error, Result};
 use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ValueRef};
@@ -420,6 +422,33 @@ impl Db {
         schedule(&tx, &ping)?;
         tx.commit()?;
         Ok(admission)
+    }
+
+    /// Re-takes, in one transaction, every partition lease and the sealer
+    /// lease the store records under `owner`, incrementing each token so
+    /// that any work an earlier incarnation of this instance left running
+    /// is fenced out, and returning those partitions' tasks to the
+    /// schedule as `retry` due at `now`. A process that starts under the
+    /// name it ran under before therefore resumes its place at once
+    /// instead of waiting for its own leases to lapse.
+    pub fn reclaim_instance_leases(&self, owner: &str, now: i64) -> Result<()> {
+        let tx = self.mutation()?;
+        let partitions = tx
+            .prepare("SELECT partition FROM pull_partitions WHERE owner = ?1 ORDER BY partition")?
+            .query_map([owner], |row| row.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for partition in partitions {
+            tx.execute(
+                "UPDATE pull_partitions SET lease_until = ?2, token = token + 1 WHERE partition = ?1",
+                (partition, now.saturating_add(PARTITION_LEASE_SECONDS)),
+            )?;
+            return_tasks(&tx, "partition = ?1", [partition], now)?;
+        }
+        tx.execute(
+            "UPDATE sealer_lease SET lease_until = ?2, token = token + 1 WHERE id = 0 AND owner = ?1",
+            (owner, now.saturating_add(SEALER_LEASE_SECONDS)),
+        )?;
+        tx.commit()
     }
 
     /// Claims up to `slots` due pulls for `owner` at `now`. First renews

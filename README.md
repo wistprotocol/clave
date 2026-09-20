@@ -13,7 +13,8 @@ Snapshots over HTTP for Consumer sync.
 Subcommands: `init` (generate the log's genesis key and local store, and
 print the signed-note verifier key a Witness is configured with),
 `serve` (HTTP ingest + read endpoints; seals an Epoch at every cadence
-grid instant unless `--no-seal`), `seal` (append the next Epoch's
+grid instant unless `--no-seal`, under the store instance name
+`--instance <name>` gives it), `seal` (append the next Epoch's
 Entries to the tree and publish its Checkpoint at the wall clock floored
 to the accepted cadence grid, or at `--at <whole-second UTC instant>` for
 a test Log that advances Log time faster than the clock), `witness`
@@ -451,8 +452,21 @@ reason, and a class with nothing due yields its turn, so neither Pings
 nor scheduled pulls wait behind the other's backlog. Claiming searches
 each held partition's `due_at` indexes and never scans the publishers.
 Two dispatchers on one store never hold the same partition and so never
-claim the same domain; a restarted process has a new owner ID and takes
-over its predecessor's partitions once their leases lapse.
+claim the same domain.
+
+A lease's owner is the instance name `serve --instance <name>` runs
+under, `primary` by default, and the process holds an exclusive file
+lock on `<data dir>/instance-<name>.lock` for its lifetime: a second
+process under the same name refuses to start, naming the lock, and a
+second process on one store takes another name. A process that starts
+under the name it ran under before re-takes, in one transaction, every
+partition lease and the sealer lease recorded under that name,
+incrementing each token — which fences out anything the earlier
+incarnation left running — and returns those partitions' pulls to the
+schedule as `retry` due at once. A process killed without releasing its
+leases is therefore succeeded at once by its restart rather than after
+its own leases lapse. `clave seal` takes the sealer lease under an owner
+unique to its process and its start.
 
 A pull runs fenced by its partition and token. Every write transaction
 it begins, including its completion, first checks under the write lock
@@ -517,10 +531,12 @@ commits no Epoch, or publishes no further file after its commit.
 `clave seal` takes the lease when it is unowned or lapsed, seals under
 it with the same renewal and releases it; while another process holds
 a live lease it fails, naming the holder and the lease's end. On Ctrl-C
-or SIGTERM `serve` stops accepting requests, finishes those in flight
-and releases its partition and sealer leases, so another process takes
-them over at once; a partition's next holder still increments its
-token, fencing out any pull left running. Recovering
+or SIGTERM `serve` stops accepting requests, finishes those in flight,
+stops its dispatcher and sealing passes and only then releases its
+partition and sealer leases, so no pass takes a lease again after the
+release and another process takes them over at once; a partition's next
+holder still increments its token, fencing out any pull left running.
+Recovering
 the publication of Epochs already committed needs no lease, since it
 rewrites byte-identical files. Durable publication remains a separate
 requirement.

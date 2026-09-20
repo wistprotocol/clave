@@ -1,0 +1,199 @@
+//! `serve`'s instance identity: the name a process serves a store under,
+//! the exclusive lock it holds on that name, and the leases it re-takes
+//! from its own earlier incarnation.
+use std::io::{BufRead, BufReader};
+use std::path::Path;
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+const INSTANCE: &str = clave::serve::DEFAULT_INSTANCE;
+
+struct Served(Child);
+
+impl Drop for Served {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl Served {
+    /// Ends the process the way a crash does: no signal handler runs, so
+    /// nothing is released.
+    fn hard_kill(mut self) {
+        self.0.kill().unwrap();
+        self.0.wait().unwrap();
+        std::mem::forget(self);
+    }
+}
+
+/// Starts the `clave` executable serving `data` under `instance` and
+/// returns it with the address it bound.
+fn serve(data: &Path, instance: &str, seal: bool) -> (Served, String) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_clave"));
+    command.args([
+        "serve",
+        "--data",
+        data.to_str().unwrap(),
+        "--bind",
+        "127.0.0.1:0",
+        "--allow-http",
+        "--instance",
+        instance,
+    ]);
+    if !seal {
+        command.arg("--no-seal");
+    }
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let line = lines
+        .next()
+        .expect("clave serve prints the address it bound")
+        .unwrap();
+    std::thread::spawn(move || lines.for_each(|_| {}));
+    let addr = line
+        .trim()
+        .strip_prefix("listening on http://")
+        .unwrap_or_else(|| panic!("clave serve printed {line:?}"))
+        .to_string();
+    (Served(child), format!("http://{addr}"))
+}
+
+fn store(data: &Path) -> clave::db::Db {
+    clave::db::Db::connect(&data.join("clave.sqlite")).unwrap()
+}
+
+fn ping(base: &str, host: &str) -> u16 {
+    reqwest::blocking::Client::new()
+        .post(format!("{base}/ingest"))
+        .json(&serde_json::json!({ "host": host }))
+        .send()
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
+fn poll_until(what: &str, timeout: Duration, mut ready: impl FnMut() -> bool) {
+    let deadline = Instant::now() + timeout;
+    while !ready() {
+        assert!(Instant::now() < deadline, "{what} within {timeout:?}");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// A host on loopback that answers nothing, so its pull ends at the
+/// first-contact rejection of WIST-2 §5 step 0 as soon as it is claimed.
+fn unreachable_host() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    addr.to_string()
+}
+
+fn rejected(data: &Path, host: &str) -> bool {
+    !store(data).list_rejections(host).unwrap().is_empty()
+}
+
+#[test]
+fn a_hard_killed_instance_is_reclaimed_by_its_restart_and_pulls_a_waiting_ping_at_once() {
+    let data = tempfile::tempdir().unwrap();
+    clave::init::run("127.0.0.1:0", data.path()).unwrap();
+    let (first, base) = serve(data.path(), INSTANCE, false);
+    let before = unreachable_host();
+    assert_eq!(ping(&base, &before), 202);
+    poll_until(
+        "the running instance pulls its Ping",
+        Duration::from_secs(10),
+        || rejected(data.path(), &before),
+    );
+    let held = store(data.path()).partition_leases().unwrap();
+    assert!(
+        held.iter()
+            .all(|(_, lease)| lease.owner.as_deref() == Some(INSTANCE)),
+        "the instance holds its partitions under its own name"
+    );
+    first.hard_kill();
+    assert!(
+        store(data.path())
+            .partition_leases()
+            .unwrap()
+            .iter()
+            .all(|(_, lease)| lease.owner.as_deref() == Some(INSTANCE)),
+        "a hard-killed instance releases nothing"
+    );
+
+    let (_restarted, base) = serve(data.path(), INSTANCE, false);
+    let after = unreachable_host();
+    let started = Instant::now();
+    assert_eq!(ping(&base, &after), 202);
+    poll_until(
+        "the restarted instance pulls a waiting Ping",
+        Duration::from_secs(2),
+        || rejected(data.path(), &after),
+    );
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let reclaimed = store(data.path()).partition_leases().unwrap();
+    for ((partition, before), (_, after)) in held.iter().zip(&reclaimed) {
+        assert_eq!(
+            after.token,
+            before.token + 1,
+            "partition {partition} fences the killed incarnation's pulls"
+        );
+        assert_eq!(after.owner.as_deref(), Some(INSTANCE));
+    }
+}
+
+#[test]
+fn a_second_process_under_the_same_instance_name_is_refused_while_the_first_serves() {
+    let data = tempfile::tempdir().unwrap();
+    clave::init::run("127.0.0.1:0", data.path()).unwrap();
+    let (_first, _base) = serve(data.path(), INSTANCE, false);
+    let refused = clave::serve::run_with_options(
+        data.path().to_path_buf(),
+        data.path().join("clave.sqlite"),
+        "127.0.0.1:0".parse().unwrap(),
+        clave::fetch::Client::new(true),
+        clave::serve::ServeOptions {
+            instance: INSTANCE.to_string(),
+            seal: false,
+            ..clave::serve::ServeOptions::default()
+        },
+    );
+    let Err(clave::Error::Instance(message)) = refused else {
+        panic!("a second process took the instance name: {refused:?}");
+    };
+    assert!(message.contains(INSTANCE), "{message}");
+    assert!(
+        data.path()
+            .join(format!("instance-{INSTANCE}.lock"))
+            .exists(),
+        "the instance lock names one file inside the data directory"
+    );
+}
+
+#[test]
+fn an_instance_name_outside_one_path_component_is_refused() {
+    let data = tempfile::tempdir().unwrap();
+    clave::init::run("127.0.0.1:0", data.path()).unwrap();
+    for name in ["", "..", "../elsewhere", "a/b"] {
+        let refused = clave::serve::run_with_options(
+            data.path().to_path_buf(),
+            data.path().join("clave.sqlite"),
+            "127.0.0.1:0".parse().unwrap(),
+            clave::fetch::Client::new(true),
+            clave::serve::ServeOptions {
+                instance: name.to_string(),
+                seal: false,
+                ..clave::serve::ServeOptions::default()
+            },
+        );
+        assert!(
+            matches!(refused, Err(clave::Error::Instance(_))),
+            "{name:?}: {refused:?}"
+        );
+    }
+}

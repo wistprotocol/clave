@@ -30,6 +30,8 @@ pub enum Error {
     Payload(&'static str),
     #[error("clock: {0}")]
     Clock(String),
+    #[error("instance: {0}")]
+    Instance(String),
     #[error("seal: {0}")]
     Seal(String),
     #[error("snapshot: {0}")]
