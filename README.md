@@ -440,11 +440,15 @@ in one write transaction:
    schedule as `retry` due at once;
 3. returns every task of a held partition whose lease lapsed to the
    schedule the same way, which recovers a pull that ended without
-   completing;
+   completing, except for the domains whose pulls this dispatcher still
+   has in flight: a lease left unrenewed by a slow pass names a pull
+   that is still running here, and returning it would dispatch the
+   domain a second time beside itself, both passing the partition's
+   fence;
 4. claims up to the free slots of due rows of the partitions it holds
-   whose domain has no pull in flight, leasing each for `LEASE_SECONDS`
-   (600) under its process's owner ID and recording the partition's
-   token.
+   whose domain has neither a pull in flight nor one running here,
+   leasing each for `LEASE_SECONDS` (600) under its instance name and
+   recording the partition's token.
 
 It renews its running pulls' leases while they run. Claims alternate
 between the oldest due `ping` row and the oldest due row of any other

@@ -436,7 +436,7 @@ fn a_pull_in_flight_at_restart_is_dispatched_once_and_rescheduled_one_baseline_l
         let crashed_at = unix_now() - clave::db::PARTITION_LEASE_SECONDS;
         db.schedule_ping(&host, crashed_at, 4).unwrap();
         let claimed = db
-            .claim_pulls(crashed_at, 1, "crashed-process", ALL, &mut true)
+            .claim_pulls(crashed_at, 1, "crashed-process", ALL, &[], &mut true)
             .unwrap();
         assert_eq!(claimed.len(), 1);
         assert_eq!(
@@ -507,6 +507,7 @@ fn a_ping_moves_a_scheduled_pull_earlier_never_later_and_takes_no_new_slot() {
                 1,
                 "earlier-process",
                 ALL,
+                &[],
                 &mut false,
             )
             .unwrap()
@@ -561,7 +562,7 @@ fn a_ping_moves_a_scheduled_pull_earlier_never_later_and_takes_no_new_slot() {
 
     let db = store(tmp.path());
     let claimed = db
-        .claim_pulls(unix_now(), 1, "elsewhere", ALL, &mut true)
+        .claim_pulls(unix_now(), 1, "elsewhere", ALL, &[], &mut true)
         .unwrap();
     assert_eq!(claimed[0].domain, domain);
     assert_eq!(ping(domain), 202, "a domain in flight takes no new slot");

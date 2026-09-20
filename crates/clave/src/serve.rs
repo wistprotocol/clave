@@ -339,7 +339,8 @@ fn pull(state: &AppState, owner: &str, task: &PullTask) {
 /// each finished pull and at least every `DISPATCH_INTERVAL`; renews its
 /// partition leases and the leases of the pulls it runs, takes over
 /// lapsed partitions up to `max_partitions` and returns lapsed pulls to
-/// the schedule.
+/// the schedule, apart from the domains it is running, which no pass
+/// claims or returns while their pulls are in flight here.
 async fn dispatch(state: AppState, owner: Arc<str>, slots: usize, max_partitions: usize) {
     let running = Arc::new(Mutex::new(HashSet::<String>::new()));
     let mut ping_next = true;
@@ -361,7 +362,7 @@ async fn dispatch(state: AppState, owner: Arc<str>, slots: usize, max_partitions
                 if !held.is_empty() {
                     db.renew_pull_leases(&held, &owner, now)?;
                 }
-                let tasks = db.claim_pulls(now, free, &owner, max_partitions, &mut next)?;
+                let tasks = db.claim_pulls(now, free, &owner, max_partitions, &held, &mut next)?;
                 Ok::<_, Error>((tasks, next))
             })
             .await
