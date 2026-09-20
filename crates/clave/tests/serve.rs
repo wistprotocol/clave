@@ -470,6 +470,7 @@ fn a_pull_in_flight_at_restart_is_dispatched_once_and_rescheduled_one_baseline_l
             due_at: last_pull + 3600,
             reason: clave::db::Reason::Baseline,
             attempts: 0,
+            pinged_at: None,
         })
     );
     std::thread::sleep(Duration::from_millis(2500));

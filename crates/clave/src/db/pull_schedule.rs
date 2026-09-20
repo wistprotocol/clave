@@ -20,14 +20,16 @@ pub const LEASE_SECONDS: i64 = 600;
 pub const RETRY_BASE_SECONDS: i64 = 60;
 
 const SCHEMA: &str = "
-CREATE TABLE pull_schedule(domain TEXT PRIMARY KEY, partition INTEGER NOT NULL, due_at INTEGER NOT NULL, reason TEXT NOT NULL CHECK(reason IN ('ping','baseline','resume','retry')), attempts INTEGER NOT NULL DEFAULT 0);
-CREATE TABLE pull_tasks(domain TEXT PRIMARY KEY, partition INTEGER NOT NULL, token INTEGER NOT NULL, reason TEXT NOT NULL CHECK(reason IN ('ping','baseline','resume','retry')), owner TEXT NOT NULL, lease_until INTEGER NOT NULL, issued_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE pull_schedule(domain TEXT PRIMARY KEY, partition INTEGER NOT NULL, due_at INTEGER NOT NULL, reason TEXT NOT NULL CHECK(reason IN ('ping','baseline','resume','retry')), attempts INTEGER NOT NULL DEFAULT 0, pinged_at INTEGER);
+CREATE TABLE pull_tasks(domain TEXT PRIMARY KEY, partition INTEGER NOT NULL, token INTEGER NOT NULL, reason TEXT NOT NULL CHECK(reason IN ('ping','baseline','resume','retry')), owner TEXT NOT NULL, lease_until INTEGER NOT NULL, issued_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, pinged_at INTEGER);
 ";
 
 const PARTITION_COLUMNS: &str = "
 ALTER TABLE pull_schedule ADD COLUMN partition INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE pull_tasks ADD COLUMN partition INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE pull_tasks ADD COLUMN token INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE pull_schedule ADD COLUMN pinged_at INTEGER;
+ALTER TABLE pull_tasks ADD COLUMN pinged_at INTEGER;
 DROP INDEX IF EXISTS pull_schedule_due;
 DROP INDEX IF EXISTS pull_tasks_lease;
 ";
@@ -39,8 +41,8 @@ CREATE INDEX IF NOT EXISTS pull_schedule_partition_reason ON pull_schedule(parti
 CREATE INDEX IF NOT EXISTS pull_tasks_partition ON pull_tasks(partition, lease_until);
 ";
 
-const OLDEST_DUE_PING: &str = "SELECT domain, due_at, reason, attempts FROM pull_schedule WHERE partition = ?2 AND reason = 'ping' AND due_at <= ?1 AND NOT EXISTS (SELECT 1 FROM pull_tasks WHERE pull_tasks.domain = pull_schedule.domain) ORDER BY due_at, domain";
-const OLDEST_DUE_DUTY: &str = "SELECT domain, due_at, reason, attempts FROM pull_schedule WHERE partition = ?2 AND reason != 'ping' AND due_at <= ?1 AND NOT EXISTS (SELECT 1 FROM pull_tasks WHERE pull_tasks.domain = pull_schedule.domain) ORDER BY due_at, domain";
+const OLDEST_DUE_PING: &str = "SELECT domain, due_at, reason, attempts, pinged_at FROM pull_schedule WHERE partition = ?2 AND reason = 'ping' AND due_at <= ?1 AND NOT EXISTS (SELECT 1 FROM pull_tasks WHERE pull_tasks.domain = pull_schedule.domain) ORDER BY due_at, domain";
+const OLDEST_DUE_DUTY: &str = "SELECT domain, due_at, reason, attempts, pinged_at FROM pull_schedule WHERE partition = ?2 AND reason != 'ping' AND due_at <= ?1 AND NOT EXISTS (SELECT 1 FROM pull_tasks WHERE pull_tasks.domain = pull_schedule.domain) ORDER BY due_at, domain";
 
 /// Why a domain is due for a pull.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,13 +77,16 @@ impl FromSql for Reason {
 }
 
 /// A domain's pending pull: due at `due_at` for `reason`, after
-/// `attempts` consecutive failed pulls.
+/// `attempts` consecutive failed pulls. `pinged_at` is the receipt
+/// instant of the earliest Ping this pull serves, which WIST-2 §4 keys
+/// the noise it may cost at; a pull no Ping asked for carries none.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DuePull {
     pub domain: String,
     pub due_at: i64,
     pub reason: Reason,
     pub attempts: i64,
+    pub pinged_at: Option<i64>,
 }
 
 /// A pull claimed for one dispatcher to run under its hold on
@@ -93,6 +98,8 @@ pub struct PullTask {
     pub attempts: i64,
     pub partition: i64,
     pub token: i64,
+    /// The receipt instant of the earliest Ping this pull serves, if any.
+    pub pinged_at: Option<i64>,
 }
 
 impl PullTask {
@@ -141,7 +148,11 @@ pub enum PullOutcome {
 /// already has `existing`: the earlier due time, the `retry` reason over
 /// every other and `resume` over `ping` and `baseline`, and between
 /// `ping` and `baseline` the reason of the strictly earlier row, the
-/// existing one on a tie. The failure count is the larger of the two.
+/// existing one on a tie. The pull serves the earlier of the two Pings.
+/// The failure count is the larger of the two, except that a Ping
+/// arriving against a waiting `retry` row clears it: WIST-2 §7's
+/// `WIST2-E01` row makes a fresh Ping cancel a pending backoff and start
+/// a new attempt.
 pub fn merge(existing: &DuePull, incoming: &DuePull) -> DuePull {
     use Reason::*;
     let reason = match (existing.reason, incoming.reason) {
@@ -151,11 +162,19 @@ pub fn merge(existing: &DuePull, incoming: &DuePull) -> DuePull {
         _ if incoming.due_at < existing.due_at => incoming.reason,
         _ => existing.reason,
     };
+    let attempts = match (existing.reason, incoming.reason) {
+        (Retry, Ping) => 0,
+        _ => existing.attempts.max(incoming.attempts),
+    };
     DuePull {
         domain: existing.domain.clone(),
         due_at: existing.due_at.min(incoming.due_at),
         reason,
-        attempts: existing.attempts.max(incoming.attempts),
+        attempts,
+        pinged_at: match (existing.pinged_at, incoming.pinged_at) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (at, None) | (None, at) => at,
+        },
     }
 }
 
@@ -165,13 +184,14 @@ fn due_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DuePull> {
         due_at: row.get(1)?,
         reason: row.get(2)?,
         attempts: row.get(3)?,
+        pinged_at: row.get(4)?,
     })
 }
 
 fn scheduled(conn: &Connection, domain: &str) -> Result<Option<DuePull>> {
     Ok(conn
         .query_row(
-            "SELECT domain, due_at, reason, attempts FROM pull_schedule WHERE domain = ?1",
+            "SELECT domain, due_at, reason, attempts, pinged_at FROM pull_schedule WHERE domain = ?1",
             [domain],
             due_row,
         )
@@ -195,13 +215,14 @@ fn schedule(conn: &Connection, incoming: &DuePull) -> Result<()> {
         None => incoming.clone(),
     };
     conn.execute(
-        "INSERT INTO pull_schedule(domain, partition, due_at, reason, attempts) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(domain) DO UPDATE SET due_at = excluded.due_at, reason = excluded.reason, attempts = excluded.attempts",
+        "INSERT INTO pull_schedule(domain, partition, due_at, reason, attempts, pinged_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(domain) DO UPDATE SET due_at = excluded.due_at, reason = excluded.reason, attempts = excluded.attempts, pinged_at = excluded.pinged_at",
         (
             &row.domain,
             partition_of(conn, &row.domain)?,
             row.due_at,
             row.reason.as_str(),
             row.attempts,
+            row.pinged_at,
         ),
     )?;
     Ok(())
@@ -211,7 +232,7 @@ fn schedule(conn: &Connection, incoming: &DuePull) -> Result<()> {
 /// the domain already waits or is being pulled.
 pub(super) fn exec_schedule_new_publisher(conn: &Connection, domain: &str) -> Result<()> {
     conn.execute(
-        "INSERT OR IGNORE INTO pull_schedule(domain, partition, due_at, reason, attempts) SELECT ?1, ?2, 0, 'baseline', 0 WHERE NOT EXISTS (SELECT 1 FROM pull_tasks WHERE domain = ?1)",
+        "INSERT OR IGNORE INTO pull_schedule(domain, partition, due_at, reason, attempts, pinged_at) SELECT ?1, ?2, 0, 'baseline', 0, NULL WHERE NOT EXISTS (SELECT 1 FROM pull_tasks WHERE domain = ?1)",
         (domain, partition_of(conn, domain)?),
     )?;
     Ok(())
@@ -230,16 +251,20 @@ fn return_tasks(
 ) -> Result<usize> {
     let tasks = conn
         .prepare(&format!(
-            "SELECT domain, attempts FROM pull_tasks WHERE {filter}"
+            "SELECT domain, attempts, pinged_at FROM pull_tasks WHERE {filter}"
         ))?
         .query_map(params, |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+            ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?
         .into_iter()
-        .filter(|(domain, _)| !except.contains(domain))
+        .filter(|(domain, _, _)| !except.contains(domain))
         .collect::<Vec<_>>();
-    for (domain, attempts) in &tasks {
+    for (domain, attempts, pinged_at) in &tasks {
         conn.execute("DELETE FROM pull_tasks WHERE domain = ?1", [domain])?;
         schedule(
             conn,
@@ -248,6 +273,7 @@ fn return_tasks(
                 due_at: now,
                 reason: Reason::Retry,
                 attempts: *attempts,
+                pinged_at: *pinged_at,
             },
         )?;
     }
@@ -398,6 +424,7 @@ impl Db {
                     due_at,
                     reason,
                     attempts: 0,
+                    pinged_at: None,
                 },
             )?;
         }
@@ -421,6 +448,7 @@ impl Db {
             due_at: now,
             reason: Reason::Ping,
             attempts: 0,
+            pinged_at: Some(now),
         };
         let admission = if scheduled(&tx, domain)?.is_some() || in_flight(&tx, domain)? {
             PingAdmission::Duplicate
@@ -521,8 +549,8 @@ impl Db {
             *ping_next = due.reason != Reason::Ping;
             tx.execute("DELETE FROM pull_schedule WHERE domain = ?1", [&due.domain])?;
             tx.execute(
-                "INSERT INTO pull_tasks(domain, partition, token, reason, owner, lease_until, issued_at, attempts) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                (&due.domain, partition, token, due.reason.as_str(), owner, now + LEASE_SECONDS, now, due.attempts),
+                "INSERT INTO pull_tasks(domain, partition, token, reason, owner, lease_until, issued_at, attempts, pinged_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                (&due.domain, partition, token, due.reason.as_str(), owner, now + LEASE_SECONDS, now, due.attempts, due.pinged_at),
             )?;
             claimed.push(PullTask {
                 domain: due.domain,
@@ -530,6 +558,7 @@ impl Db {
                 attempts: due.attempts,
                 partition,
                 token,
+                pinged_at: due.pinged_at,
             });
         }
         tx.commit()?;
@@ -604,6 +633,7 @@ impl Db {
                 due_at,
                 reason,
                 attempts,
+                pinged_at: None,
             },
         )?;
         tx.commit()
@@ -669,6 +699,15 @@ mod tests {
             due_at,
             reason,
             attempts,
+            pinged_at: None,
+        }
+    }
+
+    /// `due` for a row a Ping received at `pinged_at` asked for.
+    fn pinged(domain: &str, due_at: i64, reason: Reason, attempts: i64, pinged_at: i64) -> DuePull {
+        DuePull {
+            pinged_at: Some(pinged_at),
+            ..due(domain, due_at, reason, attempts)
         }
     }
 
@@ -719,34 +758,78 @@ mod tests {
     #[test]
     fn a_ping_moves_a_baseline_earlier_but_never_later() {
         let later = due("a.example", NOW + 100, Reason::Baseline, 0);
-        let ping = due("a.example", NOW, Reason::Ping, 0);
+        let ping = pinged("a.example", NOW, Reason::Ping, 0, NOW);
         assert_eq!(merge(&later, &ping), ping);
         let overdue = due("a.example", NOW - 100, Reason::Baseline, 0);
-        assert_eq!(merge(&overdue, &ping), overdue);
+        assert_eq!(
+            merge(&overdue, &ping),
+            pinged("a.example", NOW - 100, Reason::Baseline, 0, NOW)
+        );
     }
 
     #[test]
-    fn retry_and_resume_are_never_downgraded_and_keep_their_attempts() {
+    fn retry_and_resume_are_never_downgraded_and_a_ping_clears_a_pending_backoff() {
         let retry = due("a.example", NOW + 100, Reason::Retry, 3);
-        let ping = due("a.example", NOW, Reason::Ping, 0);
+        let ping = pinged("a.example", NOW, Reason::Ping, 0, NOW);
         assert_eq!(
             merge(&retry, &ping),
-            due("a.example", NOW, Reason::Retry, 3)
+            pinged("a.example", NOW, Reason::Retry, 0, NOW),
+            "WIST-2 §7: a fresh Ping cancels a pending backoff and starts a new attempt"
         );
         let resume = due("a.example", NOW + 100, Reason::Resume, 0);
         assert_eq!(
             merge(&resume, &ping),
-            due("a.example", NOW, Reason::Resume, 0)
+            pinged("a.example", NOW, Reason::Resume, 0, NOW)
         );
-        let pinged = due("a.example", NOW - 5, Reason::Ping, 0);
+        let earlier = pinged("a.example", NOW - 5, Reason::Ping, 0, NOW - 5);
         assert_eq!(
-            merge(&pinged, &due("a.example", NOW, Reason::Resume, 0)),
-            due("a.example", NOW - 5, Reason::Resume, 0)
+            merge(&earlier, &due("a.example", NOW, Reason::Resume, 0)),
+            pinged("a.example", NOW - 5, Reason::Resume, 0, NOW - 5)
         );
         assert_eq!(
-            merge(&pinged, &due("a.example", NOW + 3600, Reason::Baseline, 0)),
-            pinged
+            merge(&earlier, &due("a.example", NOW + 3600, Reason::Baseline, 0)),
+            earlier
         );
+    }
+
+    #[test]
+    fn a_pull_serves_the_earliest_ping_merged_into_its_row_and_no_other() {
+        let first = pinged("a.example", NOW, Reason::Ping, 0, NOW);
+        let later = pinged("a.example", NOW + 30, Reason::Ping, 0, NOW + 30);
+        assert_eq!(merge(&first, &later).pinged_at, Some(NOW));
+        assert_eq!(merge(&later, &first).pinged_at, Some(NOW));
+        let baseline = due("a.example", NOW + 3600, Reason::Baseline, 0);
+        assert_eq!(merge(&baseline, &later).pinged_at, Some(NOW + 30));
+        assert_eq!(
+            merge(&baseline, &due("a.example", NOW, Reason::Retry, 1)).pinged_at,
+            None,
+            "a pull no Ping asked for serves none"
+        );
+    }
+
+    #[test]
+    fn a_failed_pulls_retry_serves_no_ping_and_a_ping_meanwhile_is_the_one_it_serves() {
+        let (_tmp, db) = open_db();
+        db.insert_publisher("a.example", b"{}", "k", "p").unwrap();
+        db.schedule_ping("a.example", NOW, 4).unwrap();
+        let task = db
+            .claim_pulls(NOW, 1, "me", ALL, &[], &mut true)
+            .unwrap()
+            .remove(0);
+        assert_eq!(task.pinged_at, Some(NOW));
+        db.complete_pull(&task, "me", NOW, PullOutcome::Failed, NOW + 1)
+            .unwrap();
+        assert_eq!(
+            db.scheduled_pull("a.example").unwrap().unwrap().pinged_at,
+            None
+        );
+
+        db.schedule_ping("a.example", NOW + 2, 4).unwrap();
+        let retry = db
+            .claim_pulls(NOW + 300, 1, "me", ALL, &[], &mut true)
+            .unwrap()
+            .remove(0);
+        assert_eq!(retry.pinged_at, Some(NOW + 2));
     }
 
     #[test]
@@ -843,7 +926,7 @@ mod tests {
         );
         assert_eq!(
             db.scheduled_pull("a.example").unwrap(),
-            Some(due("a.example", NOW, Reason::Ping, 0))
+            Some(pinged("a.example", NOW, Reason::Ping, 0, NOW))
         );
         assert_eq!(claim(&db, 1, &mut true), vec!["a.example"]);
         assert_eq!(
@@ -955,7 +1038,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             db.scheduled_pull("a.example").unwrap(),
-            Some(due("a.example", NOW + 5, Reason::Ping, 0))
+            Some(pinged("a.example", NOW + 5, Reason::Ping, 0, NOW + 5))
         );
     }
 

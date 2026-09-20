@@ -925,3 +925,69 @@ fn declaration_field_rejections_preserve_signed_state_through_reopen_and_sealing
     .unwrap();
     assert_eq!(*state.domains()[&host].current().envelope(), signed);
 }
+
+/// WIST-2 §4: only a Ping's own pull can cost its Registrable Domain
+/// noise, counted under the unit and UTC day in force at the Ping.
+#[test]
+fn only_a_pulls_own_ping_is_charged_noise_and_at_the_instant_it_was_received() {
+    let (listener, host, client) = reserve_addr();
+    let p = make_publisher_with_scope(&host, &["example.com"]);
+    write_feed(&p, "elsewhere.example", &[], "2026-08-09T12:00:00Z");
+    serve_static(listener, p.dir.path().to_path_buf());
+
+    let tmp = tempfile::tempdir().unwrap();
+    clave::init::run(&host, tmp.path()).unwrap();
+    let db = clave::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+    let all = clave::db::PARTITIONS as usize;
+    let now = jiff::Timestamp::now().as_second();
+    let day = |unix: i64| jiff::Timestamp::from_second(unix).unwrap().to_string()[..10].to_string();
+
+    let pinged_at = now - 86_400;
+    db.schedule_ping(&host, pinged_at, 4).unwrap();
+    let task = db
+        .claim_pulls(now, 1, "me", all, &[], &mut true)
+        .unwrap()
+        .remove(0);
+    assert_eq!(task.pinged_at, Some(pinged_at));
+    let pull = |task: &clave::db::PullTask, at: i64| {
+        let now = jiff::Timestamp::from_second(at).unwrap().to_string();
+        let run = clave::ingest::open_pull(
+            &db,
+            &client,
+            tmp.path(),
+            &host,
+            &now,
+            jiff::Timestamp::now,
+            clave::ingest::PullLimits::default(),
+        )
+        .unwrap();
+        clave::ingest::finish_pull(&db, task, "me", at, run, at).unwrap()
+    };
+
+    let report = pull(&task, now);
+    assert_eq!(report.noise, Some("WIST2-E04"));
+    assert_eq!(
+        db.noise_ping_count(&host, &day(pinged_at)).unwrap(),
+        1,
+        "the noise is counted on the day of the Ping it answered"
+    );
+    assert_eq!(db.noise_ping_count(&host, &day(now)).unwrap(), 0);
+
+    let baseline = db.scheduled_pull(&host).unwrap().unwrap();
+    assert_eq!(baseline.reason, clave::db::Reason::Baseline);
+    assert_eq!(baseline.pinged_at, None);
+    let later = baseline.due_at;
+    let task = db
+        .claim_pulls(later, 1, "me", all, &[], &mut false)
+        .unwrap()
+        .remove(0);
+    assert_eq!(task.pinged_at, None);
+    assert_eq!(pull(&task, later).noise, Some("WIST2-E04"));
+    for at in [pinged_at, now, later] {
+        assert_eq!(
+            db.noise_ping_count(&host, &day(at)).unwrap(),
+            i64::from(at == pinged_at),
+            "a baseline poll no Ping asked for counts against no quota"
+        );
+    }
+}

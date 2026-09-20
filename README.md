@@ -396,9 +396,11 @@ restarted at the head each time.
 
 `serve` schedules pulls durably in the store. `pull_schedule` holds at
 most one due-time row per domain (`due_at` in Unix seconds, `reason`
-`ping`, `baseline`, `resume` or `retry`, and the count of consecutive
-failed pulls); `pull_tasks` holds each pull in flight with its owning
-process, its lease and the partition token it was claimed under.
+`ping`, `baseline`, `resume` or `retry`, the count of consecutive failed
+pulls, and `pinged_at`, the receipt instant of the earliest Ping the
+pull serves); `pull_tasks` holds each pull in flight with the same
+`pinged_at`, its owning instance, its lease and the partition token it
+was claimed under.
 Opening a store without the schedule gives every
 known publisher a row: `resume` due at once for a suspended walk,
 otherwise `baseline` due `baseline_poll_seconds` after its last pull,
@@ -419,7 +421,16 @@ schedules it, and 202 answers only after that commits:
 The first two take no backlog slot. Rows combine as follows: the due
 time is the earlier one; `retry` outranks every other reason and
 `resume` outranks `ping` and `baseline`; between `ping` and `baseline`
-the strictly earlier row's reason stays.
+the strictly earlier row's reason stays; the pull serves the earlier of
+the two rows' Pings. A Ping arriving against a waiting `retry` row also
+clears its failure count, so a fresh Ping cancels a pending backoff and
+starts a new attempt (WIST-2 §7, `WIST2-E01`).
+
+A pull's noise disposition (WIST-2 §4: `WIST2-E02` or `WIST2-E04`) is
+charged only to the Ping the pull serves, against the Registrable
+Domain and the UTC day in force at that Ping's receipt instant, not at
+the pull's. A baseline poll, a resumption and a retry that no Ping asked
+for cost the domain's quota nothing.
 
 Every domain belongs to one of the store's `PARTITIONS` (16) pull
 partitions: the first eight bytes of the SHA-256 of its canonical host,

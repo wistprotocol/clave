@@ -383,6 +383,11 @@ pub fn run_bounded(
 /// takeover between a pull's end and its completion leaves the run for
 /// the new holder rather than a closed run with no next pull. `run` is
 /// `None` where no run was opened, which schedules nothing further.
+///
+/// WIST-2 §4: a noise disposition counts against the Ping quota of the
+/// Registrable Domain in force at the Ping, on the UTC day of the Ping.
+/// The pull therefore counts only the Ping it serves, if it serves one:
+/// a baseline poll, a resumption and a retry cost the domain nothing.
 pub fn finish_pull(
     db: &Db,
     task: &crate::db::PullTask,
@@ -396,8 +401,8 @@ pub fn finish_pull(
         Some(run_id) => admit::close_run(db, run_id)?,
         None => IngestReport::default(),
     };
-    if report.noise.is_some() {
-        let at = registry::instant(started_at)?;
+    if let (true, Some(pinged_at)) = (report.noise.is_some(), task.pinged_at) {
+        let at = registry::instant(pinged_at)?;
         let unit = crate::suffix_list::unit_at(db, &task.domain, &at)?;
         db.bump_noise_ping(&unit, at.get(..10).unwrap_or(&at))?;
     }
