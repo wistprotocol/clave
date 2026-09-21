@@ -2,9 +2,9 @@
 //! its phase, remaining work and item queue; every object the run fetched
 //! with its status, its bytes and the references it was verified under;
 //! the Declaration retries and predecessor retrievals it used; and, per
-//! domain and walk, the pages walked so far. A pull that stops without
-//! closing its run leaves this state for the next pull of the domain to
-//! resume from.
+//! domain and walk, the pages walked so far. WIST-2 §5's resumption is a
+//! later pull, so a run an interrupted pull left open is dropped, while
+//! the walk cursor outlives it.
 use super::Db;
 use crate::error::{Error, Result};
 use rusqlite::{Connection, OptionalExtension};
@@ -206,7 +206,16 @@ fn run_by(conn: &Connection, filter: &str, key: impl rusqlite::Params) -> Result
         .transpose()
 }
 
+fn release_reservations(conn: &Connection, run_id: i64) -> Result<()> {
+    conn.execute(
+        "INSERT INTO ingest_meter(domain, day, bytes) SELECT run.unit, run.day, -SUM(object.debited) FROM pull_runs run JOIN pull_objects object ON object.run_id = run.run_id WHERE run.run_id = ?1 AND object.status = 'issued' GROUP BY run.unit, run.day ON CONFLICT(domain, day) DO UPDATE SET bytes = bytes + excluded.bytes",
+        [run_id],
+    )?;
+    Ok(())
+}
+
 fn delete_run(conn: &Connection, run_id: i64) -> Result<()> {
+    release_reservations(conn, run_id)?;
     conn.execute("DELETE FROM pull_objects WHERE run_id = ?1", [run_id])?;
     conn.execute("DELETE FROM pull_attempts WHERE run_id = ?1", [run_id])?;
     conn.execute("DELETE FROM pull_runs WHERE run_id = ?1", [run_id])?;
@@ -225,32 +234,17 @@ pub(crate) struct NewRun<'a> {
 }
 
 impl Db {
-    /// Opens the run of a pull of `run.domain`: the domain's open run when
-    /// one exists for the same UTC day and began less than `max_age`
-    /// seconds before `now`, with this connection's fence token recorded,
-    /// and otherwise a fresh run, after the stale one's objects are
-    /// dropped. The domain's walk cursor outlives either, since a walk
-    /// suspended under the budget resumes from where it stopped.
-    pub(crate) fn start_pull_run(
-        &self,
-        run: &NewRun<'_>,
-        now: i64,
-        max_age: i64,
-    ) -> Result<PullRun> {
+    /// Opens a fresh run of a pull of `run.domain`, dropping one an earlier
+    /// pull left open and returning its unsettled reservations to the
+    /// budget: WIST-2 §5's resumption is a later pull, and WIST-1 §3.4
+    /// gives a new attempt a new clock and schedule. The walk cursor
+    /// outlives the run.
+    pub(crate) fn start_pull_run(&self, run: &NewRun<'_>) -> Result<PullRun> {
         let tx = self.mutation()?;
         let token = self.fence.map(|fence| match fence {
             super::Fence::Partition { token, .. } | super::Fence::Sealer { token } => token,
         });
         if let Some(open) = run_by(&tx, "domain = ?1", [run.domain])? {
-            let began = crate::registry::unix(&open.now).unwrap_or(i64::MIN);
-            if open.day == run.day && now.saturating_sub(began) < max_age {
-                tx.execute(
-                    "UPDATE pull_runs SET token = ?2 WHERE run_id = ?1",
-                    (open.run_id, token),
-                )?;
-                tx.commit()?;
-                return Ok(open);
-            }
             delete_run(&tx, open.run_id)?;
         }
         tx.execute(

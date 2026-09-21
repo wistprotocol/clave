@@ -1,7 +1,7 @@
 //! Stage 4: stateful admission. Each function is one fenced write
 //! transaction that both changes the Log's state and records how far the
-//! run has come, so a pull resumed after an interruption neither repeats
-//! an admission nor loses one.
+//! run has come, so a repeated occurrence of an item within the pull
+//! neither repeats an admission nor loses one.
 use crate::db::{Db, Phase, PullRun, Status, WalkPage};
 use crate::declaration::{self, Decision};
 use crate::error::Result;

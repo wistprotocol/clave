@@ -209,7 +209,7 @@ fn served_bytes(publisher: &common::TestPub, paths: &[String]) -> i64 {
 }
 
 #[test]
-fn a_new_holder_continues_the_run_the_taken_over_pull_committed() {
+fn a_new_holder_fetches_feed_json_again_and_admits_each_delta_once() {
     let (listener, host, client) = reserve_addr();
     let origin = listener.local_addr().unwrap();
     let p = make_publisher_with_scope(&host, &["example.com"]);
@@ -258,7 +258,7 @@ fn a_new_holder_continues_the_run_the_taken_over_pull_committed() {
     assert_eq!(
         open_runs(&path),
         1,
-        "the taken-over pull leaves its run for the new holder"
+        "the taken-over pull leaves its run behind"
     );
 
     let client = clave::fetch::Client::with_builder(
@@ -282,7 +282,11 @@ fn a_new_holder_continues_the_run_the_taken_over_pull_committed() {
 
     assert_eq!(report.accepted, vec![id.clone()]);
     assert!(db.is_delta_seen_for(&id, &host).unwrap());
-    assert_eq!(db.count_pending_entries("publisher_delta").unwrap(), 1);
+    assert_eq!(
+        db.count_pending_entries("publisher_delta").unwrap(),
+        1,
+        "the Delta is admitted exactly once"
+    );
     assert_eq!(payload_files(tmp.path()), 1);
     assert_eq!(open_runs(&path), 0, "the completed run is closed");
     assert!(db.scheduled_pull(&host).unwrap().is_some());
@@ -292,8 +296,8 @@ fn a_new_holder_continues_the_run_the_taken_over_pull_committed() {
     let counted = |suffix: String| requests.iter().filter(|path| **path == suffix).count();
     assert_eq!(
         counted("/.well-known/wist/feed.json".into()),
-        1,
-        "the new holder walks from the run rather than fetching the Feed again"
+        2,
+        "the new holder fetches the live Feed again rather than continuing the run"
     );
     assert_eq!(
         counted(format!("/.well-known/wist/deltas/{hex}.json")),
@@ -306,11 +310,12 @@ fn a_new_holder_continues_the_run_the_taken_over_pull_committed() {
             &p,
             &[
                 "feed.json".into(),
+                "feed.json".into(),
                 format!("deltas/{hex}.json"),
                 format!("payloads/{hex}.json"),
             ]
         ),
-        "the reservation the taken-over request left is settled once"
+        "each pull is metered for what it read, and the reservation of the abandoned request returns to the budget"
     );
 }
 
@@ -356,7 +361,7 @@ fn a_takeover_before_a_pull_completes_leaves_its_run_and_its_next_pull_unwritten
         clave::ingest::finish_pull(&pull, &old, "old", claimed_at, run, now),
         Err(clave::Error::Fenced)
     ));
-    assert_eq!(open_runs(&path), 1, "the run stays open for the new holder");
+    assert_eq!(open_runs(&path), 1, "the run the pull left stays behind");
     assert!(db
         .get_publisher_status(&host)
         .unwrap()
@@ -370,7 +375,7 @@ fn a_takeover_before_a_pull_completes_leaves_its_run_and_its_next_pull_unwritten
             .resolve("localhost", origin),
     );
     let pull = clave::db::Db::connect(&path).unwrap().fenced(new.fence());
-    let resumed = clave::ingest::open_pull(
+    let fresh = clave::ingest::open_pull(
         &pull,
         &client,
         tmp.path(),
@@ -380,9 +385,14 @@ fn a_takeover_before_a_pull_completes_leaves_its_run_and_its_next_pull_unwritten
         clave::ingest::PullLimits::default(),
     )
     .unwrap();
-    assert_eq!(resumed, run, "the new holder continues the same run");
-    let report = clave::ingest::finish_pull(&pull, &new, "new", now, resumed, now).unwrap();
-    assert_eq!(report.accepted, vec![id]);
+    assert_ne!(fresh, run, "the new holder begins a fresh run");
+    let report = clave::ingest::finish_pull(&pull, &new, "new", now, fresh, now).unwrap();
+    assert!(
+        report.accepted.is_empty(),
+        "the Delta the taken-over pull admitted is seen and admitted no second time"
+    );
+    assert!(db.is_delta_seen_for(&id, &host).unwrap());
+    assert_eq!(db.count_pending_entries("publisher_delta").unwrap(), 1);
     assert_eq!(open_runs(&path), 0);
     assert!(db
         .get_publisher_status(&host)

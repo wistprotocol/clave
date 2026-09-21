@@ -369,17 +369,20 @@ spent and the predecessors it retrieved; and the run's phase, queue,
 position, chain position and remaining work advance in the same
 transaction as the admission that moved them.
 
+Within one pull, a response the run already holds is read from the run
+instead of requested again and an admission or rejection it already
+recorded is not repeated, so a second delivery of either changes nothing.
 A pull that stops before its run is closed — a crash, or a partition
-taken over mid-pull — leaves the run open, and the next pull of that
-domain continues it: a response the run already holds is read from the
-run instead of requested again, an admission or rejection it already
-recorded is not repeated, and a reservation left behind is moved to the
-new request rather than debited twice. A run is continued only on the UTC
-day it began and within `baseline_poll_seconds` of its start; otherwise
-its objects are dropped and a fresh run begins, keeping the walk cursor.
-Closing a run rebuilds the pull's report from the objects it admitted and
-rejected in the order it decided them, records whether the walk
-suspended, and drops the run's state.
+taken over mid-pull — leaves the run behind, and the next pull of that
+domain drops it with its objects and starts fresh, returning to the
+budget what a request that never settled had reserved: resumption is a
+later pull (WIST-2 §5), which takes its own clock and schedule (WIST-1
+§3.4) and fetches `feed.json` again. Nothing is admitted twice across the
+interruption, because an ID already accepted for sealing is seen (WIST-1
+§3.5) and the walk cursor, which the run's deletion keeps, holds the
+pages already walked. Closing a run rebuilds the pull's report from the
+objects it admitted and rejected in the order it decided them, records
+whether the walk suspended, and drops the run's state.
 
 The pages a walk reads are the domain's walk cursor, which outlives the
 pull that walked them. A pull whose walk suspended keeps them; the next
@@ -488,9 +491,9 @@ it begins, including its completion, first checks under the write lock
 that the partition's token is unchanged; once another dispatcher has
 taken the partition over, the transaction writes nothing and fails with
 `Error::Fenced`, and the pull is abandoned without a completion, since
-the takeover already returned the domain to the schedule. What its run
-committed before that stays: the new holder continues that run instead of
-pulling the domain from the start. A Payload
+the takeover already returned the domain to the schedule. What it
+admitted before that stays, and the new holder pulls the domain fresh,
+admitting nothing a second time. A Payload
 file is written inside its Delta's admission transaction, after that
 check, and is named by the Delta ID and holds the bytes the Delta
 commits to, so a fenced-out pull writes none and a repeated admission
@@ -500,8 +503,9 @@ A finished pull, in one write transaction, closes its run — which
 rebuilds its report, records the walk's suspension and, for a completed
 walk, the pull instant — drops its task and schedules the next pull,
 combined with any Ping row that arrived meanwhile. A takeover between the
-pull's last admission and that transaction writes none of it, so the new
-holder closes the run itself:
+pull's last admission and that transaction writes none of it, so the
+domain's next pull, held by the new dispatcher, schedules from its own
+completion:
 
 - after a completed walk, `baseline` due `baseline_poll_seconds` after
   the pull started;

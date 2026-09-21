@@ -420,11 +420,10 @@ pub fn finish_pull(
 }
 
 /// Pulls `host` once and leaves its run open for the caller to close
-/// beside whatever else the pull's completion records. Every handoff
-/// between the pull's stages is persisted under the run, so a pull that
-/// stops before its run is closed is continued by the next pull of the
-/// domain rather than begun again. `None` means `host` is no bare
-/// authority and nothing was pulled.
+/// beside whatever else the pull's completion records. A run an
+/// interrupted pull left open is dropped rather than continued (WIST-2 §5:
+/// resumption is a later pull). `None` means `host` is no bare authority
+/// and nothing was pulled.
 pub fn open_pull(
     db: &Db,
     client: &Client,
@@ -438,19 +437,15 @@ pub fn open_pull(
         return Ok(None);
     };
     let host = host.as_str();
-    let run = db.start_pull_run(
-        &NewRun {
-            domain: host,
-            now,
-            day: now.get(..10).unwrap_or(now),
-            unit: &crate::suffix_list::unit_at(db, host, now)?,
-            work_bytes: limits.work_bytes,
-            work_objects: limits.work_objects,
-            pages_epoch: db.last_epoch()?.map(|epoch| epoch.epoch_number),
-        },
-        registry::unix(now)?,
-        registry::effective(db, "baseline_poll_seconds", now)?,
-    )?;
+    let run = db.start_pull_run(&NewRun {
+        domain: host,
+        now,
+        day: now.get(..10).unwrap_or(now),
+        unit: &crate::suffix_list::unit_at(db, host, now)?,
+        work_bytes: limits.work_bytes,
+        work_objects: limits.work_objects,
+        pages_epoch: db.last_epoch()?.map(|epoch| epoch.epoch_number),
+    })?;
     let run_id = run.run_id;
     let now_unix = registry::unix(&run.now)?;
     let scheme = crate::fetch::scheme_for_host(host, client.allow_http());

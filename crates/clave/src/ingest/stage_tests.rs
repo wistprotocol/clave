@@ -211,42 +211,29 @@ fn instant(at: &str) -> jiff::Timestamp {
 }
 
 fn start_run(db: &Db, host: &str, now: &str) -> PullRun {
-    db.start_pull_run(
-        &NewRun {
-            domain: host,
-            now,
-            day: &now[..10],
-            unit: host,
-            work_bytes: 1 << 20,
-            work_objects: 64,
-            pages_epoch: None,
-        },
-        registry::unix(now).unwrap(),
-        86_400,
-    )
+    db.start_pull_run(&NewRun {
+        domain: host,
+        now,
+        day: &now[..10],
+        unit: host,
+        work_bytes: 1 << 20,
+        work_objects: 64,
+        pages_epoch: None,
+    })
     .unwrap()
 }
 
-/// Everything a pull writes outside its own run, in a comparable form.
-fn persisted_state(log: &Log) -> Vec<String> {
+/// A pull run again after an interruption re-reads what it had not
+/// admitted, so this leaves out the rejection log and the bytes read.
+fn admitted_state(log: &Log) -> Vec<String> {
     let conn = rusqlite::Connection::open(log.path()).unwrap();
     let mut dump = Vec::new();
     for query in [
-        "SELECT code, at, delta_id, detail FROM rejections ORDER BY rowid",
         "SELECT delta_id, domain FROM seen_deltas ORDER BY delta_id",
-        "SELECT entry_type, domain, chain_pos, acceptance_order, length(entry_json) FROM pending_entries ORDER BY rowid",
-        "SELECT domain, delta_id, chain_pos, acceptance_order FROM queued_deltas ORDER BY rowid",
+        "SELECT entry_type, domain, json_extract(CAST(entry_json AS TEXT), '$.delta.url'), json_extract(CAST(entry_json AS TEXT), '$.delta.observed_at') FROM pending_entries ORDER BY rowid",
+        "SELECT domain, delta_id FROM queued_deltas ORDER BY rowid",
         "SELECT url, domain, tip FROM url_tips ORDER BY domain, url",
-        "SELECT domain, day, bytes FROM ingest_meter ORDER BY domain, day",
-        "SELECT domain, suspended FROM walk_state ORDER BY domain",
-        "SELECT domain, last_pull_at, state, declaration_fetched_at FROM publishers ORDER BY domain",
-        "SELECT domain, generated_at_s FROM feed_observations ORDER BY domain",
-        "SELECT domain, generated_at_s FROM label_feed_observations ORDER BY domain",
         "SELECT id, domain FROM seen_labels ORDER BY id",
-        "SELECT COUNT(*) FROM pull_runs",
-        "SELECT COUNT(*) FROM pull_objects",
-        "SELECT COUNT(*) FROM pull_walk",
-        "SELECT COUNT(*) FROM pull_attempts",
     ] {
         let mut statement = conn.prepare(query).unwrap();
         let columns = statement.column_count();
@@ -274,27 +261,11 @@ fn persisted_state(log: &Log) -> Vec<String> {
     dump
 }
 
-/// Whether the store still holds a run for a pull to resume.
-fn holds_open_run(log: &Log) -> bool {
+fn open_runs(log: &Log) -> i64 {
     rusqlite::Connection::open(log.path())
         .unwrap()
-        .query_row("SELECT COUNT(*) FROM pull_runs", [], |row| {
-            row.get::<_, i64>(0)
-        })
+        .query_row("SELECT COUNT(*) FROM pull_runs", [], |row| row.get(0))
         .unwrap()
-        > 0
-}
-
-fn report_of(report: &IngestReport) -> String {
-    format!(
-        "{:?} {:?} {:?} {:?} {:?} {}",
-        report.accepted,
-        report.queued,
-        report.rejected,
-        report.labels,
-        report.noise,
-        report.suspended
-    )
 }
 
 /// A Site whose pull walks a sealed Page and the live Feed, admits a
@@ -590,7 +561,7 @@ fn delivering_the_same_fetched_or_verified_result_twice_changes_nothing() {
 }
 
 #[test]
-fn a_reservation_outlives_a_crash_and_settles_once_to_the_bytes_read() {
+fn the_reservation_a_crashed_pull_left_is_released_with_its_run_and_settles_once() {
     let site = Site::new();
     site.feed(&[], NOW, None);
     let log = Log::onboard(&site);
@@ -614,10 +585,15 @@ fn a_reservation_outlives_a_crash_and_settles_once_to_the_bytes_read() {
         "an issued request reserves its whole bound against the budget"
     );
 
-    let resumed = start_run(db, &host, NOW);
-    assert_eq!(resumed.run_id, run.run_id, "the open run is resumed");
+    let next = start_run(db, &host, NOW);
+    assert_ne!(next.run_id, run.run_id, "the open run is not continued");
+    assert_eq!(
+        db.ingest_bytes(&host, day).unwrap(),
+        spent,
+        "the reservation of the request that never settled returns to the budget"
+    );
     db.reserve_pull_object(
-        resumed.run_id,
+        next.run_id,
         "delta",
         slot,
         "https://localhost/d",
@@ -626,18 +602,14 @@ fn a_reservation_outlives_a_crash_and_settles_once_to_the_bytes_read() {
         4096,
     )
     .unwrap();
-    assert_eq!(
-        db.ingest_bytes(&host, day).unwrap(),
-        spent + 4096,
-        "re-issuing the request moves its reservation rather than adding one"
-    );
-    db.settle_pull_object(&resumed, "delta", slot, Settled::Body(b"12345"))
+    assert_eq!(db.ingest_bytes(&host, day).unwrap(), spent + 4096);
+    db.settle_pull_object(&next, "delta", slot, Settled::Body(b"12345"))
         .unwrap();
     assert_eq!(db.ingest_bytes(&host, day).unwrap(), spent + 5);
 }
 
 #[test]
-fn a_pull_interrupted_after_any_commit_resumes_to_the_same_state_and_report() {
+fn a_fresh_pull_after_an_interruption_at_any_commit_admits_what_one_pull_admits() {
     let (site, ids) = walked_site();
     let expected = {
         let log = Log::onboard(&site);
@@ -654,7 +626,7 @@ fn a_pull_interrupted_after_any_commit_resumes_to_the_same_state_and_report() {
             ]
         );
         assert!(!report.suspended && report.noise.is_none());
-        (report_of(&report), persisted_state(&log))
+        admitted_state(&log)
     };
     for commits in 0.. {
         let log = Log::onboard(&site);
@@ -670,46 +642,27 @@ fn a_pull_interrupted_after_any_commit_resumes_to_the_same_state_and_report() {
             interrupted.is_err(),
             "the {commits}th commit interrupts the pull"
         );
-        if !holds_open_run(&log) {
-            assert_eq!(
-                persisted_state(&log),
-                expected.1,
-                "the pull closed its run before the {commits}th commit interrupted it"
-            );
-            break;
-        }
-        let resumed = log.pull(&site).unwrap();
-        assert_eq!(
-            (report_of(&resumed), persisted_state(&log)),
-            expected,
-            "resuming after the {commits}th commit"
+        let fresh = log.pull(&site).unwrap();
+        assert!(
+            !fresh.suspended,
+            "the pull after the {commits}th commit runs to its end"
         );
+        assert_eq!(
+            admitted_state(&log),
+            expected,
+            "a fresh pull after the {commits}th commit"
+        );
+        assert_eq!(open_runs(&log), 0, "the fresh pull closed its own run");
     }
 }
 
 #[test]
-fn an_open_run_resumes_only_within_its_day_and_the_baseline_interval() {
+fn a_pull_never_continues_the_run_an_interrupted_pull_left_open() {
     let site = Site::new();
     site.feed(&[], NOW, None);
     let log = Log::onboard(&site);
     let db = &log.db;
-    let fresh_run = |now: &str, max_age: i64| {
-        db.start_pull_run(
-            &NewRun {
-                domain: &site.host,
-                now,
-                day: &now[..10],
-                unit: &site.host,
-                work_bytes: 1 << 20,
-                work_objects: 64,
-                pages_epoch: None,
-            },
-            registry::unix(now).unwrap(),
-            max_age,
-        )
-        .unwrap()
-    };
-    let run = fresh_run(NOW, 86_400);
+    let run = start_run(db, &site.host, NOW);
     db.record_pull_object(
         run.run_id,
         "delta",
@@ -721,20 +674,19 @@ fn an_open_run_resumes_only_within_its_day_and_the_baseline_interval() {
     )
     .unwrap();
 
-    let resumed = fresh_run(NOW, 86_400);
-    assert_eq!(resumed.run_id, run.run_id);
-    assert!(db
-        .pull_object(run.run_id, "delta", "sha256:abc#0")
-        .unwrap()
-        .is_some());
-
-    let aged = fresh_run("2026-08-09T12:30:05Z", 60);
-    assert_ne!(aged.run_id, run.run_id, "a run older than the interval");
-    assert!(db
-        .pull_object(run.run_id, "delta", "sha256:abc#0")
-        .unwrap()
-        .is_none());
-
-    let next_day = fresh_run("2026-08-10T00:00:05Z", 86_400);
-    assert_ne!(next_day.run_id, aged.run_id, "a run of an earlier UTC day");
+    let next = start_run(db, &site.host, NOW);
+    assert_ne!(next.run_id, run.run_id, "the pull begins a fresh run");
+    assert_eq!(open_runs(&log), 1, "one run per domain");
+    assert!(
+        db.pull_object(run.run_id, "delta", "sha256:abc#0")
+            .unwrap()
+            .is_none(),
+        "the objects of the run left open are dropped with it"
+    );
+    assert_eq!(
+        next.phase,
+        Phase::Walk,
+        "a fresh run starts at Declaration discovery and the Feed walk"
+    );
+    assert_eq!(next.now, NOW, "a fresh run takes the new pull's clock");
 }
