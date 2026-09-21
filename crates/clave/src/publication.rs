@@ -145,6 +145,20 @@ fn publish_epoch(db: &Db, data_dir: &Path, epoch_number: u64, note: &str) -> Res
     Ok(wrote)
 }
 
+/// Lowest height first; returns the heights published. A connection whose
+/// lease was taken over writes no file.
+pub fn finish_committed(db: &Db, data_dir: &Path) -> Result<Vec<u64>> {
+    db.check_fence()?;
+    let mut published = Vec::new();
+    for (epoch_number, note) in db.unpublished_publications()? {
+        db.check_fence()?;
+        publish_epoch(db, data_dir, epoch_number, &note)?;
+        db.mark_published(epoch_number)?;
+        published.push(epoch_number);
+    }
+    Ok(published)
+}
+
 /// Re-signs every unsealed document a key removed at or below the store's
 /// head signed (WIST-3 §3.4), before a Checkpoint at that head is served
 /// to verify them against, then finishes every publication the store
@@ -155,13 +169,7 @@ fn publish_epoch(db: &Db, data_dir: &Path, epoch_number: u64, note: &str) -> Res
 pub fn recover(db: &Db, data_dir: &Path) -> Result<Vec<u64>> {
     db.check_fence()?;
     crate::snapshot::resign_unsealed(db, data_dir)?;
-    let mut republished = Vec::new();
-    for (epoch_number, note) in db.unpublished_publications()? {
-        db.check_fence()?;
-        publish_epoch(db, data_dir, epoch_number, &note)?;
-        db.mark_published(epoch_number)?;
-        republished.push(epoch_number);
-    }
+    let mut republished = finish_committed(db, data_dir)?;
     if let Some((epoch_number, note)) = db.head_publication()? {
         db.check_fence()?;
         if !republished.contains(&epoch_number) && publish_epoch(db, data_dir, epoch_number, &note)?

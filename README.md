@@ -234,8 +234,15 @@ restates the previous size and root.
 Epoch's `sealed_at` (at the current time before the first Epoch), an
 empty Epoch when nothing is eligible. An instant is sealed within its
 grace of `min(60, cadence / 2)` seconds after it, with `sealed_at` equal
-to the instant; one missed by more, or whose seal failed, is skipped and
-never sealed late. `serve --no-seal` leaves sealing to `seal`.
+to the instant however many attempts it took: while the instant is
+unsealed and its grace lasts, a failed seal is retried every 5 seconds,
+so a transient failure costs the Epoch nothing. An instant still unsealed
+once its grace has passed is skipped and never sealed late. Every pass
+first publishes each Epoch the store committed without publishing, under
+the same sealer lease, so a seal interrupted between its commit and its
+files serves that Checkpoint on the next pass rather than at the next
+grid instant. Without the lease a pass neither seals nor publishes.
+`serve --no-seal` leaves sealing to `seal`.
 
 Distribution runs after the commit, is idempotent and restart-safe, and
 writes each file through a sibling temporary file, syncing the file and

@@ -11,6 +11,13 @@ const RETRY_AFTER_READ_FAILURE: Duration = Duration::from_secs(1);
 /// How often the sealer lease's holder renews it and another process
 /// looks whether it has lapsed.
 const LEASE_RENEWAL_SECONDS: i64 = SEALER_LEASE_SECONDS / 3;
+const RETRY_INTERVAL_SECONDS: i64 = 5;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Attempt {
+    instant: i64,
+    at: i64,
+}
 
 /// What the sealing scheduler does next, as a Unix second on the cadence
 /// grid.
@@ -93,6 +100,60 @@ fn report_failure(what: &str, err: impl std::fmt::Display) {
     let _ = writeln!(std::io::stderr(), "{what}: {err}");
 }
 
+fn finish_publications(db_path: &Path, data_dir: &Path, owner: &str, token: i64) -> Result<()> {
+    let db = Db::connect(db_path)?.fenced(Fence::Sealer { token });
+    if db.unpublished_publications()?.is_empty() {
+        return Ok(());
+    }
+    crate::seal::under_renewed_lease(
+        db_path,
+        owner,
+        token,
+        crate::seal::LeaseTerms::default(),
+        || crate::publication::finish_committed(&db, data_dir),
+    )?;
+    Ok(())
+}
+
+fn pass(
+    db_path: &Path,
+    data_dir: &Path,
+    owner: &str,
+    now_unix: i64,
+    attempt: Option<Attempt>,
+    seal: impl FnOnce(i64, i64) -> Result<()>,
+) -> Result<(i64, Option<Attempt>)> {
+    let db = Db::connect(db_path)?;
+    let Some(token) = db.hold_sealer_lease(owner, now_unix)? else {
+        return Ok((now_unix + LEASE_RENEWAL_SECONDS, attempt));
+    };
+    finish_publications(db_path, data_dir, owner, token)?;
+    let (last, cadence) = grid(&db, now_unix)?;
+    match next_seal(last, cadence, now_unix) {
+        Decision::SleepUntil(instant) => {
+            Ok((instant.min(now_unix + LEASE_RENEWAL_SECONDS), attempt))
+        }
+        Decision::SealNow(instant) => {
+            if let Some(previous) = attempt.filter(|previous| previous.instant == instant) {
+                let due = previous.at + RETRY_INTERVAL_SECONDS;
+                if now_unix < due {
+                    return Ok((due, attempt));
+                }
+            }
+            if let Err(err) = seal(instant, token) {
+                report_failure(&format!("seal at Unix second {instant}"), err);
+            }
+            Ok((
+                now_unix,
+                Some(Attempt {
+                    instant,
+                    at: now_unix,
+                }),
+            ))
+        }
+    }
+}
+
 async fn sleep_until(instant: i64) {
     let wait = instant
         .saturating_mul(1000)
@@ -105,63 +166,43 @@ async fn sleep_until(instant: i64) {
 /// Seals an Epoch at every grid instant reached while serving and holding
 /// the Log's sealer lease as `owner`, re-reading the lease, the last Epoch
 /// and the cadence before each decision and at least every
-/// `LEASE_RENEWAL_SECONDS`. Each seal is fenced by the lease's token, so a
-/// seal begun after another process took the lease over commits nothing.
-/// An instant is attempted once: a failed seal is reported and the next
-/// instant awaited.
+/// `LEASE_RENEWAL_SECONDS`. An instant whose seal failed is retried while its
+/// grace lasts (WIST-3 §3.2) and never sealed late. Every seal and
+/// publication is fenced by the lease's token, so work begun after another
+/// process took the lease over writes nothing.
 pub async fn run(db_path: PathBuf, data_dir: PathBuf, client: Arc<Client>, owner: Arc<str>) {
-    let mut attempted: Option<i64> = None;
+    let mut attempt: Option<Attempt> = None;
     loop {
-        let read_path = db_path.clone();
-        let holder = owner.clone();
-        let read = tokio::task::spawn_blocking(move || {
+        let (store, data, client, holder) = (
+            db_path.clone(),
+            data_dir.clone(),
+            client.clone(),
+            owner.clone(),
+        );
+        let passed = tokio::task::spawn_blocking(move || {
             let now_unix = jiff::Timestamp::now().as_second();
-            let db = Db::connect(&read_path)?;
-            let Some(token) = db.hold_sealer_lease(&holder, now_unix)? else {
-                return Ok(None);
-            };
-            grid(&db, now_unix).map(|(last, cadence)| Some((token, last, cadence, now_unix)))
+            pass(
+                &store,
+                &data,
+                &holder,
+                now_unix,
+                attempt,
+                |instant, token| seal_at(&store, &data, &client, instant, &holder, token),
+            )
         })
         .await;
-        let (token, last, cadence, now_unix) = match read {
-            Ok(Ok(Some(state))) => state,
-            Ok(Ok(None)) => {
-                tokio::time::sleep(Duration::from_secs(LEASE_RENEWAL_SECONDS as u64)).await;
-                continue;
+        match passed {
+            Ok(Ok((due, made))) => {
+                attempt = made;
+                sleep_until(due).await;
             }
             Ok(Err(err)) => {
                 report_failure("sealing schedule", err);
                 tokio::time::sleep(RETRY_AFTER_READ_FAILURE).await;
-                continue;
             }
             Err(err) => {
                 report_failure("sealing schedule", err);
                 tokio::time::sleep(RETRY_AFTER_READ_FAILURE).await;
-                continue;
-            }
-        };
-        match next_seal(last.max(attempted), cadence, now_unix) {
-            Decision::SleepUntil(instant) => {
-                sleep_until(instant.min(now_unix + LEASE_RENEWAL_SECONDS)).await
-            }
-            Decision::SealNow(instant) => {
-                attempted = Some(instant);
-                let (db_path, data_dir, client, holder) = (
-                    db_path.clone(),
-                    data_dir.clone(),
-                    client.clone(),
-                    owner.clone(),
-                );
-                let sealed = tokio::task::spawn_blocking(move || {
-                    seal_at(&db_path, &data_dir, &client, instant, &holder, token)
-                })
-                .await;
-                let what = format!("seal at Unix second {instant}");
-                match sealed {
-                    Ok(Ok(())) => {}
-                    Ok(Err(err)) => report_failure(&what, err),
-                    Err(err) => report_failure(&what, err),
-                }
             }
         }
     }
@@ -173,6 +214,145 @@ mod tests {
 
     const HOUR: i64 = 3600;
     const T: i64 = 1_786_276_800;
+    const OWNER: &str = "sealing";
+
+    fn log(data: &Path) -> (PathBuf, Db) {
+        crate::init::run("127.0.0.1:0", data).unwrap();
+        let db_path = data.join("clave.sqlite");
+        let db = Db::open(&db_path).unwrap();
+        db.set_param("epoch_cadence_seconds", HOUR).unwrap();
+        (db_path, db)
+    }
+
+    fn transient(_instant: i64, _token: i64) -> Result<()> {
+        Err(Error::Seal("transient failure".into()))
+    }
+
+    #[test]
+    fn a_transient_seal_failure_is_retried_five_seconds_later_within_grace() {
+        let data = tempfile::tempdir().unwrap();
+        let (db_path, db) = log(data.path());
+        let (due, attempt) = pass(&db_path, data.path(), OWNER, T, None, transient).unwrap();
+        assert_eq!(due, T);
+        assert!(db.last_epoch().unwrap().is_none());
+
+        let mut attempts = 0;
+        let (due, attempt) = pass(&db_path, data.path(), OWNER, T + 4, attempt, |_, _| {
+            attempts += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!((due, attempts), (T + RETRY_INTERVAL_SECONDS, 0));
+
+        let client = Client::new(false);
+        pass(
+            &db_path,
+            data.path(),
+            OWNER,
+            T + 5,
+            attempt,
+            |instant, token| seal_at(&db_path, data.path(), &client, instant, OWNER, token),
+        )
+        .unwrap();
+        let epoch = db.last_epoch().unwrap().unwrap();
+        assert_eq!(
+            (epoch.epoch_number, epoch.sealed_at),
+            (0, crate::registry::instant(T).unwrap())
+        );
+        assert!(crate::publication::head_path(data.path()).exists());
+    }
+
+    #[test]
+    fn an_epoch_committed_without_publication_is_published_on_the_next_pass() {
+        let data = tempfile::tempdir().unwrap();
+        let (db_path, db) = log(data.path());
+        let (_, attempt) = pass(&db_path, data.path(), OWNER, T, None, |instant, _| {
+            crate::db::tests::seal_epoch(&db, 0, &crate::registry::instant(instant)?, &[]);
+            Err(Error::Seal("interrupted before publication".into()))
+        })
+        .unwrap();
+        assert_eq!(db.last_epoch().unwrap().unwrap().epoch_number, 0);
+        assert!(!crate::publication::head_path(data.path()).exists());
+
+        let mut attempts = 0;
+        let (due, _) = pass(&db_path, data.path(), OWNER, T + 1, attempt, |_, _| {
+            attempts += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(attempts, 0);
+        assert!(due < T + HOUR);
+        assert!(crate::publication::head_path(data.path()).exists());
+        assert!(crate::publication::archive_path(data.path(), 0).exists());
+        assert!(db.unpublished_publications().unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_unsealed_instant_is_retried_through_the_last_second_of_its_grace_and_no_later() {
+        let data = tempfile::tempdir().unwrap();
+        let (db_path, db) = log(data.path());
+        let (_, attempt) = pass(&db_path, data.path(), OWNER, T, None, transient).unwrap();
+
+        let mut attempts = 0;
+        let (_, attempt) = pass(
+            &db_path,
+            data.path(),
+            OWNER,
+            T + grace(HOUR),
+            attempt,
+            |instant, token| {
+                attempts += 1;
+                transient(instant, token)
+            },
+        )
+        .unwrap();
+        assert_eq!(attempts, 1);
+
+        let (due, _) = pass(
+            &db_path,
+            data.path(),
+            OWNER,
+            T + grace(HOUR) + 1,
+            attempt,
+            |_, _| {
+                attempts += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            (attempts, due),
+            (1, T + grace(HOUR) + 1 + LEASE_RENEWAL_SECONDS)
+        );
+        assert!(db.last_epoch().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_pass_without_the_sealer_lease_neither_retries_nor_publishes() {
+        let data = tempfile::tempdir().unwrap();
+        let (db_path, db) = log(data.path());
+        crate::db::tests::seal_epoch(&db, 0, &crate::registry::instant(T - HOUR).unwrap(), &[]);
+        assert!(db
+            .hold_sealer_lease("another instance", T)
+            .unwrap()
+            .is_some());
+        let waiting = Attempt {
+            instant: T,
+            at: T - RETRY_INTERVAL_SECONDS,
+        };
+
+        let mut attempts = 0;
+        let (due, attempt) = pass(&db_path, data.path(), OWNER, T, Some(waiting), |_, _| {
+            attempts += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!((attempts, due), (0, T + LEASE_RENEWAL_SECONDS));
+        assert_eq!(attempt, Some(waiting));
+        assert_eq!(db.last_epoch().unwrap().unwrap().epoch_number, 0);
+        assert!(!crate::publication::head_path(data.path()).exists());
+        assert_eq!(db.unpublished_publications().unwrap().len(), 1);
+    }
 
     #[test]
     fn grace_is_half_the_cadence_capped_at_sixty_seconds() {
