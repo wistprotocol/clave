@@ -64,7 +64,7 @@ fn ingest_endpoint_and_status_and_static() {
     let c = reqwest::blocking::Client::new();
     let r = c
         .post(format!("{addr}/ingest"))
-        .json(&serde_json::json!({"host": "127.0.0.1:9"}))
+        .json(&serde_json::json!({"host": "127.0.0.1"}))
         .send()
         .unwrap();
     assert_eq!(r.status(), 202);
@@ -207,7 +207,7 @@ fn ingest_rejects_unknown_fields() {
     let c = reqwest::blocking::Client::new();
     let r = c
         .post(format!("{addr}/ingest"))
-        .json(&serde_json::json!({"host": "127.0.0.1:9", "extra": true}))
+        .json(&serde_json::json!({"host": "127.0.0.1", "extra": true}))
         .send()
         .unwrap();
     assert_eq!(r.status(), 400);
@@ -268,7 +268,7 @@ fn ingest_ping_over_quota_gets_429_with_retry_after() {
     let c = reqwest::blocking::Client::new();
     let r = c
         .post(format!("{addr}/ingest"))
-        .json(&serde_json::json!({"host": "127.0.0.1:9"}))
+        .json(&serde_json::json!({"host": "127.0.0.1"}))
         .send()
         .unwrap();
     assert_eq!(r.status(), 429);
@@ -365,6 +365,140 @@ fn ingest_rejects_host_with_no_canonicalization() {
     assert_eq!(r.status(), 400);
 }
 
+fn idle_server(data_dir: &Path, allow_http: bool) -> String {
+    spawn_server_with_options(
+        data_dir,
+        clave::fetch::Client::new(allow_http),
+        clave::serve::ServeOptions {
+            max_concurrent_ingests: 0,
+            max_partitions: 0,
+            ..unsealed()
+        },
+    )
+}
+
+fn assert_nothing_started(data_dir: &Path, sent: &str, hosts: [&str; 2]) {
+    let db = store(data_dir);
+    let day = jiff::Timestamp::now().to_string()[..10].to_string();
+    for host in hosts {
+        assert_eq!(
+            db.scheduled_pull(host).unwrap(),
+            None,
+            "{sent:?} scheduled a pull for {host:?}"
+        );
+        assert_eq!(
+            db.noise_ping_count(host, &day).unwrap(),
+            0,
+            "{sent:?} counted against {host:?}'s quota"
+        );
+        assert!(
+            db.list_rejections(host).unwrap().is_empty(),
+            "{sent:?} recorded a rejection against {host:?}"
+        );
+        assert!(
+            db.get_publisher_status(host).unwrap().is_none(),
+            "{sent:?} made {host:?} a known domain"
+        );
+    }
+}
+
+fn ping(addr: &str, host: &str) -> u16 {
+    reqwest::blocking::Client::new()
+        .post(format!("{addr}/ingest"))
+        .json(&serde_json::json!({"host": host}))
+        .send()
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
+#[test]
+fn a_ping_whose_host_is_not_byte_identical_to_its_canonical_form_is_rejected_and_starts_nothing() {
+    for allow_http in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        clave::init::run("127.0.0.1:0", tmp.path()).unwrap();
+        let addr = idle_server(tmp.path(), allow_http);
+        for (sent, canonical) in [
+            ("EXAMPLE.com", "example.com"),
+            ("example.com.", "example.com"),
+            ("bücher.example", "xn--bcher-kva.example"),
+            ("example.com:8443", "example.com"),
+            ("LOCALHOST:8080", "localhost"),
+        ] {
+            assert_eq!(
+                ping(&addr, sent),
+                400,
+                "a non-canonical host {sent:?} must be rejected (allow_http: {allow_http})"
+            );
+            assert_nothing_started(tmp.path(), sent, [sent, canonical]);
+        }
+    }
+}
+
+#[test]
+fn a_ported_loopback_ping_host_is_admitted_only_under_the_loopback_http_opt_in() {
+    let strict = tempfile::tempdir().unwrap();
+    clave::init::run("127.0.0.1:0", strict.path()).unwrap();
+    let addr = idle_server(strict.path(), false);
+    assert_eq!(
+        ping(&addr, "127.0.0.1:9"),
+        400,
+        "a ported authority is no Canonical Host without the opt-in"
+    );
+    assert_nothing_started(strict.path(), "127.0.0.1:9", ["127.0.0.1:9", "127.0.0.1"]);
+
+    let relaxed = tempfile::tempdir().unwrap();
+    clave::init::run("127.0.0.1:0", relaxed.path()).unwrap();
+    let addr = idle_server(relaxed.path(), true);
+    assert_eq!(
+        ping(&addr, "127.0.0.1:9"),
+        202,
+        "the loopback deployment extension admits a ported loopback authority"
+    );
+    let db = store(relaxed.path());
+    assert_eq!(
+        db.scheduled_pull("127.0.0.1:9")
+            .unwrap()
+            .map(|pull| pull.reason),
+        Some(clave::db::Reason::Ping),
+        "the pull is scheduled under the ported authority"
+    );
+    assert_eq!(
+        db.scheduled_pull("127.0.0.1").unwrap(),
+        None,
+        "the ported authority is not stored port-free"
+    );
+}
+
+#[test]
+fn a_ping_whose_host_is_already_its_canonical_form_is_accepted_with_202() {
+    for allow_http in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        clave::init::run("127.0.0.1:0", tmp.path()).unwrap();
+        let addr = idle_server(tmp.path(), allow_http);
+        for host in [
+            "example.com",
+            "xn--bcher-kva.example",
+            "127.0.0.1",
+            "localhost",
+        ] {
+            assert_eq!(
+                ping(&addr, host),
+                202,
+                "a canonical host {host:?} must be accepted (allow_http: {allow_http})"
+            );
+            assert_eq!(
+                store(tmp.path())
+                    .scheduled_pull(host)
+                    .unwrap()
+                    .map(|pull| pull.reason),
+                Some(clave::db::Reason::Ping),
+                "{host:?} scheduled no pull"
+            );
+        }
+    }
+}
+
 #[test]
 fn pings_beyond_the_pending_bound_are_refused_with_retry_after() {
     let tmp = tempfile::tempdir().unwrap();
@@ -382,7 +516,7 @@ fn pings_beyond_the_pending_bound_are_refused_with_retry_after() {
     let c = reqwest::blocking::Client::new();
     let ping = |n: u8| {
         c.post(format!("{addr}/ingest"))
-            .json(&serde_json::json!({"host": format!("127.0.0.{n}:9")}))
+            .json(&serde_json::json!({"host": format!("127.0.0.{n}")}))
             .send()
             .unwrap()
     };

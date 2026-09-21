@@ -233,15 +233,28 @@ fn seconds_to_next_utc_day(now: &str) -> i64 {
         .unwrap_or(86400)
 }
 
+fn ping_host_admitted(host: &str, allow_http: bool) -> bool {
+    // WIST-2 §4 rejects a non-canonical host rather than canonicalizing it.
+    // The ported authority below is the --allow-http loopback extension, which
+    // `scheme_for_host` bounds to the hosts that opt-in reaches over http.
+    if wist_core::host::canonical_host(host).ok().as_deref() == Some(host) {
+        return true;
+    }
+    allow_http
+        && canonical_authority(host).as_deref() == Some(host)
+        && crate::fetch::scheme_for_host(host, true) == "http"
+}
+
 async fn ingest_handler(State(state): State<AppState>, body: Bytes) -> axum::response::Response {
     use axum::response::IntoResponse;
     let payload: IngestRequest = match serde_json::from_slice(&body) {
         Ok(p) => p,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
-    let Some(host) = canonical_authority(&payload.host) else {
+    let host = payload.host;
+    if !ping_host_admitted(&host, state.client.allow_http()) {
         return StatusCode::BAD_REQUEST.into_response();
-    };
+    }
     let now_unix = jiff::Timestamp::now().as_second();
     let now = utc(now_unix);
 

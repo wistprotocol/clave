@@ -93,13 +93,13 @@ fn poll_until(what: &str, timeout: Duration, mut ready: impl FnMut() -> bool) {
     }
 }
 
-/// A host on loopback that answers nothing, so its pull ends at the
-/// first-contact rejection of WIST-2 §5 step 0 as soon as it is claimed.
+/// A fresh loopback host serving no Publisher Declaration, so its pull
+/// ends at the first-contact rejection of WIST-2 §5 step 0 as soon as it
+/// is claimed. It carries no port, which WIST-2 §4's Canonical Host bars.
 fn unreachable_host() -> String {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-    addr.to_string()
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let nth = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("127.0.0.{}", 2 + nth % 250)
 }
 
 fn rejected(data: &Path, host: &str) -> bool {

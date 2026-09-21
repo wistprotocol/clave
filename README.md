@@ -208,6 +208,17 @@ waiting bound is refused with 503 and `Retry-After: 30`, is not queued,
 and counts as neither noise nor a pull, so the Publisher retries later
 under its own backoff. Quota (429) is answered before admission.
 
+The endpoint admits a Ping only when its `host` is byte-identical to its
+own Canonical Host (WIST-1 §2), the form WIST-2 §4 requires: an uppercase
+spelling, a trailing dot, an IDN U-label and a `host:port` authority are
+answered 400 instead of being canonicalized, and such a Ping schedules no
+pull, counts against no quota and records nothing. Under `--allow-http`,
+the local-test exception, the endpoint additionally admits `<host>:<port>`
+when `<host>` is a loopback name or address already in its Canonical Host
+form, so a loopback deployment on a nondefault port is pinged and pulled
+under that authority; every other spelling, `example.com:8443` and
+`LOCALHOST:8080` included, is answered 400 in both modes.
+
 ## The tree, its static layout and distribution
 
 The Log is one growing RFC 6962 tree over SHA-256 (WIST-3 §4). The store
