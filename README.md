@@ -414,8 +414,9 @@ restarted at the head each time.
 
 `serve` schedules pulls durably in the store. `pull_schedule` holds at
 most one due-time row per domain (`due_at` in Unix seconds, `reason`
-`ping`, `baseline`, `resume` or `retry`, the count of consecutive failed
-pulls, and `pinged_at`, the receipt instant of the earliest Ping the
+`ping`, `baseline`, `resume` or `retry`, the count of consecutive pulls
+that reached `WIST2-E01` or an internal failure, and `pinged_at`, the
+receipt instant of the earliest Ping the
 pull serves); `pull_tasks` holds each pull in flight with the same
 `pinged_at`, its owning instance, its lease and the partition token it
 was claimed under.
@@ -441,8 +442,8 @@ time is the earlier one; `retry` outranks every other reason and
 `resume` outranks `ping` and `baseline`; between `ping` and `baseline`
 the strictly earlier row's reason stays; the pull serves the earlier of
 the two rows' Pings. A Ping arriving against a waiting `retry` row also
-clears its failure count, so a fresh Ping cancels a pending backoff and
-starts a new attempt (WIST-2 §7, `WIST2-E01`).
+clears its retry count, so a fresh Ping cancels a pending backoff and
+starts a new attempt at the first delay (WIST-2 §7, `WIST2-E01`).
 
 A pull's noise disposition (WIST-2 §4: `WIST2-E02` or `WIST2-E04`) is
 charged only to the Ping the pull serves, against the Registrable
@@ -515,21 +516,34 @@ commits to, so a fenced-out pull writes none and a repeated admission
 writes the same file.
 
 A finished pull, in one write transaction, closes its run — which
-rebuilds its report, records the walk's suspension and, for a completed
-walk, the pull instant — drops its task and schedules the next pull,
+rebuilds its report, reports the code the pull or its Feed walk ended
+at, records the walk's suspension and, for a completed walk, the pull
+instant — drops its task and schedules the next pull,
 combined with any Ping row that arrived meanwhile. A takeover between the
 pull's last admission and that transaction writes none of it, so the
 domain's next pull, held by the new dispatcher, schedules from its own
 completion:
 
 - after a completed walk, `baseline` due `baseline_poll_seconds` after
-  the pull started;
+  the pull started, unless the walk stopped at a `next` failing the
+  target rule;
 - after a walk suspended at the pull's work limits, `resume` due at
   once, or at the next UTC day while the domain's daily ingest budget is
-  spent;
-- after a failed pull, `retry` due after `RETRY_BASE_SECONDS` (60)
-  doubled for every earlier consecutive failure, at most
-  `baseline_poll_seconds`; a successful pull resets the count.
+  spent, whatever the walk stopped at;
+- after a pull that ended at `WIST2-E01` — the Aggregator holds no usable
+  Feed — or that ran to its end with its Feed walk stopped at a `next`
+  failing the target rule, whose Deltas already fetched proceeded
+  regardless, or at an internal failure, `retry` due
+  `RETRY_BASE_SECONDS` (60) quadrupled for every earlier consecutive such
+  pull after the instant the pull ended, so WIST-2 §7's retries fall at
+  1, 4, 16 and 64 minutes; these delays are absolute, so a
+  `baseline_poll_seconds` shorter than one of them does not shorten it.
+  Once the fourth retry ends the same way the domain returns to the
+  baseline schedule with the count reset, and a pull whose walk completed
+  usably resets it too;
+- after a pull that ended at `WIST2-E04`, `WIST2-E05` or `WIST1-E02`,
+  `baseline` as after a completed walk: WIST-2 §7 backs off `WIST2-E01`
+  alone.
 
 A domain that is still no known publisher after its pull gets no next
 pull. Running a returned pull again is safe because admission is

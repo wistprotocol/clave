@@ -280,7 +280,6 @@ pub(super) fn abort(
     key: Option<&ObjectKey>,
     code: &str,
     detail: &str,
-    noise: bool,
 ) -> Result<()> {
     let mutation = db.mutation()?;
     reject(db, host, code, &run.now, None, detail)?;
@@ -295,9 +294,7 @@ pub(super) fn abort(
         )?;
     }
     run.phase = Phase::Aborted;
-    if noise {
-        run.noise = Some(code.to_string());
-    }
+    run.ended = Some(code.to_string());
     db.update_pull_run(run)?;
     mutation.commit()
 }
@@ -372,13 +369,15 @@ pub(super) fn admit_page(
         )?;
         if walk == Walk::Feed {
             run.phase = Phase::Aborted;
+            run.ended = Some("WIST2-E05".to_string());
             db.update_pull_run(run)?;
         }
         mutation.commit()?;
         return Ok(None);
     }
     let unseen = unseen(db, host, walk, &page.feed.deltas)?;
-    if walk == Walk::Feed && unseen && next == Some(None) {
+    let stopped_at_next = walk == Walk::Feed && unseen && next == Some(None);
+    if stopped_at_next {
         reject(
             db,
             host,
@@ -398,6 +397,9 @@ pub(super) fn admit_page(
     db.record_walk_page(host, walk.as_str(), index, &walked)?;
     if walk == Walk::Feed && unseen {
         run.unseen_any = true;
+        if stopped_at_next {
+            run.ended = Some("WIST2-E01".to_string());
+        }
         db.update_pull_run(run)?;
     }
     db.advance_pull_object(
@@ -747,16 +749,17 @@ pub(super) fn close_run(db: &Db, run_id: i64) -> Result<IngestReport> {
             code => report.rejected.push((id, code.to_string())),
         }
     }
-    report.noise = match run.noise.as_deref() {
+    report.noise = match run.ended.as_deref() {
         Some("WIST2-E04") => Some("WIST2-E04"),
         Some(_) | None => None,
     };
     match run.phase {
-        Phase::Aborted => {}
+        Phase::Aborted => report.ended = run.ended.clone(),
         Phase::Closing => {
             report.suspended = run.suspended;
             db.set_walk_suspended(&run.domain, run.suspended)?;
             if !run.suspended {
+                report.ended = run.ended.clone();
                 if !run.unseen_any
                     && report.accepted.is_empty()
                     && report.queued.is_empty()

@@ -10,7 +10,7 @@ use crate::error::{Error, Result};
 use rusqlite::{Connection, OptionalExtension};
 
 const SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS pull_runs(run_id INTEGER PRIMARY KEY AUTOINCREMENT, domain TEXT NOT NULL UNIQUE, token INTEGER, now TEXT NOT NULL, day TEXT NOT NULL, unit TEXT NOT NULL, phase TEXT NOT NULL CHECK(phase IN ('walk','deltas','labels','label_items','closing','aborted')), work_bytes INTEGER NOT NULL, work_objects INTEGER NOT NULL, feed_retry_used INTEGER NOT NULL DEFAULT 0, unseen_any INTEGER NOT NULL DEFAULT 0, suspended INTEGER NOT NULL DEFAULT 0, chain_pos INTEGER NOT NULL DEFAULT 0, pages_epoch INTEGER, queue_json BLOB NOT NULL DEFAULT '[]', position INTEGER NOT NULL DEFAULT 0, noise TEXT);
+CREATE TABLE IF NOT EXISTS pull_runs(run_id INTEGER PRIMARY KEY AUTOINCREMENT, domain TEXT NOT NULL UNIQUE, token INTEGER, now TEXT NOT NULL, day TEXT NOT NULL, unit TEXT NOT NULL, phase TEXT NOT NULL CHECK(phase IN ('walk','deltas','labels','label_items','closing','aborted')), work_bytes INTEGER NOT NULL, work_objects INTEGER NOT NULL, feed_retry_used INTEGER NOT NULL DEFAULT 0, unseen_any INTEGER NOT NULL DEFAULT 0, suspended INTEGER NOT NULL DEFAULT 0, chain_pos INTEGER NOT NULL DEFAULT 0, pages_epoch INTEGER, queue_json BLOB NOT NULL DEFAULT '[]', position INTEGER NOT NULL DEFAULT 0, ended TEXT);
 CREATE TABLE IF NOT EXISTS pull_objects(run_id INTEGER NOT NULL, kind TEXT NOT NULL, object_id TEXT NOT NULL, url TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('issued','fetched','verified','admitted','rejected','failed')), raw BLOB, byte_len INTEGER, debited INTEGER NOT NULL DEFAULT 0, checks_json TEXT, refs_json TEXT, report TEXT, report_seq INTEGER, PRIMARY KEY(run_id, kind, object_id));
 CREATE TABLE IF NOT EXISTS pull_walk(domain TEXT NOT NULL, feed TEXT NOT NULL CHECK(feed IN ('feed','label')), idx INTEGER NOT NULL, url TEXT NOT NULL, generated_at TEXT NOT NULL, ids_json BLOB NOT NULL, next_url TEXT, raw BLOB, PRIMARY KEY(domain, feed, idx));
 CREATE TABLE IF NOT EXISTS pull_attempts(run_id INTEGER NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('delta_refresh','resolved_prev')), id TEXT NOT NULL, PRIMARY KEY(run_id, kind, id));
@@ -130,7 +130,7 @@ pub(crate) struct PullRun {
     pub pages_epoch: Option<u64>,
     pub queue: Vec<String>,
     pub position: usize,
-    pub noise: Option<String>,
+    pub ended: Option<String>,
 }
 
 /// One object of a run as its row records it.
@@ -187,7 +187,7 @@ pub(crate) enum Settled<'a> {
     Failed(&'a str),
 }
 
-const RUN_COLUMNS: &str = "run_id, domain, now, day, unit, phase, work_bytes, work_objects, feed_retry_used, unseen_any, suspended, chain_pos, pages_epoch, queue_json, position, noise";
+const RUN_COLUMNS: &str = "run_id, domain, now, day, unit, phase, work_bytes, work_objects, feed_retry_used, unseen_any, suspended, chain_pos, pages_epoch, queue_json, position, ended";
 
 fn run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(PullRun, String, String)> {
     Ok((
@@ -207,7 +207,7 @@ fn run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(PullRun, String, String
             pages_epoch: row.get::<_, Option<i64>>(12)?.map(|h| h.max(0) as u64),
             queue: Vec::new(),
             position: row.get::<_, i64>(14)?.max(0) as usize,
-            noise: row.get(15)?,
+            ended: row.get(15)?,
         },
         row.get(5)?,
         row.get(13)?,
@@ -296,11 +296,11 @@ impl Db {
         run_by(&self.conn, "run_id = ?1", [run_id])
     }
 
-    /// Records `run`'s phase, remaining work, flags, position and noise,
+    /// Records `run`'s phase, remaining work, flags, position and `ended`,
     /// not its queue: rewriting that per item costs its length squared.
     pub(crate) fn update_pull_run(&self, run: &PullRun) -> Result<()> {
         self.execute(
-            "UPDATE pull_runs SET phase = ?2, work_bytes = ?3, work_objects = ?4, feed_retry_used = ?5, unseen_any = ?6, suspended = ?7, chain_pos = ?8, position = ?9, noise = ?10 WHERE run_id = ?1",
+            "UPDATE pull_runs SET phase = ?2, work_bytes = ?3, work_objects = ?4, feed_retry_used = ?5, unseen_any = ?6, suspended = ?7, chain_pos = ?8, position = ?9, ended = ?10 WHERE run_id = ?1",
             rusqlite::params![
                 run.run_id,
                 run.phase.as_str(),
@@ -311,7 +311,7 @@ impl Db {
                 run.suspended,
                 run.chain_pos,
                 run.position as i64,
-                run.noise,
+                run.ended,
             ],
         )?;
         Ok(())

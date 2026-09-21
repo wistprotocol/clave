@@ -2325,6 +2325,34 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_run_table_naming_its_disposition_noise_is_reopened_with_the_column_renamed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("clave.sqlite");
+        let db = Db::open(&path).unwrap();
+        let mut run = db
+            .start_pull_run(&NewRun {
+                domain: "a.example",
+                now: "2026-08-09T12:00:00Z",
+                day: "2026-08-09",
+                unit: "a.example",
+                work_bytes: 1,
+                work_objects: 1,
+                pages_epoch: None,
+            })
+            .unwrap();
+        run.ended = Some("WIST2-E01".to_string());
+        db.update_pull_run(&run).unwrap();
+        db.conn
+            .execute_batch("ALTER TABLE pull_runs RENAME COLUMN ended TO noise")
+            .unwrap();
+        drop(db);
+
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.pull_run(run.run_id).unwrap(), Some(run));
+        Db::open(&path).unwrap();
+    }
+
+    #[test]
     fn feed_observations_are_atomic_and_host_scoped_across_connections() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("clave.sqlite");

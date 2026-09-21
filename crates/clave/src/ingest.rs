@@ -26,6 +26,8 @@ pub struct IngestReport {
     /// Label and Dispute IDs accepted for sealing from the Label Feed.
     pub labels: Vec<String>,
     pub noise: Option<&'static str>,
+    /// The rejection code the pull, or its Feed walk alone, ended at.
+    pub ended: Option<String>,
     pub suspended: bool,
 }
 
@@ -406,15 +408,13 @@ pub fn finish_pull(
         let unit = crate::suffix_list::unit_at(db, &task.domain, &at)?;
         db.bump_noise_ping(&unit, at.get(..10).unwrap_or(&at))?;
     }
-    db.complete_pull(
-        task,
-        owner,
-        started_at,
-        crate::db::PullOutcome::Pulled {
+    let outcome = match report.ended.as_deref() {
+        Some("WIST2-E01") => crate::db::PullOutcome::FeedUnusable,
+        _ => crate::db::PullOutcome::Pulled {
             suspended: report.suspended,
         },
-        now,
-    )?;
+    };
+    db.complete_pull(task, owner, started_at, outcome, now)?;
     mutation.commit()?;
     Ok(report)
 }
@@ -706,14 +706,8 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
         )
     }
 
-    fn abort(
-        &mut self,
-        key: Option<&ObjectKey>,
-        code: &str,
-        detail: &str,
-        noise: bool,
-    ) -> Result<()> {
-        admit::abort(self.db, &mut self.run, self.host, key, code, detail, noise)
+    fn abort(&mut self, key: Option<&ObjectKey>, code: &str, detail: &str) -> Result<()> {
+        admit::abort(self.db, &mut self.run, self.host, key, code, detail)
     }
 
     /// Ends the pull's work, suspended or complete, leaving the run to be
@@ -768,7 +762,7 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
                     admit::onboard(db, &mut self.run, host, &key, &raw, &value, &publisher)?
                 }
                 Err(detail) => {
-                    self.abort(Some(&key), "WIST2-E04", &detail, true)?;
+                    self.abort(Some(&key), "WIST2-E04", &detail)?;
                     return Ok(false);
                 }
             }
@@ -786,7 +780,6 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
                             None,
                             "WIST1-E02",
                             &format!("Key Set cache expired and rediscovery failed: {e}"),
-                            false,
                         )?;
                         return Ok(false);
                     }
@@ -798,12 +791,11 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
                 None,
                 "WIST1-E02",
                 "Key Set cache expired without an accepted Declaration refresh",
-                false,
             )?;
             return Ok(false);
         }
         if let Err(e) = declaration::publisher_of(&current_doc) {
-            self.abort(None, "WIST2-E04", &e, true)?;
+            self.abort(None, "WIST2-E04", &e)?;
             return Ok(false);
         }
         Ok(true)
@@ -890,15 +882,13 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
                     let (raw, value) = match self.page_envelope(&key, &url, cursor.get(&url))? {
                         Got::Body(raw, value) => (raw, value),
                         Got::Suspend => return self.finish(true),
-                        Got::Failed(detail) => {
-                            return self.abort(Some(&key), "WIST2-E01", &detail, false)
-                        }
+                        Got::Failed(detail) => return self.abort(Some(&key), "WIST2-E01", &detail),
                     };
                     let checks = verify::page(&value, host);
                     let parsed = match checks.fields {
                         Ok(parsed) => parsed,
                         Err(detail) => {
-                            return self.abort(Some(&key), "WIST2-E01", detail, false);
+                            return self.abort(Some(&key), "WIST2-E01", detail);
                         }
                     };
                     if !checks.domain_matches {
@@ -906,7 +896,6 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
                             Some(&key),
                             "WIST2-E04",
                             "feed domain does not match the host it was fetched from",
-                            true,
                         );
                     }
                     self.settle()?;
@@ -941,7 +930,6 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
                             Some(&key),
                             "WIST2-E04",
                             "feed signature does not verify against the domain's Key Set",
-                            true,
                         );
                     }
                     let next =

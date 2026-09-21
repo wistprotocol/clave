@@ -15,9 +15,9 @@ use rusqlite::{Connection, OptionalExtension};
 /// holding its partition may return it to the schedule; a running pull's
 /// lease is renewed while it runs.
 pub const LEASE_SECONDS: i64 = 600;
-/// The delay after a pull's first consecutive failure; each further
-/// failure doubles it, up to `baseline_poll_seconds`.
+/// WIST-2 §7's first backoff delay, each further one quadrupling it.
 pub const RETRY_BASE_SECONDS: i64 = 60;
+const RETRY_ATTEMPTS: i64 = 4;
 
 const SCHEMA: &str = "
 CREATE TABLE pull_schedule(domain TEXT PRIMARY KEY, partition INTEGER NOT NULL, due_at INTEGER NOT NULL, reason TEXT NOT NULL CHECK(reason IN ('ping','baseline','resume','retry')), attempts INTEGER NOT NULL DEFAULT 0, pinged_at INTEGER);
@@ -141,6 +141,8 @@ pub enum PullOutcome {
     Pulled {
         suspended: bool,
     },
+    /// WIST-2 §5 and §7: the one disposition §7's backoff retries.
+    FeedUnusable,
     Failed,
 }
 
@@ -355,6 +357,12 @@ fn oldest_due(
 
 fn baseline_interval(db: &Db, now: i64) -> Result<i64> {
     crate::registry::effective(db, "baseline_poll_seconds", &crate::registry::instant(now)?)
+}
+
+fn retry_delay(before: i64) -> Option<i64> {
+    (0..RETRY_ATTEMPTS)
+        .contains(&before)
+        .then(|| RETRY_BASE_SECONDS << (2 * before))
 }
 
 impl Db {
@@ -579,9 +587,9 @@ impl Db {
     }
 
     /// Ends `owner`'s pull of `task`, which started at `started_at`, and
-    /// schedules the domain's next pull at `now`: after a failure `retry`
-    /// with one more attempt, due after `RETRY_BASE_SECONDS` doubled per
-    /// earlier consecutive failure and at most `baseline_poll_seconds`;
+    /// schedules the domain's next pull at `now`: after an unusable Feed or
+    /// an internal failure `retry` with one more attempt, due at WIST-2 §7's
+    /// backoff delay past `now`, or `baseline` once its four are spent;
     /// after a suspended walk `resume`, due at once while the domain's
     /// daily ingest budget has room and at the next UTC day otherwise;
     /// after a completed walk `baseline`, due `baseline_poll_seconds`
@@ -611,14 +619,10 @@ impl Db {
         }
         let interval = baseline_interval(self, now)?;
         let (due_at, reason, attempts) = match outcome {
-            PullOutcome::Failed => {
-                let attempts = task.attempts + 1;
-                let backoff = RETRY_BASE_SECONDS
-                    .checked_shl((attempts - 1).clamp(0, 32) as u32)
-                    .unwrap_or(i64::MAX)
-                    .min(interval);
-                (now.saturating_add(backoff), Reason::Retry, attempts)
-            }
+            PullOutcome::FeedUnusable | PullOutcome::Failed => match retry_delay(task.attempts) {
+                Some(delay) => (now.saturating_add(delay), Reason::Retry, task.attempts + 1),
+                None => (started_at.saturating_add(interval), Reason::Baseline, 0),
+            },
             PullOutcome::Pulled { suspended: true } => {
                 (self.resume_at(&task.domain, now)?, Reason::Resume, 0)
             }
@@ -1090,29 +1094,54 @@ mod tests {
         );
     }
 
-    #[test]
-    fn failing_pulls_back_off_exponentially_up_to_the_baseline_interval_and_reset_on_success() {
-        let (_tmp, db) = open_db();
-        db.set_param("baseline_poll_seconds", 600).unwrap();
-        db.insert_publisher("a.example", b"{}", "k", "p").unwrap();
+    fn back_off_four_times(db: &Db, outcome: PullOutcome) -> i64 {
         let mut now = NOW;
-        for (attempts, backoff) in [(1, 60), (2, 120), (3, 240), (4, 480), (5, 600)] {
+        for (attempts, backoff) in [(1, 60), (2, 240), (3, 960), (4, 3_840)] {
             let task = db
                 .claim_pulls(now, 1, "me", ALL, &[], &mut false)
                 .unwrap()
                 .remove(0);
-            db.complete_pull(&task, "me", now, PullOutcome::Failed, now)
-                .unwrap();
+            let ended = now + 5;
+            db.complete_pull(&task, "me", now, outcome, ended).unwrap();
             assert_eq!(
                 db.scheduled_pull("a.example").unwrap(),
-                Some(due("a.example", now + backoff, Reason::Retry, attempts))
+                Some(due("a.example", ended + backoff, Reason::Retry, attempts)),
+                "the retry follows the instant the pull ended"
             );
             assert!(db
-                .claim_pulls(now + backoff - 1, 1, "me", ALL, &[], &mut false)
+                .claim_pulls(ended + backoff - 1, 1, "me", ALL, &[], &mut false)
                 .unwrap()
                 .is_empty());
-            now += backoff;
+            now = ended + backoff;
         }
+        now
+    }
+
+    #[test]
+    fn a_pull_ended_at_wist2_e01_is_retried_at_one_four_sixteen_and_sixty_four_minutes() {
+        let (_tmp, db) = open_db();
+        db.set_param("baseline_poll_seconds", 86_400).unwrap();
+        db.insert_publisher("a.example", b"{}", "k", "p").unwrap();
+        let now = back_off_four_times(&db, PullOutcome::FeedUnusable);
+        let task = db
+            .claim_pulls(now, 1, "me", ALL, &[], &mut false)
+            .unwrap()
+            .remove(0);
+        db.complete_pull(&task, "me", now, PullOutcome::FeedUnusable, now + 5)
+            .unwrap();
+        assert_eq!(
+            db.scheduled_pull("a.example").unwrap(),
+            Some(due("a.example", now + 86_400, Reason::Baseline, 0)),
+            "a fourth retry ending at WIST2-E01 returns the domain to the baseline schedule"
+        );
+    }
+
+    #[test]
+    fn internal_failures_back_off_past_a_shorter_baseline_and_reset_on_success() {
+        let (_tmp, db) = open_db();
+        db.set_param("baseline_poll_seconds", 600).unwrap();
+        db.insert_publisher("a.example", b"{}", "k", "p").unwrap();
+        let now = back_off_four_times(&db, PullOutcome::Failed);
         let task = db
             .claim_pulls(now, 1, "me", ALL, &[], &mut false)
             .unwrap()
@@ -1122,12 +1151,75 @@ mod tests {
             "me",
             now,
             PullOutcome::Pulled { suspended: false },
-            now,
+            now + 5,
         )
         .unwrap();
         assert_eq!(
             db.scheduled_pull("a.example").unwrap(),
             Some(due("a.example", now + 600, Reason::Baseline, 0))
+        );
+    }
+
+    #[test]
+    fn a_successful_pull_clears_the_retry_count_of_the_pulls_that_ended_at_wist2_e01() {
+        let (_tmp, db) = open_db();
+        db.set_param("baseline_poll_seconds", 3600).unwrap();
+        db.insert_publisher("a.example", b"{}", "k", "p").unwrap();
+        let complete = |now: i64, outcome: PullOutcome| {
+            let task = db
+                .claim_pulls(now, 1, "me", ALL, &[], &mut false)
+                .unwrap()
+                .remove(0);
+            db.complete_pull(&task, "me", now, outcome, now).unwrap();
+            db.scheduled_pull("a.example").unwrap().unwrap()
+        };
+        let first = complete(NOW, PullOutcome::FeedUnusable);
+        assert_eq!(first, due("a.example", NOW + 60, Reason::Retry, 1));
+        let second = complete(first.due_at, PullOutcome::FeedUnusable);
+        assert_eq!(
+            second,
+            due("a.example", first.due_at + 240, Reason::Retry, 2)
+        );
+        let pulled = complete(second.due_at, PullOutcome::Pulled { suspended: false });
+        assert_eq!(
+            pulled,
+            due("a.example", second.due_at + 3600, Reason::Baseline, 0)
+        );
+        assert_eq!(
+            complete(pulled.due_at, PullOutcome::FeedUnusable),
+            due("a.example", pulled.due_at + 60, Reason::Retry, 1),
+            "the next pull that ends at WIST2-E01 is the first retry again"
+        );
+    }
+
+    #[test]
+    fn a_pull_ended_at_e04_e05_or_wist1_e02_keeps_the_baseline_schedule() {
+        let (_tmp, db) = open_db();
+        db.set_param("baseline_poll_seconds", 3600).unwrap();
+        db.insert_publisher("a.example", b"{}", "k", "p").unwrap();
+        let task = db
+            .claim_pulls(NOW, 1, "me", ALL, &[], &mut false)
+            .unwrap()
+            .remove(0);
+        db.complete_pull(&task, "me", NOW, PullOutcome::FeedUnusable, NOW)
+            .unwrap();
+        let retry = db.scheduled_pull("a.example").unwrap().unwrap();
+        assert_eq!(retry.attempts, 1);
+        let task = db
+            .claim_pulls(retry.due_at, 1, "me", ALL, &[], &mut false)
+            .unwrap()
+            .remove(0);
+        db.complete_pull(
+            &task,
+            "me",
+            retry.due_at,
+            PullOutcome::Pulled { suspended: false },
+            retry.due_at,
+        )
+        .unwrap();
+        assert_eq!(
+            db.scheduled_pull("a.example").unwrap(),
+            Some(due("a.example", retry.due_at + 3600, Reason::Baseline, 0))
         );
     }
 

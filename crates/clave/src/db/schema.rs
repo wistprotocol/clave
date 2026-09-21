@@ -4,7 +4,7 @@ use super::Mutation;
 use crate::error::{Error, Result};
 use rusqlite::{Connection, OptionalExtension};
 
-/// Applies the schema, the lease tables, the added columns, the acceptance-order clock, the
+/// Applies the schema, the lease tables, the run disposition rename, the added columns, the acceptance-order clock, the
 /// key-act backfill and the url_tips key migration, each idempotent on a
 /// current store.
 pub(super) fn migrate(conn: &Connection) -> Result<()> {
@@ -12,6 +12,7 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA)?;
     super::leases::create(conn)?;
     super::pull_runs::create(conn)?;
+    rename_run_disposition(conn)?;
     add_missing_columns(conn)?;
     restore_acceptance_order(conn)?;
     backfill_key_acts(conn)?;
@@ -93,6 +94,18 @@ CREATE TABLE IF NOT EXISTS sealed_declarations(domain TEXT NOT NULL, seq INTEGER
 CREATE TABLE IF NOT EXISTS queued_deltas(rowid INTEGER PRIMARY KEY AUTOINCREMENT, domain TEXT NOT NULL, delta_id TEXT NOT NULL, entry_json BLOB NOT NULL, url TEXT NOT NULL, chain_pos INTEGER NOT NULL, acceptance_order INTEGER);
 CREATE TABLE IF NOT EXISTS pending_identities(domain TEXT PRIMARY KEY, declaration_json BLOB NOT NULL);
 ";
+
+fn rename_run_disposition(conn: &Connection) -> Result<()> {
+    let legacy: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('pull_runs') WHERE name = 'noise')",
+        [],
+        |row| row.get(0),
+    )?;
+    if legacy {
+        conn.execute_batch("ALTER TABLE pull_runs RENAME COLUMN noise TO ended")?;
+    }
+    Ok(())
+}
 
 pub(super) fn add_missing_columns(conn: &Connection) -> Result<()> {
     for statement in [
