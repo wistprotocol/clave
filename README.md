@@ -196,10 +196,12 @@ so a name that rebinds between two fetches is refused on the second. A
 refused destination is a failed fetch with the address class named.
 A redirect may leave the requested Canonical Host only for a host the
 Publisher's Declaration lists in `subdomain_scope` at the moment the
-request is issued (WIST-2 §8): a replacement Declaration admitted
-earlier in the same pull governs the requests after it, a scope it
-withdrew no longer authorizes a redirect, and before the first accepted
-Declaration a redirect stays on the requested host.
+request is issued (WIST-2 §8): a replacement Declaration admitted, or a
+recovery settlement applied, earlier in the same pull governs the
+requests after it — including the Declaration retry a Delta's binding
+failure asks for — a scope it withdrew no longer authorizes a redirect,
+and before the first accepted Declaration a redirect stays on the
+requested host.
 
 `serve` bounds the work a Ping can start: at most 4 pulls run at once and
 at most 64 accepted Pings wait for a slot. A Ping for a host with a pull

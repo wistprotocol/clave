@@ -612,12 +612,11 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
         })
     }
 
-    /// Requests `publisher.json` outside the budget under the redirect
-    /// scope `scope`, unless the run already holds the response.
+    /// Requests `publisher.json` outside the budget, under the redirect
+    /// scope in force when it is issued, unless the run holds the response.
     fn get_declaration(
         &self,
         key: &ObjectKey,
-        scope: Vec<String>,
         checks: Option<&str>,
     ) -> Result<std::result::Result<(Vec<u8>, Value), String>> {
         let (kind, slot) = (key.kind(), key.name());
@@ -633,7 +632,7 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
             self.client,
             &FetchRequest {
                 url: url.clone(),
-                scope,
+                scope: self.scope()?,
                 limit: crate::fetch::OBJECT_CAP_BYTES,
                 cap: crate::fetch::OBJECT_CAP_BYTES,
                 metered: false,
@@ -682,8 +681,8 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
 
     /// Requests `publisher.json` for the retry `key` carries and admits
     /// what it returns, spending the retry either way.
-    fn refresh(&mut self, key: &ObjectKey, scope: Vec<String>) -> Result<()> {
-        match self.get_declaration(key, scope, None)? {
+    fn refresh(&mut self, key: &ObjectKey) -> Result<()> {
+        match self.get_declaration(key, None)? {
             Ok((raw, value)) => {
                 self.admit_declaration(key, &raw, value)?;
             }
@@ -752,7 +751,7 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
         let checks = serde_json::json!({ "first_contact": first_contact }).to_string();
         if first_contact && !discovered {
             let first = self
-                .get_declaration(&key, self.scope()?, Some(&checks))?
+                .get_declaration(&key, Some(&checks))?
                 .and_then(|(raw, value)| {
                     let publisher = verify::initial_declaration(&value, host)?;
                     Ok((raw, value, publisher))
@@ -772,7 +771,7 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
             .ok_or_else(|| crate::error::Error::Fetch("publisher row lost mid-ingest".into()))?;
         let mut current_doc: Value = crate::json::parse(&stored_raw)?;
         if !first_contact && !discovered {
-            match self.get_declaration(&key, self.scope()?, Some(&checks))? {
+            match self.get_declaration(&key, Some(&checks))? {
                 Ok((raw, value)) => current_doc = self.admit_declaration(&key, &raw, value)?,
                 Err(e) => {
                     if key_set_cache_expired(db, host, &self.now())? {
@@ -932,7 +931,7 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
                         let retry = ObjectKey::Declaration {
                             attempt: Attempt::Feed,
                         };
-                        self.refresh(&retry, self.scope()?)?;
+                        self.refresh(&retry)?;
                         self.settle()?;
                         passed = verified(self)?;
                     }
@@ -1262,7 +1261,6 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
         doc: &Value,
         attempt: &mut verify::IssuedRefs,
     ) -> Result<std::result::Result<(), &'static str>> {
-        let scope = self.scope()?;
         self.settle()?;
         attempt.decl = declaration_ref(self.db, self.host)?;
         let mut authority = verify::delta_authority(&attempt.decl.sources, doc);
@@ -1274,7 +1272,7 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
             let key = ObjectKey::Declaration {
                 attempt: Attempt::Delta(id.to_string()),
             };
-            self.refresh(&key, scope)?;
+            self.refresh(&key)?;
             self.settle()?;
             attempt.decl = declaration_ref(self.db, self.host)?;
             authority = verify::delta_authority(&attempt.decl.sources, doc);
