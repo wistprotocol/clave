@@ -268,6 +268,28 @@ fn open_runs(log: &Log) -> i64 {
         .unwrap()
 }
 
+/// SQLite fires `UPDATE OF` on the statement's SET list, so this counts
+/// writes of the queue column, changed value or not.
+fn count_queue_writes(log: &Log) {
+    rusqlite::Connection::open(log.path())
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE queue_writes(writes INTEGER NOT NULL);
+            INSERT INTO queue_writes VALUES (0);
+            CREATE TRIGGER count_queue_writes AFTER UPDATE OF queue_json ON pull_runs BEGIN
+                UPDATE queue_writes SET writes = writes + 1;
+            END;",
+        )
+        .unwrap();
+}
+
+fn queue_writes(log: &Log) -> i64 {
+    rusqlite::Connection::open(log.path())
+        .unwrap()
+        .query_row("SELECT writes FROM queue_writes", [], |row| row.get(0))
+        .unwrap()
+}
+
 /// A Site whose pull walks a sealed Page and the live Feed, admits a
 /// Delta whose predecessor it must retrieve, rejects one whose Payload
 /// does not match its commitment, and walks a Label Feed listing a file
@@ -689,4 +711,36 @@ fn a_pull_never_continues_the_run_an_interrupted_pull_left_open() {
         "a fresh run starts at Declaration discovery and the Feed walk"
     );
     assert_eq!(next.now, NOW, "a fresh run takes the new pull's clock");
+}
+
+#[test]
+fn settling_a_fetch_or_admitting_an_item_does_not_write_the_run_s_queue() {
+    let mut writes = Vec::new();
+    for items in [2u32, 8] {
+        let site = Site::new();
+        let ids: Vec<String> = (0..items)
+            .map(|n| {
+                site.delta(
+                    &format!("https://localhost/{n}"),
+                    "listed",
+                    None,
+                    "2026-08-09T11:00:00Z",
+                )
+            })
+            .collect();
+        site.feed(&ids, NOW, None);
+        let log = Log::onboard(&site);
+        count_queue_writes(&log);
+        let report = log.pull(&site).unwrap();
+        assert_eq!(report.accepted, ids, "every listed Delta is admitted");
+        writes.push(queue_writes(&log));
+    }
+    assert_eq!(
+        writes[0], writes[1],
+        "the queue is written where it changes, not once per item decided"
+    );
+    assert_eq!(
+        writes[0], 3,
+        "the Feed walk, the Delta queue and the Label Feed walk each end once"
+    );
 }

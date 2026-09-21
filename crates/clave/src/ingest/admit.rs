@@ -495,6 +495,7 @@ pub(super) fn splice_predecessor(
     db.record_pull_attempt(run.run_id, "resolved_prev", id)?;
     run.queue.insert(index, prev.to_string());
     run.position = index;
+    db.set_pull_queue(run)?;
     db.update_pull_run(run)?;
     mutation.commit()
 }
@@ -716,6 +717,7 @@ pub(super) fn end_walk(
     run.phase = phase;
     run.queue = queue;
     run.position = 0;
+    db.set_pull_queue(run)?;
     db.update_pull_run(run)?;
     mutation.commit()
 }

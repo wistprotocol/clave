@@ -271,10 +271,11 @@ impl Db {
         run_by(&self.conn, "run_id = ?1", [run_id])
     }
 
-    /// Records `run`'s phase, remaining work, flags, queue and noise.
+    /// Records `run`'s phase, remaining work, flags, position and noise,
+    /// not its queue: rewriting that per item costs its length squared.
     pub(crate) fn update_pull_run(&self, run: &PullRun) -> Result<()> {
         self.execute(
-            "UPDATE pull_runs SET phase = ?2, work_bytes = ?3, work_objects = ?4, feed_retry_used = ?5, unseen_any = ?6, suspended = ?7, chain_pos = ?8, queue_json = ?9, position = ?10, noise = ?11 WHERE run_id = ?1",
+            "UPDATE pull_runs SET phase = ?2, work_bytes = ?3, work_objects = ?4, feed_retry_used = ?5, unseen_any = ?6, suspended = ?7, chain_pos = ?8, position = ?9, noise = ?10 WHERE run_id = ?1",
             rusqlite::params![
                 run.run_id,
                 run.phase.as_str(),
@@ -284,10 +285,17 @@ impl Db {
                 run.unseen_any,
                 run.suspended,
                 run.chain_pos,
-                serde_json::to_string(&run.queue)?,
                 run.position as i64,
                 run.noise,
             ],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn set_pull_queue(&self, run: &PullRun) -> Result<()> {
+        self.execute(
+            "UPDATE pull_runs SET queue_json = ?2 WHERE run_id = ?1",
+            rusqlite::params![run.run_id, serde_json::to_string(&run.queue)?],
         )?;
         Ok(())
     }

@@ -365,9 +365,10 @@ domain): each request enters `pull_objects` with the bytes it reserved
 before it is issued, and the response, its verification and its admission
 move that row forward; the domain's walk cursor (`pull_walk`) holds the
 pages walked; `pull_attempts` holds the Declaration retry each Delta ID
-spent and the predecessors it retrieved; and the run's phase, queue,
-position, chain position and remaining work advance in the same
-transaction as the admission that moved them.
+spent and the predecessors it retrieved; and the run's phase, position,
+chain position and remaining work advance in the same transaction as the
+admission that moved them, its queue being written where a walk ends or a
+retrieved predecessor is spliced into it rather than at each item.
 
 Within one pull, a response the run already holds is read from the run
 instead of requested again and an admission or rejection it already
