@@ -744,3 +744,41 @@ fn settling_a_fetch_or_admitting_an_item_does_not_write_the_run_s_queue() {
         "the Feed walk, the Delta queue and the Label Feed walk each end once"
     );
 }
+
+#[test]
+fn a_page_that_cannot_be_fetched_leaves_the_cursor_holding_the_feed_it_read() {
+    let site = Site::new();
+    let first = site.delta("https://localhost/a", "first", None, "2026-08-09T11:00:00Z");
+    let second = site.delta(
+        "https://localhost/b",
+        "second",
+        None,
+        "2026-08-09T11:10:00Z",
+    );
+    let listed = [first.clone(), second.clone()];
+    site.feed(&listed, NOW, Some(0));
+    let log = Log::onboard(&site);
+
+    let report = run_bounded(
+        &log.db,
+        &site.client,
+        log.data.path(),
+        &site.host,
+        NOW,
+        || instant(NOW),
+        PullLimits {
+            work_bytes: u64::MAX,
+            work_objects: 3,
+        },
+    )
+    .unwrap();
+    assert_eq!(report.accepted, [first]);
+    assert!(report.suspended);
+    assert_eq!(report.ended, None);
+    let held = log.db.walk_pages(&site.host, "feed").unwrap();
+    assert_eq!(
+        held.iter().map(|page| page.ids.clone()).collect::<Vec<_>>(),
+        [listed],
+        "the Feed the walk read stays held and the Page it could not fetch does not"
+    );
+}

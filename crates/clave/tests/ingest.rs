@@ -1024,6 +1024,15 @@ fn a_pull_ended_at_wist2_e01_is_retried_a_minute_later_and_not_at_the_baseline()
     let report = clave::ingest::finish_pull(&db, &task, "me", started_at, run, ended_at).unwrap();
     assert_eq!(report.ended.as_deref(), Some("WIST2-E01"));
     assert!(report.noise.is_none(), "an unusable Feed is no noise");
+    assert!(report.accepted.is_empty() && report.queued.is_empty());
+    assert_eq!(
+        db.get_publisher_status(&host)
+            .unwrap()
+            .unwrap()
+            .last_pull_at,
+        None,
+        "with no Feed nothing proceeds and the pull is no poll of the domain"
+    );
     assert!(db
         .list_rejections(&host)
         .unwrap()
@@ -1082,6 +1091,129 @@ fn a_walk_stopped_at_the_target_rule_that_suspends_resumes_instead_of_retrying()
     let next = db.scheduled_pull(&host).unwrap().unwrap();
     assert_eq!(next.reason, clave::db::Reason::Resume);
     assert_eq!(next.attempts, 0);
+}
+
+fn pull_through_the_schedule(
+    db: &clave::db::Db,
+    client: &clave::fetch::Client,
+    data_dir: &std::path::Path,
+    host: &str,
+    started_at: i64,
+    ended_at: i64,
+) -> clave::ingest::IngestReport {
+    db.schedule_ping(host, started_at, 4).unwrap();
+    let task = db
+        .claim_pulls(
+            started_at,
+            1,
+            "me",
+            clave::db::PARTITIONS as usize,
+            &[],
+            &mut true,
+        )
+        .unwrap()
+        .remove(0);
+    let run = clave::ingest::open_pull(
+        db,
+        client,
+        data_dir,
+        host,
+        &jiff::Timestamp::from_second(started_at)
+            .unwrap()
+            .to_string(),
+        jiff::Timestamp::now,
+        clave::ingest::PullLimits::default(),
+    )
+    .unwrap();
+    clave::ingest::finish_pull(db, &task, "me", started_at, run, ended_at).unwrap()
+}
+
+#[test]
+fn a_sealed_page_that_cannot_be_fetched_stops_the_walk_and_is_retried() {
+    let (listener, host, client) = reserve_addr();
+    let p = make_publisher_with_scope(&host, &["example.com"]);
+    let id = add_delta(&p, "https://example.com/a", "alpha body", None);
+    let started_at = jiff::Timestamp::now().as_second();
+    let at = |unix: i64| jiff::Timestamp::from_second(unix).unwrap().to_string();
+    common::write_feed_with_next(
+        &p,
+        &host,
+        std::slice::from_ref(&id),
+        &at(started_at - 60),
+        Some(&common::page_url(&host, 0)),
+    );
+    serve_static(listener, p.dir.path().to_path_buf());
+
+    let tmp = tempfile::tempdir().unwrap();
+    clave::init::run(&host, tmp.path()).unwrap();
+    let db = clave::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+    db.set_param("baseline_poll_seconds", 86_400).unwrap();
+    let ended_at = started_at + 5;
+    let report = pull_through_the_schedule(&db, &client, tmp.path(), &host, started_at, ended_at);
+
+    assert_eq!(
+        report.accepted,
+        vec![id],
+        "the Deltas of the Feed already fetched proceed"
+    );
+    assert!(!report.suspended);
+    assert!(report.noise.is_none());
+    assert_eq!(report.ended.as_deref(), Some("WIST2-E01"));
+    assert!(db
+        .list_rejections(&host)
+        .unwrap()
+        .iter()
+        .any(|entry| entry.code == "WIST2-E01"));
+
+    let next = db.scheduled_pull(&host).unwrap().unwrap();
+    assert_eq!(next.reason, clave::db::Reason::Retry);
+    assert_eq!(next.attempts, 1);
+    assert_eq!(next.due_at, ended_at + 60);
+}
+
+#[test]
+fn a_sealed_page_that_is_not_well_formed_json_stops_the_walk_and_is_retried() {
+    let (listener, host, client) = reserve_addr();
+    let p = make_publisher_with_scope(&host, &["example.com"]);
+    let id = add_delta(&p, "https://example.com/a", "alpha body", None);
+    let started_at = jiff::Timestamp::now().as_second();
+    let at = |unix: i64| jiff::Timestamp::from_second(unix).unwrap().to_string();
+    common::write_feed_with_next(
+        &p,
+        &host,
+        std::slice::from_ref(&id),
+        &at(started_at - 60),
+        Some(&common::page_url(&host, 0)),
+    );
+    let pages = p.dir.path().join(".well-known/wist/feed");
+    fs::create_dir_all(&pages).unwrap();
+    fs::write(pages.join("0.json"), b"{\"feed\": ").unwrap();
+    serve_static(listener, p.dir.path().to_path_buf());
+
+    let tmp = tempfile::tempdir().unwrap();
+    clave::init::run(&host, tmp.path()).unwrap();
+    let db = clave::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+    db.set_param("baseline_poll_seconds", 86_400).unwrap();
+    let ended_at = started_at + 5;
+    let report = pull_through_the_schedule(&db, &client, tmp.path(), &host, started_at, ended_at);
+
+    assert_eq!(
+        report.accepted,
+        vec![id],
+        "the Deltas of the Feed already fetched proceed"
+    );
+    assert!(!report.suspended);
+    assert_eq!(report.ended.as_deref(), Some("WIST2-E01"));
+    assert!(db
+        .list_rejections(&host)
+        .unwrap()
+        .iter()
+        .any(|entry| entry.code == "WIST2-E01"));
+
+    let next = db.scheduled_pull(&host).unwrap().unwrap();
+    assert_eq!(next.reason, clave::db::Reason::Retry);
+    assert_eq!(next.attempts, 1);
+    assert_eq!(next.due_at, ended_at + 60);
 }
 
 #[test]

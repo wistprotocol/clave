@@ -113,32 +113,54 @@ fn signed_field_dispositions_and_retry_counts_survive_restart() {
 }
 
 #[test]
-fn invalid_page_fields_stop_before_source_replay_and_delta_fetch() {
+fn invalid_page_fields_stop_the_walk_before_source_replay_and_the_pages_deltas() {
     let (listener, host, client) = reserve_addr();
     let publisher = make_publisher(&host);
     serve_static(listener, publisher.dir.path().into());
     let id = add_delta(&publisher, "https://localhost/a", "content", None);
-    write_feed_with_next(
-        &publisher,
-        &host,
-        std::slice::from_ref(&id),
-        NOW,
-        Some(&page_url(&host, 0)),
-    );
+    let paged = add_delta(&publisher, "https://localhost/b", "paged", None);
     let directory = tempfile::tempdir().unwrap();
     clave::init::run(&host, directory.path()).unwrap();
     let path = directory.path().join("clave.sqlite");
-    for cut in [
+    for (number, cut) in [
         "2026-08-09T14:00:00.0Z",
         "2026-08-09T14:00:00+00:00",
         "2026-02-29T14:00:00Z",
-    ] {
-        write_feed_page(&publisher, &host, 0, &[], cut, None);
+    ]
+    .iter()
+    .enumerate()
+    {
+        let lead = add_delta(
+            &publisher,
+            &format!("https://localhost/lead/{number}"),
+            "lead",
+            None,
+        );
+        write_feed_with_next(
+            &publisher,
+            &host,
+            std::slice::from_ref(&lead),
+            NOW,
+            Some(&page_url(&host, 0)),
+        );
+        write_feed_page(
+            &publisher,
+            &host,
+            0,
+            std::slice::from_ref(&paged),
+            cut,
+            None,
+        );
         let db = Db::open(&path).unwrap();
         let report = clave::ingest::run(&db, &client, directory.path(), &host, NOW).unwrap();
         assert!(report.noise.is_none());
-        assert!(report.accepted.is_empty() && report.queued.is_empty());
-        assert!(!db.is_delta_seen(&id).unwrap());
+        assert_eq!(
+            report.accepted,
+            [lead],
+            "the Deltas of the Feed the walk read proceed"
+        );
+        assert_eq!(report.ended.as_deref(), Some("WIST2-E01"));
+        assert!(!db.is_delta_seen(&paged).unwrap());
         assert!(db
             .list_rejections(&host)
             .unwrap()
@@ -146,11 +168,12 @@ fn invalid_page_fields_stop_before_source_replay_and_delta_fetch() {
             .all(|entry| entry.code == "WIST2-E01"));
         assert!(!directory
             .path()
-            .join(format!("payloads/{}.json", &id[7..]))
+            .join(format!("payloads/{}.json", &paged[7..]))
             .exists());
     }
     write_feed_with_next(&publisher, &host, std::slice::from_ref(&id), NOW, None);
     let db = Db::open(&path).unwrap();
     let report = clave::ingest::run(&db, &client, directory.path(), &host, NOW).unwrap();
     assert_eq!(report.accepted, [id]);
+    assert_eq!(report.ended, None);
 }

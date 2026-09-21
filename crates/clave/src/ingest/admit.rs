@@ -299,6 +299,26 @@ pub(super) fn abort(
     mutation.commit()
 }
 
+fn refuse_page(
+    db: &Db,
+    run: &PullRun,
+    host: &str,
+    key: &ObjectKey,
+    code: &str,
+    detail: &str,
+) -> Result<()> {
+    reject(db, host, code, &run.now, None, detail)?;
+    db.advance_pull_object(
+        run.run_id,
+        key.kind(),
+        &key.name(),
+        &[Status::Fetched, Status::Failed],
+        Status::Rejected,
+        None,
+    )?;
+    Ok(())
+}
+
 /// Refuses a Label Feed page: the rejection is recorded and the walk ends
 /// with the pages before it, leaving the Feed walk that completed before
 /// it untouched.
@@ -311,15 +331,24 @@ pub(super) fn reject_page(
     detail: &str,
 ) -> Result<()> {
     let mutation = db.mutation()?;
-    reject(db, host, code, &run.now, None, detail)?;
-    db.advance_pull_object(
-        run.run_id,
-        key.kind(),
-        &key.name(),
-        &[Status::Fetched, Status::Failed],
-        Status::Rejected,
-        None,
-    )?;
+    refuse_page(db, run, host, key, code, detail)?;
+    mutation.commit()
+}
+
+/// Refuses a sealed Page of the Feed walk: WIST-2 §3.2 stops the walk
+/// there with the Pages before it, whose Deltas proceed under §5.
+pub(super) fn stop_walk(
+    db: &Db,
+    run: &mut PullRun,
+    host: &str,
+    key: &ObjectKey,
+    code: &str,
+    detail: &str,
+) -> Result<()> {
+    let mutation = db.mutation()?;
+    refuse_page(db, run, host, key, code, detail)?;
+    run.ended = Some(code.to_string());
+    db.update_pull_run(run)?;
     mutation.commit()
 }
 

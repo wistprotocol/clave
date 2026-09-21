@@ -859,8 +859,9 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
     }
 
     /// Walks the Feed from `feed.json` through its sealed Pages (WIST-2
-    /// §3.2, §5 step 1) until a page lists no unseen ID, `next` ends or
-    /// fails the target rule, or the walk suspends.
+    /// §3.2, §5 step 1) until a page lists no unseen ID, `next` ends,
+    /// fails the target rule or names a Page the walk cannot use, or the
+    /// walk suspends.
     fn walk_feed(&mut self) -> Result<()> {
         let (db, host) = (self.db, self.host);
         let mut pages: Vec<Vec<String>> = Vec::new();
@@ -882,13 +883,23 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
                     let (raw, value) = match self.page_envelope(&key, &url, cursor.get(&url))? {
                         Got::Body(raw, value) => (raw, value),
                         Got::Suspend => return self.finish(true),
-                        Got::Failed(detail) => return self.abort(Some(&key), "WIST2-E01", &detail),
+                        Got::Failed(detail) if index == 0 => {
+                            return self.abort(Some(&key), "WIST2-E01", &detail)
+                        }
+                        Got::Failed(detail) => {
+                            admit::stop_walk(db, &mut self.run, host, &key, "WIST2-E01", &detail)?;
+                            break;
+                        }
                     };
                     let checks = verify::page(&value, host);
                     let parsed = match checks.fields {
                         Ok(parsed) => parsed,
-                        Err(detail) => {
+                        Err(detail) if index == 0 => {
                             return self.abort(Some(&key), "WIST2-E01", detail);
+                        }
+                        Err(detail) => {
+                            admit::stop_walk(db, &mut self.run, host, &key, "WIST2-E01", detail)?;
+                            break;
                         }
                     };
                     if !checks.domain_matches {

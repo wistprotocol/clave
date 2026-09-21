@@ -47,6 +47,7 @@ fn signed_last_value_duplicates_reject_before_live_admission_and_retry_after_res
         let path = data.path().join("clave.sqlite");
         let db = Db::open(&path).unwrap();
         let id = add_delta(&p, "https://localhost/article", "body", None);
+        let mut listed = Vec::new();
         if object == "page" {
             write_feed(&p, &host, &[], "2026-08-09T12:00:00Z");
             clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:01Z").unwrap();
@@ -60,10 +61,11 @@ fn signed_last_value_duplicates_reject_before_live_admission_and_retry_after_res
                 "2026-08-09T12:00:00Z",
                 None,
             );
+            listed.push(add_delta(&p, "https://localhost/listed", "listed", None));
             write_feed_with_next(
                 &p,
                 &host,
-                std::slice::from_ref(&id),
+                &listed,
                 "2026-08-09T12:00:00Z",
                 Some(&page_url(&host, 1)),
             );
@@ -80,7 +82,7 @@ fn signed_last_value_duplicates_reject_before_live_admission_and_retry_after_res
         fs::write(&source, duplicate(&original, name, escaped)).unwrap();
         let report =
             clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:02Z").unwrap();
-        assert!(report.accepted.is_empty(), "{object}/{name}");
+        assert_eq!(report.accepted, listed, "{object}/{name}");
         assert!(!db.is_delta_seen(&id).unwrap());
         assert_eq!(
             db.url_tip(&host, "https://localhost/article").unwrap(),
@@ -111,9 +113,21 @@ fn signed_last_value_duplicates_reject_before_live_admission_and_retry_after_res
         fs::write(&source, &original).unwrap();
         drop(db);
         let db = Db::open(&path).unwrap();
+        let mut expected = vec![id.clone()];
+        if object == "page" {
+            let again = add_delta(&p, "https://localhost/again", "again", None);
+            write_feed_with_next(
+                &p,
+                &host,
+                std::slice::from_ref(&again),
+                "2026-08-09T12:00:00Z",
+                Some(&page_url(&host, 1)),
+            );
+            expected.push(again);
+        }
         let report =
             clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:03Z").unwrap();
-        assert_eq!(report.accepted, [id], "{object}/{name}");
+        assert_eq!(report.accepted, expected, "{object}/{name}");
         assert!(report.rejected.is_empty());
         assert_eq!(fs::read(source).unwrap(), original);
     }

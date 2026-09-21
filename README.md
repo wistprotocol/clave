@@ -406,7 +406,10 @@ sources resolve may have changed since the page was walked: a recovery
 settlement can exclude the Declaration that signed it. Only the request
 and its debit against the budget are skipped. The walk stops, held page
 or fetched, at the first page listing no unseen ID, and at a `next` that
-is absent or fails the target rule.
+is absent or fails the target rule. It stops the same way at a sealed
+Page it cannot fetch or whose fields fail: the Page records `WIST2-E01`,
+the pages walked before it stay held and their Deltas proceed (WIST-2
+§3.2), while an unusable `feed.json` leaves no Feed and ends the pull.
 The cursor is dropped once the Delta walk it fed completes, and the Label
 Feed's once its Labels have been processed, so a page chain longer than
 one pull's byte or object limit is walked across pulls instead of
@@ -526,14 +529,15 @@ completion:
 
 - after a completed walk, `baseline` due `baseline_poll_seconds` after
   the pull started, unless the walk stopped at a `next` failing the
-  target rule;
+  target rule or at a sealed Page it could not use;
 - after a walk suspended at the pull's work limits, `resume` due at
   once, or at the next UTC day while the domain's daily ingest budget is
   spent, whatever the walk stopped at;
 - after a pull that ended at `WIST2-E01` — the Aggregator holds no usable
   Feed — or that ran to its end with its Feed walk stopped at a `next`
-  failing the target rule, whose Deltas already fetched proceeded
-  regardless, or at an internal failure, `retry` due
+  failing the target rule or at a sealed Page it could not use, whose
+  Deltas already fetched proceeded regardless, or at an internal
+  failure, `retry` due
   `RETRY_BASE_SECONDS` (60) quadrupled for every earlier consecutive such
   pull after the instant the pull ended, so WIST-2 §7's retries fall at
   1, 4, 16 and 64 minutes; these delays are absolute, so a
@@ -1104,7 +1108,8 @@ receive WIST2-E04 without retry, even with a bad signature.
 
 `feed-fields.json` supplies 134 signed probes; live HTTP tests exercise 133
 through first contact and restart, checking persisted diagnostics, noise and
-request counts. Page field regressions stop before Delta/Payload admission.
+request counts. A Page field regression stops the walk before that Page's own
+Deltas, while the Deltas already fetched proceed.
 The schema gate does not establish exact Page cardinality, publication/history
 partitioning, supported-major policy or durable selected-source provenance;
 target validation is described under [Feed next targets](#feed-next-targets).

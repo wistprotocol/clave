@@ -170,10 +170,12 @@ fn downstream_failures_and_budget_suspension_preserve_the_observation() {
             db.set_param("ingest_budget_bytes_day", size).unwrap();
         }
         let report = clave::ingest::run(&db, &client, data.path(), &host, NOW).unwrap();
-        assert!(
-            report.accepted.is_empty() && report.queued.is_empty(),
-            "{failure}"
-        );
+        let admitted: &[String] = match failure {
+            "page" => std::slice::from_ref(&id),
+            _ => &[],
+        };
+        assert_eq!(report.accepted, admitted, "{failure}");
+        assert!(report.queued.is_empty(), "{failure}");
         assert_eq!(report.suspended, failure == "budget", "{failure}");
         assert_eq!(
             retained(&path, &host),
