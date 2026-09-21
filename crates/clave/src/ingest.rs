@@ -813,7 +813,8 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
     /// by URL. The live page at `live_url` is never among them: it is
     /// always re-fetched, since the Publisher rewrites it, while a sealed
     /// Page is immutable and the walk resumes over the ones it holds
-    /// (WIST-2 §5's resumption from where the walk stopped).
+    /// (WIST-2 §5's resumption from where the walk stopped), each checked
+    /// again since §3.2's sources may have changed since it was walked.
     fn cursor(
         &self,
         walk: Walk,
@@ -828,18 +829,29 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
             .collect())
     }
 
-    /// Takes a page the cursor holds into this walk at `index`, with the
-    /// diff of its IDs against those seen now.
-    fn resume_page(
-        &self,
-        walk: Walk,
-        index: u32,
-        page: &WalkPage,
-    ) -> Result<Option<(WalkPage, bool)>> {
-        self.db
-            .record_walk_page(self.host, walk.as_str(), index, page)?;
-        let unseen = admit::unseen(self.db, self.host, walk, &page.ids)?;
-        Ok(Some((page.clone(), unseen)))
+    /// The Envelope of the page at `url`: the octets the cursor holds for
+    /// it, whose request and budget debit alone are skipped, or a fetch.
+    fn page_envelope(
+        &mut self,
+        key: &ObjectKey,
+        url: &str,
+        held: Option<&WalkPage>,
+    ) -> Result<Got> {
+        if let Some(raw) = held.and_then(|page| page.raw.as_deref()) {
+            if let Ok(value) = crate::json::parse(raw) {
+                self.db.record_pull_object(
+                    self.run.run_id,
+                    key.kind(),
+                    &key.name(),
+                    url,
+                    Status::Fetched,
+                    Some(raw),
+                    None,
+                )?;
+                return Ok(Got::Body(raw.to_vec(), value));
+            }
+        }
+        self.get(key, &key.name(), url, Object::Page)
     }
 
     /// The page at `index` of `walk` as the run's cursor holds it, once
@@ -874,12 +886,9 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
                     let unseen = admit::unseen(db, host, Walk::Feed, &page.ids)?;
                     Some((page, unseen))
                 }
-                None if cursor.contains_key(&url) => {
-                    self.resume_page(Walk::Feed, index, &cursor[&url])?
-                }
                 None => {
-                    let value = match self.get(&key, &key.name(), &url, Object::Page)? {
-                        Got::Body(_, value) => value,
+                    let (raw, value) = match self.page_envelope(&key, &url, cursor.get(&url))? {
+                        Got::Body(raw, value) => (raw, value),
                         Got::Suspend => return self.finish(true),
                         Got::Failed(detail) => {
                             return self.abort(Some(&key), "WIST2-E01", &detail, false)
@@ -949,6 +958,7 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
                         index,
                         &url,
                         &parsed,
+                        &raw,
                         next,
                     )?
                 }
@@ -1318,12 +1328,9 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
                     let unseen = admit::unseen(db, host, Walk::Label, &page.ids)?;
                     Some((page, unseen))
                 }
-                None if cursor.contains_key(&url) => {
-                    self.resume_page(Walk::Label, index, &cursor[&url])?
-                }
                 None => {
-                    let value = match self.get(&key, &key.name(), &url, Object::Page)? {
-                        Got::Body(_, value) => value,
+                    let (raw, value) = match self.page_envelope(&key, &url, cursor.get(&url))? {
+                        Got::Body(raw, value) => (raw, value),
                         Got::Suspend => return self.finish(!live),
                         Got::Failed(detail) => {
                             if !live {
@@ -1400,6 +1407,7 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
                         index,
                         &url,
                         &parsed,
+                        &raw,
                         next,
                     )?
                 }

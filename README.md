@@ -390,9 +390,16 @@ pull that walked them. A pull whose walk suspended keeps them; the next
 pull fetches the live `feed.json` again, since the Publisher rewrites it,
 and wherever the chain it reads names a page the cursor already holds it
 takes that page — a sealed Page is immutable — instead of fetching it,
-then continues from where the cursor stopped. A held page is read under
-the same rules as a fetched one: the walk stops at the first page listing
-no unseen ID, and at a `next` that is absent or fails the target rule.
+then continues from where the cursor stopped. The cursor retains each
+page's Envelope octets, and a page taken from it is admitted under every
+check a freshly fetched sealed Page passes — fields, domain, signature
+under §3.2's sealed sources at the height the pull pinned, and the target
+rule on `next` — with the same dispositions, since the Declarations those
+sources resolve may have changed since the page was walked: a recovery
+settlement can exclude the Declaration that signed it. Only the request
+and its debit against the budget are skipped. The walk stops, held page
+or fetched, at the first page listing no unseen ID, and at a `next` that
+is absent or fails the target rule.
 The cursor is dropped once the Delta walk it fed completes, and the Label
 Feed's once its Labels have been processed, so a page chain longer than
 one pull's byte or object limit is walked across pulls instead of

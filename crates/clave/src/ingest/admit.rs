@@ -329,7 +329,8 @@ pub(super) fn reject_page(
 /// Admits an authenticated page to its walk: a live page's `generated_at`
 /// is compared and retained (WIST-2 §3.2, `WIST2-E05`), the page's IDs
 /// are diffed against those seen, its `next` target is recorded and the
-/// page joins the domain's walk cursor with what the walk reads from it.
+/// page joins the domain's walk cursor with what the walk reads from it
+/// and the `raw` octets it was authenticated as.
 /// `next` is the target rule's result for the page's `next`, if it has
 /// one. `None` means the page was refused and its rejection recorded.
 #[allow(clippy::too_many_arguments)]
@@ -343,6 +344,7 @@ pub(super) fn admit_page(
     index: u32,
     url: &str,
     page: &FeedEnvelope,
+    raw: &[u8],
     next: Option<Option<String>>,
 ) -> Result<Option<(WalkPage, bool)>> {
     let mutation = db.mutation()?;
@@ -391,6 +393,7 @@ pub(super) fn admit_page(
         generated_at: page.feed.generated_at.clone(),
         ids: page.feed.deltas.clone(),
         next_url: next.flatten(),
+        raw: Some(raw.to_vec()),
     };
     db.record_walk_page(host, walk.as_str(), index, &walked)?;
     if walk == Walk::Feed && unseen {

@@ -12,7 +12,7 @@ use rusqlite::{Connection, OptionalExtension};
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS pull_runs(run_id INTEGER PRIMARY KEY AUTOINCREMENT, domain TEXT NOT NULL UNIQUE, token INTEGER, now TEXT NOT NULL, day TEXT NOT NULL, unit TEXT NOT NULL, phase TEXT NOT NULL CHECK(phase IN ('walk','deltas','labels','label_items','closing','aborted')), work_bytes INTEGER NOT NULL, work_objects INTEGER NOT NULL, feed_retry_used INTEGER NOT NULL DEFAULT 0, unseen_any INTEGER NOT NULL DEFAULT 0, suspended INTEGER NOT NULL DEFAULT 0, chain_pos INTEGER NOT NULL DEFAULT 0, pages_epoch INTEGER, queue_json BLOB NOT NULL DEFAULT '[]', position INTEGER NOT NULL DEFAULT 0, noise TEXT);
 CREATE TABLE IF NOT EXISTS pull_objects(run_id INTEGER NOT NULL, kind TEXT NOT NULL, object_id TEXT NOT NULL, url TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('issued','fetched','verified','admitted','rejected','failed')), raw BLOB, byte_len INTEGER, debited INTEGER NOT NULL DEFAULT 0, checks_json TEXT, refs_json TEXT, report TEXT, report_seq INTEGER, PRIMARY KEY(run_id, kind, object_id));
-CREATE TABLE IF NOT EXISTS pull_walk(domain TEXT NOT NULL, feed TEXT NOT NULL CHECK(feed IN ('feed','label')), idx INTEGER NOT NULL, url TEXT NOT NULL, generated_at TEXT NOT NULL, ids_json BLOB NOT NULL, next_url TEXT, PRIMARY KEY(domain, feed, idx));
+CREATE TABLE IF NOT EXISTS pull_walk(domain TEXT NOT NULL, feed TEXT NOT NULL CHECK(feed IN ('feed','label')), idx INTEGER NOT NULL, url TEXT NOT NULL, generated_at TEXT NOT NULL, ids_json BLOB NOT NULL, next_url TEXT, raw BLOB, PRIMARY KEY(domain, feed, idx));
 CREATE TABLE IF NOT EXISTS pull_attempts(run_id INTEGER NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('delta_refresh','resolved_prev')), id TEXT NOT NULL, PRIMARY KEY(run_id, kind, id));
 ";
 
@@ -153,6 +153,31 @@ pub(crate) struct WalkPage {
     pub ids: Vec<String>,
     /// The target the page's `next` names under the target rule, if any.
     pub next_url: Option<String>,
+    /// The Envelope octets the page was authenticated as; `None` in a store
+    /// written before the cursor retained them.
+    pub raw: Option<Vec<u8>>,
+}
+
+type WalkRow = (String, String, Vec<u8>, Option<String>, Option<Vec<u8>>);
+
+fn walk_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WalkRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+    ))
+}
+
+fn page_of((url, generated_at, ids, next_url, raw): WalkRow) -> Result<WalkPage> {
+    Ok(WalkPage {
+        url,
+        generated_at,
+        ids: serde_json::from_slice(&ids)?,
+        next_url,
+        raw,
+    })
 }
 
 /// How a fetch that was issued ended, as persisted.
@@ -587,26 +612,12 @@ impl Db {
     pub(crate) fn walk_page(&self, domain: &str, feed: &str, idx: u32) -> Result<Option<WalkPage>> {
         self.conn
             .query_row(
-                "SELECT url, generated_at, ids_json, next_url FROM pull_walk WHERE domain = ?1 AND feed = ?2 AND idx = ?3",
+                "SELECT url, generated_at, ids_json, next_url, raw FROM pull_walk WHERE domain = ?1 AND feed = ?2 AND idx = ?3",
                 (domain, feed, idx),
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Vec<u8>>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                    ))
-                },
+                walk_row,
             )
             .optional()?
-            .map(|(url, generated_at, ids, next_url)| {
-                Ok(WalkPage {
-                    url,
-                    generated_at,
-                    ids: serde_json::from_slice(&ids)?,
-                    next_url,
-                })
-            })
+            .map(page_of)
             .transpose()
     }
 
@@ -618,7 +629,7 @@ impl Db {
         page: &WalkPage,
     ) -> Result<()> {
         self.execute(
-            "INSERT OR REPLACE INTO pull_walk(domain, feed, idx, url, generated_at, ids_json, next_url) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT OR REPLACE INTO pull_walk(domain, feed, idx, url, generated_at, ids_json, next_url, raw) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             rusqlite::params![
                 domain,
                 feed,
@@ -627,6 +638,7 @@ impl Db {
                 page.generated_at,
                 serde_json::to_vec(&page.ids)?,
                 page.next_url,
+                page.raw,
             ],
         )?;
         Ok(())
@@ -636,26 +648,10 @@ impl Db {
     pub(crate) fn walk_pages(&self, domain: &str, feed: &str) -> Result<Vec<WalkPage>> {
         let rows = self
             .conn
-            .prepare("SELECT url, generated_at, ids_json, next_url FROM pull_walk WHERE domain = ?1 AND feed = ?2 ORDER BY idx")?
-            .query_map((domain, feed), |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Vec<u8>>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                ))
-            })?
+            .prepare("SELECT url, generated_at, ids_json, next_url, raw FROM pull_walk WHERE domain = ?1 AND feed = ?2 ORDER BY idx")?
+            .query_map((domain, feed), walk_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        rows.into_iter()
-            .map(|(url, generated_at, ids, next_url)| {
-                Ok(WalkPage {
-                    url,
-                    generated_at,
-                    ids: serde_json::from_slice(&ids)?,
-                    next_url,
-                })
-            })
-            .collect()
+        rows.into_iter().map(page_of).collect()
     }
 
     /// Drops the pages a walk that ended before `pages` left behind.

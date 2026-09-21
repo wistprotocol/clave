@@ -277,9 +277,10 @@ fn repeated_declaration_entries_bound_the_first_next_page_source() {
     fixture.probe("2026-08-09T12:30:00Z", &K2_SEED, true);
 }
 
-#[test]
-fn completed_recovery_excludes_page_sources_at_current_and_first_next_cutoffs() {
-    let mut fixture = Fixture::new();
+/// A domain whose open recovery window holds a competitor Declaration
+/// beside the owner's branch, carrying the page key a settlement excludes.
+fn contested_recovery() -> Fixture {
+    let fixture = Fixture::new();
     let mut initial = current_declaration(&fixture.publisher)["publisher"].clone();
     initial["keys"]
         .as_array_mut()
@@ -303,6 +304,24 @@ fn completed_recovery_excludes_page_sources_at_current_and_first_next_cutoffs() 
     follower["prev_declaration"] = declaration_hash(&owner).into();
     follower["keys"][1] = page_key(&[17; 32]);
     fixture.install_document(follower, &K1_SEED, "2026-08-09T15:00:00Z", true);
+    fixture
+}
+
+fn settle_and_seal(fixture: &Fixture, at: &str) {
+    clave::recovery::settle(&fixture.db, fixture.directory.path(), at).unwrap();
+    let signing = clave::keys::load(&fixture.directory.path().join("keys/seed")).unwrap();
+    clave::seal::run(
+        &fixture.db,
+        fixture.directory.path(),
+        &signing,
+        at.parse::<jiff::Timestamp>().unwrap().as_second(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn completed_recovery_excludes_page_sources_at_current_and_first_next_cutoffs() {
+    let mut fixture = contested_recovery();
     for now in ["2026-08-09T18:00:00Z", "2026-08-16T13:00:00Z"] {
         for cut in ["2026-08-09T13:30:00Z", "2026-08-09T14:00:00Z"] {
             fixture.probe_at(cut, &[13; 32], true, now);
@@ -324,4 +343,117 @@ fn completed_recovery_excludes_page_sources_at_current_and_first_next_cutoffs() 
         fixture.probe_at(cut, &X1_SEED, true, "2026-08-16T18:00:00Z");
         fixture.probe_at(cut, &[17; 32], true, "2026-08-16T18:00:00Z");
     }
+}
+
+fn cursor_pages(fixture: &Fixture) -> i64 {
+    rusqlite::Connection::open(fixture.directory.path().join("clave.sqlite"))
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM pull_walk WHERE domain = ?1 AND feed = 'feed'",
+            [&fixture.host],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+/// The noise counted, whether nothing was accepted, the last rejection
+/// code and whether the live Delta was admitted.
+fn excluded_page_disposition(held: bool) -> (Option<&'static str>, bool, Option<String>, bool) {
+    const CUT: &str = "2026-08-09T13:30:00Z";
+    const WINDOW_END: &str = "2026-08-16T13:00:00Z";
+    const NOW: &str = "2026-08-16T18:00:00Z";
+    let fixture = contested_recovery();
+    let page = page_url(&fixture.host, 0);
+    write_feed_page_signed(
+        &fixture.publisher,
+        &fixture.host,
+        0,
+        &[],
+        CUT,
+        None,
+        &[13; 32],
+    );
+    if held {
+        let walked = add_delta(
+            &fixture.publisher,
+            &format!("https://{}/walked", fixture.host),
+            "walked while the window was open",
+            None,
+        );
+        write_feed_with_next(
+            &fixture.publisher,
+            &fixture.host,
+            std::slice::from_ref(&walked),
+            "2026-08-09T18:00:00Z",
+            Some(&page),
+        );
+        let clock = "2026-08-09T18:00:00Z".parse::<jiff::Timestamp>().unwrap();
+        let report = clave::ingest::run_bounded(
+            &fixture.db,
+            &fixture.client,
+            fixture.directory.path(),
+            &fixture.host,
+            "2026-08-09T18:00:00Z",
+            || clock,
+            clave::ingest::PullLimits {
+                work_bytes: 1 << 20,
+                work_objects: 2,
+            },
+        )
+        .unwrap();
+        assert!(
+            report.suspended && report.rejected.is_empty(),
+            "the Page is authenticated under the open window and left in the cursor"
+        );
+        assert_eq!(cursor_pages(&fixture), 2, "the Feed and the Page are held");
+        std::fs::remove_file(
+            fixture
+                .publisher
+                .dir
+                .path()
+                .join(".well-known/wist/feed/0.json"),
+        )
+        .unwrap();
+    }
+    settle_and_seal(&fixture, WINDOW_END);
+    let live = add_delta(
+        &fixture.publisher,
+        &format!("https://{}/live", fixture.host),
+        "listed beside the Page",
+        None,
+    );
+    write_feed_with_next(
+        &fixture.publisher,
+        &fixture.host,
+        std::slice::from_ref(&live),
+        NOW,
+        Some(&page),
+    );
+    let report = fixture.ingest(NOW);
+    (
+        report.noise,
+        report.accepted.is_empty() && report.queued.is_empty(),
+        fixture
+            .db
+            .list_rejections(&fixture.host)
+            .unwrap()
+            .last()
+            .map(|rejection| rejection.code.clone()),
+        fixture.db.is_delta_seen(&live).unwrap(),
+    )
+}
+
+#[test]
+fn a_held_page_whose_signing_declaration_the_settlement_excluded_is_refused_as_a_fetched_one() {
+    let fetched = excluded_page_disposition(false);
+    assert_eq!(
+        fetched,
+        (Some("WIST2-E04"), true, Some("WIST2-E04".into()), false),
+        "a fetched Page the settled sources no longer authenticate is WIST2-E04"
+    );
+    assert_eq!(
+        excluded_page_disposition(true),
+        fetched,
+        "a Page taken from the walk cursor is refused exactly as a fetched one"
+    );
 }
