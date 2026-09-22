@@ -405,16 +405,13 @@ pub(super) fn admit_page(
         return Ok(None);
     }
     let unseen = unseen(db, host, walk, &page.feed.deltas)?;
-    let stopped_at_next = walk == Walk::Feed && unseen && next == Some(None);
+    let stopped_at_next = unseen && next == Some(None);
     if stopped_at_next {
-        reject(
-            db,
-            host,
-            "WIST2-E01",
-            &run.now,
-            None,
-            "feed next fails the target rule: not its Normalized URL under the requested host's well-known prefix",
-        )?;
+        let detail = match walk {
+            Walk::Feed => "feed next fails the target rule: not its Normalized URL under the requested host's well-known prefix",
+            Walk::Label => "label feed next fails the target rule: not its Normalized URL under the requested host's well-known prefix",
+        };
+        reject(db, host, "WIST2-E01", &run.now, None, detail)?;
     }
     let walked = WalkPage {
         url: url.to_string(),

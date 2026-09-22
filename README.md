@@ -42,7 +42,9 @@ its own accounting unit), `mirror` (maintain the signed
 
 Every Feed pull also pulls the domain's Label Feed where it serves one
 (WIST-2 §3.3): `label-feed.json` and its Pages walk under the Feed's
-rules and the ingest budget, each unseen Label or dispute is fetched
+rules and the ingest budget — a `next` failing the target rule records
+`WIST2-E01` and stops the walk there, without the Feed's backoff, whose
+schedule WIST-2 §7 ties to the Feed — each unseen Label or dispute is fetched
 from `labels/<id>.json` and validated through core under the accepted
 Declaration — fields, the registry name, self-labeling, the disputed
 Label's sealing and authority, the signature — and queued as a `label`

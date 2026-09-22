@@ -1,6 +1,9 @@
 mod common;
 
-use common::{make_publisher, make_publisher_with_scope, reserve_addr, serve_static, write_feed};
+use common::{
+    make_publisher, make_publisher_with_scope, reserve_addr, serve_recording, serve_static,
+    write_feed,
+};
 use serde_json::{json, Value};
 use std::fs;
 
@@ -13,6 +16,16 @@ fn sign(p: &common::TestPub, inner_name: &str, inner: Value) -> (String, Value) 
 }
 
 fn write_listed(p: &common::TestPub, host: &str, items: &[(String, Value)], generated_at: &str) {
+    write_listed_with_next(p, host, items, generated_at, None);
+}
+
+fn write_listed_with_next(
+    p: &common::TestPub,
+    host: &str,
+    items: &[(String, Value)],
+    generated_at: &str,
+    next: Option<&str>,
+) {
     let dir = p.dir.path().join(".well-known/wist/labels");
     fs::create_dir_all(&dir).unwrap();
     for (id, envelope) in items {
@@ -23,7 +36,7 @@ fn write_listed(p: &common::TestPub, host: &str, items: &[(String, Value)], gene
         .unwrap();
     }
     let ids: Vec<&str> = items.iter().map(|(id, _)| id.as_str()).collect();
-    let feed = json!({"wist_version": "1.0.0", "domain": host, "generated_at": generated_at, "deltas": ids, "next": null});
+    let feed = json!({"wist_version": "1.0.0", "domain": host, "generated_at": generated_at, "deltas": ids, "next": next});
     let envelope = wist_core::envelope::sign_envelope(&feed, "feed", &p.kid, &p.sk).unwrap();
     fs::write(
         p.dir.path().join(".well-known/wist/label-feed.json"),
@@ -70,6 +83,61 @@ fn state_entries(data: &std::path::Path) -> Vec<Value> {
 
 fn label(labeler: &str, subject: &str, name: &str, asserted_at: &str) -> Value {
     json!({"wist_version": "1.0.0", "labeler": labeler, "subject": subject, "name": name, "asserted_at": asserted_at})
+}
+
+#[test]
+fn a_label_feed_next_failing_the_target_rule_records_e01_and_keeps_the_labels() {
+    let (listener, host, client) = reserve_addr();
+    let p = make_publisher(&host);
+    write_feed(&p, &host, &[], "2026-08-09T12:00:00Z");
+    let (id, envelope) = sign(
+        &p,
+        "label",
+        label(
+            &host,
+            "https://reduced.example.org/notice",
+            "wist:spam",
+            "2026-08-09T12:00:00Z",
+        ),
+    );
+    write_listed_with_next(
+        &p,
+        &host,
+        &[(id.clone(), envelope)],
+        "2026-08-09T12:00:00Z",
+        Some("https://localhost:443/.well-known/wist/labels/0.json"),
+    );
+    let requests = serve_recording(listener, p.dir.path().to_path_buf());
+
+    let data = tempfile::tempdir().unwrap();
+    clave::init::run(&host, data.path()).unwrap();
+    let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
+    let report =
+        clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
+    assert_eq!(report.labels, vec![id]);
+    assert!(report.rejected.is_empty());
+    assert_eq!(report.noise, None);
+    assert_eq!(
+        report.ended, None,
+        "the Label walk's stop is not the Feed's WIST2-E01 backoff"
+    );
+    let e01: Vec<_> = db
+        .list_rejections(&host)
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.code == "WIST2-E01" && r.delta_id.is_none())
+        .collect();
+    assert_eq!(e01.len(), 1);
+    assert!(e01[0]
+        .detail
+        .as_deref()
+        .unwrap_or("")
+        .contains("label feed next"));
+    assert!(!requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|uri| uri.contains("/labels/0.json")));
 }
 
 #[test]
