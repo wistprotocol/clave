@@ -398,6 +398,7 @@ fn excluded_page_disposition(held: bool) -> (Option<&'static str>, bool, Option<
             clave::ingest::PullLimits {
                 work_bytes: 1 << 20,
                 work_objects: 2,
+                ..Default::default()
             },
         )
         .unwrap();

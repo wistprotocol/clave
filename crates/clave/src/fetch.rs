@@ -249,6 +249,7 @@ pub struct PostResponse {
     pub body: Vec<u8>,
 }
 
+#[derive(Clone)]
 pub struct Client {
     allow_http: bool,
     inner: reqwest::blocking::Client,

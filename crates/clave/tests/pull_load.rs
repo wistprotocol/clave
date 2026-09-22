@@ -21,6 +21,7 @@ fn pull(
             clave::db::PARTITIONS as usize,
             &[],
             &mut true,
+            true,
         )
         .unwrap()
         .remove(0);

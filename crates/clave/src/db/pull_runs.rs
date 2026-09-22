@@ -231,12 +231,22 @@ fn run_by(conn: &Connection, filter: &str, key: impl rusqlite::Params) -> Result
         .transpose()
 }
 
-fn release_reservations(conn: &Connection, run_id: i64) -> Result<()> {
+fn release_reservations(conn: &Connection, run_id: i64) -> Result<Vec<Credit>> {
+    let credited = conn
+        .prepare("SELECT COALESCE(object.unit, run.unit), COALESCE(object.day, run.day), SUM(object.debited) FROM pull_runs run JOIN pull_objects object ON object.run_id = run.run_id WHERE run.run_id = ?1 AND object.status = 'issued' GROUP BY COALESCE(object.unit, run.unit), COALESCE(object.day, run.day) HAVING SUM(object.debited) > 0")?
+        .query_map([run_id], |row| {
+            Ok(Credit {
+                unit: row.get(0)?,
+                day: row.get(1)?,
+                bytes: row.get::<_, i64>(2)?.max(0) as u64,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
     conn.execute(
         "INSERT INTO ingest_meter(domain, day, bytes) SELECT COALESCE(object.unit, run.unit), COALESCE(object.day, run.day), -SUM(object.debited) FROM pull_runs run JOIN pull_objects object ON object.run_id = run.run_id WHERE run.run_id = ?1 AND object.status = 'issued' GROUP BY COALESCE(object.unit, run.unit), COALESCE(object.day, run.day) ON CONFLICT(domain, day) DO UPDATE SET bytes = bytes + excluded.bytes",
         [run_id],
     )?;
-    Ok(())
+    Ok(credited)
 }
 
 fn reservation_meter(
@@ -254,12 +264,19 @@ fn reservation_meter(
         .optional()?)
 }
 
-fn delete_run(conn: &Connection, run_id: i64) -> Result<()> {
-    release_reservations(conn, run_id)?;
+fn delete_run(conn: &Connection, run_id: i64) -> Result<Vec<Credit>> {
+    let credited = release_reservations(conn, run_id)?;
     conn.execute("DELETE FROM pull_objects WHERE run_id = ?1", [run_id])?;
     conn.execute("DELETE FROM pull_attempts WHERE run_id = ?1", [run_id])?;
     conn.execute("DELETE FROM pull_runs WHERE run_id = ?1", [run_id])?;
-    Ok(())
+    Ok(credited)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Credit {
+    pub unit: String,
+    pub day: String,
+    pub bytes: u64,
 }
 
 /// The fresh run of a pull of `domain` at `now`.
@@ -274,19 +291,25 @@ pub(crate) struct NewRun<'a> {
 }
 
 impl Db {
+    #[cfg(test)]
+    pub(crate) fn start_pull_run(&self, run: &NewRun<'_>) -> Result<PullRun> {
+        Ok(self.replace_pull_run(run)?.0)
+    }
+
     /// Opens a fresh run of a pull of `run.domain`, dropping one an earlier
     /// pull left open and returning its unsettled reservations to the
     /// budget: WIST-2 §5's resumption is a later pull, and WIST-1 §3.4
     /// gives a new attempt a new clock and schedule. The walk cursor
     /// outlives the run.
-    pub(crate) fn start_pull_run(&self, run: &NewRun<'_>) -> Result<PullRun> {
+    pub(crate) fn replace_pull_run(&self, run: &NewRun<'_>) -> Result<(PullRun, Vec<Credit>)> {
         let tx = self.mutation()?;
         let token = self.fence.map(|fence| match fence {
             super::Fence::Partition { token, .. } | super::Fence::Sealer { token } => token,
         });
-        if let Some(open) = run_by(&tx, "domain = ?1", [run.domain])? {
-            delete_run(&tx, open.run_id)?;
-        }
+        let credited = match run_by(&tx, "domain = ?1", [run.domain])? {
+            Some(open) => delete_run(&tx, open.run_id)?,
+            None => Vec::new(),
+        };
         tx.execute(
             "INSERT INTO pull_runs(domain, token, now, day, unit, phase, work_bytes, work_objects, pages_epoch) VALUES (?1, ?2, ?3, ?4, ?5, 'walk', ?6, ?7, ?8)",
             (
@@ -303,7 +326,7 @@ impl Db {
         let started = run_by(&tx, "domain = ?1", [run.domain])?
             .ok_or_else(|| Error::History("pull run lost after insertion".into()))?;
         tx.commit()?;
-        Ok(started)
+        Ok((started, credited))
     }
 
     /// The run `run_id`, if it is still open.
@@ -341,7 +364,7 @@ impl Db {
     }
 
     /// Drops run `run_id` with its objects and attempts.
-    pub(crate) fn delete_pull_run(&self, run_id: i64) -> Result<()> {
+    pub(crate) fn delete_pull_run(&self, run_id: i64) -> Result<Vec<Credit>> {
         self.write(|conn| delete_run(conn, run_id))
     }
 
@@ -482,11 +505,7 @@ impl Db {
         tx.commit()
     }
 
-    /// Persists how an issued metered request ended and settles its
-    /// reservation, on the meter row the request was issued against, to
-    /// the bytes actually debited, with `run`'s remaining work, in one
-    /// transaction. Returns `false`, writing nothing, when the object is
-    /// no longer issued, as when the same result is delivered twice.
+    #[cfg(test)]
     pub(crate) fn settle_pull_object(
         &self,
         run: &PullRun,
@@ -494,12 +513,29 @@ impl Db {
         object_id: &str,
         settled: Settled<'_>,
     ) -> Result<bool> {
+        Ok(self
+            .settle_pull_object_crediting(run, kind, object_id, settled)?
+            .is_some())
+    }
+
+    /// Persists how an issued metered request ended and settles its
+    /// reservation, on the meter row the request was issued against, to
+    /// the bytes actually debited, with `run`'s remaining work, in one
+    /// transaction. Returns `None`, writing nothing, when the object is
+    /// no longer issued, as when the same result is delivered twice.
+    pub(crate) fn settle_pull_object_crediting(
+        &self,
+        run: &PullRun,
+        kind: &str,
+        object_id: &str,
+        settled: Settled<'_>,
+    ) -> Result<Option<Credit>> {
         let tx = self.mutation()?;
         let Some(issued) = self
             .pull_object(run.run_id, kind, object_id)?
             .filter(|object| object.status == Status::Issued)
         else {
-            return Ok(false);
+            return Ok(None);
         };
         let (unit, day) = reservation_meter(&tx, run.run_id, kind, object_id)?
             .ok_or_else(|| Error::History(format!("{kind} {object_id} lost its reservation")))?;
@@ -529,7 +565,49 @@ impl Db {
         self.add_ingest_bytes(&unit, &day, debited as i64 - issued.debited as i64)?;
         self.update_pull_run(run)?;
         tx.commit()?;
-        Ok(true)
+        Ok(Some(Credit {
+            unit,
+            day,
+            bytes: issued.debited.saturating_sub(debited),
+        }))
+    }
+
+    pub(crate) fn wake_deferred_resumes(&self, unit: &str, day: &str, now: i64) -> Result<usize> {
+        let at = crate::registry::instant(now)?;
+        if at.get(..10) != Some(day) {
+            return Ok(0);
+        }
+        let budget = crate::registry::effective(self, "ingest_budget_bytes_day", &at)?;
+        if budget - self.ingest_bytes(unit, day)? < crate::fetch::OBJECT_CAP_BYTES as i64 {
+            return Ok(0);
+        }
+        let mut deferred = Vec::new();
+        for partition in 0..super::PARTITIONS {
+            deferred.extend(
+                self.conn
+                    .prepare_cached("SELECT domain FROM pull_schedule WHERE partition = ?1 AND reason = 'resume' AND due_at > ?2")?
+                    .query_map((partition, now), |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?,
+            );
+        }
+        let mut woken = 0;
+        for domain in deferred {
+            if crate::suffix_list::unit_at(self, &domain, &at)? == unit {
+                woken += self.execute(
+                    "UPDATE pull_schedule SET due_at = ?2 WHERE domain = ?1 AND reason = 'resume' AND due_at > ?2",
+                    (&domain, now),
+                )?;
+            }
+        }
+        Ok(woken)
+    }
+
+    pub(crate) fn walk_extent(&self, domain: &str, feed: &str, except: u32) -> Result<(u64, u64)> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(LENGTH(raw)), 0) FROM pull_walk WHERE domain = ?1 AND feed = ?2 AND idx != ?3",
+            (domain, feed, except),
+            |row| Ok((row.get::<_, i64>(0)?.max(0) as u64, row.get::<_, i64>(1)?.max(0) as u64)),
+        )?)
     }
 
     /// Moves an object from one of `from` to `to`, recording `checks`
@@ -547,7 +625,7 @@ impl Db {
         let moved = match self.pull_object(run_id, kind, object_id)? {
             Some(object) if from.contains(&object.status) => {
                 tx.execute(
-                    "UPDATE pull_objects SET status = ?4, checks_json = COALESCE(?5, checks_json) WHERE run_id = ?1 AND kind = ?2 AND object_id = ?3",
+                    "UPDATE pull_objects SET status = ?4, checks_json = COALESCE(?5, checks_json), raw = CASE WHEN ?4 IN ('admitted', 'rejected') AND kind IN ('delta', 'payload', 'label') THEN NULL ELSE raw END WHERE run_id = ?1 AND kind = ?2 AND object_id = ?3",
                     (run_id, kind, object_id, to.as_str(), checks),
                 )?;
                 true
@@ -590,7 +668,7 @@ impl Db {
             (run_id, kind, object_id, status.as_str()),
         )?;
         tx.execute(
-            "UPDATE pull_objects SET status = ?4, report = ?5, report_seq = (SELECT COALESCE(MAX(report_seq), 0) + 1 FROM pull_objects WHERE run_id = ?1) WHERE run_id = ?1 AND kind = ?2 AND object_id = ?3",
+            "UPDATE pull_objects SET status = ?4, report = ?5, report_seq = (SELECT COALESCE(MAX(report_seq), 0) + 1 FROM pull_objects WHERE run_id = ?1), raw = CASE WHEN ?4 IN ('admitted', 'rejected') AND kind IN ('delta', 'payload', 'label') THEN NULL ELSE raw END WHERE run_id = ?1 AND kind = ?2 AND object_id = ?3",
             (run_id, kind, object_id, status.as_str(), report),
         )?;
         tx.commit()

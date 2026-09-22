@@ -1,4 +1,4 @@
-use crate::db::{Db, NewRun, Phase, PullObject, PullRun, Settled, Status, WalkPage};
+use crate::db::{Credit, Db, NewRun, Phase, PullObject, PullRun, Settled, Status, WalkPage};
 use crate::error::Result;
 use crate::fetch::Client;
 use crate::history::declarations::DeclarationsReplay;
@@ -262,12 +262,20 @@ fn live_page_keys(db: &Db, host: &str) -> Result<Vec<PublisherKey>> {
         .keys)
 }
 
-/// The work one pull may do before it suspends the walk for a later pull
-/// to resume, below the per-domain daily budget of WIST-2 §5.
+/// The bounds of one pull below the per-domain daily budget of WIST-2 §5:
+/// the work, in octets, objects and seconds, it may do before it suspends
+/// the walk for a later pull to resume; the pages and octets its walk
+/// cursor may hold; and the Delta files it may fetch ahead of the item
+/// being processed.
 #[derive(Debug, Clone, Copy)]
 pub struct PullLimits {
     pub work_bytes: u64,
     pub work_objects: u32,
+    pub work_seconds: u64,
+    pub walk_pages: u32,
+    pub walk_bytes: u64,
+    pub prefetch_objects: u32,
+    pub prefetch_bytes: u64,
 }
 
 impl Default for PullLimits {
@@ -275,6 +283,11 @@ impl Default for PullLimits {
         PullLimits {
             work_bytes: 64 << 20,
             work_objects: 4096,
+            work_seconds: 300,
+            walk_pages: 1024,
+            walk_bytes: 64 << 20,
+            prefetch_objects: 0,
+            prefetch_bytes: 8 << 20,
         }
     }
 }
@@ -418,7 +431,7 @@ pub fn finish_pull(
     };
     let cost = now.saturating_sub(started_at).max(0) as f64
         + report.fetched_bytes as f64 / crate::db::BYTES_PER_SLOT_SECOND;
-    db.complete_pull_with_cost(task, owner, started_at, outcome, cost, now)?;
+    db.complete_pull(task, owner, started_at, outcome, cost, now)?;
     mutation.commit()?;
     Ok(report)
 }
@@ -441,7 +454,7 @@ pub fn open_pull(
         return Ok(None);
     };
     let host = host.as_str();
-    let run = db.start_pull_run(&NewRun {
+    let (run, released) = db.replace_pull_run(&NewRun {
         domain: host,
         now,
         day: now.get(..10).unwrap_or(now),
@@ -451,6 +464,7 @@ pub fn open_pull(
         pages_epoch: db.last_epoch()?.map(|epoch| epoch.epoch_number),
     })?;
     let run_id = run.run_id;
+    wake_credited(db, released, clock().as_second())?;
     let now_unix = registry::unix(&run.now)?;
     let scheme = crate::fetch::scheme_for_host(host, client.allow_http());
     let mut pull = Pull {
@@ -462,13 +476,51 @@ pub fn open_pull(
         now_unix,
         clock,
         run,
+        limits,
+        started: std::time::Instant::now(),
+        prefetch: std::collections::BTreeMap::new(),
+        prefetching: limits.prefetch_objects > 0,
+        prefetch_from: 0,
+        items_begun: 0,
+        yielding: false,
     };
     match pull.run() {
         Ok(()) => Ok(Some(run_id)),
         Err(crate::error::Error::Fenced) => Err(crate::error::Error::Fenced),
         Err(e) => {
-            db.delete_pull_run(run_id)?;
+            let released = db.delete_pull_run(run_id)?;
+            wake_credited(db, released, (pull.clock)().as_second())?;
             Err(e)
+        }
+    }
+}
+
+fn wake_credited(db: &Db, credits: impl IntoIterator<Item = Credit>, now: i64) -> Result<()> {
+    for credit in credits.into_iter().filter(|credit| credit.bytes > 0) {
+        db.wake_deferred_resumes(&credit.unit, &credit.day, now)?;
+    }
+    Ok(())
+}
+
+struct InFlight {
+    limit: u64,
+    fetch: Option<std::thread::JoinHandle<Outcome>>,
+}
+
+impl InFlight {
+    fn join(mut self) -> Outcome {
+        match self.fetch.take().map(std::thread::JoinHandle::join) {
+            Some(Ok(outcome)) => outcome,
+            Some(Err(panic)) => std::panic::resume_unwind(panic),
+            None => unreachable!("an in-flight fetch is joined once"),
+        }
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        if let Some(fetch) = self.fetch.take() {
+            let _ = fetch.join();
         }
     }
 }
@@ -485,6 +537,13 @@ struct Pull<'a, C: Fn() -> jiff::Timestamp> {
     now_unix: i64,
     clock: C,
     run: PullRun,
+    limits: PullLimits,
+    started: std::time::Instant,
+    prefetch: std::collections::BTreeMap<(&'static str, String), InFlight>,
+    prefetching: bool,
+    prefetch_from: usize,
+    items_begun: u32,
+    yielding: bool,
 }
 
 impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
@@ -558,12 +617,15 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
     /// Fetches one content object under the budget, bounds and meter row in
     /// force when the request is issued, and the pull's work limits,
     /// reserving the bound before the request and settling it to the bytes
-    /// read when the response persists. The walk suspends when the budget or the
-    /// work is spent, or the object would cross the budget, in which case
-    /// the bytes read up to the bound are debited. An object above its own
-    /// cap is a failed fetch.
+    /// read when the response persists. The walk suspends when the budget,
+    /// the work or the pull's time is spent, or the object would cross the
+    /// budget, in which case the bytes read up to the bound are debited. An
+    /// object above its own cap is a failed fetch.
     fn get(&mut self, key: &ObjectKey, slot: &str, url: &str, object: Object) -> Result<Got> {
         let (db, kind) = (self.db, key.kind());
+        if let Some(flight) = self.prefetch.remove(&(kind, slot.to_string())) {
+            self.land(kind, slot, flight)?;
+        }
         let held = db.pull_object(self.run.run_id, kind, slot)?;
         let reserved = match &held {
             Some(object) if object.status == Status::Issued => object.debited,
@@ -572,11 +634,22 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
         };
         let meter = self.meter_at((self.clock)())?;
         let spent = db.ingest_bytes(&meter.unit, &meter.day)? - reserved as i64;
-        let (work_bytes, work_objects) = (self.run.work_bytes, self.run.work_objects);
-        if spent >= meter.budget || work_bytes == 0 || work_objects == 0 {
+        if !self.prefetch.is_empty() && !self.within_margin(&meter, spent) {
+            self.prefetching = false;
+            self.drain()?;
+        }
+        let spent = db.ingest_bytes(&meter.unit, &meter.day)? - reserved as i64;
+        let (work_bytes, work_objects) = self.work_left();
+        if spent >= meter.budget
+            || work_bytes == 0
+            || work_objects == 0
+            || (self.yielding && self.expired())
+        {
             if held.is_some() {
                 let run = self.run.clone();
-                db.settle_pull_object(&run, kind, slot, Settled::Bounded(0))?;
+                let credit =
+                    db.settle_pull_object_crediting(&run, kind, slot, Settled::Bounded(0))?;
+                self.credited(credit)?;
             }
             return Ok(Got::Suspend);
         }
@@ -601,26 +674,183 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
                 metered: true,
             },
         );
+        self.settle_fetch(kind, slot, outcome)
+    }
+
+    /// The request that begins an item: a page after the live one, or a
+    /// queue item's own file once the pull has begun an item. Only there
+    /// does the pull's spent wall time suspend the walk, so every item
+    /// begun completes and every pull begins at least one item.
+    fn begin(&mut self, key: &ObjectKey, slot: &str, url: &str, object: Object) -> Result<Got> {
+        self.yielding = match key {
+            ObjectKey::Page { index, .. } => *index > 0,
+            _ => self.items_begun > 0,
+        };
+        let got = self.get(key, slot, url, object);
+        self.yielding = false;
+        if !matches!(key, ObjectKey::Page { .. }) && !matches!(got, Ok(Got::Suspend)) {
+            self.items_begun += 1;
+        }
+        got
+    }
+
+    /// Whether the budget and the work left, net of the prefetches in
+    /// flight, still exceed what those prefetches and their Payloads could
+    /// take, so that no bound is crossed at an object a sequential pull
+    /// would have read.
+    fn within_margin(&self, meter: &Meter, spent: i64) -> bool {
+        let most = u64::from(self.limits.prefetch_objects);
+        let reserved: u64 = self.prefetch.values().map(|flight| flight.limit).sum();
+        let margin = most.saturating_mul(meter.caps.delta + meter.caps.payload);
+        let budget_left = u64::try_from(meter.budget.saturating_sub(spent)).unwrap_or(0);
+        budget_left >= margin
+            && self.run.work_bytes.saturating_sub(reserved) >= margin
+            && u64::from(self.run.work_objects).saturating_sub(self.prefetch.len() as u64)
+                >= 2 * most
+    }
+
+    fn work_left(&self) -> (u64, u32) {
+        let reserved: u64 = self.prefetch.values().map(|flight| flight.limit).sum();
+        (
+            self.run.work_bytes.saturating_sub(reserved),
+            self.run
+                .work_objects
+                .saturating_sub(self.prefetch.len() as u32),
+        )
+    }
+
+    fn expired(&self) -> bool {
+        self.started.elapsed() >= std::time::Duration::from_secs(self.limits.work_seconds)
+    }
+
+    fn settle_fetch(&mut self, kind: &'static str, slot: &str, outcome: Outcome) -> Result<Got> {
         let mut run = self.run.clone();
         let settled = match &outcome {
             Outcome::Body { raw, .. } => {
-                run.work_bytes = work_bytes.saturating_sub(raw.len() as u64);
-                run.work_objects = work_objects.saturating_sub(1);
+                run.work_bytes = run.work_bytes.saturating_sub(raw.len() as u64);
+                run.work_objects = run.work_objects.saturating_sub(1);
                 Settled::Body(raw)
             }
             Outcome::Bounded { debited } => {
-                run.work_bytes = work_bytes.saturating_sub(*debited);
+                run.work_bytes = run.work_bytes.saturating_sub(*debited);
                 Settled::Bounded(*debited)
             }
             Outcome::Failed { detail } => Settled::Failed(detail),
         };
-        db.settle_pull_object(&run, kind, slot, settled)?;
+        let credit = self
+            .db
+            .settle_pull_object_crediting(&run, kind, slot, settled)?;
         self.run = run;
+        self.credited(credit)?;
         Ok(match outcome {
             Outcome::Body { raw, value } => Got::Body(raw, value),
             Outcome::Bounded { .. } => Got::Suspend,
             Outcome::Failed { detail } => Got::Failed(detail),
         })
+    }
+
+    fn credited(&self, credit: Option<Credit>) -> Result<()> {
+        wake_credited(self.db, credit, (self.clock)().as_second())
+    }
+
+    fn land(&mut self, kind: &'static str, slot: &str, flight: InFlight) -> Result<Got> {
+        let outcome = flight.join();
+        self.settle_fetch(kind, slot, outcome)
+    }
+
+    fn drain(&mut self) -> Result<()> {
+        let mut drained = Ok(());
+        for ((kind, slot), flight) in std::mem::take(&mut self.prefetch) {
+            let landed = self.land(kind, &slot, flight);
+            if drained.is_ok() {
+                drained = landed.map(|_| ());
+            }
+        }
+        drained
+    }
+
+    fn suspend(&mut self) -> Result<()> {
+        self.drain()?;
+        self.finish(true)
+    }
+
+    fn prefetch_deltas(&mut self, index: usize) -> Result<()> {
+        let most = self.limits.prefetch_objects;
+        let mut next = self.prefetch_from.max(index + 1);
+        while self.prefetching && (self.prefetch.len() as u32) < most {
+            let Some(id) = self.run.queue.get(next).cloned() else {
+                break;
+            };
+            if self.expired() {
+                self.prefetching = false;
+                break;
+            }
+            let Some(hex) = id.strip_prefix("sha256:") else {
+                next += 1;
+                continue;
+            };
+            let key = ObjectKey::Delta { id: id.clone() };
+            if self.db.is_delta_seen_for(&id, self.host)? {
+                next += 1;
+                continue;
+            }
+            let slot = self.slot(&key)?;
+            if self.prefetch.contains_key(&(key.kind(), slot.clone()))
+                || self
+                    .db
+                    .pull_object(self.run.run_id, key.kind(), &slot)?
+                    .is_some()
+            {
+                next += 1;
+                continue;
+            }
+            let meter = self.meter_at((self.clock)())?;
+            let spent = self.db.ingest_bytes(&meter.unit, &meter.day)?;
+            let reserved: u64 = self.prefetch.values().map(|flight| flight.limit).sum();
+            if !self.within_margin(&meter, spent) {
+                self.prefetching = false;
+                break;
+            }
+            let budget_left = u64::try_from(meter.budget.saturating_sub(spent)).unwrap_or(0);
+            let cap = meter.caps.of(Object::Delta);
+            let limit = cap
+                .min(budget_left)
+                .min(self.run.work_bytes.saturating_sub(reserved));
+            if reserved + limit > self.limits.prefetch_bytes {
+                break;
+            }
+            let url = format!("{}deltas/{hex}.json", self.base);
+            self.db.reserve_pull_object(
+                self.run.run_id,
+                key.kind(),
+                &slot,
+                &url,
+                &meter.unit,
+                &meter.day,
+                limit,
+            )?;
+            let request = FetchRequest {
+                url,
+                scope: self.scope()?,
+                limit,
+                cap,
+                metered: true,
+            };
+            let client = self.client.clone();
+            let fetch = std::thread::Builder::new()
+                .name("clave-prefetch".into())
+                .spawn(move || fetch_stage::fetch(&client, &request))?;
+            self.prefetch.insert(
+                (key.kind(), slot),
+                InFlight {
+                    limit,
+                    fetch: Some(fetch),
+                },
+            );
+            next += 1;
+        }
+        self.prefetch_from = next;
+        Ok(())
     }
 
     /// Requests `publisher.json` outside the budget, under the redirect
@@ -729,6 +959,12 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
     }
 
     fn run(&mut self) -> Result<()> {
+        let ran = self.phases();
+        let drained = self.drain();
+        ran.and(drained)
+    }
+
+    fn phases(&mut self) -> Result<()> {
         crate::recovery::settle(self.db, self.data_dir, &self.now())?;
         if self.run.phase == Phase::Walk && self.discover()? {
             self.walk_feed()?;
@@ -853,7 +1089,7 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
                 return Ok(Got::Body(raw.to_vec(), value));
             }
         }
-        self.get(key, &key.name(), url, Object::Page)
+        self.begin(key, &key.name(), url, Object::Page)
     }
 
     /// The page at `index` of `walk` as the run's cursor holds it, once
@@ -866,6 +1102,39 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
             Some(Status::Admitted) => self.db.walk_page(self.host, walk.as_str(), index),
             _ => Ok(None),
         }
+    }
+
+    fn follows(
+        &self,
+        walk: Walk,
+        index: u32,
+        next: &str,
+        cursor: &std::collections::HashMap<String, WalkPage>,
+    ) -> Result<bool> {
+        let (pages, bytes) = self.db.walk_extent(self.host, walk.as_str(), index + 1)?;
+        // A page the cursor does not hold counts at the page cap, so the
+        // cursor never exceeds `walk_bytes`.
+        let incoming = cursor
+            .get(next)
+            .and_then(|page| page.raw.as_deref())
+            .filter(|raw| crate::json::parse(raw).is_ok())
+            .map_or(crate::fetch::OBJECT_CAP_BYTES, |raw| raw.len() as u64);
+        let bound = if pages + 1 > u64::from(self.limits.walk_pages) {
+            "walk_pages"
+        } else if bytes + incoming > self.limits.walk_bytes {
+            "walk_bytes"
+        } else {
+            return Ok(true);
+        };
+        tracing::info!(
+            domain = self.host,
+            walk = walk.as_str(),
+            bound,
+            pages,
+            bytes,
+            "the walk cursor bound ends the walk"
+        );
+        Ok(false)
     }
 
     /// Walks the Feed from `feed.json` through its sealed Pages (WIST-2
@@ -977,7 +1246,9 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
             };
             pages.push(page.ids);
             match (unseen, page.next_url) {
-                (true, Some(next)) => url = next,
+                (true, Some(next)) if self.follows(Walk::Feed, index, &next, &cursor)? => {
+                    url = next
+                }
                 _ => break,
             }
         }
@@ -1027,10 +1298,11 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
                 )?;
                 continue;
             };
+            self.prefetch_deltas(index)?;
             let url = format!("{}deltas/{hex}.json", self.base);
-            let doc = match self.get(&key, &slot, &url, Object::Delta)? {
+            let doc = match self.begin(&key, &slot, &url, Object::Delta)? {
                 Got::Body(_, doc) => doc,
-                Got::Suspend => return self.finish(true),
+                Got::Suspend => return self.suspend(),
                 Got::Failed(detail) => {
                     admit::reject_item(db, &mut self.run, host, &refusal, "WIST2-E03", &detail)?;
                     continue;
@@ -1140,7 +1412,7 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
                                     admit::splice_predecessor(db, &mut self.run, &id, prev, index)?;
                                     continue;
                                 }
-                                Got::Suspend => return self.finish(true),
+                                Got::Suspend => return self.suspend(),
                                 Got::Failed(_) => consumed = Some(("delta", slot)),
                             }
                         }
@@ -1182,7 +1454,7 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
                 let url = format!("{}payloads/{hex}.json", self.base);
                 let (raw, value) = match self.get(&key, &payload_slot, &url, Object::Payload)? {
                     Got::Body(raw, value) => (raw, value),
-                    Got::Suspend => return self.finish(true),
+                    Got::Suspend => return self.suspend(),
                     Got::Failed(detail) => {
                         refusal.consumed = Some(("payload", payload_slot));
                         admit::reject_item(
@@ -1251,6 +1523,7 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
                 _ => continue,
             }
         }
+        self.drain()?;
         admit::end_walk(
             db,
             &mut self.run,
@@ -1425,7 +1698,9 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
             };
             pages.push(page.ids);
             match (unseen, page.next_url) {
-                (true, Some(next)) => url = next,
+                (true, Some(next)) if self.follows(Walk::Label, index, &next, &cursor)? => {
+                    url = next
+                }
                 _ => break,
             }
         }
@@ -1485,7 +1760,7 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
                 continue;
             };
             let url = format!("{}labels/{hex}.json", self.base);
-            let doc = match self.get(&key, &slot, &url, Object::Label)? {
+            let doc = match self.begin(&key, &slot, &url, Object::Label)? {
                 Got::Body(_, doc) => doc,
                 Got::Suspend => return self.finish(true),
                 Got::Failed(detail) => {

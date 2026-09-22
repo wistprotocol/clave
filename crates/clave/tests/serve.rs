@@ -570,7 +570,7 @@ fn a_pull_in_flight_at_restart_is_dispatched_once_and_rescheduled_one_baseline_l
         let crashed_at = unix_now() - clave::db::PARTITION_LEASE_SECONDS;
         db.schedule_ping(&host, crashed_at, 4).unwrap();
         let claimed = db
-            .claim_pulls(crashed_at, 1, "crashed-process", ALL, &[], &mut true)
+            .claim_pulls(crashed_at, 1, "crashed-process", ALL, &[], &mut true, true)
             .unwrap();
         assert_eq!(claimed.len(), 1);
         assert_eq!(
@@ -644,6 +644,7 @@ fn a_ping_moves_a_scheduled_pull_earlier_never_later_and_takes_no_new_slot() {
                 ALL,
                 &[],
                 &mut false,
+                true,
             )
             .unwrap()
             .remove(0);
@@ -652,6 +653,7 @@ fn a_ping_moves_a_scheduled_pull_earlier_never_later_and_takes_no_new_slot() {
             "earlier-process",
             now,
             clave::db::PullOutcome::Pulled { suspended: false },
+            0.0,
             now,
         )
         .unwrap();
@@ -697,7 +699,7 @@ fn a_ping_moves_a_scheduled_pull_earlier_never_later_and_takes_no_new_slot() {
 
     let db = store(tmp.path());
     let claimed = db
-        .claim_pulls(unix_now(), 1, "elsewhere", ALL, &[], &mut true)
+        .claim_pulls(unix_now(), 1, "elsewhere", ALL, &[], &mut true, true)
         .unwrap();
     assert_eq!(claimed[0].domain, domain);
     assert_eq!(ping(domain), 202, "a domain in flight takes no new slot");
@@ -816,6 +818,106 @@ fn a_slow_domain_blocks_neither_other_domains_nor_status() {
             "the slow domain's pull never completed"
         );
         std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+#[test]
+fn a_slow_domain_yields_its_slot_and_lighter_domains_go_first() {
+    let slow_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let slow_addr = slow_listener.local_addr().unwrap();
+    slow_listener.set_nonblocking(true).unwrap();
+    let slow = make_publisher_with_scope("localhost", &["example.com"]);
+    let ids: Vec<String> = (0..60)
+        .map(|n| {
+            add_delta(
+                &slow,
+                &format!("https://example.com/slow/{n}"),
+                "slow content",
+                None,
+            )
+        })
+        .collect();
+    write_feed(&slow, "localhost", &ids, "2026-08-09T12:00:00Z");
+    serve_static_slow(
+        slow_listener,
+        slow.dir.path().to_path_buf(),
+        Duration::from_millis(200),
+    );
+    let fast_hosts = ["a.localhost", "b.localhost", "c.localhost", "d.localhost"];
+    let mut builder = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .resolve("localhost", slow_addr);
+    let mut fast_publishers = Vec::new();
+    for host in fast_hosts {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        builder = builder.resolve(host, listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let publisher = make_publisher_with_scope(host, &["example.com"]);
+        let id = add_delta(
+            &publisher,
+            &format!("https://example.com/{host}"),
+            "fast content",
+            None,
+        );
+        write_feed(&publisher, host, &[id], "2026-08-09T12:00:00Z");
+        serve_static(listener, publisher.dir.path().to_path_buf());
+        fast_publishers.push(publisher);
+    }
+    let transport = clave::fetch::Client::with_builder(true, builder);
+
+    let tmp = tempfile::tempdir().unwrap();
+    clave::init::run("127.0.0.1:0", tmp.path()).unwrap();
+    let defaults = unsealed();
+    let addr = spawn_server_with_options(
+        tmp.path(),
+        transport,
+        clave::serve::ServeOptions {
+            max_concurrent_ingests: 1,
+            pull_limits: clave::ingest::PullLimits {
+                work_seconds: 1,
+                ..defaults.pull_limits
+            },
+            ..defaults
+        },
+    );
+    let c = reqwest::blocking::Client::new();
+    let last_pull_at = |host: &str| {
+        let r = c.get(format!("{addr}/status/{host}")).send().unwrap();
+        if r.status() != 200 {
+            return None;
+        }
+        let status: serde_json::Value = r.json().unwrap();
+        status["last_pull_at"].as_str().map(str::to_string)
+    };
+    let started = std::time::Instant::now();
+    assert_eq!(ping(&addr, "localhost"), 202);
+    for host in fast_hosts {
+        assert_eq!(ping(&addr, host), 202);
+    }
+    let deadline = started + Duration::from_secs(10);
+    let mut waiting = fast_hosts.to_vec();
+    while !waiting.is_empty() {
+        waiting.retain(|host| last_pull_at(host).is_none());
+        assert!(
+            std::time::Instant::now() < deadline || waiting.is_empty(),
+            "{waiting:?} waited on the slow domain's pull"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let deadline = started + Duration::from_secs(90);
+    while last_pull_at("localhost").is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the slow domain's pull never completed"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let db = store(tmp.path());
+    for id in &ids {
+        assert!(
+            db.is_delta_seen_for(id, "localhost").unwrap(),
+            "{id} of the slow domain was not admitted"
+        );
     }
 }
 

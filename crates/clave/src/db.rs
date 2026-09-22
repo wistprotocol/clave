@@ -16,7 +16,7 @@ mod tree;
 pub use leases::{
     process_owner, Fence, Lease, PARTITIONS, PARTITION_LEASE_SECONDS, SEALER_LEASE_SECONDS,
 };
-pub(crate) use pull_runs::{NewRun, Phase, PullObject, PullRun, Settled, Status, WalkPage};
+pub(crate) use pull_runs::{Credit, NewRun, Phase, PullObject, PullRun, Settled, Status, WalkPage};
 pub use pull_schedule::{
     DuePull, PingAdmission, PullLease, PullOutcome, PullTask, Reason, LEASE_SECONDS,
     RETRY_BASE_SECONDS,

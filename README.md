@@ -182,11 +182,17 @@ bounded at 1 MiB; a Delta file at 16 KiB plus twice `url_cap_bytes`; a
 Payload at `extract_cap_bytes + links_cap_bytes + summary_cap_bytes` plus
 4 KiB, each read from the schedule in force at the instant the request is
 issued. Content fetches under WIST-2 §5's daily budget are further
-bounded by the budget's remainder and by the pull's work limits (64 MiB
-and 4096 objects per pull): an object that would cross the budget or the
-work limit is not read past it, the bytes read are debited, and the walk
-suspends for a later pull to resume from where it stopped, exactly as
-budget exhaustion does; an object above its own cap is a failed fetch.
+bounded by the budget's remainder and by the pull's work limits (64 MiB,
+4096 objects and 300 seconds of wall time per pull): an object that
+would cross the budget or the work limit is not read past it, the bytes
+read are debited, and the walk suspends for a later pull to resume from
+where it stopped, exactly as budget exhaustion does; once the pull's
+wall time is spent the walk suspends the same way at the next request
+that begins an item — a page after the live one, or a queue item's own
+Delta or Label file once the pull has begun an item — while the requests
+that complete an item begun (its Payload, a predecessor, a Declaration
+retry) are still issued, so every pull begins at least one item; an
+object above its own cap is a failed fetch.
 `ingest_budget_bytes_day`, the host's Registrable Domain under the suffix
 list in force and the UTC day are read at each request too, so a pull
 that crosses midnight UTC, a `parameter_change` activation or a
@@ -196,9 +202,41 @@ where they were. The bound a request is issued under is reserved against
 that row before the request and settled there to the bytes actually read
 when the response is persisted, so neither a pull that stops mid-request
 nor two hosts pulling one Registrable Domain can read past a day's
-budget. The work limits are this Aggregator's own, not Registry
-parameters, and hold for the whole pull. Declaration requests stay
-outside the budget and carry only their own cap.
+budget. A settlement below the reservation, and the release of a
+dropped run's unsettled reservations, credit the difference back to
+that row; while the row's day is the current UTC day and the row keeps
+at least a page's cap (1 MiB) of budget free after the credit, every
+`resume` pull deferred to a later instant whose domain is of that
+Registrable Domain becomes due at once, so a host that suspended while
+a sibling's reservation held the remainder resumes when the budget
+returns rather than the next day. The work limits are this Aggregator's own, not
+Registry parameters, and hold for the whole pull. Declaration requests
+stay outside the budget and carry only their own cap.
+
+A pull may fetch Delta files ahead of the item it is processing, each on
+its own thread: at most `prefetch_objects` at once (4 under `serve`;
+the library's pull stays sequential unless its caller sets it),
+reserving at most `prefetch_bytes` (8 MiB) together. Each is issued exactly as its
+on-demand request would be, with its bound reserved against the meter
+row in force and the redirect scope read at issue, and only for a
+listed ID not yet seen that the run holds no object for. Its reservation
+counts against the pull's remaining work as settled bytes do. Prefetching
+stops for the rest of the pull once the pull's wall time is spent or the
+budget's remainder, or the remaining work net of what is in flight, falls
+below `prefetch_objects` times the sum of the Delta file and Payload caps,
+or the remaining objects below twice `prefetch_objects`, and an
+on-demand request that finds the margin gone — a predecessor chain
+retrieved past it — first joins and settles the prefetches in flight,
+returning what they reserved but did not read; within the margin every
+budget or work bound is crossed at the object a sequential pull crosses
+it at, and past it the crossing can come earlier by at most the octets
+the prefetches read. The item that reaches a prefetched file joins its
+thread and settles it as its own request would have been settled; a
+prefetched file already landed is still processed once the pull's wall
+time is spent, since no request begins it. A pull that ends, suspends
+or fails first joins and settles every prefetch still in flight, so no
+fetch thread outlives the pull and no reservation stays issued. Payloads,
+Label files and pages are fetched on demand.
 
 A fetch connects only to a public unicast address. Loopback addresses are
 allowed under `--allow-http`, the local-test exception; private,
@@ -466,7 +504,18 @@ the pages walked before it stay held and their Deltas proceed (WIST-2
 The cursor is dropped once the Delta walk it fed completes, and the Label
 Feed's once its Labels have been processed, so a page chain longer than
 one pull's byte or object limit is walked across pulls instead of
-restarted at the head each time.
+restarted at the head each time. The cursor of one domain and walk holds
+at most 1024 pages and 64 MiB of Envelope octets: a `next` whose page
+would exceed either, a page the cursor does not hold counting at the
+1 MiB page cap, ends the walk exactly as an absent `next` does, with no
+rejection recorded, and the pages walked feed the Deltas or Labels that
+proceed. A later pull's walk stops at the first page listing no unseen
+ID, so a chain beyond the bound is not reached.
+
+A Delta, Payload, Label or dispute object's fetched octets are dropped
+from `pull_objects` in the transaction that admits or rejects it, keeping
+its size, debit, checks and references; nothing reads them afterwards.
+Pages and Declarations keep their octets.
 
 `serve` schedules pulls durably in the store. `pull_schedule` holds at
 most one due-time row per domain (`due_at` in Unix seconds, `reason`
@@ -585,7 +634,8 @@ completion:
   target rule or at a sealed Page it could not use;
 - after a walk suspended at the pull's work limits, `resume` due at
   once, or at the next UTC day while the domain's daily ingest budget is
-  spent, whatever the walk stopped at;
+  spent, whatever the walk stopped at, and due at once again when a
+  credit returns budget to that Registrable Domain's row for the day;
 - after a pull that ended at `WIST2-E01` — the Aggregator holds no usable
   Feed — or that ran to its end with its Feed walk stopped at a `next`
   failing the target rule or at a sealed Page it could not use, whose

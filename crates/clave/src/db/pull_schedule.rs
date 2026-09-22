@@ -573,18 +573,6 @@ impl Db {
         tx.commit()
     }
 
-    pub fn claim_pulls(
-        &self,
-        now: i64,
-        slots: usize,
-        owner: &str,
-        max_partitions: usize,
-        running: &[String],
-        ping_next: &mut bool,
-    ) -> Result<Vec<PullTask>> {
-        self.claim_pulls_with_demand(now, slots, owner, max_partitions, running, ping_next, true)
-    }
-
     /// Claims up to `slots` due pulls for `owner` at `now`. First renews
     /// the partition leases `owner` holds and takes over unheld or lapsed
     /// ones up to `max_partitions`, returning the tasks a takeover fences
@@ -606,7 +594,7 @@ impl Db {
     /// `baseline` rows and `retry` rows serving no Ping are claimed; the
     /// others keep their due times.
     #[allow(clippy::too_many_arguments)]
-    pub fn claim_pulls_with_demand(
+    pub fn claim_pulls(
         &self,
         now: i64,
         slots: usize,
@@ -696,17 +684,6 @@ impl Db {
         tx.commit()
     }
 
-    pub fn complete_pull(
-        &self,
-        task: &PullTask,
-        owner: &str,
-        started_at: i64,
-        outcome: PullOutcome,
-        now: i64,
-    ) -> Result<()> {
-        self.complete_pull_with_cost(task, owner, started_at, outcome, 0.0, now)
-    }
-
     /// Ends `owner`'s pull of `task`, which started at `started_at`, and
     /// schedules the domain's next pull at `now`: after an unusable Feed or
     /// an internal failure `retry` with one more attempt, due at WIST-2 §7's
@@ -722,7 +699,7 @@ impl Db {
     /// slot-seconds, sets the domain's load score on its first pull and
     /// moves it halfway toward the cost on each later one; the next row
     /// takes the score's load class.
-    pub fn complete_pull_with_cost(
+    pub fn complete_pull(
         &self,
         task: &PullTask,
         owner: &str,
@@ -901,7 +878,7 @@ mod tests {
     }
 
     fn claim(db: &Db, slots: usize, ping_next: &mut bool) -> Vec<String> {
-        db.claim_pulls(NOW, slots, "me", ALL, &[], ping_next)
+        db.claim_pulls(NOW, slots, "me", ALL, &[], ping_next, true)
             .unwrap()
             .into_iter()
             .map(|task| task.domain)
@@ -1003,11 +980,11 @@ mod tests {
         db.insert_publisher("a.example", b"{}", "k", "p").unwrap();
         db.schedule_ping("a.example", NOW, 4).unwrap();
         let task = db
-            .claim_pulls(NOW, 1, "me", ALL, &[], &mut true)
+            .claim_pulls(NOW, 1, "me", ALL, &[], &mut true, true)
             .unwrap()
             .remove(0);
         assert_eq!(task.pinged_at, Some(NOW));
-        db.complete_pull(&task, "me", NOW, PullOutcome::Failed, NOW + 1)
+        db.complete_pull(&task, "me", NOW, PullOutcome::Failed, 0.0, NOW + 1)
             .unwrap();
         assert_eq!(
             db.scheduled_pull("a.example").unwrap().unwrap().pinged_at,
@@ -1016,7 +993,7 @@ mod tests {
 
         db.schedule_ping("a.example", NOW + 2, 4).unwrap();
         let retry = db
-            .claim_pulls(NOW + 300, 1, "me", ALL, &[], &mut true)
+            .claim_pulls(NOW + 300, 1, "me", ALL, &[], &mut true, true)
             .unwrap()
             .remove(0);
         assert_eq!(retry.pinged_at, Some(NOW + 2));
@@ -1061,7 +1038,7 @@ mod tests {
         );
         let mut ping_next = false;
         let mut claimed = db
-            .claim_pulls(now, 10, "me", ALL, &[], &mut ping_next)
+            .claim_pulls(now, 10, "me", ALL, &[], &mut ping_next, true)
             .unwrap()
             .into_iter()
             .map(|task| task.domain)
@@ -1188,7 +1165,7 @@ mod tests {
         db.set_param("baseline_poll_seconds", 3600).unwrap();
         db.insert_publisher("a.example", b"{}", "k", "p").unwrap();
         let task = db
-            .claim_pulls(NOW, 1, "me", ALL, &[], &mut false)
+            .claim_pulls(NOW, 1, "me", ALL, &[], &mut false, true)
             .unwrap()
             .remove(0);
         db.complete_pull(
@@ -1196,6 +1173,7 @@ mod tests {
             "me",
             NOW,
             PullOutcome::Pulled { suspended: false },
+            0.0,
             NOW + 30,
         )
         .unwrap();
@@ -1211,7 +1189,7 @@ mod tests {
         let (_tmp, db) = open_db();
         db.insert_publisher("a.example", b"{}", "k", "p").unwrap();
         let task = db
-            .claim_pulls(NOW, 1, "me", ALL, &[], &mut false)
+            .claim_pulls(NOW, 1, "me", ALL, &[], &mut false, true)
             .unwrap()
             .remove(0);
         assert_eq!(
@@ -1223,6 +1201,7 @@ mod tests {
             "me",
             NOW,
             PullOutcome::Pulled { suspended: false },
+            0.0,
             NOW + 30,
         )
         .unwrap();
@@ -1237,7 +1216,7 @@ mod tests {
         let (_tmp, db) = open_db();
         db.insert_publisher("a.example", b"{}", "k", "p").unwrap();
         let task = db
-            .claim_pulls(NOW, 1, "me", ALL, &[], &mut false)
+            .claim_pulls(NOW, 1, "me", ALL, &[], &mut false, true)
             .unwrap()
             .remove(0);
         db.complete_pull(
@@ -1245,6 +1224,7 @@ mod tests {
             "me",
             NOW,
             PullOutcome::Pulled { suspended: true },
+            0.0,
             NOW + 30,
         )
         .unwrap();
@@ -1262,7 +1242,7 @@ mod tests {
         db.add_ingest_bytes("a.example", &ts(NOW)[..10], 10)
             .unwrap();
         let task = db
-            .claim_pulls(NOW, 1, "me", ALL, &[], &mut false)
+            .claim_pulls(NOW, 1, "me", ALL, &[], &mut false, true)
             .unwrap()
             .remove(0);
         db.complete_pull(
@@ -1270,6 +1250,7 @@ mod tests {
             "me",
             NOW,
             PullOutcome::Pulled { suspended: true },
+            0.0,
             NOW,
         )
         .unwrap();
@@ -1284,18 +1265,19 @@ mod tests {
         let mut now = NOW;
         for (attempts, backoff) in [(1, 60), (2, 240), (3, 960), (4, 3_840)] {
             let task = db
-                .claim_pulls(now, 1, "me", ALL, &[], &mut false)
+                .claim_pulls(now, 1, "me", ALL, &[], &mut false, true)
                 .unwrap()
                 .remove(0);
             let ended = now + 5;
-            db.complete_pull(&task, "me", now, outcome, ended).unwrap();
+            db.complete_pull(&task, "me", now, outcome, 0.0, ended)
+                .unwrap();
             assert_eq!(
                 db.scheduled_pull("a.example").unwrap(),
                 Some(due("a.example", ended + backoff, Reason::Retry, attempts)),
                 "the retry follows the instant the pull ended"
             );
             assert!(db
-                .claim_pulls(ended + backoff - 1, 1, "me", ALL, &[], &mut false)
+                .claim_pulls(ended + backoff - 1, 1, "me", ALL, &[], &mut false, true)
                 .unwrap()
                 .is_empty());
             now = ended + backoff;
@@ -1310,10 +1292,10 @@ mod tests {
         db.insert_publisher("a.example", b"{}", "k", "p").unwrap();
         let now = back_off_four_times(&db, PullOutcome::FeedUnusable);
         let task = db
-            .claim_pulls(now, 1, "me", ALL, &[], &mut false)
+            .claim_pulls(now, 1, "me", ALL, &[], &mut false, true)
             .unwrap()
             .remove(0);
-        db.complete_pull(&task, "me", now, PullOutcome::FeedUnusable, now + 5)
+        db.complete_pull(&task, "me", now, PullOutcome::FeedUnusable, 0.0, now + 5)
             .unwrap();
         assert_eq!(
             db.scheduled_pull("a.example").unwrap(),
@@ -1329,7 +1311,7 @@ mod tests {
         db.insert_publisher("a.example", b"{}", "k", "p").unwrap();
         let now = back_off_four_times(&db, PullOutcome::Failed);
         let task = db
-            .claim_pulls(now, 1, "me", ALL, &[], &mut false)
+            .claim_pulls(now, 1, "me", ALL, &[], &mut false, true)
             .unwrap()
             .remove(0);
         db.complete_pull(
@@ -1337,6 +1319,7 @@ mod tests {
             "me",
             now,
             PullOutcome::Pulled { suspended: false },
+            0.0,
             now + 5,
         )
         .unwrap();
@@ -1353,10 +1336,11 @@ mod tests {
         db.insert_publisher("a.example", b"{}", "k", "p").unwrap();
         let complete = |now: i64, outcome: PullOutcome| {
             let task = db
-                .claim_pulls(now, 1, "me", ALL, &[], &mut false)
+                .claim_pulls(now, 1, "me", ALL, &[], &mut false, true)
                 .unwrap()
                 .remove(0);
-            db.complete_pull(&task, "me", now, outcome, now).unwrap();
+            db.complete_pull(&task, "me", now, outcome, 0.0, now)
+                .unwrap();
             db.scheduled_pull("a.example").unwrap().unwrap()
         };
         let first = complete(NOW, PullOutcome::FeedUnusable);
@@ -1384,15 +1368,15 @@ mod tests {
         db.set_param("baseline_poll_seconds", 3600).unwrap();
         db.insert_publisher("a.example", b"{}", "k", "p").unwrap();
         let task = db
-            .claim_pulls(NOW, 1, "me", ALL, &[], &mut false)
+            .claim_pulls(NOW, 1, "me", ALL, &[], &mut false, true)
             .unwrap()
             .remove(0);
-        db.complete_pull(&task, "me", NOW, PullOutcome::FeedUnusable, NOW)
+        db.complete_pull(&task, "me", NOW, PullOutcome::FeedUnusable, 0.0, NOW)
             .unwrap();
         let retry = db.scheduled_pull("a.example").unwrap().unwrap();
         assert_eq!(retry.attempts, 1);
         let task = db
-            .claim_pulls(retry.due_at, 1, "me", ALL, &[], &mut false)
+            .claim_pulls(retry.due_at, 1, "me", ALL, &[], &mut false, true)
             .unwrap()
             .remove(0);
         db.complete_pull(
@@ -1400,6 +1384,7 @@ mod tests {
             "me",
             retry.due_at,
             PullOutcome::Pulled { suspended: false },
+            0.0,
             retry.due_at,
         )
         .unwrap();
@@ -1414,7 +1399,7 @@ mod tests {
         let (_tmp, db) = open_db();
         db.schedule_ping("unknown.example", NOW, 4).unwrap();
         let task = db
-            .claim_pulls(NOW, 1, "me", ALL, &[], &mut true)
+            .claim_pulls(NOW, 1, "me", ALL, &[], &mut true, true)
             .unwrap()
             .remove(0);
         db.complete_pull(
@@ -1422,6 +1407,7 @@ mod tests {
             "me",
             NOW,
             PullOutcome::Pulled { suspended: false },
+            0.0,
             NOW,
         )
         .unwrap();
@@ -1463,8 +1449,12 @@ mod tests {
         let mut claimed: std::collections::BTreeMap<String, &str> = Default::default();
         let (mut a_next, mut b_next) = (true, true);
         loop {
-            let a = db.claim_pulls(NOW, 3, "a", half, &[], &mut a_next).unwrap();
-            let b = db.claim_pulls(NOW, 3, "b", half, &[], &mut b_next).unwrap();
+            let a = db
+                .claim_pulls(NOW, 3, "a", half, &[], &mut a_next, true)
+                .unwrap();
+            let b = db
+                .claim_pulls(NOW, 3, "b", half, &[], &mut b_next, true)
+                .unwrap();
             if a.is_empty() && b.is_empty() {
                 break;
             }
@@ -1496,7 +1486,7 @@ mod tests {
             half
         );
         assert!(db
-            .claim_pulls(NOW + 1, 1, "c", ALL, &[], &mut true)
+            .claim_pulls(NOW + 1, 1, "c", ALL, &[], &mut true, true)
             .unwrap()
             .is_empty());
         assert!(owners(&db).iter().all(|o| o.as_deref() != Some("c")));
@@ -1507,19 +1497,19 @@ mod tests {
         let (_tmp, db) = open_db();
         db.insert_publisher("a.example", b"{}", "k", "p").unwrap();
         let old = db
-            .claim_pulls(NOW, 1, "old", ALL, &[], &mut false)
+            .claim_pulls(NOW, 1, "old", ALL, &[], &mut false, true)
             .unwrap()
             .remove(0);
         let live = NOW + PARTITION_LEASE_SECONDS - 1;
         assert!(db
-            .claim_pulls(live, 0, "new", ALL, &[], &mut false)
+            .claim_pulls(live, 0, "new", ALL, &[], &mut false, true)
             .unwrap()
             .is_empty());
         assert!(owners(&db).iter().all(|o| o.as_deref() == Some("old")));
         assert_eq!(db.pull_lease("a.example").unwrap().unwrap().owner, "old");
 
         let lapsed = NOW + PARTITION_LEASE_SECONDS;
-        db.claim_pulls(lapsed, 0, "new", ALL, &[], &mut false)
+        db.claim_pulls(lapsed, 0, "new", ALL, &[], &mut false, true)
             .unwrap();
         assert!(owners(&db).iter().all(|o| o.as_deref() == Some("new")));
         assert_eq!(db.pull_lease("a.example").unwrap(), None);
@@ -1528,7 +1518,7 @@ mod tests {
             Some(due("a.example", lapsed, Reason::Retry, 0))
         );
         let new = db
-            .claim_pulls(lapsed, 1, "new", ALL, &[], &mut false)
+            .claim_pulls(lapsed, 1, "new", ALL, &[], &mut false, true)
             .unwrap()
             .remove(0);
         assert_eq!(new.domain, "a.example");
@@ -1540,11 +1530,11 @@ mod tests {
         let (_tmp, db) = open_db();
         db.insert_publisher("a.example", b"{}", "k", "p").unwrap();
         let old = db
-            .claim_pulls(NOW, 1, "old", ALL, &[], &mut false)
+            .claim_pulls(NOW, 1, "old", ALL, &[], &mut false, true)
             .unwrap()
             .remove(0);
         let lapsed = NOW + PARTITION_LEASE_SECONDS;
-        db.claim_pulls(lapsed, 0, "new", ALL, &[], &mut false)
+        db.claim_pulls(lapsed, 0, "new", ALL, &[], &mut false, true)
             .unwrap();
         let retry = db.scheduled_pull("a.example").unwrap();
         assert!(matches!(
@@ -1553,6 +1543,7 @@ mod tests {
                 "old",
                 NOW,
                 PullOutcome::Pulled { suspended: false },
+                0.0,
                 lapsed
             ),
             Err(Error::Fenced)
@@ -1560,16 +1551,16 @@ mod tests {
         assert_eq!(db.scheduled_pull("a.example").unwrap(), retry);
 
         let new = db
-            .claim_pulls(lapsed, 1, "new", ALL, &[], &mut false)
+            .claim_pulls(lapsed, 1, "new", ALL, &[], &mut false, true)
             .unwrap()
             .remove(0);
         assert!(matches!(
-            db.complete_pull(&old, "old", NOW, PullOutcome::Failed, lapsed),
+            db.complete_pull(&old, "old", NOW, PullOutcome::Failed, 0.0, lapsed),
             Err(Error::Fenced)
         ));
         assert_eq!(db.scheduled_pull("a.example").unwrap(), None);
         assert_eq!(db.pull_lease("a.example").unwrap().unwrap().owner, "new");
-        db.complete_pull(&new, "new", lapsed, PullOutcome::Failed, lapsed)
+        db.complete_pull(&new, "new", lapsed, PullOutcome::Failed, 0.0, lapsed)
             .unwrap();
         assert_eq!(
             db.scheduled_pull("a.example").unwrap(),
@@ -1587,7 +1578,7 @@ mod tests {
         let (tmp, db) = open_db();
         db.insert_publisher("a.example", b"{}", "k", "p").unwrap();
         let task = db
-            .claim_pulls(NOW, 1, "old", ALL, &[], &mut false)
+            .claim_pulls(NOW, 1, "old", ALL, &[], &mut false, true)
             .unwrap()
             .remove(0);
         let pull = Db::connect(&tmp.path().join("clave.sqlite"))
@@ -1601,6 +1592,7 @@ mod tests {
             ALL,
             &[],
             &mut false,
+            true,
         )
         .unwrap();
         assert!(matches!(
@@ -1633,12 +1625,12 @@ mod tests {
             NOW + LEASE_SECONDS + LEASE_SECONDS / 2 + 1
         );
         let renewed = NOW + LEASE_SECONDS + 1;
-        db.claim_pulls(renewed, 0, "me", ALL, &[], &mut false)
+        db.claim_pulls(renewed, 0, "me", ALL, &[], &mut false, true)
             .unwrap();
         assert!(db.pull_lease("mine.example").unwrap().is_some());
         let lapsed = NOW + LEASE_SECONDS * 2;
         let claimed = db
-            .claim_pulls(lapsed, 0, "me", ALL, &[], &mut false)
+            .claim_pulls(lapsed, 0, "me", ALL, &[], &mut false, true)
             .unwrap();
         assert!(claimed.is_empty());
         assert_eq!(db.pull_lease("mine.example").unwrap(), None);
@@ -1680,7 +1672,7 @@ mod tests {
         move_due(&mine, NOW);
         move_due(&other, NOW + 5);
         let task = db
-            .claim_pulls(NOW, 1, "me", ALL, &[], &mut false)
+            .claim_pulls(NOW, 1, "me", ALL, &[], &mut false, true)
             .unwrap()
             .remove(0);
         assert_eq!(task.domain, mine);
@@ -1688,7 +1680,7 @@ mod tests {
         let lapsed = NOW + LEASE_SECONDS + 1;
         let running = [mine.clone()];
         let claimed = db
-            .claim_pulls(lapsed, 4, "me", ALL, &running, &mut false)
+            .claim_pulls(lapsed, 4, "me", ALL, &running, &mut false, true)
             .unwrap();
         assert_eq!(
             claimed.iter().map(|task| &task.domain).collect::<Vec<_>>(),
@@ -1705,7 +1697,7 @@ mod tests {
 
         let ended = lapsed + 1;
         assert!(db
-            .claim_pulls(ended, 0, "me", ALL, &[], &mut false)
+            .claim_pulls(ended, 0, "me", ALL, &[], &mut false, true)
             .unwrap()
             .is_empty());
         assert_eq!(db.pull_lease(&mine).unwrap(), None);
@@ -1763,19 +1755,19 @@ mod tests {
         let (_tmp, db) = open_db();
         db.insert_publisher("a.example", b"{}", "k", "p").unwrap();
         let old = db
-            .claim_pulls(NOW, 1, "old", ALL, &[], &mut false)
+            .claim_pulls(NOW, 1, "old", ALL, &[], &mut false, true)
             .unwrap()
             .remove(0);
         db.release_partitions("old").unwrap();
         assert!(owners(&db).iter().all(Option::is_none));
         let new = db
-            .claim_pulls(NOW + 1, 1, "new", ALL, &[], &mut false)
+            .claim_pulls(NOW + 1, 1, "new", ALL, &[], &mut false, true)
             .unwrap()
             .remove(0);
         assert_eq!(new.domain, "a.example");
         assert_eq!(new.token, old.token + 1);
         assert!(matches!(
-            db.complete_pull(&old, "old", NOW, PullOutcome::Failed, NOW + 1),
+            db.complete_pull(&old, "old", NOW, PullOutcome::Failed, 0.0, NOW + 1),
             Err(Error::Fenced)
         ));
     }
@@ -1865,10 +1857,10 @@ mod tests {
                 .execute("UPDATE pull_schedule SET due_at = 0", [])
                 .unwrap();
             let task = db
-                .claim_pulls(NOW, 1, "me", ALL, &[], &mut false)
+                .claim_pulls(NOW, 1, "me", ALL, &[], &mut false, true)
                 .unwrap()
                 .remove(0);
-            db.complete_pull_with_cost(
+            db.complete_pull(
                 &task,
                 "me",
                 NOW,
@@ -1930,7 +1922,7 @@ mod tests {
         );
         let running = vec!["a.site.example".to_string()];
         assert!(db
-            .claim_pulls(NOW, 4, "me", ALL, &running, &mut true)
+            .claim_pulls(NOW, 4, "me", ALL, &running, &mut true, true)
             .unwrap()
             .is_empty());
         let task = PullTask {
@@ -1941,7 +1933,7 @@ mod tests {
             token: db.pull_lease("a.site.example").unwrap().unwrap().token,
             pinged_at: Some(NOW),
         };
-        db.complete_pull(&task, "me", NOW, PullOutcome::Failed, NOW)
+        db.complete_pull(&task, "me", NOW, PullOutcome::Failed, 0.0, NOW)
             .unwrap();
         assert_eq!(claim(&db, 4, &mut true), vec!["b.site.example"]);
     }
@@ -1960,7 +1952,7 @@ mod tests {
             schedule(&db.conn, row).unwrap();
         }
         let mut claimed = db
-            .claim_pulls_with_demand(NOW, 4, "me", ALL, &[], &mut true, false)
+            .claim_pulls(NOW, 4, "me", ALL, &[], &mut true, false)
             .unwrap()
             .into_iter()
             .map(|task| task.domain)

@@ -22,6 +22,7 @@ pub const MAX_PENDING_INGESTS: usize = 64;
 pub const OVERLOAD_RETRY_AFTER_SECS: u64 = 30;
 pub const BACKLOG_EPOCHS: u32 = 2;
 pub const BACKLOG_ENTRIES: u64 = 1 << 20;
+pub const PREFETCH_OBJECTS: u32 = 4;
 /// The instance name a `serve` without `--instance` runs under.
 pub const DEFAULT_INSTANCE: &str = "primary";
 
@@ -63,7 +64,10 @@ impl Default for ServeOptions {
             seal: true,
             backlog_epochs: BACKLOG_EPOCHS,
             backlog_entries: BACKLOG_ENTRIES,
-            pull_limits: ingest::PullLimits::default(),
+            pull_limits: ingest::PullLimits {
+                prefetch_objects: PREFETCH_OBJECTS,
+                ..ingest::PullLimits::default()
+            },
         }
     }
 }
@@ -351,7 +355,7 @@ fn pull(state: &AppState, owner: &str, task: &PullTask) {
         Err(Error::Fenced) => {}
         Err(_) => {
             let now = jiff::Timestamp::now().as_second();
-            let _ = db.complete_pull_with_cost(
+            let _ = db.complete_pull(
                 task,
                 owner,
                 started_at,
@@ -409,7 +413,7 @@ async fn dispatch(state: AppState, owner: Arc<str>, bounds: DispatchBounds) {
                     db.renew_pull_leases(&held, &owner, now)?;
                 }
                 let demand = !bounds.under_pressure(&db, now)?;
-                let tasks = db.claim_pulls_with_demand(
+                let tasks = db.claim_pulls(
                     now,
                     free,
                     &owner,

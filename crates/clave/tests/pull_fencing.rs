@@ -71,7 +71,7 @@ fn a_pull_whose_partition_is_taken_over_mid_pull_writes_nothing_and_the_new_hold
     let claimed_at = now - clave::db::PARTITION_LEASE_SECONDS;
     db.schedule_ping(&host, claimed_at, 4).unwrap();
     let old = db
-        .claim_pulls(claimed_at, 1, "old", ALL, &[], &mut true)
+        .claim_pulls(claimed_at, 1, "old", ALL, &[], &mut true, true)
         .unwrap()
         .remove(0);
     let at = jiff::Timestamp::from_second(now).unwrap().to_string();
@@ -93,7 +93,7 @@ fn a_pull_whose_partition_is_taken_over_mid_pull_writes_nothing_and_the_new_hold
         .recv_timeout(Duration::from_secs(10))
         .expect("the pull requested the Delta");
     let new = db
-        .claim_pulls(now, 1, "new", ALL, &[], &mut true)
+        .claim_pulls(now, 1, "new", ALL, &[], &mut true, true)
         .unwrap()
         .remove(0);
     assert_eq!(new.domain, host);
@@ -113,7 +113,14 @@ fn a_pull_whose_partition_is_taken_over_mid_pull_writes_nothing_and_the_new_hold
         .unwrap()
         .is_some_and(|status| status.last_pull_at.is_none()));
     assert!(matches!(
-        db.complete_pull(&old, "old", claimed_at, clave::db::PullOutcome::Failed, now),
+        db.complete_pull(
+            &old,
+            "old",
+            claimed_at,
+            clave::db::PullOutcome::Failed,
+            0.0,
+            now
+        ),
         Err(clave::Error::Fenced)
     ));
     assert_eq!(db.scheduled_pull(&host).unwrap(), None);
@@ -135,6 +142,7 @@ fn a_pull_whose_partition_is_taken_over_mid_pull_writes_nothing_and_the_new_hold
         clave::db::PullOutcome::Pulled {
             suspended: report.suspended,
         },
+        0.0,
         now,
     )
     .unwrap();
@@ -229,7 +237,7 @@ fn a_new_holder_fetches_feed_json_again_and_admits_each_delta_once() {
     let claimed_at = now - clave::db::PARTITION_LEASE_SECONDS;
     db.schedule_ping(&host, claimed_at, 4).unwrap();
     let old = db
-        .claim_pulls(claimed_at, 1, "old", ALL, &[], &mut true)
+        .claim_pulls(claimed_at, 1, "old", ALL, &[], &mut true, true)
         .unwrap()
         .remove(0);
     let at = jiff::Timestamp::from_second(now).unwrap().to_string();
@@ -251,7 +259,7 @@ fn a_new_holder_fetches_feed_json_again_and_admits_each_delta_once() {
         .recv_timeout(Duration::from_secs(10))
         .expect("the pull requested the Delta");
     let new = db
-        .claim_pulls(now, 1, "new", ALL, &[], &mut true)
+        .claim_pulls(now, 1, "new", ALL, &[], &mut true, true)
         .unwrap()
         .remove(0);
     assert!(matches!(puller.join().unwrap(), Err(clave::Error::Fenced)));
@@ -336,7 +344,7 @@ fn a_takeover_before_a_pull_completes_leaves_its_run_and_its_next_pull_unwritten
     let claimed_at = now - clave::db::PARTITION_LEASE_SECONDS;
     db.schedule_ping(&host, claimed_at, 4).unwrap();
     let old = db
-        .claim_pulls(claimed_at, 1, "old", ALL, &[], &mut true)
+        .claim_pulls(claimed_at, 1, "old", ALL, &[], &mut true, true)
         .unwrap()
         .remove(0);
     let at = jiff::Timestamp::from_second(now).unwrap().to_string();
@@ -354,7 +362,7 @@ fn a_takeover_before_a_pull_completes_leaves_its_run_and_its_next_pull_unwritten
     assert!(run.is_some());
 
     let new = db
-        .claim_pulls(now, 1, "new", ALL, &[], &mut true)
+        .claim_pulls(now, 1, "new", ALL, &[], &mut true, true)
         .unwrap()
         .remove(0);
     assert!(matches!(

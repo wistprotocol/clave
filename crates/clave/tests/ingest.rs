@@ -351,6 +351,7 @@ fn a_pull_suspends_at_its_work_limit_and_a_later_pull_resumes() {
         clave::ingest::PullLimits {
             work_bytes: u64::MAX,
             work_objects: 1,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -412,6 +413,7 @@ fn a_page_chain_longer_than_a_pulls_work_limit_is_walked_and_admitted_across_pul
             clave::ingest::PullLimits {
                 work_bytes: u64::MAX,
                 work_objects: 3,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -945,7 +947,7 @@ fn only_a_pulls_own_ping_is_charged_noise_and_at_the_instant_it_was_received() {
     let pinged_at = now - 86_400;
     db.schedule_ping(&host, pinged_at, 4).unwrap();
     let task = db
-        .claim_pulls(now, 1, "me", all, &[], &mut true)
+        .claim_pulls(now, 1, "me", all, &[], &mut true, true)
         .unwrap()
         .remove(0);
     assert_eq!(task.pinged_at, Some(pinged_at));
@@ -978,7 +980,7 @@ fn only_a_pulls_own_ping_is_charged_noise_and_at_the_instant_it_was_received() {
     assert_eq!(baseline.pinged_at, None);
     let later = baseline.due_at;
     let task = db
-        .claim_pulls(later, 1, "me", all, &[], &mut false)
+        .claim_pulls(later, 1, "me", all, &[], &mut false, true)
         .unwrap()
         .remove(0);
     assert_eq!(task.pinged_at, None);
@@ -1005,7 +1007,7 @@ fn a_pull_ended_at_wist2_e01_is_retried_a_minute_later_and_not_at_the_baseline()
     let started_at = jiff::Timestamp::now().as_second();
     db.schedule_ping(&host, started_at, 4).unwrap();
     let task = db
-        .claim_pulls(started_at, 1, "me", all, &[], &mut true)
+        .claim_pulls(started_at, 1, "me", all, &[], &mut true, true)
         .unwrap()
         .remove(0);
     let run = clave::ingest::open_pull(
@@ -1067,7 +1069,7 @@ fn a_walk_stopped_at_the_target_rule_that_suspends_resumes_instead_of_retrying()
     let all = clave::db::PARTITIONS as usize;
     db.schedule_ping(&host, started_at, 4).unwrap();
     let task = db
-        .claim_pulls(started_at, 1, "me", all, &[], &mut true)
+        .claim_pulls(started_at, 1, "me", all, &[], &mut true, true)
         .unwrap()
         .remove(0);
     let run = clave::ingest::open_pull(
@@ -1080,6 +1082,7 @@ fn a_walk_stopped_at_the_target_rule_that_suspends_resumes_instead_of_retrying()
         clave::ingest::PullLimits {
             work_bytes: u64::MAX,
             work_objects: 1,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -1110,6 +1113,7 @@ fn pull_through_the_schedule(
             clave::db::PARTITIONS as usize,
             &[],
             &mut true,
+            true,
         )
         .unwrap()
         .remove(0);
@@ -1234,7 +1238,7 @@ fn a_pull_ended_at_wist2_e05_keeps_the_baseline_schedule() {
     let pull = |started_at: i64| {
         db.schedule_ping(&host, started_at, 4).unwrap();
         let task = db
-            .claim_pulls(started_at, 1, "me", all, &[], &mut true)
+            .claim_pulls(started_at, 1, "me", all, &[], &mut true, true)
             .unwrap()
             .remove(0);
         let run = clave::ingest::open_pull(
@@ -1283,7 +1287,7 @@ fn a_feed_walk_stopped_at_a_next_failing_the_target_rule_admits_its_deltas_and_i
     db.set_param("baseline_poll_seconds", 86_400).unwrap();
     db.schedule_ping(&host, started_at, 4).unwrap();
     let task = db
-        .claim_pulls(started_at, 1, "me", all, &[], &mut true)
+        .claim_pulls(started_at, 1, "me", all, &[], &mut true, true)
         .unwrap()
         .remove(0);
     let run = clave::ingest::open_pull(
