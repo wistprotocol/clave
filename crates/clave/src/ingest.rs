@@ -1444,7 +1444,7 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
     /// a `label` or `dispute` Entry; a failure is `WIST2-E06` at the
     /// status endpoint.
     fn process_labels(&mut self) -> Result<()> {
-        let (db, host) = (self.db, self.host);
+        let (db, host, data_dir) = (self.db, self.host, self.data_dir);
         let Some(mut declaration) = label_declaration(db, host)? else {
             return self.finish(false);
         };
@@ -1490,8 +1490,19 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
                     continue;
                 }
             };
+            let attempt = match db
+                .pull_object(self.run.run_id, "label", &slot)?
+                .and_then(|object| object.refs_json)
+            {
+                Some(stored) => verify::IssuedRefs::from_json(&stored)?,
+                None => {
+                    let refs = issue_refs(db, data_dir, host, (self.clock)())?;
+                    db.set_pull_object_refs(self.run.run_id, "label", &slot, &refs.to_json()?)?;
+                    refs
+                }
+            };
             loop {
-                let checks = verify::label(&doc, &id, &declaration.0, url_cap_bytes);
+                let checks = verify::label(&doc, &id, &declaration.0, url_cap_bytes, &attempt);
                 let Some(kind) = checks.kind else {
                     admit::reject_item(
                         db,
@@ -1524,6 +1535,7 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
                     kind,
                     &doc,
                     &declaration,
+                    &attempt,
                     checks.label,
                 )? {
                     declaration = label_declaration(db, host)?.ok_or_else(|| {

@@ -295,7 +295,7 @@ fn labels_and_disputes_are_pulled_sealed_and_carried() {
         clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T14:00:00Z").unwrap();
     assert_eq!(report.labels, vec![retraction.0.clone()]);
 
-    let r1 = clave::seal::run(&db, data.path(), &sk, SEAL_START + 3600).unwrap();
+    let r1 = clave::seal::run(&db, data.path(), &sk, SEAL_START + 7200).unwrap();
     assert_eq!((r1.epoch_number, r1.entry_count), (1, 3));
     let sealed_entries = db.epoch_entries(1).unwrap();
     let types: Vec<&str> = sealed_entries
@@ -315,4 +315,203 @@ fn labels_and_disputes_are_pulled_sealed_and_carried() {
     ])));
     assert_eq!(db.sealed_labels().unwrap().len(), 2);
     assert_eq!(db.sealed_disputes().unwrap().len(), 1);
+}
+
+fn is_e06_for(db: &clave::db::Db, host: &str, id: &str) -> bool {
+    db.list_rejections(host)
+        .unwrap()
+        .iter()
+        .any(|r| r.code == "WIST2-E06" && r.delta_id.as_deref() == Some(id))
+}
+
+#[test]
+fn a_label_asserted_beyond_the_attempt_clock_allowance_is_rejected_and_pulled_again() {
+    let (listener, host, client) = reserve_addr();
+    let p = make_publisher(&host);
+    write_feed(&p, &host, &[], "2026-08-09T12:00:00Z");
+    let subject = "https://reduced.example.org/notice";
+    let at_bound = sign(
+        &p,
+        "label",
+        label(&host, subject, "wist:spam", "2026-08-09T12:10:00Z"),
+    );
+    let beyond = sign(
+        &p,
+        "label",
+        label(&host, subject, "wist:spam", "2026-08-09T12:10:01Z"),
+    );
+    write_listed(
+        &p,
+        &host,
+        &[at_bound.clone(), beyond.clone()],
+        "2026-08-09T12:00:00Z",
+    );
+    serve_static(listener, p.dir.path().to_path_buf());
+    let data = tempfile::tempdir().unwrap();
+    clave::init::run(&host, data.path()).unwrap();
+    let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
+
+    let report =
+        clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
+    assert_eq!(report.labels, vec![at_bound.0.clone()]);
+    assert_eq!(
+        report.rejected,
+        vec![(beyond.0.clone(), "WIST2-E06".to_string())]
+    );
+    assert!(is_e06_for(&db, &host, &beyond.0));
+    assert_eq!(db.count_pending_entries("label").unwrap(), 1);
+    assert!(db.is_label_seen_for(&at_bound.0, &host).unwrap());
+    assert!(!db.is_label_seen_for(&beyond.0, &host).unwrap());
+
+    let again =
+        clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:01Z").unwrap();
+    assert_eq!(again.labels, vec![beyond.0.clone()]);
+    assert!(again.rejected.is_empty());
+    assert_eq!(db.count_pending_entries("label").unwrap(), 2);
+}
+
+#[test]
+fn a_dispute_asserted_beyond_the_attempt_clock_allowance_is_rejected_and_pulled_again() {
+    let (listener, host, client) = reserve_addr();
+    let p = make_publisher(&host);
+    write_feed(&p, &host, &[], "2026-08-09T12:00:00Z");
+    let subject = "https://reduced.example.org/notice";
+    let (id, envelope) = sign(
+        &p,
+        "label",
+        label(&host, subject, "wist:spam", "2026-08-09T12:00:00Z"),
+    );
+    write_listed(&p, &host, &[(id.clone(), envelope)], "2026-08-09T12:00:00Z");
+    serve_static(listener, p.dir.path().to_path_buf());
+    let data = tempfile::tempdir().unwrap();
+    clave::init::run(&host, data.path()).unwrap();
+    let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
+    db.set_param("epoch_cadence_seconds", 1).unwrap();
+    clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
+    let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
+    clave::seal::run(&db, data.path(), &sk, SEAL_START).unwrap();
+    assert!(db.sealed_label_subject(&id).unwrap().is_some());
+
+    let disputant_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    disputant_listener.set_nonblocking(true).unwrap();
+    let disputant = "disputant.localhost".to_string();
+    let disputant_client = clave::fetch::Client::with_builder(
+        true,
+        reqwest::blocking::Client::builder()
+            .no_proxy()
+            .resolve(&disputant, disputant_listener.local_addr().unwrap()),
+    );
+    let d = make_publisher_with_scope(&disputant, &["reduced.example.org"]);
+    write_feed(&d, &disputant, &[], "2026-08-09T13:00:00Z");
+    let dispute = |asserted_at: &str| {
+        sign(
+            &d,
+            "dispute",
+            json!({"wist_version": "1.0.0", "disputant": disputant, "label": id, "log": "log.example", "height": 0, "asserted_at": asserted_at}),
+        )
+    };
+    let at_bound = dispute("2026-08-09T13:10:00Z");
+    let beyond = dispute("2026-08-09T13:10:01Z");
+    write_listed(
+        &d,
+        &disputant,
+        &[at_bound.clone(), beyond.clone()],
+        "2026-08-09T13:00:00Z",
+    );
+    serve_static(disputant_listener, d.dir.path().to_path_buf());
+
+    let report = clave::ingest::run(
+        &db,
+        &disputant_client,
+        data.path(),
+        &disputant,
+        "2026-08-09T13:00:00Z",
+    )
+    .unwrap();
+    assert_eq!(report.labels, vec![at_bound.0.clone()]);
+    assert_eq!(
+        report.rejected,
+        vec![(beyond.0.clone(), "WIST2-E06".to_string())]
+    );
+    assert!(is_e06_for(&db, &disputant, &beyond.0));
+    assert_eq!(db.count_pending_entries("dispute").unwrap(), 1);
+    assert!(!db.is_label_seen_for(&beyond.0, &disputant).unwrap());
+
+    let again = clave::ingest::run(
+        &db,
+        &disputant_client,
+        data.path(),
+        &disputant,
+        "2026-08-09T13:00:01Z",
+    )
+    .unwrap();
+    assert_eq!(again.labels, vec![beyond.0.clone()]);
+    assert!(again.rejected.is_empty());
+    assert_eq!(db.count_pending_entries("dispute").unwrap(), 2);
+}
+
+#[test]
+fn a_queued_label_beyond_the_allowance_at_sealed_at_is_dropped_reported_and_pulled_again() {
+    let (listener, host, client) = reserve_addr();
+    let p = make_publisher(&host);
+    write_feed(&p, &host, &[], "2026-08-16T11:55:00Z");
+    let (id, envelope) = sign(
+        &p,
+        "label",
+        label(
+            &host,
+            "https://reduced.example.org/notice",
+            "wist:spam",
+            "2026-08-16T12:03:20Z",
+        ),
+    );
+    write_listed(&p, &host, &[(id.clone(), envelope)], "2026-08-16T11:55:00Z");
+    serve_static(listener, p.dir.path().to_path_buf());
+    let data = tempfile::tempdir().unwrap();
+    clave::init::run(&host, data.path()).unwrap();
+    let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
+    let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
+    let unix = |at: &str| at.parse::<jiff::Timestamp>().unwrap().as_second();
+    let at = unix("2026-08-09T11:00:00Z");
+    clave::param_change::run(
+        &db,
+        &sk,
+        "clock_skew_seconds",
+        60,
+        Some("2026-08-16T11:59:00Z"),
+        at,
+    )
+    .unwrap();
+    assert!(clave::seal::run(&db, data.path(), &sk, at)
+        .unwrap()
+        .dropped
+        .is_empty());
+
+    let report =
+        clave::ingest::run(&db, &client, data.path(), &host, "2026-08-16T11:55:00Z").unwrap();
+    assert_eq!(report.labels, vec![id.clone()]);
+    assert!(db.is_label_seen_for(&id, &host).unwrap());
+
+    let sealed = clave::seal::run(&db, data.path(), &sk, unix("2026-08-16T12:00:00Z")).unwrap();
+    assert!(
+        sealed.dropped.contains(&format!("{id}: WIST2-E06")),
+        "{:?}",
+        sealed.dropped
+    );
+    assert!(!db
+        .epoch_entries(sealed.epoch_number)
+        .unwrap()
+        .iter()
+        .any(|entry| entry["type"] == "label"));
+    assert!(db.sealed_labels().unwrap().is_empty());
+    assert!(is_e06_for(&db, &host, &id));
+    assert_eq!(db.count_pending_entries("label").unwrap(), 0);
+    assert!(!db.is_label_seen_for(&id, &host).unwrap());
+
+    let again =
+        clave::ingest::run(&db, &client, data.path(), &host, "2026-08-16T12:02:20Z").unwrap();
+    assert_eq!(again.labels, vec![id.clone()]);
+    let resealed = clave::seal::run(&db, data.path(), &sk, unix("2026-08-16T13:00:00Z")).unwrap();
+    assert!(resealed.dropped.is_empty(), "{:?}", resealed.dropped);
+    assert_eq!(db.sealed_labels().unwrap().len(), 1);
 }

@@ -50,7 +50,14 @@ Declaration — fields, the registry name, self-labeling, the disputed
 Label's sealing and authority, the signature — and queued as a `label`
 or `dispute` Entry, sealed after the Deltas under the per-domain
 capacity and the per-Labeler cap; a failure is `WIST2-E06` at the status
-endpoint with the ID, pulled again on the next pull. The Snapshot state
+endpoint with the ID, pulled again on the next pull. `asserted_at` is
+checked against the whole-second clock and `clock_skew_seconds` captured
+when the Label's or dispute's attempt begins and kept through
+Declaration retries (WIST-1 §3.4); sealing repeats the check against the
+candidate Epoch's `sealed_at` and the allowance then in force, and a
+failing Entry is dropped with `WIST2-E06` and its ID at the status
+endpoint and its seen marker cleared, so the next pull fetches it
+again. The Snapshot state
 carries the current Labels and disputes as `label` and `dispute`
 tuples, and tier 1 carries `labels.parquet`, `disputes.parquet` and
 `labelers.parquet` (WIST-3 §7).

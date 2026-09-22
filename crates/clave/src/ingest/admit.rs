@@ -669,6 +669,7 @@ pub(super) fn admit_label(
     kind: LabelKind,
     doc: &Value,
     (declaration, decl): &(PublisherEnvelope, DeclarationRef),
+    attempt: &IssuedRefs,
     label: Option<std::result::Result<(), wist_core::label::Rejection>>,
 ) -> Result<LabelAdmission> {
     use wist_core::label::{self, LabelLookup};
@@ -685,14 +686,20 @@ pub(super) fn admit_label(
     }
     let outcome = match label {
         Some(outcome) => outcome,
-        None => label::validate_dispute(doc, declaration, |label_id| {
-            db.sealed_label_subject(label_id)
-                .ok()
-                .flatten()
-                .map_or(LabelLookup::Absent, |subject| LabelLookup::Known {
-                    subject,
-                })
-        })
+        None => label::validate_dispute(
+            doc,
+            declaration,
+            |label_id| {
+                db.sealed_label_subject(label_id)
+                    .ok()
+                    .flatten()
+                    .map_or(LabelLookup::Absent, |subject| LabelLookup::Known {
+                        subject,
+                    })
+            },
+            attempt.clock_floor_s(),
+            attempt.clock_skew_seconds,
+        )
         .map(|_| ()),
     };
     let admission = match outcome {

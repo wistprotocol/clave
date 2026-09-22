@@ -967,6 +967,37 @@ impl Db {
         Ok(report)
     }
 
+    pub(crate) fn reject_label_entries(
+        &self,
+        rejected: &[(i64, String, String, String)],
+        at: &str,
+    ) -> Result<Vec<String>> {
+        if rejected.is_empty() {
+            return Ok(Vec::new());
+        }
+        let tx = self.mutation()?;
+        let mut report = Vec::with_capacity(rejected.len());
+        for (rowid, domain, entry_type, id) in rejected {
+            tx.execute(
+                "INSERT INTO rejections(domain, code, at, delta_id, detail) VALUES (?1, 'WIST2-E06', ?2, ?3, ?4)",
+                (
+                    domain,
+                    at,
+                    id,
+                    format!("queued {entry_type} asserted_at exceeds the clock_skew_seconds allowance at sealing"),
+                ),
+            )?;
+            tx.execute(
+                "DELETE FROM seen_labels WHERE domain = ?1 AND id = ?2",
+                (domain, id),
+            )?;
+            tx.execute("DELETE FROM pending_entries WHERE rowid = ?1", [rowid])?;
+            report.push(format!("{id}: WIST2-E06"));
+        }
+        tx.commit()?;
+        Ok(report)
+    }
+
     pub(crate) fn release_queued_delta(&self, domain: &str, delta: &QueuedDeltaRow) -> Result<()> {
         self.execute(
             "INSERT INTO pending_entries(entry_type, domain, entry_json, chain_pos, acceptance_order) VALUES ('publisher_delta', ?1, ?2, ?3, ?4)",

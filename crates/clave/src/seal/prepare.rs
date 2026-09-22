@@ -539,7 +539,31 @@ pub(super) fn revalidate_queued_deltas(
     let mut dropped_rowids = Vec::new();
     let mut dropped = Vec::new();
     let mut rejections = std::collections::BTreeMap::<String, Vec<(Value, &str)>>::new();
+    let mut late_labels = Vec::new();
     for e in entries {
+        if matches!(e.entry_type.as_str(), "label" | "dispute") {
+            let asserted_at = e.body[e.entry_type.as_str()]["asserted_at"]
+                .as_str()
+                .unwrap_or_default();
+            if wist_core::publisher_time::within_clock_bound(
+                asserted_at,
+                clock.as_second(),
+                clock_skew_seconds,
+            ) == Some(true)
+            {
+                kept.push(e);
+            } else {
+                let id = if e.entry_type == "label" {
+                    wist_core::label::label_id(&e.body["label"])
+                } else {
+                    wist_core::label::dispute_id(&e.body["dispute"])
+                }
+                .map_err(|err| Error::Seal(format!("queued Label Entry has no ID: {err:?}")))?;
+                dropped_rowids.push(e.rowid);
+                late_labels.push((e.rowid, e.domain, e.entry_type, id));
+            }
+            continue;
+        }
         if e.entry_type != "publisher_delta" {
             kept.push(e);
             continue;
@@ -604,6 +628,7 @@ pub(super) fn revalidate_queued_deltas(
     for (domain, rejected) in rejections {
         dropped.extend(db.reject_delta_copies(&domain, &rejected, sealed_at)?);
     }
+    dropped.extend(db.reject_label_entries(&late_labels, sealed_at)?);
     let retained: HashSet<_> = db
         .peek_pending_entries()?
         .0

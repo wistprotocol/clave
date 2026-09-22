@@ -72,6 +72,15 @@ impl IssuedRefs {
         })?)
     }
 
+    pub fn clock_floor_s(&self) -> i64 {
+        let seconds = self.clock.as_second();
+        if self.clock.subsec_nanosecond() < 0 {
+            seconds - 1
+        } else {
+            seconds
+        }
+    }
+
     pub fn from_json(json: &str) -> crate::error::Result<Self> {
         let stored: StoredRefs = serde_json::from_str(json)?;
         Ok(IssuedRefs {
@@ -271,6 +280,7 @@ pub(super) fn label(
     id: &str,
     declaration: &PublisherEnvelope,
     url_cap_bytes: i64,
+    attempt: &IssuedRefs,
 ) -> LabelChecks {
     use wist_core::label;
     let (kind, computed) = if doc.get("label").is_some() {
@@ -287,7 +297,15 @@ pub(super) fn label(
     LabelChecks {
         kind,
         id_matches: computed.as_deref() == Ok(id),
-        label: (kind == Some(LabelKind::Label))
-            .then(|| label::validate_label(doc, declaration, url_cap_bytes).map(|_| ())),
+        label: (kind == Some(LabelKind::Label)).then(|| {
+            label::validate_label(
+                doc,
+                declaration,
+                url_cap_bytes,
+                attempt.clock_floor_s(),
+                attempt.clock_skew_seconds,
+            )
+            .map(|_| ())
+        }),
     }
 }
