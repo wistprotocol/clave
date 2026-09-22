@@ -11,7 +11,7 @@ use rusqlite::{Connection, OptionalExtension};
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS pull_runs(run_id INTEGER PRIMARY KEY AUTOINCREMENT, domain TEXT NOT NULL UNIQUE, token INTEGER, now TEXT NOT NULL, day TEXT NOT NULL, unit TEXT NOT NULL, phase TEXT NOT NULL CHECK(phase IN ('walk','deltas','labels','label_items','closing','aborted')), work_bytes INTEGER NOT NULL, work_objects INTEGER NOT NULL, feed_retry_used INTEGER NOT NULL DEFAULT 0, unseen_any INTEGER NOT NULL DEFAULT 0, suspended INTEGER NOT NULL DEFAULT 0, chain_pos INTEGER NOT NULL DEFAULT 0, pages_epoch INTEGER, queue_json BLOB NOT NULL DEFAULT '[]', position INTEGER NOT NULL DEFAULT 0, ended TEXT);
-CREATE TABLE IF NOT EXISTS pull_objects(run_id INTEGER NOT NULL, kind TEXT NOT NULL, object_id TEXT NOT NULL, url TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('issued','fetched','verified','admitted','rejected','failed')), raw BLOB, byte_len INTEGER, debited INTEGER NOT NULL DEFAULT 0, checks_json TEXT, refs_json TEXT, report TEXT, report_seq INTEGER, PRIMARY KEY(run_id, kind, object_id));
+CREATE TABLE IF NOT EXISTS pull_objects(run_id INTEGER NOT NULL, kind TEXT NOT NULL, object_id TEXT NOT NULL, url TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('issued','fetched','verified','admitted','rejected','failed')), raw BLOB, byte_len INTEGER, debited INTEGER NOT NULL DEFAULT 0, unit TEXT, day TEXT, checks_json TEXT, refs_json TEXT, report TEXT, report_seq INTEGER, PRIMARY KEY(run_id, kind, object_id));
 CREATE TABLE IF NOT EXISTS pull_walk(domain TEXT NOT NULL, feed TEXT NOT NULL CHECK(feed IN ('feed','label')), idx INTEGER NOT NULL, url TEXT NOT NULL, generated_at TEXT NOT NULL, ids_json BLOB NOT NULL, next_url TEXT, raw BLOB, PRIMARY KEY(domain, feed, idx));
 CREATE TABLE IF NOT EXISTS pull_attempts(run_id INTEGER NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('delta_refresh','resolved_prev')), id TEXT NOT NULL, PRIMARY KEY(run_id, kind, id));
 ";
@@ -233,10 +233,25 @@ fn run_by(conn: &Connection, filter: &str, key: impl rusqlite::Params) -> Result
 
 fn release_reservations(conn: &Connection, run_id: i64) -> Result<()> {
     conn.execute(
-        "INSERT INTO ingest_meter(domain, day, bytes) SELECT run.unit, run.day, -SUM(object.debited) FROM pull_runs run JOIN pull_objects object ON object.run_id = run.run_id WHERE run.run_id = ?1 AND object.status = 'issued' GROUP BY run.unit, run.day ON CONFLICT(domain, day) DO UPDATE SET bytes = bytes + excluded.bytes",
+        "INSERT INTO ingest_meter(domain, day, bytes) SELECT COALESCE(object.unit, run.unit), COALESCE(object.day, run.day), -SUM(object.debited) FROM pull_runs run JOIN pull_objects object ON object.run_id = run.run_id WHERE run.run_id = ?1 AND object.status = 'issued' GROUP BY COALESCE(object.unit, run.unit), COALESCE(object.day, run.day) ON CONFLICT(domain, day) DO UPDATE SET bytes = bytes + excluded.bytes",
         [run_id],
     )?;
     Ok(())
+}
+
+fn reservation_meter(
+    conn: &Connection,
+    run_id: i64,
+    kind: &str,
+    object_id: &str,
+) -> Result<Option<(String, String)>> {
+    Ok(conn
+        .query_row(
+            "SELECT COALESCE(object.unit, run.unit), COALESCE(object.day, run.day) FROM pull_objects object JOIN pull_runs run ON run.run_id = object.run_id WHERE object.run_id = ?1 AND object.kind = ?2 AND object.object_id = ?3",
+            (run_id, kind, object_id),
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?)
 }
 
 fn delete_run(conn: &Connection, run_id: i64) -> Result<()> {
@@ -427,7 +442,8 @@ impl Db {
 
     /// Issues a metered request: records the object as issued with `limit`
     /// bytes reserved in the budget of `unit` for `day`, or moves an
-    /// issued object's reservation to `limit`, in one transaction.
+    /// issued object's reservation to `limit`, crediting the row it held
+    /// when that row differs, in one transaction.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn reserve_pull_object(
         &self,
@@ -449,19 +465,28 @@ impl Db {
             }
             None => 0,
         };
+        let held = reservation_meter(&tx, run_id, kind, object_id)?
+            .filter(|_| reserved > 0)
+            .filter(|(held_unit, held_day)| held_unit != unit || held_day != day);
         tx.execute(
-            "INSERT INTO pull_objects(run_id, kind, object_id, url, status, debited) VALUES (?1, ?2, ?3, ?4, 'issued', ?5) ON CONFLICT(run_id, kind, object_id) DO UPDATE SET debited = excluded.debited",
-            (run_id, kind, object_id, url, limit as i64),
+            "INSERT INTO pull_objects(run_id, kind, object_id, url, status, debited, unit, day) VALUES (?1, ?2, ?3, ?4, 'issued', ?5, ?6, ?7) ON CONFLICT(run_id, kind, object_id) DO UPDATE SET debited = excluded.debited, unit = excluded.unit, day = excluded.day",
+            (run_id, kind, object_id, url, limit as i64, unit, day),
         )?;
-        self.add_ingest_bytes(unit, day, limit as i64 - reserved as i64)?;
+        match held {
+            Some((held_unit, held_day)) => {
+                self.add_ingest_bytes(&held_unit, &held_day, -(reserved as i64))?;
+                self.add_ingest_bytes(unit, day, limit as i64)?;
+            }
+            None => self.add_ingest_bytes(unit, day, limit as i64 - reserved as i64)?,
+        }
         tx.commit()
     }
 
     /// Persists how an issued metered request ended and settles its
-    /// reservation to the bytes actually debited, with `run`'s remaining
-    /// work, in one transaction. Returns `false`, writing nothing, when
-    /// the object is no longer issued, as when the same result is
-    /// delivered twice.
+    /// reservation, on the meter row the request was issued against, to
+    /// the bytes actually debited, with `run`'s remaining work, in one
+    /// transaction. Returns `false`, writing nothing, when the object is
+    /// no longer issued, as when the same result is delivered twice.
     pub(crate) fn settle_pull_object(
         &self,
         run: &PullRun,
@@ -476,6 +501,8 @@ impl Db {
         else {
             return Ok(false);
         };
+        let (unit, day) = reservation_meter(&tx, run.run_id, kind, object_id)?
+            .ok_or_else(|| Error::History(format!("{kind} {object_id} lost its reservation")))?;
         let (status, raw, debited, checks) = match settled {
             Settled::Body(raw) => (Status::Fetched, Some(raw), raw.len() as u64, None),
             Settled::Bounded(debited) => (Status::Failed, None, debited, None),
@@ -499,7 +526,7 @@ impl Db {
                 checks,
             ],
         )?;
-        self.add_ingest_bytes(&run.unit, &run.day, debited as i64 - issued.debited as i64)?;
+        self.add_ingest_bytes(&unit, &day, debited as i64 - issued.debited as i64)?;
         self.update_pull_run(run)?;
         tx.commit()?;
         Ok(true)

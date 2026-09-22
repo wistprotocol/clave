@@ -326,7 +326,7 @@ fn ingest_samples_each_delta_clock_and_uses_the_parameter_effective_then() {
             })
             .collect();
         write_feed(&p, &host, &ids, "2026-08-16T11:59:59Z");
-        serve_static(listener, p.dir.path().to_path_buf());
+        let requests = serve_recording(listener, p.dir.path().to_path_buf());
         let data = tempfile::tempdir().unwrap();
         clave::init::run(&host, data.path()).unwrap();
         let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
@@ -361,7 +361,7 @@ fn ingest_samples_each_delta_clock_and_uses_the_parameter_effective_then() {
                 "2026-08-16T12:01:00.5Z",
             ]
         };
-        let calls = std::cell::Cell::new(0);
+        let served = std::cell::RefCell::new(Vec::<String>::new());
         let report = clave::ingest::run_with_clock(
             &db,
             &client,
@@ -369,13 +369,26 @@ fn ingest_samples_each_delta_clock_and_uses_the_parameter_effective_then() {
             &host,
             "2026-08-16T11:59:59Z",
             || {
-                let i = calls.get();
-                calls.set(i + 1);
-                clocks[i].parse().unwrap()
+                let fetched = requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|request| request.contains("/deltas/"))
+                    .count();
+                let at = clocks[fetched.saturating_sub(1).min(clocks.len() - 1)];
+                let mut served = served.borrow_mut();
+                if served.last().map(String::as_str) != Some(at) {
+                    served.push(at.to_string());
+                }
+                at.parse().unwrap()
             },
         )
         .unwrap();
-        assert_eq!(calls.get(), 3);
+        assert_eq!(
+            *served.borrow(),
+            clocks,
+            "the pull reads one clock sample per Delta, in the order the Feed lists them"
+        );
         assert_eq!(report.accepted, [ids[0].clone(), ids[2].clone()]);
         assert_eq!(report.rejected, [(ids[1].clone(), "WIST1-E06".into())]);
         assert!(!db.is_delta_seen(&ids[1]).unwrap());

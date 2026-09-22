@@ -631,6 +631,66 @@ fn the_reservation_a_crashed_pull_left_is_released_with_its_run_and_settles_once
 }
 
 #[test]
+fn a_reservation_settles_and_releases_on_the_row_its_request_was_issued_against() {
+    let site = Site::new();
+    site.feed(&[], NOW, None);
+    let log = Log::onboard(&site);
+    let (db, host, day) = (&log.db, site.host.clone(), &NOW[..10]);
+    let (crossed_unit, crossed_day) = ("sub.localhost", "2026-08-10");
+    let spent = db.ingest_bytes(&host, day).unwrap();
+    let run = start_run(db, &host, NOW);
+    let slot = "sha256:abc#0";
+    db.reserve_pull_object(
+        run.run_id,
+        "delta",
+        slot,
+        "https://localhost/d",
+        crossed_unit,
+        crossed_day,
+        4096,
+    )
+    .unwrap();
+    assert_eq!(db.ingest_bytes(crossed_unit, crossed_day).unwrap(), 4096);
+    assert_eq!(
+        db.ingest_bytes(&host, day).unwrap(),
+        spent,
+        "a request issued against another row does not reserve on the run's"
+    );
+
+    assert!(db
+        .settle_pull_object(&run, "delta", slot, Settled::Body(b"12345"))
+        .unwrap());
+    assert_eq!(
+        db.ingest_bytes(crossed_unit, crossed_day).unwrap(),
+        5,
+        "the response settles on the row its bound was reserved against"
+    );
+    assert_eq!(db.ingest_bytes(&host, day).unwrap(), spent);
+
+    db.reserve_pull_object(
+        run.run_id,
+        "page",
+        "feed:0",
+        "https://localhost/f",
+        crossed_unit,
+        crossed_day,
+        2048,
+    )
+    .unwrap();
+    assert_eq!(
+        db.ingest_bytes(crossed_unit, crossed_day).unwrap(),
+        5 + 2048
+    );
+    db.delete_pull_run(run.run_id).unwrap();
+    assert_eq!(
+        db.ingest_bytes(crossed_unit, crossed_day).unwrap(),
+        5,
+        "the reservation that never settled returns to the row it debited"
+    );
+    assert_eq!(db.ingest_bytes(&host, day).unwrap(), spent);
+}
+
+#[test]
 fn a_fresh_pull_after_an_interruption_at_any_commit_admits_what_one_pull_admits() {
     let (site, ids) = walked_site();
     let expected = {

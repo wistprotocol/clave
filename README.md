@@ -171,18 +171,25 @@ before the body is read, and a body that crosses it is refused where it
 crosses. A Declaration, Feed page or Mirror list is
 bounded at 1 MiB; a Delta file at 16 KiB plus twice `url_cap_bytes`; a
 Payload at `extract_cap_bytes + links_cap_bytes + summary_cap_bytes` plus
-4 KiB, each read from the schedule in force at the pull. Content fetches
-under WIST-2 §5's daily budget are further bounded by the budget's
-remainder and by the pull's work limits (64 MiB and 4096 objects per
-pull): an object that would cross the budget or the work limit is not
-read past it, the bytes read are debited, and the walk suspends for a
-later pull to resume from where it stopped, exactly as budget exhaustion
-does; an object above its own cap is a failed fetch. The bound a request
-is issued under is reserved against the budget before the request and
-settled to the bytes actually read when the response is persisted, so
-neither a pull that stops mid-request nor two hosts pulling one
-Registrable Domain can read past a day's budget. Declaration requests
-stay outside the budget and carry only their own cap.
+4 KiB, each read from the schedule in force at the instant the request is
+issued. Content fetches under WIST-2 §5's daily budget are further
+bounded by the budget's remainder and by the pull's work limits (64 MiB
+and 4096 objects per pull): an object that would cross the budget or the
+work limit is not read past it, the bytes read are debited, and the walk
+suspends for a later pull to resume from where it stopped, exactly as
+budget exhaustion does; an object above its own cap is a failed fetch.
+`ingest_budget_bytes_day`, the host's Registrable Domain under the suffix
+list in force and the UTC day are read at each request too, so a pull
+that crosses midnight UTC, a `parameter_change` activation or a
+`suffix_list_update` activation meters the requests after the crossing
+against the row then in force while the requests before it stay debited
+where they were. The bound a request is issued under is reserved against
+that row before the request and settled there to the bytes actually read
+when the response is persisted, so neither a pull that stops mid-request
+nor two hosts pulling one Registrable Domain can read past a day's
+budget. The work limits are this Aggregator's own, not Registry
+parameters, and hold for the whole pull. Declaration requests stay
+outside the budget and carry only their own cap.
 
 A fetch connects only to a public unicast address. Loopback addresses are
 allowed under `--allow-http`, the local-test exception; private,
@@ -395,8 +402,9 @@ instead of requested again and an admission or rejection it already
 recorded is not repeated, so a second delivery of either changes nothing.
 A pull that stops before its run is closed — a crash, or a partition
 taken over mid-pull — leaves the run behind, and the next pull of that
-domain drops it with its objects and starts fresh, returning to the
-budget what a request that never settled had reserved: resumption is a
+domain drops it with its objects and starts fresh, returning what a
+request that never settled had reserved to the budget row that request
+was issued against: resumption is a
 later pull (WIST-2 §5), which takes its own clock and schedule (WIST-1
 §3.4) and fetches `feed.json` again. Nothing is admitted twice across the
 interruption, because an ID already accepted for sealing is seen (WIST-1

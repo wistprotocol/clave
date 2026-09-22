@@ -120,6 +120,8 @@ pub(super) fn add_missing_columns(conn: &Connection) -> Result<()> {
         "ALTER TABLE aggregator_keys ADD COLUMN adding_act BLOB",
         "ALTER TABLE aggregator_keys ADD COLUMN removing_act BLOB",
         "ALTER TABLE pull_walk ADD COLUMN raw BLOB",
+        "ALTER TABLE pull_objects ADD COLUMN unit TEXT",
+        "ALTER TABLE pull_objects ADD COLUMN day TEXT",
     ] {
         match conn.execute(statement, []) {
             Ok(_) => {}

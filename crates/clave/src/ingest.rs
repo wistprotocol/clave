@@ -316,9 +316,10 @@ impl ObjectCaps {
     }
 }
 
-/// The daily budget of the Registrable Domain a pull is metered on
-/// (WIST-2 §5) and the per-object bounds in force at it.
+/// The values in force at the instant a request is issued (WIST-2 §5, §8).
 struct Meter {
+    unit: String,
+    day: String,
     budget: i64,
     caps: ObjectCaps,
 }
@@ -457,10 +458,6 @@ pub fn open_pull(
         base: format!("{scheme}://{host}/.well-known/wist/"),
         now_unix,
         clock,
-        meter: Meter {
-            budget: registry::effective(db, "ingest_budget_bytes_day", &run.now)?,
-            caps: ObjectCaps::from_schedule(&db.parameter_schedule(now_unix)?, now_unix),
-        },
         run,
     };
     match pull.run() {
@@ -484,7 +481,6 @@ struct Pull<'a, C: Fn() -> jiff::Timestamp> {
     base: String,
     now_unix: i64,
     clock: C,
-    meter: Meter,
     run: PullRun,
 }
 
@@ -510,6 +506,17 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
 
     fn settle(&self) -> Result<()> {
         admit::settle_if_due(self.db, self.data_dir, self.host, &self.clock)
+    }
+
+    fn meter_at(&self, at: jiff::Timestamp) -> Result<Meter> {
+        let unix = at.as_second();
+        let at = registry::instant(unix)?;
+        Ok(Meter {
+            unit: crate::suffix_list::unit_at(self.db, self.host, &at)?,
+            day: at.get(..10).unwrap_or(&at).to_string(),
+            budget: registry::effective(self.db, "ingest_budget_bytes_day", &at)?,
+            caps: ObjectCaps::from_schedule(&self.db.parameter_schedule(unix)?, unix),
+        })
     }
 
     /// The run's object ID for `key`: the key's name, and for a listed
@@ -545,13 +552,13 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
         })
     }
 
-    /// Fetches one content object under the remaining daily budget, the
-    /// pull's work limits and the object's own cap, reserving the bound
-    /// against the budget before the request and settling it to the bytes
-    /// read when the response persists. The walk suspends when the budget
-    /// or the work is spent, or the object would cross the budget, in
-    /// which case the bytes read up to the bound are debited. An object
-    /// above its own cap is a failed fetch.
+    /// Fetches one content object under the budget, bounds and meter row in
+    /// force when the request is issued, and the pull's work limits,
+    /// reserving the bound before the request and settling it to the bytes
+    /// read when the response persists. The walk suspends when the budget or the
+    /// work is spent, or the object would cross the budget, in which case
+    /// the bytes read up to the bound are debited. An object above its own
+    /// cap is a failed fetch.
     fn get(&mut self, key: &ObjectKey, slot: &str, url: &str, object: Object) -> Result<Got> {
         let (db, kind) = (self.db, key.kind());
         let held = db.pull_object(self.run.run_id, kind, slot)?;
@@ -560,24 +567,25 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
             Some(object) => return self.stored(object),
             None => 0,
         };
-        let spent = db.ingest_bytes(&self.run.unit, &self.run.day)? - reserved as i64;
+        let meter = self.meter_at((self.clock)())?;
+        let spent = db.ingest_bytes(&meter.unit, &meter.day)? - reserved as i64;
         let (work_bytes, work_objects) = (self.run.work_bytes, self.run.work_objects);
-        if spent >= self.meter.budget || work_bytes == 0 || work_objects == 0 {
+        if spent >= meter.budget || work_bytes == 0 || work_objects == 0 {
             if held.is_some() {
                 let run = self.run.clone();
                 db.settle_pull_object(&run, kind, slot, Settled::Bounded(0))?;
             }
             return Ok(Got::Suspend);
         }
-        let cap = self.meter.caps.of(object);
-        let limit = cap.min((self.meter.budget - spent) as u64).min(work_bytes);
+        let cap = meter.caps.of(object);
+        let limit = cap.min((meter.budget - spent) as u64).min(work_bytes);
         db.reserve_pull_object(
             self.run.run_id,
             kind,
             slot,
             url,
-            &self.run.unit,
-            &self.run.day,
+            &meter.unit,
+            &meter.day,
             limit,
         )?;
         let outcome = fetch_stage::fetch(

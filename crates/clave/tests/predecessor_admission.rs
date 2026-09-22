@@ -220,7 +220,7 @@ fn corrupt_history_after_the_predecessor_stops_admission() {
     let p = make_publisher(&host);
     let first = add(&p, None, "2026-08-09T12:00:00Z");
     write_feed(&p, &host, std::slice::from_ref(&first), NOW);
-    serve_static(listener, p.dir.path().to_path_buf());
+    let requests = serve_recording(listener, p.dir.path().to_path_buf());
     let data = tempfile::tempdir().unwrap();
     clave::init::run(&host, data.path()).unwrap();
     let db = Db::open(&data.path().join("clave.sqlite")).unwrap();
@@ -236,7 +236,7 @@ fn corrupt_history_after_the_predecessor_stops_admission() {
         std::slice::from_ref(&next),
         "2026-08-09T16:00:00Z",
     );
-    let calls = std::cell::Cell::new(0);
+    let corruptions = std::cell::Cell::new(0);
     let result = clave::ingest::run_with_clock(
         &db,
         &client,
@@ -244,18 +244,29 @@ fn corrupt_history_after_the_predecessor_stops_admission() {
         &host,
         "2026-08-09T16:00:00Z",
         || {
-            calls.set(calls.get() + 1);
-            rusqlite::Connection::open(data.path().join("clave.sqlite"))
+            let fetched = requests
+                .lock()
                 .unwrap()
-                .execute(
-                    "UPDATE log_entries SET entry_json = ?1 WHERE leaf_index = 0",
-                    [br#"{"type":"label","body":{}}"#.as_slice()],
-                )
-                .unwrap();
+                .iter()
+                .any(|request| request.contains("/deltas/"));
+            if fetched && corruptions.get() == 0 {
+                corruptions.set(1);
+                rusqlite::Connection::open(data.path().join("clave.sqlite"))
+                    .unwrap()
+                    .execute(
+                        "UPDATE log_entries SET entry_json = ?1 WHERE leaf_index = 0",
+                        [br#"{"type":"label","body":{}}"#.as_slice()],
+                    )
+                    .unwrap();
+            }
             "2026-08-09T16:00:00Z".parse().unwrap()
         },
     );
-    assert_eq!(calls.get(), 1);
+    assert_eq!(
+        corruptions.get(),
+        1,
+        "the history is corrupted once, at the clock sample of the Delta's attempt"
+    );
     assert!(result.is_err());
     assert!(!db.is_delta_seen(&next).unwrap());
     assert_eq!(
