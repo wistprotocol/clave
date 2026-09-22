@@ -226,6 +226,29 @@ waiting bound is refused with 503 and `Retry-After: 30`, is not queued,
 and counts as neither noise nor a pull, so the Publisher retries later
 under its own backoff. Quota (429) is answered before admission.
 
+The order in which due pulls take free slots is this Aggregator's own; the
+specification orders no pulls across domains. Claims alternate between
+waiting Pings and scheduled duties (the WIST-2 §5 baseline poll, the
+WIST-2 §7 retry and the resumption of a suspended walk), so neither
+starves the other. Within each, a pull overdue by 300 seconds or more goes
+first, oldest first; otherwise the oldest pull of the lightest load class
+due goes. A domain's load score is the cost of its first pull, then moves
+halfway toward each later pull's cost, where a cost is the pull's wall
+seconds plus the octets it fetched under the ingest budget divided by
+1048576. Scores below 1, 10 and 100 are classes 0, 1 and 2, any higher
+score class 3; a waiting pull keeps the class its domain had when it was
+scheduled. At most one pull per Registrable Domain runs at once in a
+`serve` process: a due host whose Registrable Domain has a pull running
+or claimed waits for the next pass.
+
+Intake also pauses on sealing capacity, which the specification does not
+bound either. While the entries waiting to be sealed number at least
+1048576, or their octets, counted as WIST-3 §6 counts an Epoch's, reach
+twice the `epoch_cap_bytes` in force, only baseline polls and §7 retries
+serving no Ping are claimed; Ping-driven and resumption pulls wait with
+their due times unchanged and are the oldest once the backlog drains.
+Running pulls continue.
+
 The endpoint admits a Ping only when its `host` is byte-identical to its
 own Canonical Host (WIST-1 §2), the form WIST-2 §4 requires: an uppercase
 spelling, a trailing dot, an IDN U-label and a `host:port` authority are

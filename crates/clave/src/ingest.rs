@@ -29,6 +29,7 @@ pub struct IngestReport {
     /// The rejection code the pull, or its Feed walk alone, ended at.
     pub ended: Option<String>,
     pub suspended: bool,
+    pub fetched_bytes: u64,
 }
 
 /// WIST-2 §4: `host` MUST be a bare authority (`host[:port]`) — no scheme,
@@ -415,7 +416,9 @@ pub fn finish_pull(
             suspended: report.suspended,
         },
     };
-    db.complete_pull(task, owner, started_at, outcome, now)?;
+    let cost = now.saturating_sub(started_at).max(0) as f64
+        + report.fetched_bytes as f64 / crate::db::BYTES_PER_SLOT_SECOND;
+    db.complete_pull_with_cost(task, owner, started_at, outcome, cost, now)?;
     mutation.commit()?;
     Ok(report)
 }

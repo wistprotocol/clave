@@ -10,6 +10,7 @@ use super::Db;
 use crate::error::{Error, Result};
 use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ValueRef};
 use rusqlite::{Connection, OptionalExtension};
+use std::collections::HashSet;
 
 /// How long a claimed pull stays owned before a pass of the dispatcher
 /// holding its partition may return it to the schedule; a running pull's
@@ -18,9 +19,13 @@ pub const LEASE_SECONDS: i64 = 600;
 /// WIST-2 §7's first backoff delay, each further one quadrupling it.
 pub const RETRY_BASE_SECONDS: i64 = 60;
 const RETRY_ATTEMPTS: i64 = 4;
+pub const AGE_PRIORITY_SECONDS: i64 = 300;
+/// The octets a pull fetches that cost as much as one second of a slot.
+pub const BYTES_PER_SLOT_SECOND: f64 = 1_048_576.0;
+const MAX_LOAD_CLASS: i64 = 3;
 
 const SCHEMA: &str = "
-CREATE TABLE pull_schedule(domain TEXT PRIMARY KEY, partition INTEGER NOT NULL, due_at INTEGER NOT NULL, reason TEXT NOT NULL CHECK(reason IN ('ping','baseline','resume','retry')), attempts INTEGER NOT NULL DEFAULT 0, pinged_at INTEGER);
+CREATE TABLE pull_schedule(domain TEXT PRIMARY KEY, partition INTEGER NOT NULL, due_at INTEGER NOT NULL, reason TEXT NOT NULL CHECK(reason IN ('ping','baseline','resume','retry')), attempts INTEGER NOT NULL DEFAULT 0, pinged_at INTEGER, load_class INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE pull_tasks(domain TEXT PRIMARY KEY, partition INTEGER NOT NULL, token INTEGER NOT NULL, reason TEXT NOT NULL CHECK(reason IN ('ping','baseline','resume','retry')), owner TEXT NOT NULL, lease_until INTEGER NOT NULL, issued_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, pinged_at INTEGER);
 ";
 
@@ -34,15 +39,27 @@ DROP INDEX IF EXISTS pull_schedule_due;
 DROP INDEX IF EXISTS pull_tasks_lease;
 ";
 
+const LOAD: &str = "
+CREATE TABLE IF NOT EXISTS pull_load(domain TEXT PRIMARY KEY, score REAL NOT NULL, updated_at INTEGER NOT NULL);
+";
+
+const LOAD_COLUMN: &str = "
+ALTER TABLE pull_schedule ADD COLUMN load_class INTEGER NOT NULL DEFAULT 0;
+";
+
 const INDEXES: &str = "
 CREATE INDEX IF NOT EXISTS pull_schedule_reason ON pull_schedule(reason, due_at, domain);
 CREATE INDEX IF NOT EXISTS pull_schedule_partition_due ON pull_schedule(partition, due_at, domain);
 CREATE INDEX IF NOT EXISTS pull_schedule_partition_reason ON pull_schedule(partition, reason, due_at, domain);
+CREATE INDEX IF NOT EXISTS pull_schedule_partition_load ON pull_schedule(partition, load_class, due_at, domain);
+CREATE INDEX IF NOT EXISTS pull_schedule_partition_reason_load ON pull_schedule(partition, reason, load_class, due_at, domain);
 CREATE INDEX IF NOT EXISTS pull_tasks_partition ON pull_tasks(partition, lease_until);
 ";
 
 const OLDEST_DUE_PING: &str = "SELECT domain, due_at, reason, attempts, pinged_at FROM pull_schedule WHERE partition = ?2 AND reason = 'ping' AND due_at <= ?1 AND NOT EXISTS (SELECT 1 FROM pull_tasks WHERE pull_tasks.domain = pull_schedule.domain) ORDER BY due_at, domain";
 const OLDEST_DUE_DUTY: &str = "SELECT domain, due_at, reason, attempts, pinged_at FROM pull_schedule WHERE partition = ?2 AND reason != 'ping' AND due_at <= ?1 AND NOT EXISTS (SELECT 1 FROM pull_tasks WHERE pull_tasks.domain = pull_schedule.domain) ORDER BY due_at, domain";
+const OLDEST_DUE_PING_OF_CLASS: &str = "SELECT domain, due_at, reason, attempts, pinged_at FROM pull_schedule WHERE partition = ?2 AND reason = 'ping' AND load_class = ?3 AND due_at <= ?1 AND NOT EXISTS (SELECT 1 FROM pull_tasks WHERE pull_tasks.domain = pull_schedule.domain) ORDER BY due_at, domain";
+const OLDEST_DUE_DUTY_OF_CLASS: &str = "SELECT domain, due_at, reason, attempts, pinged_at FROM pull_schedule WHERE partition = ?2 AND reason != 'ping' AND load_class = ?3 AND due_at <= ?1 AND NOT EXISTS (SELECT 1 FROM pull_tasks WHERE pull_tasks.domain = pull_schedule.domain) ORDER BY due_at, domain";
 
 /// Why a domain is due for a pull.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,13 +228,33 @@ fn in_flight(conn: &Connection, domain: &str) -> Result<bool> {
         .is_some())
 }
 
+fn load_class(score: f64) -> i64 {
+    match score {
+        s if s < 1.0 => 0,
+        s if s < 10.0 => 1,
+        s if s < 100.0 => 2,
+        _ => MAX_LOAD_CLASS,
+    }
+}
+
+fn domain_load_class(conn: &Connection, domain: &str) -> Result<i64> {
+    Ok(conn
+        .query_row(
+            "SELECT score FROM pull_load WHERE domain = ?1",
+            [domain],
+            |row| row.get::<_, f64>(0),
+        )
+        .optional()?
+        .map_or(0, load_class))
+}
+
 fn schedule(conn: &Connection, incoming: &DuePull) -> Result<()> {
     let row = match scheduled(conn, &incoming.domain)? {
         Some(existing) => merge(&existing, incoming),
         None => incoming.clone(),
     };
     conn.execute(
-        "INSERT INTO pull_schedule(domain, partition, due_at, reason, attempts, pinged_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(domain) DO UPDATE SET due_at = excluded.due_at, reason = excluded.reason, attempts = excluded.attempts, pinged_at = excluded.pinged_at",
+        "INSERT INTO pull_schedule(domain, partition, due_at, reason, attempts, pinged_at, load_class) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT(domain) DO UPDATE SET due_at = excluded.due_at, reason = excluded.reason, attempts = excluded.attempts, pinged_at = excluded.pinged_at, load_class = excluded.load_class",
         (
             &row.domain,
             partition_of(conn, &row.domain)?,
@@ -225,6 +262,7 @@ fn schedule(conn: &Connection, incoming: &DuePull) -> Result<()> {
             row.reason.as_str(),
             row.attempts,
             row.pinged_at,
+            domain_load_class(conn, &row.domain)?,
         ),
     )?;
     Ok(())
@@ -234,8 +272,8 @@ fn schedule(conn: &Connection, incoming: &DuePull) -> Result<()> {
 /// the domain already waits or is being pulled.
 pub(super) fn exec_schedule_new_publisher(conn: &Connection, domain: &str) -> Result<()> {
     conn.execute(
-        "INSERT OR IGNORE INTO pull_schedule(domain, partition, due_at, reason, attempts, pinged_at) SELECT ?1, ?2, 0, 'baseline', 0, NULL WHERE NOT EXISTS (SELECT 1 FROM pull_tasks WHERE domain = ?1)",
-        (domain, partition_of(conn, domain)?),
+        "INSERT OR IGNORE INTO pull_schedule(domain, partition, due_at, reason, attempts, pinged_at, load_class) SELECT ?1, ?2, 0, 'baseline', 0, NULL, ?3 WHERE NOT EXISTS (SELECT 1 FROM pull_tasks WHERE domain = ?1)",
+        (domain, partition_of(conn, domain)?, domain_load_class(conn, domain)?),
     )?;
     Ok(())
 }
@@ -324,23 +362,26 @@ fn hold_partitions(
         .collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-/// The oldest row `query` finds due at `now` in any of `partitions`,
-/// ordered by due time and then domain, skipping every domain of
-/// `running`, whose pull the caller has in flight.
+/// The oldest row `query` finds due at or before `bound` in any of
+/// `partitions`, of load class `class` when the query takes one, ordered
+/// by due time and then domain, skipping every row `admit` refuses.
 fn oldest_due(
     conn: &Connection,
     query: &str,
     partitions: &[(i64, i64)],
-    now: i64,
-    running: &[String],
+    bound: i64,
+    class: Option<i64>,
+    admit: &dyn Fn(&DuePull) -> bool,
 ) -> Result<Option<(DuePull, i64, i64)>> {
     let mut statement = conn.prepare_cached(query)?;
     let mut oldest: Option<(DuePull, i64, i64)> = None;
     for &(partition, token) in partitions {
-        let mut rows = statement.query((now, partition))?;
+        let mut rows = statement.query(rusqlite::params_from_iter(
+            [bound, partition].into_iter().chain(class),
+        ))?;
         while let Some(row) = rows.next()? {
             let due = due_row(row)?;
-            if running.contains(&due.domain) {
+            if !admit(&due) {
                 continue;
             }
             if oldest
@@ -353,6 +394,25 @@ fn oldest_due(
         }
     }
     Ok(oldest)
+}
+
+fn next_due(
+    conn: &Connection,
+    [aged, of_class]: [&str; 2],
+    partitions: &[(i64, i64)],
+    now: i64,
+    admit: &dyn Fn(&DuePull) -> bool,
+) -> Result<Option<(DuePull, i64, i64)>> {
+    let overdue = now.saturating_sub(AGE_PRIORITY_SECONDS);
+    if let Some(found) = oldest_due(conn, aged, partitions, overdue, None, admit)? {
+        return Ok(Some(found));
+    }
+    for class in 0..=MAX_LOAD_CLASS {
+        if let Some(found) = oldest_due(conn, of_class, partitions, now, Some(class), admit)? {
+            return Ok(Some(found));
+        }
+    }
+    Ok(None)
 }
 
 fn baseline_interval(db: &Db, now: i64) -> Result<i64> {
@@ -401,10 +461,20 @@ impl Db {
                     }
                 }
             }
+            let classed: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('pull_schedule') WHERE name = 'load_class')",
+                [],
+                |row| row.get(0),
+            )?;
+            tx.execute_batch(LOAD)?;
+            if !classed {
+                tx.execute_batch(LOAD_COLUMN)?;
+            }
             tx.execute_batch(INDEXES)?;
             return tx.commit();
         }
         tx.execute_batch(SCHEMA)?;
+        tx.execute_batch(LOAD)?;
         tx.execute_batch(INDEXES)?;
         let now = jiff::Timestamp::now().as_second();
         let interval = baseline_interval(self, now)?;
@@ -503,6 +573,18 @@ impl Db {
         tx.commit()
     }
 
+    pub fn claim_pulls(
+        &self,
+        now: i64,
+        slots: usize,
+        owner: &str,
+        max_partitions: usize,
+        running: &[String],
+        ping_next: &mut bool,
+    ) -> Result<Vec<PullTask>> {
+        self.claim_pulls_with_demand(now, slots, owner, max_partitions, running, ping_next, true)
+    }
+
     /// Claims up to `slots` due pulls for `owner` at `now`. First renews
     /// the partition leases `owner` holds and takes over unheld or lapsed
     /// ones up to `max_partitions`, returning the tasks a takeover fences
@@ -514,10 +596,17 @@ impl Db {
     /// pass the partition's fence. Claims come only from partitions
     /// `owner` holds and alternate between the oldest due Ping row and the
     /// oldest due row of any other reason, starting with Pings when
-    /// `ping_next` is set; a class with nothing due yields its turn. On
-    /// return `ping_next` names the class the next claim starts with, so
-    /// neither Pings nor scheduled duties wait behind the other.
-    pub fn claim_pulls(
+    /// `ping_next` is set; a set with nothing due yields its turn. On
+    /// return `ping_next` names the set the next claim starts with, so
+    /// neither Pings nor scheduled duties wait behind the other. Within a
+    /// set, a row overdue by `AGE_PRIORITY_SECONDS` goes first, the oldest
+    /// such; otherwise the oldest row of the lowest load class due. A row
+    /// whose Registrable Domain is that of a domain in `running` or of a
+    /// row claimed earlier in the call is skipped. Without `demand` only
+    /// `baseline` rows and `retry` rows serving no Ping are claimed; the
+    /// others keep their due times.
+    #[allow(clippy::too_many_arguments)]
+    pub fn claim_pulls_with_demand(
         &self,
         now: i64,
         slots: usize,
@@ -525,8 +614,26 @@ impl Db {
         max_partitions: usize,
         running: &[String],
         ping_next: &mut bool,
+        demand: bool,
     ) -> Result<Vec<PullTask>> {
         let tx = self.mutation()?;
+        let list = crate::suffix_list::in_force_at(self, &crate::registry::instant(now)?)?;
+        let unit = |domain: &str| {
+            wist_core::suffix_list::registrable_domain(domain, list.as_deref()).domain
+        };
+        let busy = std::cell::RefCell::new(
+            running
+                .iter()
+                .map(|domain| unit(domain))
+                .collect::<HashSet<_>>(),
+        );
+        let admit = |due: &DuePull| {
+            (demand
+                || due.reason == Reason::Baseline
+                || (due.reason == Reason::Retry && due.pinged_at.is_none()))
+                && !running.contains(&due.domain)
+                && !busy.borrow().contains(&unit(&due.domain))
+        };
         let held = hold_partitions(&tx, owner, max_partitions, now)?;
         for &(partition, _) in &held {
             return_tasks(
@@ -539,14 +646,16 @@ impl Db {
         }
         let mut claimed = Vec::new();
         while claimed.len() < slots {
+            let pings = [OLDEST_DUE_PING, OLDEST_DUE_PING_OF_CLASS];
+            let duties = [OLDEST_DUE_DUTY, OLDEST_DUE_DUTY_OF_CLASS];
             let order = if *ping_next {
-                [OLDEST_DUE_PING, OLDEST_DUE_DUTY]
+                [pings, duties]
             } else {
-                [OLDEST_DUE_DUTY, OLDEST_DUE_PING]
+                [duties, pings]
             };
             let mut next = None;
-            for query in order {
-                next = oldest_due(&tx, query, &held, now, running)?;
+            for queries in order {
+                next = next_due(&tx, queries, &held, now, &admit)?;
                 if next.is_some() {
                     break;
                 }
@@ -555,6 +664,7 @@ impl Db {
                 break;
             };
             *ping_next = due.reason != Reason::Ping;
+            busy.borrow_mut().insert(unit(&due.domain));
             tx.execute("DELETE FROM pull_schedule WHERE domain = ?1", [&due.domain])?;
             tx.execute(
                 "INSERT INTO pull_tasks(domain, partition, token, reason, owner, lease_until, issued_at, attempts, pinged_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -586,6 +696,17 @@ impl Db {
         tx.commit()
     }
 
+    pub fn complete_pull(
+        &self,
+        task: &PullTask,
+        owner: &str,
+        started_at: i64,
+        outcome: PullOutcome,
+        now: i64,
+    ) -> Result<()> {
+        self.complete_pull_with_cost(task, owner, started_at, outcome, 0.0, now)
+    }
+
     /// Ends `owner`'s pull of `task`, which started at `started_at`, and
     /// schedules the domain's next pull at `now`: after an unusable Feed or
     /// an internal failure `retry` with one more attempt, due at WIST-2 §7's
@@ -597,13 +718,17 @@ impl Db {
     /// in. A domain that is no known publisher gets no next pull. Once the
     /// task's partition has been taken over the pull is fenced out:
     /// nothing is written and `Error::Fenced` is returned, since the new
-    /// holder has already scheduled the domain again.
-    pub fn complete_pull(
+    /// holder has already scheduled the domain again. The pull's `cost`, in
+    /// slot-seconds, sets the domain's load score on its first pull and
+    /// moves it halfway toward the cost on each later one; the next row
+    /// takes the score's load class.
+    pub fn complete_pull_with_cost(
         &self,
         task: &PullTask,
         owner: &str,
         started_at: i64,
         outcome: PullOutcome,
+        cost: f64,
         now: i64,
     ) -> Result<()> {
         let tx = self.mutation()?;
@@ -613,6 +738,10 @@ impl Db {
         tx.execute(
             "DELETE FROM pull_tasks WHERE domain = ?1 AND owner = ?2 AND token = ?3",
             (&task.domain, owner, task.token),
+        )?;
+        tx.execute(
+            "INSERT INTO pull_load(domain, score, updated_at) VALUES (?1, ?2, ?3) ON CONFLICT(domain) DO UPDATE SET score = (score + excluded.score) / 2, updated_at = excluded.updated_at",
+            (&task.domain, cost, now),
         )?;
         if self.get_publisher(&task.domain)?.is_none() {
             return tx.commit();
@@ -652,6 +781,42 @@ impl Db {
             return Ok(now);
         }
         Ok(now - now.rem_euclid(86_400) + 86_400)
+    }
+
+    pub fn pull_load_score(&self, domain: &str) -> Result<Option<f64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT score FROM pull_load WHERE domain = ?1",
+                [domain],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub(crate) fn pull_run_fetched_bytes(&self, run_id: i64) -> Result<u64> {
+        let bytes: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(debited), 0) FROM pull_objects WHERE run_id = ?1 AND status != 'issued'",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        Ok(bytes.max(0) as u64)
+    }
+
+    /// Octets as WIST-3 §6 counts an Epoch's: each Entry's JCS
+    /// serialization, its body inside the `{"body":…,"type":"…"}` wrapper,
+    /// plus two.
+    pub fn sealing_backlog(&self) -> Result<(u64, u64)> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(LENGTH(entry_json) + LENGTH(entry_type) + 21), 0) FROM pending_entries",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?.max(0) as u64,
+                    row.get::<_, i64>(1)?.max(0) as u64,
+                ))
+            },
+        )?)
     }
 
     /// The pull `domain` waits for, if any.
@@ -720,8 +885,15 @@ mod tests {
             .conn
             .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
             .unwrap();
+        let params: &[i64] = if statement.parameter_count() == 3 {
+            &[NOW, 0, 0]
+        } else {
+            &[NOW, 0]
+        };
         statement
-            .query_map((NOW, 0), |row| row.get::<_, String>(3))
+            .query_map(rusqlite::params_from_iter(params), |row| {
+                row.get::<_, String>(3)
+            })
             .unwrap()
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap()
@@ -753,7 +925,21 @@ mod tests {
             ),
             "{ping}"
         );
-        for plan in [duty, ping] {
+        let duty_of_class = plan(&db, OLDEST_DUE_DUTY_OF_CLASS);
+        assert!(
+            duty_of_class.contains(
+                "SEARCH pull_schedule USING INDEX pull_schedule_partition_load (partition=? AND load_class=? AND due_at<?)"
+            ),
+            "{duty_of_class}"
+        );
+        let ping_of_class = plan(&db, OLDEST_DUE_PING_OF_CLASS);
+        assert!(
+            ping_of_class.contains(
+                "SEARCH pull_schedule USING INDEX pull_schedule_partition_reason_load (partition=? AND reason=? AND load_class=? AND due_at<?)"
+            ),
+            "{ping_of_class}"
+        );
+        for plan in [duty, ping, duty_of_class, ping_of_class] {
             assert!(!plan.contains("SCAN"), "{plan}");
             assert!(!plan.contains("TEMP B-TREE"), "{plan}");
         }
@@ -1592,5 +1778,247 @@ mod tests {
             db.complete_pull(&old, "old", NOW, PullOutcome::Failed, NOW + 1),
             Err(Error::Fenced)
         ));
+    }
+
+    fn set_load(db: &Db, domain: &str, score: f64) {
+        db.conn
+            .execute(
+                "INSERT INTO pull_load(domain, score, updated_at) VALUES (?1, ?2, ?3) ON CONFLICT(domain) DO UPDATE SET score = excluded.score",
+                (domain, score, NOW),
+            )
+            .unwrap();
+    }
+
+    fn class_of(db: &Db, domain: &str) -> i64 {
+        db.conn
+            .query_row(
+                "SELECT load_class FROM pull_schedule WHERE domain = ?1",
+                [domain],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn a_lighter_due_row_is_claimed_before_a_heavier_row_due_earlier() {
+        let (_tmp, db) = open_db();
+        set_load(&db, "heavy.example", 50.0);
+        db.schedule_ping("heavy.example", NOW - 100, 4).unwrap();
+        db.schedule_ping("light.example", NOW - 10, 4).unwrap();
+        assert_eq!(claim(&db, 1, &mut true), vec!["light.example"]);
+        assert_eq!(claim(&db, 1, &mut true), vec!["heavy.example"]);
+
+        set_load(&db, "heavy.duty.example", 50.0);
+        db.insert_publisher("heavy.duty.example", b"{}", "k", "p")
+            .unwrap();
+        db.insert_publisher("light.duty.example", b"{}", "k", "p")
+            .unwrap();
+        for (domain, due_at) in [
+            ("heavy.duty.example", NOW - 100),
+            ("light.duty.example", NOW - 10),
+        ] {
+            db.conn
+                .execute(
+                    "UPDATE pull_schedule SET due_at = ?2 WHERE domain = ?1",
+                    (domain, due_at),
+                )
+                .unwrap();
+        }
+        let mut ping_next = false;
+        assert_eq!(claim(&db, 1, &mut ping_next), vec!["light.duty.example"]);
+    }
+
+    #[test]
+    fn a_row_overdue_by_the_age_priority_is_claimed_before_a_lighter_one() {
+        let (_tmp, db) = open_db();
+        for domain in ["aged.example", "young.example"] {
+            set_load(&db, domain, 500.0);
+        }
+        db.schedule_ping("aged.example", NOW - AGE_PRIORITY_SECONDS, 4)
+            .unwrap();
+        db.schedule_ping("young.example", NOW - AGE_PRIORITY_SECONDS + 1, 4)
+            .unwrap();
+        db.schedule_ping("light.example", NOW - 10, 4).unwrap();
+        assert_eq!(claim(&db, 1, &mut true), vec!["aged.example"]);
+        assert_eq!(claim(&db, 1, &mut true), vec!["light.example"]);
+        assert_eq!(claim(&db, 1, &mut true), vec!["young.example"]);
+    }
+
+    #[test]
+    fn a_first_pull_sets_the_load_score_and_each_later_one_halves_toward_its_cost() {
+        let (_tmp, db) = open_db();
+        db.insert_publisher("a.example", b"{}", "k", "p").unwrap();
+        assert_eq!(db.pull_load_score("a.example").unwrap(), None);
+        for (cost, score, class) in [
+            (8.0, 8.0, 1),
+            (0.0, 4.0, 1),
+            (196.0, 100.0, 3),
+            (0.0, 50.0, 2),
+            (0.0, 25.0, 2),
+            (0.0, 12.5, 2),
+            (0.0, 6.25, 1),
+            (1.0, 3.625, 1),
+            (0.0, 1.8125, 1),
+            (0.0, 0.90625, 0),
+        ] {
+            db.conn
+                .execute("UPDATE pull_schedule SET due_at = 0", [])
+                .unwrap();
+            let task = db
+                .claim_pulls(NOW, 1, "me", ALL, &[], &mut false)
+                .unwrap()
+                .remove(0);
+            db.complete_pull_with_cost(
+                &task,
+                "me",
+                NOW,
+                PullOutcome::Pulled { suspended: false },
+                cost,
+                NOW,
+            )
+            .unwrap();
+            assert_eq!(db.pull_load_score("a.example").unwrap(), Some(score));
+            assert_eq!(class_of(&db, "a.example"), class, "score {score}");
+        }
+    }
+
+    #[test]
+    fn a_ping_row_takes_its_domains_load_class_when_scheduled_or_merged() {
+        let (_tmp, db) = open_db();
+        set_load(&db, "a.example", 15.0);
+        db.schedule_ping("a.example", NOW, 4).unwrap();
+        assert_eq!(class_of(&db, "a.example"), 2);
+        db.schedule_ping("b.example", NOW, 4).unwrap();
+        assert_eq!(class_of(&db, "b.example"), 0);
+        set_load(&db, "a.example", 0.5);
+        assert_eq!(
+            db.schedule_ping("a.example", NOW + 1, 4).unwrap(),
+            PingAdmission::Duplicate
+        );
+        assert_eq!(class_of(&db, "a.example"), 0);
+    }
+
+    #[test]
+    fn hosts_of_one_registrable_domain_are_claimed_one_per_pass() {
+        let (_tmp, db) = open_db();
+        let list = b"// ===BEGIN ICANN DOMAINS===\nexample\n// ===END ICANN DOMAINS===\n";
+        let identifier = wist_core::suffix_list::identifier(list);
+        db.store_suffix_list(&identifier, list).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO epochs(epoch_number, tree_size, root, sealed_at, note) VALUES (0, 0, '', ?1, '')",
+                [ts(NOW - 3600)],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO suffix_list_acts(epoch_number, sha256) VALUES (0, ?1)",
+                [&identifier],
+            )
+            .unwrap();
+        for domain in [
+            "a.site.example",
+            "b.site.example",
+            "other.example",
+            "third.example",
+        ] {
+            db.schedule_ping(domain, NOW, 8).unwrap();
+        }
+        assert_eq!(
+            claim(&db, 4, &mut true),
+            vec!["a.site.example", "other.example", "third.example"]
+        );
+        let running = vec!["a.site.example".to_string()];
+        assert!(db
+            .claim_pulls(NOW, 4, "me", ALL, &running, &mut true)
+            .unwrap()
+            .is_empty());
+        let task = PullTask {
+            domain: "a.site.example".into(),
+            reason: Reason::Ping,
+            attempts: 0,
+            partition: db.partition_of("a.site.example").unwrap(),
+            token: db.pull_lease("a.site.example").unwrap().unwrap().token,
+            pinged_at: Some(NOW),
+        };
+        db.complete_pull(&task, "me", NOW, PullOutcome::Failed, NOW)
+            .unwrap();
+        assert_eq!(claim(&db, 4, &mut true), vec!["b.site.example"]);
+    }
+
+    #[test]
+    fn without_demand_a_claim_takes_only_baseline_and_retry_rows() {
+        let (_tmp, db) = open_db();
+        let waiting = [
+            pinged("ping.example", NOW - 40, Reason::Ping, 0, NOW - 40),
+            due("resume.example", NOW - 30, Reason::Resume, 0),
+            due("baseline.example", NOW - 20, Reason::Baseline, 0),
+            due("retry.example", NOW - 10, Reason::Retry, 1),
+            pinged("pinged-retry.example", NOW - 5, Reason::Retry, 0, NOW - 5),
+        ];
+        for row in &waiting {
+            schedule(&db.conn, row).unwrap();
+        }
+        let mut claimed = db
+            .claim_pulls_with_demand(NOW, 4, "me", ALL, &[], &mut true, false)
+            .unwrap()
+            .into_iter()
+            .map(|task| task.domain)
+            .collect::<Vec<_>>();
+        claimed.sort();
+        assert_eq!(claimed, vec!["baseline.example", "retry.example"]);
+        for row in waiting[..2].iter().chain(&waiting[4..]) {
+            assert_eq!(db.scheduled_pull(&row.domain).unwrap().as_ref(), Some(row));
+        }
+        let mut claimed = claim(&db, 4, &mut true);
+        claimed.sort();
+        assert_eq!(
+            claimed,
+            vec!["ping.example", "pinged-retry.example", "resume.example"]
+        );
+    }
+
+    #[test]
+    fn the_backlog_counts_each_pending_entry_as_its_wrapped_serialization_plus_two() {
+        let (_tmp, db) = open_db();
+        assert_eq!(db.sealing_backlog().unwrap(), (0, 0));
+        for json in ["{}", "{\"a\":1}"] {
+            db.conn
+                .execute(
+                    "INSERT INTO pending_entries(entry_type, domain, entry_json, chain_pos) VALUES ('publisher_delta', 'a.example', CAST(?1 AS BLOB), 0)",
+                    [json],
+                )
+                .unwrap();
+        }
+        let wrapped = |body: &str| {
+            let entry = serde_json::json!({"type": "publisher_delta", "body": serde_json::from_str::<serde_json::Value>(body).unwrap()});
+            wist_core::jcs::canonicalize(&entry).unwrap().len() as u64 + 2
+        };
+        assert_eq!(
+            db.sealing_backlog().unwrap(),
+            (2, wrapped("{}") + wrapped("{\"a\":1}"))
+        );
+    }
+
+    #[test]
+    fn a_schedule_without_load_classes_is_migrated_and_searches_the_class_indexes() {
+        let (tmp, db) = open_db();
+        db.conn
+            .execute_batch(
+                "DROP TABLE pull_schedule; DROP TABLE pull_load;
+                CREATE TABLE pull_schedule(domain TEXT PRIMARY KEY, partition INTEGER NOT NULL, due_at INTEGER NOT NULL, reason TEXT NOT NULL CHECK(reason IN ('ping','baseline','resume','retry')), attempts INTEGER NOT NULL DEFAULT 0, pinged_at INTEGER);
+                INSERT INTO pull_schedule VALUES ('waiting.example', 0, 5, 'baseline', 0, NULL);",
+            )
+            .unwrap();
+        drop(db);
+        let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+        assert_eq!(class_of(&db, "waiting.example"), 0);
+        assert_eq!(db.pull_load_score("waiting.example").unwrap(), None);
+        let plan = plan(&db, OLDEST_DUE_PING_OF_CLASS);
+        assert!(
+            plan.contains("pull_schedule_partition_reason_load"),
+            "{plan}"
+        );
+        assert_eq!(claim(&db, 1, &mut false), vec!["waiting.example"]);
     }
 }

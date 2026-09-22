@@ -810,6 +810,7 @@ pub(super) fn close_run(db: &Db, run_id: i64) -> Result<IngestReport> {
             ))
         }
     }
+    report.fetched_bytes = db.pull_run_fetched_bytes(run_id)?;
     db.delete_pull_run(run_id)?;
     mutation.commit()?;
     Ok(report)

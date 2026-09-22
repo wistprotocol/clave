@@ -21,6 +21,7 @@ pub use pull_schedule::{
     DuePull, PingAdmission, PullLease, PullOutcome, PullTask, Reason, LEASE_SECONDS,
     RETRY_BASE_SECONDS,
 };
+pub use pull_schedule::{AGE_PRIORITY_SECONDS, BYTES_PER_SLOT_SECOND};
 pub use tree::StoredTree;
 
 /// A write transaction: at the top level it begins immediately, taking

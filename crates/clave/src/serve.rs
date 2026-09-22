@@ -20,6 +20,8 @@ use wist_core::objects::Status;
 pub const MAX_CONCURRENT_INGESTS: usize = 4;
 pub const MAX_PENDING_INGESTS: usize = 64;
 pub const OVERLOAD_RETRY_AFTER_SECS: u64 = 30;
+pub const BACKLOG_EPOCHS: u32 = 2;
+pub const BACKLOG_ENTRIES: u64 = 1 << 20;
 /// The instance name a `serve` without `--instance` runs under.
 pub const DEFAULT_INSTANCE: &str = "primary";
 
@@ -35,6 +37,10 @@ pub const DEFAULT_INSTANCE: &str = "primary";
 /// name and holds an exclusive file lock on it for its lifetime, so a
 /// restart resumes its predecessor's place instead of waiting for the
 /// leases to lapse, and two processes on one store take distinct names.
+/// While the entries waiting to be sealed reach `backlog_entries`, or
+/// `backlog_epochs` times the `epoch_cap_bytes` in force, the dispatcher
+/// claims only `baseline` and `retry` pulls. Each pull runs under
+/// `pull_limits`.
 #[derive(Debug, Clone)]
 pub struct ServeOptions {
     pub instance: String,
@@ -42,6 +48,9 @@ pub struct ServeOptions {
     pub max_pending_ingests: usize,
     pub max_partitions: usize,
     pub seal: bool,
+    pub backlog_epochs: u32,
+    pub backlog_entries: u64,
+    pub pull_limits: ingest::PullLimits,
 }
 
 impl Default for ServeOptions {
@@ -52,6 +61,9 @@ impl Default for ServeOptions {
             max_pending_ingests: MAX_PENDING_INGESTS,
             max_partitions: crate::db::PARTITIONS as usize,
             seal: true,
+            backlog_epochs: BACKLOG_EPOCHS,
+            backlog_entries: BACKLOG_ENTRIES,
+            pull_limits: ingest::PullLimits::default(),
         }
     }
 }
@@ -105,6 +117,7 @@ struct AppState {
     data_dir: PathBuf,
     max_pending: usize,
     wake: Arc<tokio::sync::Notify>,
+    pull_limits: ingest::PullLimits,
 }
 
 #[derive(Deserialize)]
@@ -322,7 +335,7 @@ fn pull(state: &AppState, owner: &str, task: &PullTask) {
         &task.domain,
         &now,
         jiff::Timestamp::now,
-        ingest::PullLimits::default(),
+        state.pull_limits,
     );
     match run {
         Ok(run) => {
@@ -337,14 +350,34 @@ fn pull(state: &AppState, owner: &str, task: &PullTask) {
         }
         Err(Error::Fenced) => {}
         Err(_) => {
-            let _ = db.complete_pull(
+            let now = jiff::Timestamp::now().as_second();
+            let _ = db.complete_pull_with_cost(
                 task,
                 owner,
                 started_at,
                 PullOutcome::Failed,
-                jiff::Timestamp::now().as_second(),
+                now.saturating_sub(started_at).max(0) as f64,
+                now,
             );
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DispatchBounds {
+    slots: usize,
+    max_partitions: usize,
+    backlog_epochs: u32,
+    backlog_entries: u64,
+}
+
+impl DispatchBounds {
+    fn under_pressure(&self, db: &Db, now: i64) -> Result<bool> {
+        let (entries, bytes) = db.sealing_backlog()?;
+        let cap =
+            crate::registry::effective(db, "epoch_cap_bytes", &crate::registry::instant(now)?)?;
+        let limit = (cap.max(0) as u64).saturating_mul(u64::from(self.backlog_epochs));
+        Ok(bytes >= limit || entries >= self.backlog_entries)
     }
 }
 
@@ -354,7 +387,7 @@ fn pull(state: &AppState, owner: &str, task: &PullTask) {
 /// lapsed partitions up to `max_partitions` and returns lapsed pulls to
 /// the schedule, apart from the domains it is running, which no pass
 /// claims or returns while their pulls are in flight here.
-async fn dispatch(state: AppState, owner: Arc<str>, slots: usize, max_partitions: usize) {
+async fn dispatch(state: AppState, owner: Arc<str>, bounds: DispatchBounds) {
     let running = Arc::new(Mutex::new(HashSet::<String>::new()));
     let mut ping_next = true;
     loop {
@@ -364,7 +397,7 @@ async fn dispatch(state: AppState, owner: Arc<str>, slots: usize, max_partitions
             .iter()
             .cloned()
             .collect();
-        let free = slots.saturating_sub(held.len());
+        let free = bounds.slots.saturating_sub(held.len());
         let pass = {
             let db_path = state.db_path.clone();
             let owner = owner.clone();
@@ -375,7 +408,16 @@ async fn dispatch(state: AppState, owner: Arc<str>, slots: usize, max_partitions
                 if !held.is_empty() {
                     db.renew_pull_leases(&held, &owner, now)?;
                 }
-                let tasks = db.claim_pulls(now, free, &owner, max_partitions, &held, &mut next)?;
+                let demand = !bounds.under_pressure(&db, now)?;
+                let tasks = db.claim_pulls_with_demand(
+                    now,
+                    free,
+                    &owner,
+                    bounds.max_partitions,
+                    &held,
+                    &mut next,
+                    demand,
+                )?;
                 Ok::<_, Error>((tasks, next))
             })
             .await
@@ -474,6 +516,7 @@ pub fn run_with_options(
         data_dir: data_dir.clone(),
         max_pending: options.max_pending_ingests,
         wake: Arc::new(tokio::sync::Notify::new()),
+        pull_limits: options.pull_limits,
     };
     let bg_state = state.clone();
     let app = Router::new()
@@ -506,8 +549,12 @@ pub fn run_with_options(
         let dispatching = tokio::spawn(dispatch(
             bg_state,
             owner.clone(),
-            options.max_concurrent_ingests,
-            options.max_partitions,
+            DispatchBounds {
+                slots: options.max_concurrent_ingests,
+                max_partitions: options.max_partitions,
+                backlog_epochs: options.backlog_epochs,
+                backlog_entries: options.backlog_entries,
+            },
         ));
         let listener = tokio::net::TcpListener::bind(bind).await?;
         let local_addr = listener.local_addr()?;

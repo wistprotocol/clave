@@ -933,3 +933,77 @@ fn two_serving_processes_on_one_store_seal_each_grid_instant_once_under_one_seal
     assert!(lease.owner.is_some());
     assert_eq!(lease.token, 1, "the sealer lease changed hands");
 }
+
+#[test]
+fn demand_pulls_wait_while_the_sealing_backlog_is_full_and_resume_once_sealed() {
+    let hosts = ["a.localhost", "b.localhost", "c.localhost"];
+    let mut builder = reqwest::blocking::Client::builder().no_proxy();
+    let mut publishers = Vec::new();
+    for host in hosts {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        builder = builder.resolve(host, listener.local_addr().unwrap());
+        let p = make_publisher_with_scope(host, &["example.com"]);
+        let id = add_delta(&p, &format!("https://example.com/{host}"), host, None);
+        write_feed(&p, host, &[id], "2026-08-09T12:00:00Z");
+        serve_static(listener, p.dir.path().to_path_buf());
+        publishers.push(p);
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    init_with_cadence(tmp.path(), 1);
+    let addr = spawn_server_with_options(
+        tmp.path(),
+        clave::fetch::Client::with_builder(true, builder),
+        clave::serve::ServeOptions {
+            max_concurrent_ingests: 1,
+            backlog_entries: 4,
+            ..unsealed()
+        },
+    );
+    for host in hosts {
+        assert_eq!(ping(&addr, host), 202);
+    }
+    let pulled = || {
+        let db = store(tmp.path());
+        hosts
+            .into_iter()
+            .filter(|host| {
+                db.get_publisher_status(host)
+                    .unwrap()
+                    .is_some_and(|row| row.last_pull_at.is_some())
+            })
+            .collect::<Vec<_>>()
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while pulled().len() < 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the first two pulls never completed"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(2500));
+    let done = pulled();
+    assert_eq!(done.len(), 2, "a Ping was pulled past a full backlog");
+    let waiting = hosts.into_iter().find(|host| !done.contains(host)).unwrap();
+    assert_eq!(
+        store(tmp.path()).sealing_backlog().unwrap().0,
+        4,
+        "each first pull leaves its Declaration's entry and its Delta's"
+    );
+    let row = store(tmp.path()).scheduled_pull(waiting).unwrap().unwrap();
+    assert_eq!(row.reason, clave::db::Reason::Ping);
+
+    let db = store(tmp.path());
+    let sk = clave::keys::load(&tmp.path().join("keys/seed")).unwrap();
+    clave::seal::run(&db, tmp.path(), &sk, unix_now()).unwrap();
+    assert_eq!(db.sealing_backlog().unwrap().0, 0);
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while pulled().len() < 3 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the waiting Ping was never pulled once the backlog was sealed"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
