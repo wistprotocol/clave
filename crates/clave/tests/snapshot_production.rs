@@ -231,15 +231,26 @@ fn a_seal_committed_while_files_are_written_leaves_the_manifest_at_the_read_heig
             Ok(())
         })
         .unwrap();
+    let Outcome::Built {
+        epoch_number,
+        tree_size,
+        snapshot_date,
+        shards_rebuilt,
+        shard_count,
+        ..
+    } = outcome
+    else {
+        panic!("no Snapshot built");
+    };
     assert_eq!(
-        outcome,
-        Outcome::Built {
-            epoch_number: 0,
-            tree_size: read_head.tree_size,
-            snapshot_date: DATE.to_string(),
-            shards_rebuilt: 1,
-            shard_count: 1,
-        }
+        (
+            epoch_number,
+            tree_size,
+            snapshot_date,
+            shards_rebuilt,
+            shard_count
+        ),
+        (0, read_head.tree_size, DATE.to_string(), 1, 1)
     );
     let manifest = log.manifest(DATE);
     assert_eq!(manifest["manifest"]["epoch_number"], 0);
@@ -252,15 +263,26 @@ fn a_seal_committed_while_files_are_written_leaves_the_manifest_at_the_read_heig
     assert_eq!(listed[0]["tree_size"], read_head.tree_size);
 
     let head = log.db.last_epoch().unwrap().unwrap();
+    let Outcome::Built {
+        epoch_number,
+        tree_size,
+        snapshot_date,
+        shards_rebuilt,
+        shard_count,
+        ..
+    } = log.produce().unwrap()
+    else {
+        panic!("no Snapshot built");
+    };
     assert_eq!(
-        log.produce().unwrap(),
-        Outcome::Built {
-            epoch_number: 1,
-            tree_size: head.tree_size,
-            snapshot_date: DATE.to_string(),
-            shards_rebuilt: 1,
-            shard_count: 1,
-        }
+        (
+            epoch_number,
+            tree_size,
+            snapshot_date,
+            shards_rebuilt,
+            shard_count
+        ),
+        (1, head.tree_size, DATE.to_string(), 1, 1)
     );
     assert_eq!(
         log.manifest(DATE)["manifest"]["content_digest"],

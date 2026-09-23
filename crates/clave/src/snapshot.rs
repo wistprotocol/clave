@@ -74,7 +74,11 @@ struct Tier1Row {
 
 /// WIST-3 §7: a party missing a Payload that was never withdrawn reports
 /// that rather than emit a Snapshot silently missing a record.
-fn load_tier1_rows(data_dir: &Path, records: &[&RecordRow]) -> Result<Vec<Tier1Row>> {
+fn load_tier1_rows(
+    data_dir: &Path,
+    records: &[&RecordRow],
+    cost: &mut Cost,
+) -> Result<Vec<Tier1Row>> {
     let mut rows = Vec::with_capacity(records.len());
     for r in records {
         let hex = r.delta_id.strip_prefix("sha256:").unwrap_or(&r.delta_id);
@@ -86,6 +90,8 @@ fn load_tier1_rows(data_dir: &Path, records: &[&RecordRow]) -> Result<Vec<Tier1R
                 ))
             },
         )?;
+        cost.payloads_read += 1;
+        cost.payload_bytes_read += bytes.len() as u64;
         let payload: Value = crate::json::parse(&bytes).map_err(|error| {
             Error::Snapshot(format!(
                 "the Payload of live record {} does not parse: {error}",
@@ -883,14 +889,28 @@ fn reusable(entry: &Path, wanted: &Fingerprint) -> Option<Vec<CachedFile>> {
     matches.then_some(cached.files)
 }
 
-fn link_or_copy(source: &Path, target: &Path) -> Result<()> {
+#[derive(Debug, Default)]
+struct Cost {
+    bytes_written: u64,
+    bytes_reused: u64,
+    cache_bytes_written: u64,
+    payloads_read: u64,
+    payload_bytes_read: u64,
+}
+
+enum Placed {
+    Linked(u64),
+    Copied(u64),
+}
+
+fn link_or_copy(source: &Path, target: &Path) -> Result<Placed> {
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
     }
     if std::fs::hard_link(source, target).is_err() {
-        std::fs::copy(source, target)?;
+        return Ok(Placed::Copied(std::fs::copy(source, target)?));
     }
-    Ok(())
+    Ok(Placed::Linked(std::fs::metadata(target)?.len()))
 }
 
 fn shard_base(staged: &Path, shard_count: u64, shard: u64) -> PathBuf {
@@ -908,6 +928,7 @@ fn build_staged(
     snapshot_date: &str,
     mode: Mode,
     observe: &mut dyn FnMut(Phase) -> Result<()>,
+    cost: &mut Cost,
 ) -> Result<Vec<Fingerprint>> {
     let (key_id, sk) = (&read.signer.0, &read.signer.1);
     let shard_count = read.shard_count;
@@ -966,12 +987,15 @@ fn build_staged(
         };
         if let Some(cached) = cached {
             for (path, _) in TIER_FILES {
-                link_or_copy(&entry.join(path), &shard_base.join(path))?;
+                match link_or_copy(&entry.join(path), &shard_base.join(path))? {
+                    Placed::Linked(bytes) => cost.bytes_reused += bytes,
+                    Placed::Copied(bytes) => cost.bytes_written += bytes,
+                }
             }
             fingerprint.files = cached;
         } else {
             let sqlite_bytes = build_tier0(&shard_base.join("tier0"), &shard_records)?;
-            let tier1_rows = load_tier1_rows(data_dir, &shard_records)?;
+            let tier1_rows = load_tier1_rows(data_dir, &shard_records, cost)?;
             let (extracts_bytes, links_bytes) =
                 build_tier1(&shard_base.join("tier1"), &tier1_rows)?;
             let tables = build_label_tables(
@@ -997,6 +1021,7 @@ fn build_staged(
                     bytes: bytes.len() as u64,
                 })
                 .collect();
+            cost.bytes_written += fingerprint.files.iter().map(|f| f.bytes).sum::<u64>();
             rebuilt.push(fingerprint.clone());
         }
         for (file, (_, tier)) in fingerprint.files.iter().zip(TIER_FILES) {
@@ -1019,6 +1044,7 @@ fn build_staged(
     let state_envelope = sign_envelope(&state_value, "state", key_id, sk)?;
     let state_bytes = serde_json::to_vec(&state_envelope)?;
     std::fs::write(staged.join("state.json"), &state_bytes)?;
+    cost.bytes_written += state_bytes.len() as u64;
 
     let manifest = SnapshotManifest {
         wist_version: WIST_VERSION.to_string(),
@@ -1041,10 +1067,9 @@ fn build_staged(
     };
     let manifest_value = serde_json::to_value(&manifest)?;
     let manifest_envelope = sign_envelope(&manifest_value, "manifest", key_id, sk)?;
-    std::fs::write(
-        staged.join("manifest.json"),
-        serde_json::to_vec(&manifest_envelope)?,
-    )?;
+    let manifest_bytes = serde_json::to_vec(&manifest_envelope)?;
+    std::fs::write(staged.join("manifest.json"), &manifest_bytes)?;
+    cost.bytes_written += manifest_bytes.len() as u64;
     sync_tree(staged)?;
     Ok(rebuilt)
 }
@@ -1105,7 +1130,8 @@ fn update_cache(
     staged: &Path,
     shard_count: u64,
     rebuilt: &[Fingerprint],
-) -> Result<()> {
+) -> Result<u64> {
+    let mut copied = 0;
     let cache = shard_cache(data_dir);
     std::fs::create_dir_all(&cache)?;
     for fingerprint in rebuilt {
@@ -1114,7 +1140,9 @@ fn update_cache(
         remove_path(&fresh)?;
         let source = shard_base(staged, shard_count, fingerprint.shard);
         for (path, _) in TIER_FILES {
-            link_or_copy(&source.join(path), &fresh.join(path))?;
+            if let Placed::Copied(bytes) = link_or_copy(&source.join(path), &fresh.join(path))? {
+                copied += bytes;
+            }
             std::fs::File::open(fresh.join(path))?.sync_all()?;
         }
         sync_directory(&fresh.join("tier0"))?;
@@ -1133,7 +1161,8 @@ fn update_cache(
             remove_path(&path)?;
         }
     }
-    sync_directory(&cache)
+    sync_directory(&cache)?;
+    Ok(copied)
 }
 
 fn clear_directory(path: &Path) -> Result<()> {
@@ -1237,6 +1266,11 @@ pub enum Outcome {
         snapshot_date: String,
         shards_rebuilt: u64,
         shard_count: u64,
+        bytes_written: u64,
+        bytes_reused: u64,
+        cache_bytes_written: u64,
+        payloads_read: u64,
+        payload_bytes_read: u64,
     },
     Current {
         epoch_number: u64,
@@ -1360,7 +1394,16 @@ pub fn produce_with(
     let staged = staging(data_dir).join(built.to_string());
     remove_tree(&staged)?;
     std::fs::create_dir_all(&staged)?;
-    let rebuilt = match build_staged(&read, data_dir, &staged, &snapshot_date, mode, observe) {
+    let mut cost = Cost::default();
+    let rebuilt = match build_staged(
+        &read,
+        data_dir,
+        &staged,
+        &snapshot_date,
+        mode,
+        observe,
+        &mut cost,
+    ) {
         Ok(rebuilt) => rebuilt,
         Err(error) => {
             if let Some(withdrawal_height) = superseding(&db, built)? {
@@ -1398,7 +1441,7 @@ pub fn produce_with(
     }
     // Under the swap lock and after the superseding check: a withdrawal seal
     // either abandons this build or runs after it and removes its shard.
-    update_cache(data_dir, &staged, read.shard_count, &rebuilt)?;
+    cost.cache_bytes_written = update_cache(data_dir, &staged, read.shard_count, &rebuilt)?;
     let served_root = data_dir.join("snapshots");
     std::fs::create_dir_all(&served_root)?;
     swap_in(&staged, &served_root.join(&snapshot_date))?;
@@ -1414,6 +1457,11 @@ pub fn produce_with(
         snapshot_date,
         shards_rebuilt: rebuilt.len() as u64,
         shard_count: read.shard_count,
+        bytes_written: cost.bytes_written,
+        bytes_reused: cost.bytes_reused,
+        cache_bytes_written: cost.cache_bytes_written,
+        payloads_read: cost.payloads_read,
+        payload_bytes_read: cost.payload_bytes_read,
     })
 }
 

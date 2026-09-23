@@ -392,7 +392,13 @@ of `snapshot built at epoch N for <date> in M ms, K of S shards rebuilt`,
 `snapshot current at
 epoch N` (the newest served Snapshot is already at the head), `snapshot
 superseded by a withdrawal at epoch H` or `snapshot not built: no Epoch
-sealed`.
+sealed`. A built Snapshot is followed by `snapshot bytes written N`
+(bytes the build wrote into the staging directory: rebuilt tier files,
+tier files copied because a hard link failed, `state.json` and
+`manifest.json`), `snapshot bytes reused N` (tier files hard-linked from
+the shard cache), `snapshot cache bytes written N` (bytes copied rather
+than hard-linked into the shard cache), `snapshot payloads read N` and
+`snapshot payload bytes read N` (Payload files read to build tier 1).
 
 A producer reads the head Epoch and every input of the build (records
 with withdrawn Deltas excluded, chain tips, withdrawals, parameters,

@@ -187,6 +187,57 @@ impl Log {
         }
     }
 
+    fn produce_cost(&self, mode: Mode) -> Cost {
+        match self.produce(mode) {
+            Outcome::Built {
+                bytes_written,
+                bytes_reused,
+                cache_bytes_written,
+                payloads_read,
+                payload_bytes_read,
+                ..
+            } => Cost {
+                bytes_written,
+                bytes_reused,
+                cache_bytes_written,
+                payloads_read,
+                payload_bytes_read,
+            },
+            other => panic!("no Snapshot built: {other:?}"),
+        }
+    }
+
+    fn served_shard_bytes(&self, shard: u64) -> u64 {
+        TIER_FILES
+            .iter()
+            .map(|file| file_size(&self.served_file(shard, file)))
+            .sum()
+    }
+
+    fn served_top_level_bytes(&self) -> u64 {
+        ["state.json", "manifest.json"]
+            .iter()
+            .map(|file| file_size(&self.served_dir().join(file)))
+            .sum()
+    }
+
+    fn tier1_records(&self, shard: u64) -> u64 {
+        table_rows(&self.served_file(shard, "tier1/extracts.parquet")).len() as u64
+    }
+
+    fn payload_bytes(&self, ids: &[String]) -> u64 {
+        ids.iter()
+            .map(|id| {
+                file_size(
+                    &self
+                        .path()
+                        .join("payloads")
+                        .join(format!("{}.json", &id[7..])),
+                )
+            })
+            .sum()
+    }
+
     fn shard_of(&self, domain: &str) -> u64 {
         shard_index(domain, self.shard_count)
     }
@@ -250,6 +301,19 @@ impl Log {
         assert_eq!(self.produce_built(Mode::Full), self.shard_count);
         self.capture()
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct Cost {
+    bytes_written: u64,
+    bytes_reused: u64,
+    cache_bytes_written: u64,
+    payloads_read: u64,
+    payload_bytes_read: u64,
+}
+
+fn file_size(path: &Path) -> u64 {
+    std::fs::metadata(path).unwrap().len()
 }
 
 struct Captured {
@@ -674,4 +738,68 @@ fn reconciliation_removes_unfinished_cache_entries_and_keeps_complete_ones() {
     clave::snapshot::reconcile(&log.db, log.path()).unwrap();
     assert!(!unfinished.exists());
     assert_eq!(cache_bytes(&log), complete);
+}
+
+#[test]
+fn an_empty_epoch_build_reads_no_payloads_and_writes_only_state_and_manifest() {
+    let mut log = built_log(2);
+    log.seal();
+    let cost = log.produce_cost(Mode::Incremental);
+    assert_eq!(
+        cost,
+        Cost {
+            bytes_written: log.served_top_level_bytes(),
+            bytes_reused: log.served_shard_bytes(0) + log.served_shard_bytes(1),
+            cache_bytes_written: 0,
+            payloads_read: 0,
+            payload_bytes_read: 0,
+        }
+    );
+}
+
+#[test]
+fn a_new_delta_build_reads_the_payloads_of_its_rebuilt_shard_only() {
+    let mut log = built_log(2);
+    let changed = log.shard_of(&log.other_domain());
+    let kept = log.shard_of(PRIMARY);
+    log.publish(false, "b");
+    log.seal();
+    let cost = log.produce_cost(Mode::Incremental);
+    assert_eq!(log.tier1_records(changed), 2);
+    assert_eq!(
+        cost,
+        Cost {
+            bytes_written: log.served_shard_bytes(changed) + log.served_top_level_bytes(),
+            bytes_reused: log.served_shard_bytes(kept),
+            cache_bytes_written: 0,
+            payloads_read: log.tier1_records(changed),
+            payload_bytes_read: log.payload_bytes(&log.other.ids),
+        }
+    );
+}
+
+#[test]
+fn a_full_build_reuses_nothing_and_reads_every_payload() {
+    let log = built_log(2);
+    let cost = log.produce_cost(Mode::Full);
+    let ids: Vec<String> = log
+        .primary
+        .ids
+        .iter()
+        .chain(&log.other.ids)
+        .cloned()
+        .collect();
+    assert_eq!(
+        cost,
+        Cost {
+            bytes_written: log.served_shard_bytes(0)
+                + log.served_shard_bytes(1)
+                + log.served_top_level_bytes(),
+            bytes_reused: 0,
+            cache_bytes_written: 0,
+            payloads_read: log.tier1_records(0) + log.tier1_records(1),
+            payload_bytes_read: log.payload_bytes(&ids),
+        }
+    );
+    assert_eq!(cost.payloads_read, 2);
 }

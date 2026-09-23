@@ -48,15 +48,32 @@ fn snapshot_build_produces_verifiable_tier0_state_and_signed_artifacts() {
         0,
         "sealing publishes the Checkpoint only"
     );
+    let clave::snapshot::Outcome::Built {
+        epoch_number,
+        tree_size,
+        snapshot_date,
+        shards_rebuilt,
+        shard_count,
+        ..
+    } = clave::snapshot::produce(&data.path().join("clave.sqlite"), data.path()).unwrap()
+    else {
+        panic!("no Snapshot built");
+    };
     assert_eq!(
-        clave::snapshot::produce(&data.path().join("clave.sqlite"), data.path()).unwrap(),
-        clave::snapshot::Outcome::Built {
-            epoch_number: 0,
-            tree_size: db.last_epoch().unwrap().unwrap().tree_size,
-            snapshot_date: "2026-08-09".to_string(),
-            shards_rebuilt: 1,
-            shard_count: 1,
-        }
+        (
+            epoch_number,
+            tree_size,
+            snapshot_date,
+            shards_rebuilt,
+            shard_count
+        ),
+        (
+            0,
+            db.last_epoch().unwrap().unwrap().tree_size,
+            "2026-08-09".to_string(),
+            1,
+            1
+        )
     );
 
     let head = db.last_epoch().unwrap().unwrap();

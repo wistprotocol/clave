@@ -166,7 +166,6 @@ fn produce_snapshot(
     db_path: &std::path::Path,
     data: &std::path::Path,
     mode: clave::snapshot::Mode,
-    timed: bool,
 ) -> Result<(), clave::Error> {
     let started = std::time::Instant::now();
     let outcome = clave::snapshot::produce_with(db_path, data, mode, &mut |_| Ok(()))?;
@@ -177,10 +176,22 @@ fn produce_snapshot(
             snapshot_date,
             shards_rebuilt,
             shard_count,
+            bytes_written,
+            bytes_reused,
+            cache_bytes_written,
+            payloads_read,
+            payload_bytes_read,
             ..
-        } => println!(
-            "snapshot built at epoch {epoch_number} for {snapshot_date} in {took} ms, {shards_rebuilt} of {shard_count} shards rebuilt"
-        ),
+        } => {
+            println!(
+                "snapshot built at epoch {epoch_number} for {snapshot_date} in {took} ms, {shards_rebuilt} of {shard_count} shards rebuilt"
+            );
+            println!("snapshot bytes written {bytes_written}");
+            println!("snapshot bytes reused {bytes_reused}");
+            println!("snapshot cache bytes written {cache_bytes_written}");
+            println!("snapshot payloads read {payloads_read}");
+            println!("snapshot payload bytes read {payload_bytes_read}");
+        }
         clave::snapshot::Outcome::Current { epoch_number } => {
             println!("snapshot current at epoch {epoch_number}")
         }
@@ -189,9 +200,7 @@ fn produce_snapshot(
         } => println!("snapshot superseded by a withdrawal at epoch {withdrawal_height}"),
         clave::snapshot::Outcome::Unsealed => println!("snapshot not built: no Epoch sealed"),
     }
-    if timed {
-        println!("snapshot took {took} ms");
-    }
+    println!("snapshot took {took} ms");
     Ok(())
 }
 
@@ -292,7 +301,7 @@ fn main() -> Result<(), clave::Error> {
             }
             println!("seal took {} ms", sealing.as_millis());
             if !no_snapshot {
-                produce_snapshot(&db_path, &data, clave::snapshot::Mode::Incremental, true)?;
+                produce_snapshot(&db_path, &data, clave::snapshot::Mode::Incremental)?;
             }
         }
         Command::Snapshot { data, rebuild } => {
@@ -301,7 +310,7 @@ fn main() -> Result<(), clave::Error> {
             } else {
                 clave::snapshot::Mode::Incremental
             };
-            produce_snapshot(&data.join("clave.sqlite"), &data, mode, false)?;
+            produce_snapshot(&data.join("clave.sqlite"), &data, mode)?;
         }
         Command::VerifyHistory { data } => {
             let db = clave::db::Db::open(&data.join("clave.sqlite"))?;
