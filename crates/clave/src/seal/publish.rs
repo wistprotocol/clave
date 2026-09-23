@@ -194,7 +194,8 @@ pub(super) fn epoch(
             let _ = std::fs::remove_file(data_dir.join("payloads").join(format!("{hex}.json")));
             db.delete_record_by_delta(delta_id)?;
         }
-        crate::snapshot::withdraw_served(db, data_dir)?;
+        let publishers: Vec<&str> = withdrawals.iter().map(|w| w.domain.as_str()).collect();
+        crate::snapshot::withdraw_served(db, data_dir, &publishers)?;
     }
 
     Ok(SealReport {

@@ -75,6 +75,9 @@ enum Command {
     Snapshot {
         #[arg(long)]
         data: PathBuf,
+        /// Rebuild every shard instead of reusing unchanged ones.
+        #[arg(long)]
+        rebuild: bool,
     },
     VerifyHistory {
         #[arg(long)]
@@ -162,17 +165,22 @@ enum LogKeyCommand {
 fn produce_snapshot(
     db_path: &std::path::Path,
     data: &std::path::Path,
+    mode: clave::snapshot::Mode,
     timed: bool,
 ) -> Result<(), clave::Error> {
     let started = std::time::Instant::now();
-    let outcome = clave::snapshot::produce(db_path, data)?;
+    let outcome = clave::snapshot::produce_with(db_path, data, mode, &mut |_| Ok(()))?;
     let took = started.elapsed().as_millis();
     match outcome {
         clave::snapshot::Outcome::Built {
             epoch_number,
             snapshot_date,
+            shards_rebuilt,
+            shard_count,
             ..
-        } => println!("snapshot built at epoch {epoch_number} for {snapshot_date} in {took} ms"),
+        } => println!(
+            "snapshot built at epoch {epoch_number} for {snapshot_date} in {took} ms, {shards_rebuilt} of {shard_count} shards rebuilt"
+        ),
         clave::snapshot::Outcome::Current { epoch_number } => {
             println!("snapshot current at epoch {epoch_number}")
         }
@@ -284,11 +292,16 @@ fn main() -> Result<(), clave::Error> {
             }
             println!("seal took {} ms", sealing.as_millis());
             if !no_snapshot {
-                produce_snapshot(&db_path, &data, true)?;
+                produce_snapshot(&db_path, &data, clave::snapshot::Mode::Incremental, true)?;
             }
         }
-        Command::Snapshot { data } => {
-            produce_snapshot(&data.join("clave.sqlite"), &data, false)?;
+        Command::Snapshot { data, rebuild } => {
+            let mode = if rebuild {
+                clave::snapshot::Mode::Full
+            } else {
+                clave::snapshot::Mode::Incremental
+            };
+            produce_snapshot(&data.join("clave.sqlite"), &data, mode, false)?;
         }
         Command::VerifyHistory { data } => {
             let db = clave::db::Db::open(&data.join("clave.sqlite"))?;

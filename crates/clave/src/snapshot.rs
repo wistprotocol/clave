@@ -18,6 +18,40 @@ use wist_core::objects::{
 };
 use wist_core::snapshot::{content_digest, state_digest};
 
+pub const SHARD_CACHE_DIRECTORY: &str = "snapshot-shards";
+const FINGERPRINT: &str = "fingerprint.json";
+const TIER_FILES: [(&str, u8); 6] = [
+    ("tier0/index.sqlite", 0),
+    ("tier1/extracts.parquet", 1),
+    ("tier1/links.parquet", 1),
+    ("tier1/labels.parquet", 1),
+    ("tier1/disputes.parquet", 1),
+    ("tier1/labelers.parquet", 1),
+];
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct CachedFile {
+    path: String,
+    sha256: String,
+    bytes: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct Fingerprint {
+    shard_count: u64,
+    shard: u64,
+    epoch_number: u64,
+    record_digest: String,
+    label_digest: String,
+    files: Vec<CachedFile>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Mode {
+    Incremental,
+    Full,
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     hex_encode(&Sha256::digest(bytes))
 }
@@ -785,12 +819,96 @@ fn prefer_one_publisher(db: &Db, records: Vec<RecordRow>) -> Result<Vec<RecordRo
         .collect())
 }
 
+fn label_digest(
+    labels: &[LabelEntry],
+    disputes: &[DisputeEntry],
+    labelers: &[LabelerRow],
+) -> Result<String> {
+    let labels = labels
+        .iter()
+        .cloned()
+        .map(|entry| serde_json::to_value(StateEntry::Label(entry)))
+        .collect::<serde_json::Result<Vec<Value>>>()?;
+    let disputes = disputes
+        .iter()
+        .cloned()
+        .map(|entry| serde_json::to_value(StateEntry::Dispute(entry)))
+        .collect::<serde_json::Result<Vec<Value>>>()?;
+    let labelers: Vec<Value> = labelers
+        .iter()
+        .map(|row| {
+            serde_json::json!({
+                "labeler": row.labeler,
+                "label_count": row.label_count,
+                "retraction_count": row.retraction_count,
+                "distinct_subjects": row.distinct_subjects,
+                "first_seen_height": row.first_seen_height,
+            })
+        })
+        .collect();
+    let canonical = wist_core::jcs::canonicalize(&serde_json::json!({
+        "labels": labels,
+        "disputes": disputes,
+        "labelers": labelers,
+    }))?;
+    Ok(sha256_hex(&canonical))
+}
+
+fn shard_cache(data_dir: &Path) -> PathBuf {
+    data_dir.join(SHARD_CACHE_DIRECTORY)
+}
+
+fn read_fingerprint(entry: &Path) -> Option<Fingerprint> {
+    let bytes = std::fs::read(entry.join(FINGERPRINT)).ok()?;
+    let fingerprint: Fingerprint = serde_json::from_slice(&bytes).ok()?;
+    (fingerprint.shard_count > 0).then_some(fingerprint)
+}
+
+fn reusable(entry: &Path, wanted: &Fingerprint) -> Option<Vec<CachedFile>> {
+    let cached = read_fingerprint(entry)?;
+    let matches = cached.shard_count == wanted.shard_count
+        && cached.shard == wanted.shard
+        && cached.record_digest == wanted.record_digest
+        && cached.label_digest == wanted.label_digest
+        && cached.files.len() == TIER_FILES.len()
+        && cached
+            .files
+            .iter()
+            .zip(TIER_FILES)
+            .all(|(file, (path, _))| {
+                file.path == path
+                    && std::fs::metadata(entry.join(path))
+                        .is_ok_and(|meta| meta.is_file() && meta.len() == file.bytes)
+            });
+    matches.then_some(cached.files)
+}
+
+fn link_or_copy(source: &Path, target: &Path) -> Result<()> {
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if std::fs::hard_link(source, target).is_err() {
+        std::fs::copy(source, target)?;
+    }
+    Ok(())
+}
+
+fn shard_base(staged: &Path, shard_count: u64, shard: u64) -> PathBuf {
+    if shard_count > 1 {
+        staged.join(format!("shard-{shard}"))
+    } else {
+        staged.to_path_buf()
+    }
+}
+
 fn build_staged(
     read: &ReadState,
     data_dir: &Path,
     staged: &Path,
     snapshot_date: &str,
-) -> Result<()> {
+    mode: Mode,
+    observe: &mut dyn FnMut(Phase) -> Result<()>,
+) -> Result<Vec<Fingerprint>> {
     let (key_id, sk) = (&read.signer.0, &read.signer.1);
     let shard_count = read.shard_count;
     let sharded = shard_count > 1;
@@ -804,17 +922,16 @@ fn build_staged(
 
     let mut files = Vec::new();
     let mut shard_digests = Vec::new();
+    let mut rebuilt = Vec::new();
     for (i, shard_records) in partitions.into_iter().enumerate() {
+        let shard = i as u64;
         let (prefix, shard_field) = if sharded {
-            (format!("shard-{i}/"), Some(i as u64))
+            (format!("shard-{i}/"), Some(shard))
         } else {
             (String::new(), None)
         };
-        let shard_base = staged.join(prefix.trim_end_matches('/'));
-        let sqlite_bytes = build_tier0(&shard_base.join("tier0"), &shard_records)?;
-        let tier1_rows = load_tier1_rows(data_dir, &shard_records)?;
-        let (extracts_bytes, links_bytes) = build_tier1(&shard_base.join("tier1"), &tier1_rows)?;
-        let in_shard = |domain: &str| !sharded || shard_index(domain, shard_count) as usize == i;
+        let shard_base = shard_base(staged, shard_count, shard);
+        let in_shard = |domain: &str| !sharded || shard_index(domain, shard_count) == shard;
         let shard_labels: Vec<LabelEntry> = read
             .labels
             .iter()
@@ -833,33 +950,68 @@ fn build_staged(
             .filter(|r| in_shard(&r.labeler))
             .cloned()
             .collect();
-        let tables = build_label_tables(
-            &shard_base.join("tier1"),
-            &shard_labels,
-            &shard_disputes,
-            &shard_labelers,
-        )?;
-        for (rel, bytes, tier) in [
-            ("tier0/index.sqlite", &sqlite_bytes, 0u8),
-            ("tier1/extracts.parquet", &extracts_bytes, 1),
-            ("tier1/links.parquet", &links_bytes, 1),
-            ("tier1/labels.parquet", &tables.labels, 1),
-            ("tier1/disputes.parquet", &tables.disputes, 1),
-            ("tier1/labelers.parquet", &tables.labelers, 1),
-        ] {
+        let projection: Vec<Value> = shard_records.iter().map(|r| record_projection(r)).collect();
+        let mut fingerprint = Fingerprint {
+            shard_count,
+            shard,
+            epoch_number: read.head.epoch_number,
+            record_digest: content_digest(&projection)?,
+            label_digest: label_digest(&shard_labels, &shard_disputes, &shard_labelers)?,
+            files: Vec::new(),
+        };
+        let entry = shard_cache(data_dir).join(shard.to_string());
+        let cached = match mode {
+            Mode::Incremental => reusable(&entry, &fingerprint),
+            Mode::Full => None,
+        };
+        if let Some(cached) = cached {
+            for (path, _) in TIER_FILES {
+                link_or_copy(&entry.join(path), &shard_base.join(path))?;
+            }
+            fingerprint.files = cached;
+        } else {
+            let sqlite_bytes = build_tier0(&shard_base.join("tier0"), &shard_records)?;
+            let tier1_rows = load_tier1_rows(data_dir, &shard_records)?;
+            let (extracts_bytes, links_bytes) =
+                build_tier1(&shard_base.join("tier1"), &tier1_rows)?;
+            let tables = build_label_tables(
+                &shard_base.join("tier1"),
+                &shard_labels,
+                &shard_disputes,
+                &shard_labelers,
+            )?;
+            let written = [
+                &sqlite_bytes,
+                &extracts_bytes,
+                &links_bytes,
+                &tables.labels,
+                &tables.disputes,
+                &tables.labelers,
+            ];
+            fingerprint.files = TIER_FILES
+                .iter()
+                .zip(written)
+                .map(|((path, _), bytes)| CachedFile {
+                    path: (*path).to_string(),
+                    sha256: sha256_hex(bytes),
+                    bytes: bytes.len() as u64,
+                })
+                .collect();
+            rebuilt.push(fingerprint.clone());
+        }
+        for (file, (_, tier)) in fingerprint.files.iter().zip(TIER_FILES) {
             files.push(SnapshotFile {
-                path: format!("{prefix}{rel}"),
-                sha256: sha256_hex(bytes),
-                bytes: bytes.len() as u64,
+                path: format!("{prefix}{}", file.path),
+                sha256: file.sha256.clone(),
+                bytes: file.bytes,
                 tier,
                 shard: shard_field,
             });
         }
         if sharded {
-            let projection: Vec<Value> =
-                shard_records.iter().map(|r| record_projection(r)).collect();
-            shard_digests.push(content_digest(&projection)?);
+            shard_digests.push(fingerprint.record_digest);
         }
+        observe(Phase::ShardWritten(shard))?;
     }
 
     let (state, state_digest_value) = build_state(read)?;
@@ -893,7 +1045,8 @@ fn build_staged(
         staged.join("manifest.json"),
         serde_json::to_vec(&manifest_envelope)?,
     )?;
-    sync_tree(staged)
+    sync_tree(staged)?;
+    Ok(rebuilt)
 }
 
 fn sync_directory(path: &Path) -> Result<()> {
@@ -918,6 +1071,69 @@ fn remove_tree(path: &Path) -> Result<()> {
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
         _ => Ok(()),
     }
+}
+
+fn remove_path(path: &Path) -> Result<()> {
+    if path.is_dir() {
+        return remove_tree(path);
+    }
+    match std::fs::remove_file(path) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+        _ => Ok(()),
+    }
+}
+
+fn cache_entries(data_dir: &Path) -> Result<Vec<(String, PathBuf)>> {
+    let entries = match std::fs::read_dir(shard_cache(data_dir)) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut listed = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        listed.push((
+            entry.file_name().to_string_lossy().into_owned(),
+            entry.path(),
+        ));
+    }
+    Ok(listed)
+}
+
+fn update_cache(
+    data_dir: &Path,
+    staged: &Path,
+    shard_count: u64,
+    rebuilt: &[Fingerprint],
+) -> Result<()> {
+    let cache = shard_cache(data_dir);
+    std::fs::create_dir_all(&cache)?;
+    for fingerprint in rebuilt {
+        let entry = cache.join(fingerprint.shard.to_string());
+        let fresh = cache.join(format!("{}.new", fingerprint.shard));
+        remove_path(&fresh)?;
+        let source = shard_base(staged, shard_count, fingerprint.shard);
+        for (path, _) in TIER_FILES {
+            link_or_copy(&source.join(path), &fresh.join(path))?;
+            std::fs::File::open(fresh.join(path))?.sync_all()?;
+        }
+        sync_directory(&fresh.join("tier0"))?;
+        sync_directory(&fresh.join("tier1"))?;
+        sync_directory(&fresh)?;
+        // The fingerprint is written last: an entry without one is never reused.
+        crate::publication::write_durable(
+            &fresh.join(FINGERPRINT),
+            &serde_json::to_vec(fingerprint)?,
+        )?;
+        remove_path(&entry)?;
+        std::fs::rename(&fresh, &entry)?;
+    }
+    for (name, path) in cache_entries(data_dir)? {
+        if name.parse::<u64>().is_ok_and(|shard| shard >= shard_count) {
+            remove_path(&path)?;
+        }
+    }
+    sync_directory(&cache)
 }
 
 fn clear_directory(path: &Path) -> Result<()> {
@@ -977,6 +1193,11 @@ fn swap_lock(data_dir: &Path) -> Result<std::fs::File> {
 fn reconcile_locked(db: &Db, data_dir: &Path, clear_staging: bool) -> Result<()> {
     if clear_staging {
         clear_directory(&staging(data_dir))?;
+        for (name, path) in cache_entries(data_dir)? {
+            if name.ends_with(".new") {
+                remove_path(&path)?;
+            }
+        }
     }
     let _swap = swap_lock(data_dir)?;
     regenerate_index(db, data_dir, false)
@@ -991,10 +1212,20 @@ pub fn reconcile(db: &Db, data_dir: &Path) -> Result<()> {
 
 /// WIST-3 §6.2, §7: every served Snapshot and every staged build may carry
 /// the withdrawn content, so all are removed and the index lists none.
-pub(crate) fn withdraw_served(db: &Db, data_dir: &Path) -> Result<()> {
+pub(crate) fn withdraw_served(db: &Db, data_dir: &Path, publishers: &[&str]) -> Result<()> {
     clear_directory(&staging(data_dir))?;
     let _swap = swap_lock(data_dir)?;
     clear_directory(&data_dir.join("snapshots"))?;
+    for (_, path) in cache_entries(data_dir)? {
+        let affected = read_fingerprint(&path).is_none_or(|fingerprint| {
+            publishers.iter().any(|publisher| {
+                shard_index(publisher, fingerprint.shard_count) == fingerprint.shard
+            })
+        });
+        if affected {
+            remove_path(&path)?;
+        }
+    }
     regenerate_index(db, data_dir, true)
 }
 
@@ -1004,6 +1235,8 @@ pub enum Outcome {
         epoch_number: u64,
         tree_size: u64,
         snapshot_date: String,
+        shards_rebuilt: u64,
+        shard_count: u64,
     },
     Current {
         epoch_number: u64,
@@ -1019,13 +1252,14 @@ pub enum Outcome {
 pub enum Phase {
     Reading,
     Read,
+    ShardWritten(u64),
     FilesWritten,
     Swapped,
     Indexed,
 }
 
 pub fn produce(db_path: &Path, data_dir: &Path) -> Result<Outcome> {
-    produce_with(db_path, data_dir, &mut |_| Ok(()))
+    produce_with(db_path, data_dir, Mode::Incremental, &mut |_| Ok(()))
 }
 
 fn served_epoch(data_dir: &Path) -> Result<Option<u64>> {
@@ -1084,6 +1318,7 @@ fn swap_in(staged: &Path, target: &Path) -> Result<()> {
 pub fn produce_with(
     db_path: &Path,
     data_dir: &Path,
+    mode: Mode,
     observe: &mut dyn FnMut(Phase) -> Result<()>,
 ) -> Result<Outcome> {
     let producer_lock = data_dir.join(PRODUCER_LOCK);
@@ -1100,7 +1335,7 @@ pub fn produce_with(
     let Some(head) = db.last_epoch()? else {
         return Ok(Outcome::Unsealed);
     };
-    if served == Some(head.epoch_number) {
+    if mode == Mode::Incremental && served == Some(head.epoch_number) {
         return Ok(Outcome::Current {
             epoch_number: head.epoch_number,
         });
@@ -1125,16 +1360,19 @@ pub fn produce_with(
     let staged = staging(data_dir).join(built.to_string());
     remove_tree(&staged)?;
     std::fs::create_dir_all(&staged)?;
-    if let Err(error) = build_staged(&read, data_dir, &staged, &snapshot_date) {
-        if let Some(withdrawal_height) = superseding(&db, built)? {
-            remove_tree(&staged)?;
-            return Ok(Outcome::Superseded {
-                built,
-                withdrawal_height,
-            });
+    let rebuilt = match build_staged(&read, data_dir, &staged, &snapshot_date, mode, observe) {
+        Ok(rebuilt) => rebuilt,
+        Err(error) => {
+            if let Some(withdrawal_height) = superseding(&db, built)? {
+                remove_tree(&staged)?;
+                return Ok(Outcome::Superseded {
+                    built,
+                    withdrawal_height,
+                });
+            }
+            return Err(error);
         }
-        return Err(error);
-    }
+    };
     sync_directory(&staging(data_dir))?;
     observe(Phase::FilesWritten)?;
 
@@ -1158,6 +1396,9 @@ pub fn produce_with(
             withdrawal_height,
         });
     }
+    // Under the swap lock and after the superseding check: a withdrawal seal
+    // either abandons this build or runs after it and removes its shard.
+    update_cache(data_dir, &staged, read.shard_count, &rebuilt)?;
     let served_root = data_dir.join("snapshots");
     std::fs::create_dir_all(&served_root)?;
     swap_in(&staged, &served_root.join(&snapshot_date))?;
@@ -1171,6 +1412,8 @@ pub fn produce_with(
         epoch_number: built,
         tree_size: read.head.tree_size,
         snapshot_date,
+        shards_rebuilt: rebuilt.len() as u64,
+        shard_count: read.shard_count,
     })
 }
 

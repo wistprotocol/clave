@@ -54,6 +54,8 @@ fn snapshot_build_produces_verifiable_tier0_state_and_signed_artifacts() {
             epoch_number: 0,
             tree_size: db.last_epoch().unwrap().unwrap().tree_size,
             snapshot_date: "2026-08-09".to_string(),
+            shards_rebuilt: 1,
+            shard_count: 1,
         }
     );
 

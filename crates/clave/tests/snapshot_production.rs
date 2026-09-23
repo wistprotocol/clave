@@ -73,7 +73,12 @@ impl Log {
         &self,
         observe: &mut dyn FnMut(Phase) -> clave::error::Result<()>,
     ) -> clave::error::Result<Outcome> {
-        clave::snapshot::produce_with(&self.db_path(), self.path(), observe)
+        clave::snapshot::produce_with(
+            &self.db_path(),
+            self.path(),
+            clave::snapshot::Mode::Incremental,
+            observe,
+        )
     }
 
     fn publish(&mut self, url: &str, generated_at: &str) -> String {
@@ -232,6 +237,8 @@ fn a_seal_committed_while_files_are_written_leaves_the_manifest_at_the_read_heig
             epoch_number: 0,
             tree_size: read_head.tree_size,
             snapshot_date: DATE.to_string(),
+            shards_rebuilt: 1,
+            shard_count: 1,
         }
     );
     let manifest = log.manifest(DATE);
@@ -251,6 +258,8 @@ fn a_seal_committed_while_files_are_written_leaves_the_manifest_at_the_read_heig
             epoch_number: 1,
             tree_size: head.tree_size,
             snapshot_date: DATE.to_string(),
+            shards_rebuilt: 1,
+            shard_count: 1,
         }
     );
     assert_eq!(

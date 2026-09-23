@@ -381,12 +381,15 @@ stop being served once the full tile exists.
 
 A seal publishes the Checkpoint only; the Snapshot at the sealed head is
 produced afterwards by `seal` (unless `--no-snapshot`), by `clave snapshot
---data <dir>`, or by `serve`'s producer task, which runs at start, after
-each successful seal and every 60 seconds, and retries at once when a
+--data <dir>` (`--rebuild` rebuilds every shard instead of reusing
+unchanged ones, at the head even when the served Snapshot is current),
+or by `serve`'s producer task, which runs at start, after each
+successful seal and every 60 seconds, and retries at once when a
 withdrawal supersedes its build. `--no-seal` instances never produce. One
 producer runs per data directory at a time, holding an exclusive lock on
 `snapshot-build.lock`; a second one fails naming it. Production prints one
-of `snapshot built at epoch N for <date> in M ms`, `snapshot current at
+of `snapshot built at epoch N for <date> in M ms, K of S shards rebuilt`,
+`snapshot current at
 epoch N` (the newest served Snapshot is already at the head), `snapshot
 superseded by a withdrawal at epoch H` or `snapshot not built: no Epoch
 sealed`.
@@ -407,15 +410,33 @@ the build's Epoch, the swap and the index write hold
 `snapshot-swap.lock`, as does a withdrawal seal's removal; such a
 withdrawal abandons the build instead of swapping it in.
 
+Tier files are reused per shard (unsharded: one shard). A shard whose
+record projections (WIST-3 §7 `content_digest` over the shard) and
+Labels, disputes and labeler rows are unchanged since the last build
+hard-links (else copies) its six tier files from
+`snapshot-shards/<shard>/` instead of rebuilding them, reading no
+Payloads; `content_digest`, `state.json` and the manifest are computed
+in full every build. The cache lies outside `/snapshots` and is never
+served. Each entry holds the tier files and `fingerprint.json` (shard
+count, shard, Epoch, both digests, each file's `sha256` and `bytes`); an
+entry is reused only when its fingerprint parses, matches and every file
+has its listed length. Entries of rebuilt shards are replaced under
+`snapshot-swap.lock` after the withdrawal check and before the swap,
+through `<shard>.new/` with the fingerprint written last; entries at or
+above the shard count are removed. After `snapshot-shards/` is deleted,
+the next build rebuilds every shard.
+
 Every start of `seal` and `serve`, and every seal, reconciles the served
 tree before re-signing it: an abandoned staging directory is removed
 unless a producer holds its lock, a Snapshot directory without a readable
 manifest for its date is removed, and `snapshots/index.json` is
 regenerated when it is unparsable, missing while Snapshots are served, or
 lists other entries than the manifests present (WIST-3 §6). A withdrawal
-seal removes every served Snapshot and the staging area, then writes an
-index listing none; the next production rebuilds without the withdrawn
-content.
+seal removes every served Snapshot, the staging area and the
+`snapshot-shards/` entries of the withdrawn Deltas' Publisher shards, then
+writes an index listing none; the next production rebuilds those shards
+without the withdrawn content. Reconciliation without a running producer
+also removes unfinished `snapshot-shards/*.new/` entries.
 
 ## Witness cosignatures
 
