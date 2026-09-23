@@ -81,7 +81,6 @@ impl Harness {
             .map(|raw| serde_json::from_slice(&raw).unwrap())
     }
 
-    /// The `pending_declaration` tuple of the newest Snapshot, if any.
     fn pending_tuple(&self) -> Option<Value> {
         let read = |path: &std::path::Path| -> Value {
             serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
@@ -106,8 +105,6 @@ impl Harness {
             .cloned()
     }
 
-    /// Serves a replacement Declaration naming `prev`, signed by `seed`, and
-    /// keeps the Feed under whichever key the Aggregator still holds.
     fn serve_replacement(&self, seq: u64, prev: &Value, keys: Value, seed: &[u8; 32]) -> Value {
         let mut replacement = current_declaration(&self.p)["publisher"].clone();
         replacement["seq"] = seq.into();
@@ -139,8 +136,6 @@ fn a_fresh_identity_is_pending_and_supplies_no_authority_until_activation() {
     assert_eq!(tuple[3], sealed_at);
     assert_eq!(tuple[4], sealed_at + activation_delay());
 
-    // A Delta under the pending key has no authority; one under the key in
-    // force keeps it.
     let rejected = add_delta_signed(
         &h.p,
         &format!("https://{}/pending", h.host),
@@ -241,8 +236,6 @@ fn a_replacement_of_the_declaration_in_force_reverses_a_pending_identity() {
         h.ingest("2026-08-09T12:30:00Z");
         assert_eq!(h.pending_declaration().unwrap(), fresh, "{recovery_signed}");
 
-        // The owner still holds a listed key and answers with a Declaration
-        // naming the one in force; the pending head is discarded.
         let signer = if recovery_signed { &R1_SEED } else { &K1_SEED };
         let reversal = h.serve_replacement(
             floor + 2,
@@ -273,7 +266,6 @@ fn a_second_fresh_identity_names_the_pending_head_or_is_rejected() {
     write_feed_signed(&h.p, &h.host, &[], "2026-08-09T12:30:00Z", &K1_SEED);
     h.ingest("2026-08-09T12:30:00Z");
 
-    // Naming the Declaration in force beside a pending head is WIST1-E08.
     h.serve_replacement(
         2,
         &original,
@@ -290,8 +282,6 @@ fn a_second_fresh_identity_names_the_pending_head_or_is_rejected() {
         .iter()
         .any(|rejection| rejection.code == "WIST1-E08"));
 
-    // Naming the pending head advances it without moving the Declaration in
-    // force.
     let follower = h.serve_replacement(
         3,
         &fresh,
@@ -308,8 +298,6 @@ fn a_second_fresh_identity_names_the_pending_head_or_is_rejected() {
 fn a_pending_or_reversed_declaration_supplies_no_page_authority() {
     let mut h = Harness::start();
     let original = h.stored_declaration();
-    // A party holding the web host publishes a fresh identity and cuts a
-    // Page under its key.
     h.serve_replacement(
         1,
         &original,

@@ -37,8 +37,6 @@ fn queue(db: &Db, body: &Value) {
         .unwrap();
 }
 
-/// Seals an empty Epoch carrying `changes` at `sealed_at`, recording
-/// `octets` as the Epoch's entry-bundle size.
 fn seal_sizes(db: &Db, height: u64, sealed_at: &str, changes: &[ParamChangeRow], octets: u64) {
     db.commit_seal(
         &SigningKey::from_seed(&[9u8; 32]),

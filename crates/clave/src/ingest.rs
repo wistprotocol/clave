@@ -23,21 +23,15 @@ pub struct IngestReport {
     pub accepted: Vec<String>,
     pub queued: Vec<String>,
     pub rejected: Vec<(String, String)>,
-    /// Label and Dispute IDs accepted for sealing from the Label Feed.
     pub labels: Vec<String>,
     pub noise: Option<&'static str>,
-    /// The rejection code the pull, or its Feed walk alone, ended at.
     pub ended: Option<String>,
     pub suspended: bool,
     pub fetched_bytes: u64,
 }
 
-/// WIST-2 §4: `host` MUST be a bare authority (`host[:port]`) — no scheme,
-/// path, query, fragment or userinfo — before it is interpolated into a
-/// fetch URL. This is narrower validation than WIST-1 §2's full Canonical
-/// Host (which forbids a port and requires UTS #46 processing); this
-/// codebase already treats `host` as `host[:port]` throughout (see the
-/// aggregator's own `log_id`), so bare-authority syntax is what's enforced.
+/// WIST-2 §4: `host` must be a bare `host[:port]` authority before it is
+/// interpolated into a fetch URL, narrower than WIST-1 §2's Canonical Host.
 pub fn is_bare_authority(host: &str) -> bool {
     if host.is_empty()
         || host
@@ -57,10 +51,8 @@ pub fn is_bare_authority(host: &str) -> bool {
         && parsed.fragment().is_none()
 }
 
-/// WIST-1 §2 Canonical Host over a bare `host[:port]` authority: the
-/// hostname is canonicalized (UTS #46, A-labels, lowercase), IP literals
-/// pass through, and the port is preserved as this implementation's
-/// loopback-deployment extension to §2's port-free Canonical Host.
+/// WIST-1 §2 Canonical Host; the port is kept as this implementation's
+/// loopback-deployment extension to §2's port-free form.
 pub fn canonical_authority(host: &str) -> Option<String> {
     if !is_bare_authority(host) {
         return None;
@@ -77,9 +69,8 @@ pub fn canonical_authority(host: &str) -> Option<String> {
     })
 }
 
-/// The Declarations WIST-2 §3.2 resolves a sealed Page's Key Set
-/// through, as the Log stands at the height `at`, which a run pins so
-/// that resuming it reads the same sources.
+/// WIST-2 §3.2's sources at height `at`, which a run pins so that resuming
+/// it reads the same sources.
 fn page_declarations(
     db: &Db,
     data_dir: &Path,
@@ -173,9 +164,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
     wist_core::crypto::hex_encode(&sha2::Sha256::digest(bytes))
 }
 
-/// The version of the domain's accepted Declaration and recovery window
-/// with the admission sources they yield: the window's prior and owner
-/// Declarations while one is open, the accepted Declaration otherwise.
 fn declaration_ref(db: &Db, host: &str) -> Result<verify::DeclarationRef> {
     let window = db.get_recovery_window(host)?;
     let stored = db.get_publisher_declaration(host)?;
@@ -213,8 +201,7 @@ fn declaration_ref(db: &Db, host: &str) -> Result<verify::DeclarationRef> {
     })
 }
 
-/// Issues the references of one Delta attempt at its clock sample. The
-/// schedule's height is read before the schedule, so a seal that lands
+/// The schedule's height is read before the schedule, so a seal that lands
 /// between them makes admission recheck the caps rather than miss them.
 fn issue_refs(
     db: &Db,
@@ -233,8 +220,6 @@ fn issue_refs(
     })
 }
 
-/// The domain's accepted Declaration, which Labels and disputes validate
-/// under, with its version.
 fn label_declaration(
     db: &Db,
     host: &str,
@@ -250,8 +235,6 @@ fn label_declaration(
     Ok(Some((declaration, declaration_ref(db, host)?)))
 }
 
-/// The keys of the Declaration the domain holds, which a live Feed or
-/// Label Feed verifies under.
 fn live_page_keys(db: &Db, host: &str) -> Result<Vec<PublisherKey>> {
     let raw = db
         .get_publisher_declaration(host)?
@@ -262,11 +245,7 @@ fn live_page_keys(db: &Db, host: &str) -> Result<Vec<PublisherKey>> {
         .keys)
 }
 
-/// The bounds of one pull below the per-domain daily budget of WIST-2 §5:
-/// the work, in octets, objects and seconds, it may do before it suspends
-/// the walk for a later pull to resume; the pages and octets its walk
-/// cursor may hold; and the Delta files it may fetch ahead of the item
-/// being processed.
+/// Per-pull bounds below WIST-2 §5's per-domain daily budget.
 #[derive(Debug, Clone, Copy)]
 pub struct PullLimits {
     pub work_bytes: u64,
@@ -292,21 +271,14 @@ impl Default for PullLimits {
     }
 }
 
-/// The kinds of content object a pull fetches under the byte budget, each
-/// bounded while it streams.
-/// The kinds of object a pull fetches, each under its own WIST-2 §8 bound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Object {
     Page,
     Delta,
     Payload,
-    /// A Label or Dispute Envelope, bounded as a Delta file is.
     Label,
 }
 
-/// Per-object bounds: Feed pages by the shared object cap, a Delta file
-/// by its URL cap and fixed fields, a Payload by the content caps in
-/// force plus its salt and framing.
 pub struct ObjectCaps {
     delta: u64,
     payload: u64,
@@ -330,7 +302,7 @@ impl ObjectCaps {
     }
 }
 
-/// The values in force at the instant a request is issued (WIST-2 §5, §8).
+/// WIST-2 §5, §8: the values in force at the instant a request is issued.
 struct Meter {
     unit: String,
     day: String,
@@ -338,11 +310,8 @@ struct Meter {
     caps: ObjectCaps,
 }
 
-/// A metered fetch's result as the coordinator applies it.
 enum Got {
     Body(Vec<u8>, Value),
-    /// The budget or the pull's work is spent, or the object would cross
-    /// it: the walk suspends.
     Suspend,
     Failed(String),
 }
@@ -379,7 +348,6 @@ pub fn run_with_clock(
     )
 }
 
-/// Pulls `host` once (WIST-2 §5) and closes the run it ran under.
 pub fn run_bounded(
     db: &Db,
     client: &Client,
@@ -395,16 +363,13 @@ pub fn run_bounded(
     }
 }
 
-/// Closes the run of a finished pull, schedules the domain's next pull
-/// and records the pull's noise disposition, all in one transaction: a
-/// takeover between a pull's end and its completion leaves the run for
-/// the new holder rather than a closed run with no next pull. `run` is
-/// `None` where no run was opened, which schedules nothing further.
+/// One transaction, so a takeover between a pull's end and its completion
+/// leaves the run for the new holder rather than a closed run with no next
+/// pull.
 ///
 /// WIST-2 §4: a noise disposition counts against the Ping quota of the
-/// Registrable Domain in force at the Ping, on the UTC day of the Ping.
-/// The pull therefore counts only the Ping it serves, if it serves one:
-/// a baseline poll, a resumption and a retry cost the domain nothing.
+/// Registrable Domain in force at the Ping, on the UTC day of the Ping, so
+/// only the Ping a pull serves is charged.
 pub fn finish_pull(
     db: &Db,
     task: &crate::db::PullTask,
@@ -436,11 +401,6 @@ pub fn finish_pull(
     Ok(report)
 }
 
-/// Pulls `host` once and leaves its run open for the caller to close
-/// beside whatever else the pull's completion records. A run an
-/// interrupted pull left open is dropped rather than continued (WIST-2 §5:
-/// resumption is a later pull). `None` means `host` is no bare authority
-/// and nothing was pulled.
 pub fn open_pull(
     db: &Db,
     client: &Client,
@@ -525,9 +485,6 @@ impl Drop for InFlight {
     }
 }
 
-/// The coordinator of one pull: it reads the store, issues each fetch,
-/// hands the result to verification and the verified object to
-/// admission, and persists every handoff under the run.
 struct Pull<'a, C: Fn() -> jiff::Timestamp> {
     db: &'a Db,
     client: &'a Client,
@@ -551,10 +508,8 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
         self.run.now.clone()
     }
 
-    /// WIST-2 §8: the hosts a redirect may reach are those the Publisher's
-    /// Declaration lists at the moment the request is issued, so a
-    /// replacement admitted earlier in the pull governs the requests after
-    /// it; before the first accepted Declaration a redirect stays on the
+    /// WIST-2 §8: the scope is the one the Declaration lists when the request
+    /// is issued; before the first accepted Declaration a redirect stays on the
     /// requested host.
     fn scope(&self) -> Result<Vec<String>> {
         Ok(self
@@ -581,9 +536,6 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
         })
     }
 
-    /// The run's object ID for `key`: the key's name, and for a listed
-    /// item the attempt of its ID that is still open, or a further one
-    /// once admission is done with the last.
     fn slot(&self, key: &ObjectKey) -> Result<String> {
         let name = key.name();
         if !key.per_attempt() {
@@ -600,9 +552,6 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
         Ok(format!("{name}#{attempt}"))
     }
 
-    /// What a persisted object hands the coordinator, so a resumed pull
-    /// and a repeated occurrence read the response the run already holds
-    /// rather than request it again.
     fn stored(&self, object: &PullObject) -> Result<Got> {
         if let Some(raw) = &object.raw {
             let value = crate::json::parse(raw)?;
@@ -614,13 +563,6 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
         })
     }
 
-    /// Fetches one content object under the budget, bounds and meter row in
-    /// force when the request is issued, and the pull's work limits,
-    /// reserving the bound before the request and settling it to the bytes
-    /// read when the response persists. The walk suspends when the budget,
-    /// the work or the pull's time is spent, or the object would cross the
-    /// budget, in which case the bytes read up to the bound are debited. An
-    /// object above its own cap is a failed fetch.
     fn get(&mut self, key: &ObjectKey, slot: &str, url: &str, object: Object) -> Result<Got> {
         let (db, kind) = (self.db, key.kind());
         if let Some(flight) = self.prefetch.remove(&(kind, slot.to_string())) {
@@ -677,10 +619,8 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
         self.settle_fetch(kind, slot, outcome)
     }
 
-    /// The request that begins an item: a page after the live one, or a
-    /// queue item's own file once the pull has begun an item. Only there
-    /// does the pull's spent wall time suspend the walk, so every item
-    /// begun completes and every pull begins at least one item.
+    /// Only here does spent wall time suspend the walk, so every item begun
+    /// completes and every pull begins at least one item.
     fn begin(&mut self, key: &ObjectKey, slot: &str, url: &str, object: Object) -> Result<Got> {
         self.yielding = match key {
             ObjectKey::Page { index, .. } => *index > 0,
@@ -694,10 +634,8 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
         got
     }
 
-    /// Whether the budget and the work left, net of the prefetches in
-    /// flight, still exceed what those prefetches and their Payloads could
-    /// take, so that no bound is crossed at an object a sequential pull
-    /// would have read.
+    /// Prefetches must leave room for what they and their Payloads could take,
+    /// so no bound is crossed at an object a sequential pull would have read.
     fn within_margin(&self, meter: &Meter, spent: i64) -> bool {
         let most = u64::from(self.limits.prefetch_objects);
         let reserved: u64 = self.prefetch.values().map(|flight| flight.limit).sum();
@@ -853,8 +791,6 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
         Ok(())
     }
 
-    /// Requests `publisher.json` outside the budget, under the redirect
-    /// scope in force when it is issued, unless the run holds the response.
     fn get_declaration(
         &self,
         key: &ObjectKey,
@@ -920,8 +856,6 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
         })
     }
 
-    /// Requests `publisher.json` for the retry `key` carries and admits
-    /// what it returns, spending the retry either way.
     fn refresh(&mut self, key: &ObjectKey) -> Result<()> {
         match self.get_declaration(key, None)? {
             Ok((raw, value)) => {
@@ -950,8 +884,6 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
         admit::abort(self.db, &mut self.run, self.host, key, code, detail)
     }
 
-    /// Ends the pull's work, suspended or complete, leaving the run to be
-    /// closed.
     fn finish(&mut self, suspended: bool) -> Result<()> {
         self.run.phase = Phase::Closing;
         self.run.suspended = suspended;
@@ -981,9 +913,7 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
         Ok(())
     }
 
-    /// WIST-2 §5 step 0 and ADR-0031: the domain's first-contact or
-    /// periodic `publisher.json`, then the Key Set cache's age. `false`
-    /// ends the pull.
+    /// WIST-2 §5 step 0 and ADR-0031.
     fn discover(&mut self) -> Result<bool> {
         let (db, host) = (self.db, self.host);
         let key = ObjectKey::Declaration {
@@ -1047,12 +977,9 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
         Ok(true)
     }
 
-    /// The pages of `walk` an earlier pull left in the domain's cursor,
-    /// by URL. The live page at `live_url` is never among them: it is
-    /// always re-fetched, since the Publisher rewrites it, while a sealed
-    /// Page is immutable and the walk resumes over the ones it holds
-    /// (WIST-2 §5's resumption from where the walk stopped), each checked
-    /// again since §3.2's sources may have changed since it was walked.
+    /// The live page is always re-fetched, since the Publisher rewrites it; a
+    /// sealed Page is immutable, so the walk resumes over the held ones (WIST-2
+    /// §5), each checked again since §3.2's sources may have changed.
     fn cursor(
         &self,
         walk: Walk,
@@ -1067,8 +994,6 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
             .collect())
     }
 
-    /// The Envelope of the page at `url`: the octets the cursor holds for
-    /// it, whose request and budget debit alone are skipped, or a fetch.
     fn page_envelope(
         &mut self,
         key: &ObjectKey,
@@ -1092,8 +1017,6 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
         self.begin(key, &key.name(), url, Object::Page)
     }
 
-    /// The page at `index` of `walk` as the run's cursor holds it, once
-    /// its admission recorded it.
     fn walked(&self, key: &ObjectKey, walk: Walk, index: u32) -> Result<Option<WalkPage>> {
         let object = self
             .db
@@ -1137,10 +1060,8 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
         Ok(false)
     }
 
-    /// Walks the Feed from `feed.json` through its sealed Pages (WIST-2
-    /// §3.2, §5 step 1) until a page lists no unseen ID, `next` ends,
-    /// fails the target rule or names a Page the walk cannot use, or the
-    /// walk suspends.
+    /// WIST-2 §3.2, §5 step 1: the walk stops at the first page listing no
+    /// unseen ID.
     fn walk_feed(&mut self) -> Result<()> {
         let (db, host) = (self.db, self.host);
         let mut pages: Vec<Vec<String>> = Vec::new();
@@ -1265,8 +1186,7 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
         )
     }
 
-    /// WIST-2 §5 steps 2–4 over the walked pages' Delta IDs, oldest page
-    /// first.
+    /// WIST-2 §5 steps 2–4, oldest page first.
     fn process_deltas(&mut self) -> Result<()> {
         let (db, host, data_dir) = (self.db, self.host, self.data_dir);
         while self.run.position < self.run.queue.len() {
@@ -1535,10 +1455,8 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
         )
     }
 
-    /// WIST-1 §5.1 authority of a Delta under the admission sources after
-    /// any settlement due, with the one Declaration retry WIST-2 §5 allows
-    /// each Delta ID per pull on a binding failure. The attempt's
-    /// Declaration reference becomes the version the check read.
+    /// WIST-1 §5.1, with the one Declaration retry WIST-2 §5 allows each Delta
+    /// ID per pull on a binding failure.
     fn authority(
         &mut self,
         id: &str,
@@ -1564,9 +1482,6 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
         Ok(authority)
     }
 
-    /// Re-issues a stale attempt's references at its frozen clock: the
-    /// current Declaration version and, when an Epoch was sealed since,
-    /// the caps of the schedule it extended.
     fn reissue(&self, refs: verify::IssuedRefs) -> Result<verify::IssuedRefs> {
         let schedule_at = self.db.last_epoch()?.map(|epoch| epoch.epoch_number);
         if schedule_at != refs.schedule_at {
@@ -1578,10 +1493,9 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
         })
     }
 
-    /// WIST-2 §3.3: walks the domain's Label Feed beside its Feed, under
-    /// §3.2's rules and the ingest budget. A Label walk that cannot begin
-    /// under a spent budget waits for the next pull without suspending the
-    /// Feed walk that completed before it.
+    /// WIST-2 §3.3, under §3.2's rules. A Label walk that cannot begin under a
+    /// spent budget waits for the next pull without suspending the Feed walk
+    /// that completed before it.
     fn walk_labels(&mut self) -> Result<()> {
         let (db, host) = (self.db, self.host);
         if label_declaration(db, host)?.is_none() {
@@ -1717,10 +1631,6 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
         )
     }
 
-    /// Fetches each unseen Label or dispute of the walked Label Feed
-    /// pages, validates it under the accepted Declaration and queues it as
-    /// a `label` or `dispute` Entry; a failure is `WIST2-E06` at the
-    /// status endpoint.
     fn process_labels(&mut self) -> Result<()> {
         let (db, host, data_dir) = (self.db, self.host, self.data_dir);
         let Some(mut declaration) = label_declaration(db, host)? else {
@@ -1831,7 +1741,6 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
     }
 }
 
-/// A recorded flag of an object's checks.
 fn checks_flag(object: &PullObject, name: &str) -> bool {
     object
         .checks_json
@@ -1840,8 +1749,6 @@ fn checks_flag(object: &PullObject, name: &str) -> bool {
         .is_some_and(|checks| checks[name] == true)
 }
 
-/// The failure a fetch recorded, if it failed rather than suspended the
-/// walk at a bound.
 fn failure_detail(object: &PullObject) -> Option<String> {
     object
         .checks_json

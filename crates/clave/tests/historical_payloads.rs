@@ -31,8 +31,6 @@ impl Fixture {
         rusqlite::Connection::open(self.data.path().join("clave.sqlite")).unwrap()
     }
 
-    /// The leaf data of the first Entry of Epoch `height`, which a fault
-    /// injection replaces to corrupt the retained history.
     fn first_leaf(&self, height: u64) -> (u64, Vec<u8>) {
         let index = self.db.size_before(height).unwrap();
         let bytes: Vec<u8> = self

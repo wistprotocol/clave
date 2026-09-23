@@ -24,10 +24,9 @@ pub use pull_schedule::{
 pub use pull_schedule::{AGE_PRIORITY_SECONDS, BYTES_PER_SLOT_SECOND};
 pub use tree::StoredTree;
 
-/// A write transaction: at the top level it begins immediately, taking
-/// the store's write lock before any read so a concurrent connection can
-/// neither invalidate what it read nor make its commit fail; nested, it
-/// is a savepoint inside the enclosing transaction.
+/// A top-level transaction takes the write lock before any read, so a
+/// concurrent connection can neither invalidate what it read nor make its
+/// commit fail.
 pub(crate) struct Mutation<'a> {
     conn: &'a Connection,
     committed: bool,
@@ -39,10 +38,9 @@ impl<'a> Mutation<'a> {
         Self::fenced(conn, None)
     }
 
-    /// Begins a write transaction that proceeds only while `fence`, when
-    /// set, still holds: at the top level its token is compared under the
-    /// write lock, which no takeover can change before the transaction
-    /// ends; a nested one inherits the enclosing transaction's check.
+    /// The fence token is compared under the write lock, which no takeover can
+    /// change before the transaction ends; a nested transaction inherits the
+    /// enclosing one's check.
     fn fenced(conn: &'a Connection, fence: Option<Fence>) -> Result<Self> {
         let top_level = conn.is_autocommit();
         if top_level {
@@ -79,8 +77,6 @@ impl<'a> Mutation<'a> {
     }
 }
 
-/// A test hook that stops the current thread's work right after a chosen
-/// top-level commit, as a crash there would.
 #[cfg(test)]
 pub(crate) mod interrupt {
     use std::cell::Cell;
@@ -89,18 +85,14 @@ pub(crate) mod interrupt {
         static REMAINING: Cell<Option<usize>> = const { Cell::new(None) };
     }
 
-    /// Unwinds with `Interrupted` right after the `commits`-th next
-    /// top-level commit on this thread, counting from zero.
     pub(crate) fn after(commits: usize) {
         REMAINING.with(|remaining| remaining.set(Some(commits)));
     }
 
-    /// Disarms the hook, returning whether it was still armed.
     pub(crate) fn disarm() -> bool {
         REMAINING.with(|remaining| remaining.take().is_some())
     }
 
-    /// The payload the hook unwinds with.
     pub(crate) struct Interrupted;
 
     pub(super) fn committed() {
@@ -154,8 +146,6 @@ pub struct PublisherStatusRow {
     pub state: PublisherState,
 }
 
-/// A sealed Epoch as its Checkpoint states it: the Epoch's number, the
-/// tree size and root at that Epoch, and its `sealed_at` (WIST-3 §3.1).
 #[derive(Debug, Clone)]
 pub struct EpochRow {
     pub epoch_number: u64,
@@ -172,7 +162,6 @@ pub struct RecordRow {
     pub title: String,
     pub abstract_text: Option<String>,
     pub lang: String,
-    /// `sealed_at` of the Epoch that sealed the Delta this record holds.
     pub sealed_at: String,
 }
 
@@ -186,9 +175,8 @@ pub struct PendingEntryRow {
     pub entry_type: String,
     pub domain: String,
     pub entry_json: Value,
-    /// WIST-4 §5: the Epoch at which this Delta's turn arrived — the
-    /// first with room for it under WIST-3 §3.2's per-domain capacity.
-    /// The inclusion ceiling runs from here.
+    /// WIST-4 §5: the first Epoch with room for this Delta under WIST-3 §3.2's
+    /// per-domain capacity; the inclusion ceiling runs from it.
     pub turn_epoch: Option<u64>,
 }
 
@@ -205,18 +193,16 @@ pub struct WithdrawalRow<'a> {
     pub domain: &'a str,
 }
 
-/// `(delta_id, publisher domain, sealing height)` of an accepted
-/// withdrawal, the WIST-3 §7 `withdrawal` tuple.
+/// WIST-3 §7 `withdrawal` tuple: `(delta_id, publisher domain, sealing
+/// height)`.
 pub type WithdrawalState = (String, String, u64);
 
-/// A `label` Entry this Epoch seals, at its canonical Entry index.
 pub struct SealedLabelRow<'a> {
     pub label_id: &'a str,
     pub entry_index: u64,
     pub label: &'a wist_core::objects::Label,
 }
 
-/// A `dispute` Entry this Epoch seals, at its canonical Entry index.
 pub struct SealedDisputeRow<'a> {
     pub dispute_id: &'a str,
     pub entry_index: u64,
@@ -343,18 +329,13 @@ fn exec_upsert_record(conn: &Connection, r: &RecordUpsert, sealed_at: &str) -> R
     Ok(())
 }
 
-/// A sealed height with the signed note its Checkpoint carries.
 pub type Publication = (u64, String);
 
-/// A Witness the Aggregator submits its Checkpoints to (WIST-3 §5).
 #[derive(Debug, Clone)]
 pub struct WitnessRow {
     pub name: String,
-    /// The Witness's verifier-key string, as configured.
     pub public_key: String,
     pub base_url: String,
-    /// The tree size this Witness last cosigned, the size a Consistency
-    /// Proof for its next `add-checkpoint` call runs from.
     pub last_size: u64,
 }
 
@@ -396,9 +377,6 @@ impl Db {
         self.write(|conn| Ok(conn.execute(sql, params)?))
     }
 
-    /// This connection with every write transaction it begins fenced by
-    /// `fence`: once another holder has taken the lease over, each fails
-    /// with `Error::Fenced` and writes nothing.
     pub fn fenced(self, fence: Fence) -> Db {
         Db {
             fence: Some(fence),
@@ -413,10 +391,8 @@ impl Db {
         Ok(db)
     }
 
-    /// Another connection to a store `open` has already migrated and
-    /// restored, for work that must not share a connection: each pull,
-    /// status request and background pass takes its own so a slow one
-    /// holds nothing another needs. SQLite serializes their writes.
+    /// Work that must not share a connection (each pull, status request and
+    /// background pass) takes its own.
     pub fn connect(path: &Path) -> Result<Db> {
         let conn = Connection::open(path)?;
         conn.busy_timeout(std::time::Duration::from_millis(5000))?;
@@ -538,9 +514,8 @@ impl Db {
         Ok(())
     }
 
-    /// WIST-1 §5.2: the pending head of a fresh identity accepted at
-    /// admission, held beside the current Declaration until the Log
-    /// activates or reverses it.
+    /// WIST-1 §5.2: a fresh identity's pending head is held beside the current
+    /// Declaration until the Log activates or reverses it.
     pub fn get_pending_identity(&self, domain: &str) -> Result<Option<Vec<u8>>> {
         self.conn
             .query_row(
@@ -552,9 +527,6 @@ impl Db {
             .map_err(Error::Db)
     }
 
-    /// Accepts a Declaration as the pending head: it is queued for
-    /// sealing and raises the sequence floor without replacing the
-    /// current Declaration.
     pub fn record_pending_identity(
         &self,
         domain: &str,
@@ -608,8 +580,7 @@ impl Db {
         Ok(())
     }
 
-    /// WIST-1 §5.1: the instant the stored Key Set was last discovered,
-    /// against which `keyset_cache_ttl_seconds` is measured.
+    /// WIST-1 §5.1: `keyset_cache_ttl_seconds` is measured from this instant.
     pub fn declaration_fetched_at(&self, domain: &str) -> Result<Option<String>> {
         Ok(self
             .conn
@@ -630,9 +601,6 @@ impl Db {
         Ok(())
     }
 
-    /// Every Declaration of a domain the Log has sealed, oldest first,
-    /// so a Key Set can be resolved at the height a rule names rather
-    /// than only at the present.
     pub fn sealed_declarations(&self, domain: &str) -> Result<Vec<SealedDeclarationEntry>> {
         let mut stmt = self.conn.prepare(
             "SELECT seq, epoch_number, sealed_at, declaration_json FROM sealed_declarations WHERE domain = ?1 ORDER BY seq ASC",
@@ -701,9 +669,8 @@ impl Db {
             .map_err(Error::Db)
     }
 
-    /// WIST-1 §5.2: the window's chain head — the recovery Declaration, or
-    /// the newest Declaration that legitimately follows it. Settlement
-    /// revalidates against this and the domain resumes under it.
+    /// WIST-1 §5.2: the recovery Declaration or the newest Declaration that
+    /// legitimately follows it; settlement revalidates against it.
     pub fn update_recovery_chain_head(&self, domain: &str, declaration_json: &[u8]) -> Result<()> {
         self.execute(
             "UPDATE recovery_windows SET declaration_json = ?2 WHERE domain = ?1",
@@ -802,9 +769,6 @@ impl Db {
         Ok(())
     }
 
-    /// A Delta already accepted and pending when its domain's recovery
-    /// window opens: it is moved into the queue rather than sealed, and
-    /// its `seen` and chain-tip state is already recorded.
     pub(crate) fn requeue_pending_delta(&self, entry: &PendingEntryRow) -> Result<()> {
         let delta = &entry.entry_json["delta"];
         let delta_id = wist_core::delta::delta_id(delta)?;
@@ -1116,8 +1080,7 @@ impl Db {
             .map_err(Error::Db)
     }
 
-    /// The tree size Checkpoint `epoch_number - 1` states, `size(-1)`
-    /// being 0 (WIST-3 §3).
+    /// WIST-3 §3: `size(-1)` is 0.
     pub fn size_before(&self, epoch_number: u64) -> Result<u64> {
         Ok(self.conn.query_row(
             "SELECT COALESCE(MAX(tree_size), 0) FROM epochs WHERE epoch_number < ?1",
@@ -1130,24 +1093,18 @@ impl Db {
         self.size_before(u64::MAX)
     }
 
-    /// A `HashReader` over the stored tree hashes.
     pub fn log_tree(&self) -> StoredTree<'_> {
         StoredTree::new(&self.conn)
     }
 
-    /// The leaf data of the leaves in `[from, to)`, in leaf order.
     pub fn entry_range(&self, from: u64, to: u64) -> Result<Vec<Vec<u8>>> {
         tree::entry_range(&self.conn, from, to)
     }
 
-    /// The hashes one stored tile holds, as many as the tree the store
-    /// has reached requires of it.
     pub fn tile_hashes(&self, level: u8, index: u64) -> Result<Option<Vec<[u8; 32]>>> {
         tree::read_tile(&self.conn, level, index)
     }
 
-    /// The root the tree reaches when `leaves` are appended at
-    /// `previous_size`, computed without writing anything.
     pub fn root_after_appending(
         &self,
         previous_size: u64,
@@ -1156,14 +1113,11 @@ impl Db {
         tree::root_after_appending(&self.conn, previous_size, leaves)
     }
 
-    /// The Consistency Proof from tree size `from` to tree size `to`
-    /// (WIST-3 §4).
     pub fn consistency_proof(&self, from: u64, to: u64) -> Result<Vec<[u8; 32]>> {
         wist_core::merkle::consistency_proof_from(&self.log_tree(), from, to)
             .map_err(|e| Error::History(e.to_string()))
     }
 
-    /// The Entries of Epoch `epoch_number` in canonical order.
     pub fn epoch_entries(&self, epoch_number: u64) -> Result<Vec<Value>> {
         let Some(epoch) = self.epoch_at(epoch_number)? else {
             return Ok(Vec::new());
@@ -1214,8 +1168,6 @@ impl Db {
         Ok(())
     }
 
-    /// Every sealed Epoch whose files are not yet confirmed on disk,
-    /// lowest height first.
     pub fn unpublished_publications(&self) -> Result<Vec<Publication>> {
         let mut statement = self.conn.prepare(
             "SELECT epoch_number, note FROM epochs WHERE published = 0 ORDER BY epoch_number",
@@ -1226,8 +1178,6 @@ impl Db {
         Ok(rows)
     }
 
-    /// The note of the highest sealed Epoch's Checkpoint, with every
-    /// signature line it has obtained.
     pub fn head_publication(&self) -> Result<Option<Publication>> {
         Ok(self
             .conn
@@ -1250,8 +1200,7 @@ impl Db {
             .optional()?)
     }
 
-    /// Replaces a Checkpoint's stored note with one carrying a further
-    /// signature line; the note text itself never changes (WIST-3 §6).
+    /// WIST-3 §6: the note text never changes; only signature lines are added.
     pub fn replace_checkpoint_note(&self, epoch_number: u64, note: &str) -> Result<()> {
         self.execute(
             "UPDATE epochs SET note = ?2 WHERE epoch_number = ?1",
@@ -1299,8 +1248,7 @@ impl Db {
         Ok(())
     }
 
-    /// WIST-3 §3.4: the note key ID of every Aggregator key ever admitted
-    /// to the Log, the genesis key included.
+    /// WIST-3 §3.4: the genesis key included.
     pub fn admitted_note_key_ids(&self) -> Result<Vec<String>> {
         let mut statement = self
             .conn
@@ -1325,9 +1273,7 @@ impl Db {
         Ok(())
     }
 
-    /// WIST-3 §3.4 and §7: the `aggregator_key` tuples the Log has
-    /// established, removed keys included, ordered by `key_id`, each
-    /// carrying the accepted acts that admitted and retired its key.
+    /// WIST-3 §3.4, §7: removed keys included, ordered by `key_id`.
     pub fn aggregator_key_entries(&self) -> Result<Vec<AggregatorKeyEntry>> {
         let mut statement = self.conn.prepare(
             "SELECT key_id, public_key, added_epoch, removed_epoch, adding_act, removing_act FROM aggregator_keys ORDER BY key_id",
@@ -1359,9 +1305,6 @@ impl Db {
             .collect()
     }
 
-    /// The `key_id` a document this Aggregator signs names in `sig.key_id`:
-    /// the one the key registry binds to the signing key, or the genesis
-    /// `key_id` for a store whose registry does not carry it.
     pub fn signing_key_id(&self, public_key: &wist_core::crypto::PublicKey) -> Result<String> {
         let encoded = public_key.to_b64u();
         Ok(self
@@ -1375,8 +1318,6 @@ impl Db {
             .unwrap_or_else(|| crate::keys::GENESIS_KEY_ID.to_string()))
     }
 
-    /// Seals Epoch `epoch_number` under one Aggregator key, leaving the
-    /// key registry as it stands.
     #[allow(clippy::too_many_arguments)]
     pub fn commit_seal(
         &self,
@@ -1414,14 +1355,9 @@ impl Db {
         )
     }
 
-    /// Seals Epoch `epoch_number`: appends its Entries' leaves to the
-    /// tree, signs the Checkpoint that states the root they reach under
-    /// every `signers` key — the held keys valid at this height (WIST-3
-    /// §3.4, §5) — and writes it with the key-registry, acceptance,
-    /// schedule, withdrawal, Label and Declaration rows the Epoch carries,
-    /// all in one transaction (WIST-3 §3.2, §5). `key_entries` replaces
-    /// the stored key registry where the Epoch establishes one. Returns
-    /// the Epoch the Checkpoint states.
+    /// WIST-3 §3.2, §5: the leaves, the Checkpoint signed under every `signers`
+    /// key (the held keys valid at this height, §3.4) and the rows the Epoch
+    /// carries are written in one transaction.
     #[allow(clippy::too_many_arguments)]
     pub fn commit_seal_under(
         &self,
@@ -1630,7 +1566,6 @@ impl Db {
         Ok(())
     }
 
-    /// The subject of a Label this Log sealed, for a dispute's check.
     pub fn sealed_label_subject(&self, label_id: &str) -> Result<Option<String>> {
         Ok(self
             .conn
@@ -1642,8 +1577,8 @@ impl Db {
             .optional()?)
     }
 
-    /// The Label Feed's retained authenticated observation (WIST-2 §3.3,
-    /// under §3.2's rules): accepted when `at` does not regress it.
+    /// WIST-2 §3.3, under §3.2's rules: accepted when `at` does not regress the
+    /// retained observation.
     pub(crate) fn observe_label_feed_generated_at(&self, domain: &str, at: &str) -> Result<bool> {
         let at = crate::registry::unix(at)?;
         self.write(|conn| {
@@ -1661,7 +1596,6 @@ impl Db {
         })
     }
 
-    /// Every sealed `label` Entry in Log order.
     pub fn sealed_labels(&self) -> Result<Vec<wist_core::label::SealedLabel>> {
         let mut stmt = self.conn.prepare(
             "SELECT label_id, labeler, subject, name, value, asserted_at, retracted, expires_at, delta, epoch_number, entry_index FROM labels ORDER BY epoch_number, entry_index",
@@ -1689,7 +1623,6 @@ impl Db {
         Ok(rows)
     }
 
-    /// Every sealed `dispute` Entry in Log order.
     pub fn sealed_disputes(&self) -> Result<Vec<wist_core::label::SealedDispute>> {
         let mut stmt = self.conn.prepare(
             "SELECT dispute_id, label_id, disputant, reason, asserted_at, epoch_number, entry_index FROM disputes ORDER BY epoch_number, entry_index",
@@ -1746,8 +1679,7 @@ impl Db {
             .map(|n| n.max(0) as u64))
     }
 
-    /// WIST-4 §3.1: every accepted `suffix_list_update` that changed the
-    /// snapshot in force, in Log order, with its sealing height.
+    /// WIST-4 §3.1: only acts that changed the snapshot in force, in Log order.
     pub fn suffix_list_acts(&self) -> Result<Vec<(u64, String)>> {
         let mut stmt = self
             .conn
@@ -1773,8 +1705,6 @@ impl Db {
             .optional()?)
     }
 
-    /// The snapshot in force at the instant `at` with the height of the
-    /// act that put it there: the most recent act sealed at or before `at`.
     pub fn suffix_list_in_force_at(&self, at: &str) -> Result<Option<(String, u64)>> {
         self.suffix_list_row(
             "SELECT a.sha256, a.epoch_number FROM suffix_list_acts a JOIN epochs b ON b.epoch_number = a.epoch_number WHERE b.sealed_at <= ?1 ORDER BY a.rowid DESC LIMIT 1",
@@ -1782,8 +1712,6 @@ impl Db {
         )
     }
 
-    /// The snapshot in force at Epoch `epoch_number`: the most recent act
-    /// sealed below it.
     pub fn suffix_list_in_force_at_epoch(
         &self,
         epoch_number: u64,
@@ -1794,8 +1722,7 @@ impl Db {
         )
     }
 
-    /// WIST-3 §7: the `suffix_list` tuple at a Snapshot's Epoch, the most
-    /// recent act sealed at or below it.
+    /// WIST-3 §7: the most recent act sealed at or below the Snapshot's Epoch.
     pub fn suffix_list_at_epoch(&self, epoch_number: u64) -> Result<Option<(String, u64)>> {
         self.suffix_list_row(
             "SELECT sha256, epoch_number FROM suffix_list_acts WHERE epoch_number <= ?1 ORDER BY rowid DESC LIMIT 1",
@@ -1803,8 +1730,8 @@ impl Db {
         )
     }
 
-    /// WIST-3 §7 `withdrawal` tuples: every withdrawn Delta with its
-    /// Publisher and the earliest Epoch that sealed a withdrawal of it.
+    /// WIST-3 §7: each withdrawn Delta at the earliest Epoch that sealed a
+    /// withdrawal of it.
     pub fn withdrawal_state(&self) -> Result<Vec<WithdrawalState>> {
         let mut stmt = self
             .conn
@@ -1823,8 +1750,6 @@ impl Db {
         )?)
     }
 
-    /// Whether `delta_id` is an accepted Delta of `domain` that a sealed
-    /// Epoch already carries: accepted, and neither pending nor queued.
     pub fn is_delta_sealed_for(&self, delta_id: &str, domain: &str) -> Result<bool> {
         if !self.is_delta_seen_for(delta_id, domain)? {
             return Ok(false);
@@ -2188,8 +2113,6 @@ pub(crate) mod tests {
         wist_core::crypto::SigningKey::from_seed(&[7u8; 32])
     }
 
-    /// Seals an empty Epoch carrying only `param_changes`, for stores
-    /// whose Entries are not the subject under test.
     pub(crate) fn seal_epoch(
         db: &Db,
         epoch_number: u64,

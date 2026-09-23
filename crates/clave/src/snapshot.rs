@@ -128,7 +128,6 @@ fn write_parquet_strings(
     Ok(std::fs::read(path)?)
 }
 
-/// One column of a tier-1 table: required or optional, text or integer.
 enum Column {
     Text(Vec<Vec<u8>>),
     OptionalText(Vec<Option<Vec<u8>>>),
@@ -203,7 +202,6 @@ fn optional_text(values: impl Iterator<Item = Option<String>>) -> Column {
     Column::OptionalText(values.map(|v| v.map(String::into_bytes)).collect())
 }
 
-/// WIST-3 §7: the label, dispute and labeler tables of one shard.
 struct LabelTables {
     labels: Vec<u8>,
     disputes: Vec<u8>,
@@ -258,9 +256,8 @@ fn build_label_tables(
     })
 }
 
-/// WIST-2 §3.3 and WIST-3 §7: the current Labels and disputes the Log's
-/// sealed Entries leave at a Snapshot whose head Epoch is sealed at
-/// `head_sealed_at`, and the labeler statistics over every sealed Label.
+/// WIST-2 §3.3, WIST-3 §7: the Labels and disputes current at
+/// `head_sealed_at`, and labeler statistics over every sealed Label.
 fn label_state(
     db: &Db,
     head_sealed_at: &str,
@@ -389,11 +386,9 @@ fn build_state(
         .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
 
     let mut entries = Vec::with_capacity(2 + domains.len() + records.len());
-    // WIST-3 §7: one `aggregator_key` tuple per key the Log has admitted,
-    // removed keys included, each carrying the accepted acts that admitted
-    // and retired its key, so a resuming Consumer authenticates the tuples
-    // from the Anchor and judges a Checkpoint at or below the Snapshot
-    // under the keys valid at its height (§3.4).
+    // WIST-3 §7: one `aggregator_key` tuple per admitted key, removed keys
+    // included, so a resuming Consumer judges a Checkpoint at or below the
+    // Snapshot under the keys valid at its height (§3.4).
     let mut key_entries = db.aggregator_key_entries()?;
     if key_entries.is_empty() {
         let anchor = crate::history::anchor(data_dir)?;
@@ -597,16 +592,12 @@ fn served_name(data_dir: &Path, path: &Path) -> String {
         .into_owned()
 }
 
-/// WIST-3 §3.4: an unsealed Aggregator-signed document — the Snapshot
-/// index, every manifest and state file, the Mirror list — verifies under
-/// the keys valid at the height of the Checkpoint a Consumer adopts, so a
-/// removed key's signature on one this Aggregator still serves is re-made
-/// under a key valid at the head. Every state file comes first, then the
-/// manifest that carries its `sha256` and `bytes`, then the index and the
-/// Mirror list; `content_digest` and `state_digest` are carried verbatim.
-/// Each document is judged alone, on its `sig.key_id` and, for a manifest,
-/// on the state file it describes, so an interrupted pass is finished by
-/// the next one.
+/// WIST-3 §3.4: an unsealed Aggregator-signed document verifies under the
+/// keys valid at the Checkpoint a Consumer adopts, so a removed key's
+/// signature is re-made under a key valid at the head. Every state file
+/// comes first, then the manifest that carries its `sha256` and `bytes`,
+/// then the index and the Mirror list; each document is judged alone, so
+/// an interrupted pass is finished by the next one.
 pub fn resign_unsealed(db: &Db, data_dir: &Path) -> Result<Vec<String>> {
     let head = crate::keys::head_height(db)?;
     let registry = db.aggregator_key_entries()?;

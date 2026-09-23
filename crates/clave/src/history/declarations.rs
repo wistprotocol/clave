@@ -8,7 +8,6 @@ pub use wist_core::declarations::{
     Settlement,
 };
 
-/// Replay over the authenticated Epoch history the aggregator retains.
 pub trait DeclarationsReplay: Sized {
     fn reconstruct(db: &Db, directory: &Path, head: Option<EpochRow>) -> Result<Self>;
     fn apply(&mut self, verified: &VerifiedEpoch) -> Result<Effects>;

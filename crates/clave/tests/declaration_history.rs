@@ -266,8 +266,6 @@ fn timestamp(at: i64) -> String {
     clave::registry::instant(at).unwrap()
 }
 
-/// A fixture Epoch's `sealed_at`, whether it carries a Checkpoint note
-/// (a vector Epoch) or the plain field a locally built one carries.
 fn sealed_at(epoch: &Value) -> String {
     match epoch.get("checkpoint").and_then(Value::as_str) {
         Some(note) => wist_core::checkpoint::Checkpoint::parse(note)
@@ -557,8 +555,6 @@ fn recovery_heads_sequence_floors_and_named_predecessors_match_signed_vectors() 
     }
 }
 
-/// Applies one authenticated Epoch under the parameter map a vector
-/// declares, rather than the registry defaults its fixture Log carries.
 fn apply_under(
     state: &mut Declarations,
     epoch: &clave::history::VerifiedEpoch,

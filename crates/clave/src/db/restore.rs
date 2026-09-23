@@ -1,15 +1,11 @@
-//! Restoration of derived columns and tables a reopened store may lack,
-//! recomputed from the retained Log and the store's own rows before
-//! routine operations read them.
 use super::{accepted_declaration_seq, exec_retain_declaration_seq, Db};
 use crate::error::{Error, Result};
 use crate::history::declarations::DeclarationsReplay;
 use serde_json::Value;
 use std::path::Path;
 
-/// Runs every restoration in dependency order: the parameter schedule
-/// first, then recovery owners, Declaration floors, Delta indexes and the
-/// pull schedule.
+/// Runs in dependency order: each restoration may read what an earlier one
+/// restored.
 pub(super) fn run(db: &Db, path: &Path) -> Result<()> {
     db.parameter_schedule(0)?;
     db.restore_recovery_owners(path)?;

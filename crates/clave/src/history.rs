@@ -15,15 +15,14 @@ use wist_core::objects::{
 };
 use wist_core::parameters::{Amendment, Schedule};
 
-/// The Log's out-of-band trust root as the data directory holds it.
 pub struct LogAnchor {
     pub log_id: String,
     pub key: PublicKey,
     pub key_id: String,
 }
 
-/// Reads and verifies `anchor.json`: it is self-signed under the very
-/// genesis key it declares (WIST-3 §3.4).
+/// WIST-3 §3.4: `anchor.json` is self-signed under the genesis key it
+/// declares.
 pub fn anchor(directory: &Path) -> Result<LogAnchor> {
     let doc: Value = crate::json::parse(&std::fs::read(directory.join("anchor.json"))?)?;
     let parsed: LogAnchorEnvelope = serde_json::from_value(doc.clone())?;
@@ -50,8 +49,6 @@ pub fn anchor(directory: &Path) -> Result<LogAnchor> {
     })
 }
 
-/// One Epoch of the Log with its Checkpoint verified and its Entries
-/// checked against the tree that Checkpoint states.
 #[derive(Debug)]
 pub struct VerifiedEpoch {
     epoch_number: u64,
@@ -77,8 +74,6 @@ impl VerifiedEpoch {
         self.tree_size
     }
 
-    /// The root of the tree at this Epoch in the `"sha256:" + hex` form
-    /// WIST-3 §3.1 gives it.
     pub fn root(&self) -> &str {
         &self.root
     }
@@ -95,8 +90,7 @@ impl VerifiedEpoch {
         self.sealed_at_s
     }
 
-    /// The octets this Epoch's Entries occupy in entry bundles
-    /// (WIST-3 §6).
+    /// WIST-3 §6: octets this Epoch's Entries occupy in entry bundles.
     pub fn octets(&self) -> u64 {
         self.octets
     }
@@ -157,14 +151,11 @@ impl<'a> History<'a> {
         &self.log_id
     }
 
-    /// The Aggregator key registry the Epochs read so far establish
-    /// (WIST-3 §3.4).
     pub fn key_registry(&self) -> &Registry {
         &self.registry
     }
 
-    /// The §7 `aggregator_key` tuples the replayed registry holds, removed
-    /// keys included.
+    /// WIST-3 §7: removed keys included.
     pub fn key_entries(&self) -> Vec<AggregatorKeyEntry> {
         self.registry.entries()
     }
@@ -237,9 +228,7 @@ impl<'a> History<'a> {
         // WIST-3 §5: the keys that can speak for Epoch N are the ones the
         // Log establishes at N, so this Epoch's key acts are applied to the
         // registry — under the keys valid at N−1 (§3.4) — before the
-        // Checkpoint's signature is verified under the keys valid at N. An
-        // Epoch whose Checkpoint does not verify is never applied, so the
-        // acts land on a copy until it does.
+        // Checkpoint's signature is verified under the keys valid at N.
         let mut registry = self.registry.clone();
         registry.apply_epoch(
             height,

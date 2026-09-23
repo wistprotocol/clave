@@ -1,8 +1,3 @@
-//! The durable pull schedule: one due-time row per domain waiting for a
-//! pull and one leased task per pull in flight, both in Unix seconds.
-//! Each domain belongs to one partition; a dispatcher claims due rows only
-//! from partitions it holds, and each task records the partition token it
-//! was claimed under.
 use super::leases::{
     fence_holds, partition_of, Fence, PARTITION_LEASE_SECONDS, SEALER_LEASE_SECONDS,
 };
@@ -12,9 +7,6 @@ use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ValueRef};
 use rusqlite::{Connection, OptionalExtension};
 use std::collections::HashSet;
 
-/// How long a claimed pull stays owned before a pass of the dispatcher
-/// holding its partition may return it to the schedule; a running pull's
-/// lease is renewed while it runs.
 pub const LEASE_SECONDS: i64 = 600;
 /// WIST-2 §7's first backoff delay, each further one quadrupling it.
 pub const RETRY_BASE_SECONDS: i64 = 60;
@@ -61,7 +53,6 @@ const OLDEST_DUE_DUTY: &str = "SELECT domain, due_at, reason, attempts, pinged_a
 const OLDEST_DUE_PING_OF_CLASS: &str = "SELECT domain, due_at, reason, attempts, pinged_at FROM pull_schedule WHERE partition = ?2 AND reason = 'ping' AND load_class = ?3 AND due_at <= ?1 AND NOT EXISTS (SELECT 1 FROM pull_tasks WHERE pull_tasks.domain = pull_schedule.domain) ORDER BY due_at, domain";
 const OLDEST_DUE_DUTY_OF_CLASS: &str = "SELECT domain, due_at, reason, attempts, pinged_at FROM pull_schedule WHERE partition = ?2 AND reason != 'ping' AND load_class = ?3 AND due_at <= ?1 AND NOT EXISTS (SELECT 1 FROM pull_tasks WHERE pull_tasks.domain = pull_schedule.domain) ORDER BY due_at, domain";
 
-/// Why a domain is due for a pull.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reason {
     Ping,
@@ -93,10 +84,8 @@ impl FromSql for Reason {
     }
 }
 
-/// A domain's pending pull: due at `due_at` for `reason`, after
-/// `attempts` consecutive failed pulls. `pinged_at` is the receipt
-/// instant of the earliest Ping this pull serves, which WIST-2 §4 keys
-/// the noise it may cost at; a pull no Ping asked for carries none.
+/// WIST-2 §4 keys the noise a pull may cost at `pinged_at`, the receipt
+/// instant of the earliest Ping it serves.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DuePull {
     pub domain: String,
@@ -106,8 +95,6 @@ pub struct DuePull {
     pub pinged_at: Option<i64>,
 }
 
-/// A pull claimed for one dispatcher to run under its hold on
-/// `partition` at `token`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PullTask {
     pub domain: String,
@@ -115,12 +102,10 @@ pub struct PullTask {
     pub attempts: i64,
     pub partition: i64,
     pub token: i64,
-    /// The receipt instant of the earliest Ping this pull serves, if any.
     pub pinged_at: Option<i64>,
 }
 
 impl PullTask {
-    /// The fence every write of this pull must pass.
     pub fn fence(&self) -> Fence {
         Fence::Partition {
             partition: self.partition,
@@ -129,8 +114,6 @@ impl PullTask {
     }
 }
 
-/// A pull in flight: its owner, the instant its lease lapses and the
-/// partition token it was claimed under.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PullLease {
     pub owner: String,
@@ -139,22 +122,15 @@ pub struct PullLease {
     pub token: i64,
 }
 
-/// What a Ping's domain was admitted to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PingAdmission {
-    /// A new Ping row now waits for a worker.
     Scheduled,
-    /// The domain already waits or is being pulled; no new row was taken.
     Duplicate,
-    /// Every Ping row the backlog allows is taken.
     Overloaded,
 }
 
-/// How a claimed pull ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PullOutcome {
-    /// The pull ran; `suspended` when the walk stopped at the budget or
-    /// the pull's work limits.
     Pulled {
         suspended: bool,
     },
@@ -163,15 +139,8 @@ pub enum PullOutcome {
     Failed,
 }
 
-/// The row that results from scheduling `incoming` for a domain that
-/// already has `existing`: the earlier due time, the `retry` reason over
-/// every other and `resume` over `ping` and `baseline`, and between
-/// `ping` and `baseline` the reason of the strictly earlier row, the
-/// existing one on a tie. The pull serves the earlier of the two Pings.
-/// The failure count is the larger of the two, except that a Ping
-/// arriving against a waiting `retry` row clears it: WIST-2 §7's
-/// `WIST2-E01` row makes a fresh Ping cancel a pending backoff and start
-/// a new attempt.
+/// WIST-2 §7 (`WIST2-E01`): a Ping arriving against a waiting `retry` row
+/// clears its failure count, cancelling the pending backoff.
 pub fn merge(existing: &DuePull, incoming: &DuePull) -> DuePull {
     use Reason::*;
     let reason = match (existing.reason, incoming.reason) {
@@ -268,8 +237,6 @@ fn schedule(conn: &Connection, incoming: &DuePull) -> Result<()> {
     Ok(())
 }
 
-/// Inserts a never-pulled publisher's baseline row, due at once, unless
-/// the domain already waits or is being pulled.
 pub(super) fn exec_schedule_new_publisher(conn: &Connection, domain: &str) -> Result<()> {
     conn.execute(
         "INSERT OR IGNORE INTO pull_schedule(domain, partition, due_at, reason, attempts, pinged_at, load_class) SELECT ?1, ?2, 0, 'baseline', 0, NULL, ?3 WHERE NOT EXISTS (SELECT 1 FROM pull_tasks WHERE domain = ?1)",
@@ -278,10 +245,8 @@ pub(super) fn exec_schedule_new_publisher(conn: &Connection, domain: &str) -> Re
     Ok(())
 }
 
-/// Returns the tasks `filter` selects to the schedule as `retry` due at
-/// `now`, leaving out every domain of `except`, whose pull is still
-/// running under the caller and would otherwise be dispatched a second
-/// time beside itself.
+/// `except` holds domains whose pull still runs under the caller; returning
+/// them would dispatch each a second time beside itself.
 fn return_tasks(
     conn: &Connection,
     filter: &str,
@@ -320,12 +285,6 @@ fn return_tasks(
     Ok(tasks.len())
 }
 
-/// Renews every partition lease `owner` holds to `PARTITION_LEASE_SECONDS`
-/// past `now`, then takes over unheld or lapsed partitions, lowest first,
-/// until `owner` holds `max_partitions`. A takeover increments the
-/// partition's token and returns every task claimed under an older one to
-/// the schedule as `retry` due at `now`. Returns the partitions `owner`
-/// holds with their tokens.
 fn hold_partitions(
     conn: &Connection,
     owner: &str,
@@ -362,9 +321,6 @@ fn hold_partitions(
         .collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-/// The oldest row `query` finds due at or before `bound` in any of
-/// `partitions`, of load class `class` when the query takes one, ordered
-/// by due time and then domain, skipping every row `admit` refuses.
 fn oldest_due(
     conn: &Connection,
     query: &str,
@@ -426,13 +382,6 @@ fn retry_delay(before: i64) -> Option<i64> {
 }
 
 impl Db {
-    /// Creates the schedule on a store that lacks it and gives every
-    /// known publisher its row: `resume` due at once for a suspended
-    /// walk, otherwise `baseline` due `baseline_poll_seconds` after its
-    /// last pull, or at once if it was never pulled. A schedule without
-    /// partitions has each row assigned its domain's partition; its tasks
-    /// carry token 0 and return to the schedule when their partition is
-    /// first taken.
     pub(super) fn restore_pull_schedule(&self) -> Result<()> {
         let tx = self.mutation()?;
         let present: bool = tx.query_row(
@@ -509,11 +458,6 @@ impl Db {
         tx.commit()
     }
 
-    /// Admits a Ping for `domain` received at `now`. A domain that already
-    /// waits has its row moved to `now` when that is earlier; a domain
-    /// being pulled gets a Ping row the next pull starts from; neither
-    /// takes a new backlog slot. Any other domain gets a `ping` row due
-    /// at `now` unless `max_pending` Ping rows already wait.
     pub fn schedule_ping(
         &self,
         domain: &str,
@@ -546,13 +490,8 @@ impl Db {
         Ok(admission)
     }
 
-    /// Re-takes, in one transaction, every partition lease and the sealer
-    /// lease the store records under `owner`, incrementing each token so
-    /// that any work an earlier incarnation of this instance left running
-    /// is fenced out, and returning those partitions' tasks to the
-    /// schedule as `retry` due at `now`. A process that starts under the
-    /// name it ran under before therefore resumes its place at once
-    /// instead of waiting for its own leases to lapse.
+    /// Incrementing each token fences out any work an earlier incarnation of
+    /// `owner` left running.
     pub fn reclaim_instance_leases(&self, owner: &str, now: i64) -> Result<()> {
         let tx = self.mutation()?;
         let partitions = tx
@@ -573,26 +512,10 @@ impl Db {
         tx.commit()
     }
 
-    /// Claims up to `slots` due pulls for `owner` at `now`. First renews
-    /// the partition leases `owner` holds and takes over unheld or lapsed
-    /// ones up to `max_partitions`, returning the tasks a takeover fences
-    /// out and every lapsed task of a held partition to the schedule.
-    /// `running` names the domains `owner` has a pull in flight for: their
-    /// tasks are neither returned nor claimed, since a lease that lapsed
-    /// under a slow renewal names a pull that is still running here, and
-    /// dispatching it again would run two pulls of one domain that both
-    /// pass the partition's fence. Claims come only from partitions
-    /// `owner` holds and alternate between the oldest due Ping row and the
-    /// oldest due row of any other reason, starting with Pings when
-    /// `ping_next` is set; a set with nothing due yields its turn. On
-    /// return `ping_next` names the set the next claim starts with, so
-    /// neither Pings nor scheduled duties wait behind the other. Within a
-    /// set, a row overdue by `AGE_PRIORITY_SECONDS` goes first, the oldest
-    /// such; otherwise the oldest row of the lowest load class due. A row
-    /// whose Registrable Domain is that of a domain in `running` or of a
-    /// row claimed earlier in the call is skipped. Without `demand` only
-    /// `baseline` rows and `retry` rows serving no Ping are claimed; the
-    /// others keep their due times.
+    /// `running` domains are neither returned nor claimed: a lease that lapsed
+    /// under a slow renewal names a pull still running here, and dispatching it
+    /// again would run two pulls of one domain that both pass the partition's
+    /// fence.
     #[allow(clippy::too_many_arguments)]
     pub fn claim_pulls(
         &self,
@@ -671,8 +594,6 @@ impl Db {
         Ok(claimed)
     }
 
-    /// Extends the leases `owner` holds on `domains` to `LEASE_SECONDS`
-    /// past `now` once less than half of a lease remains.
     pub fn renew_pull_leases(&self, domains: &[String], owner: &str, now: i64) -> Result<()> {
         let tx = self.mutation()?;
         for domain in domains {
@@ -684,21 +605,7 @@ impl Db {
         tx.commit()
     }
 
-    /// Ends `owner`'s pull of `task`, which started at `started_at`, and
-    /// schedules the domain's next pull at `now`: after an unusable Feed or
-    /// an internal failure `retry` with one more attempt, due at WIST-2 §7's
-    /// backoff delay past `now`, or `baseline` once its four are spent;
-    /// after a suspended walk `resume`, due at once while the domain's
-    /// daily ingest budget has room and at the next UTC day otherwise;
-    /// after a completed walk `baseline`, due `baseline_poll_seconds`
-    /// after `started_at`. A Ping row that arrived meanwhile is merged
-    /// in. A domain that is no known publisher gets no next pull. Once the
-    /// task's partition has been taken over the pull is fenced out:
-    /// nothing is written and `Error::Fenced` is returned, since the new
-    /// holder has already scheduled the domain again. The pull's `cost`, in
-    /// slot-seconds, sets the domain's load score on its first pull and
-    /// moves it halfway toward the cost on each later one; the next row
-    /// takes the score's load class.
+    /// `cost` is in slot-seconds.
     pub fn complete_pull(
         &self,
         task: &PullTask,
@@ -796,12 +703,10 @@ impl Db {
         )?)
     }
 
-    /// The pull `domain` waits for, if any.
     pub fn scheduled_pull(&self, domain: &str) -> Result<Option<DuePull>> {
         scheduled(&self.conn, domain)
     }
 
-    /// The lease on `domain`'s pull in flight, if any.
     pub fn pull_lease(&self, domain: &str) -> Result<Option<PullLease>> {
         Ok(self
             .conn
@@ -849,7 +754,6 @@ mod tests {
         }
     }
 
-    /// `due` for a row a Ping received at `pinged_at` asked for.
     fn pinged(domain: &str, due_at: i64, reason: Reason, attempts: i64, pinged_at: i64) -> DuePull {
         DuePull {
             pinged_at: Some(pinged_at),
@@ -1640,8 +1544,6 @@ mod tests {
         );
     }
 
-    /// Two domains the store maps to one partition, so that a claim must
-    /// look past the first of them rather than give the partition up.
     fn colliding_domains(db: &Db) -> (String, String) {
         let mut seen: std::collections::BTreeMap<i64, String> = Default::default();
         for n in 0.. {

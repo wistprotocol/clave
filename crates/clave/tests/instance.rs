@@ -1,6 +1,3 @@
-//! `serve`'s instance identity: the name a process serves a store under,
-//! the exclusive lock it holds on that name, and the leases it re-takes
-//! from its own earlier incarnation.
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -18,8 +15,6 @@ impl Drop for Served {
 }
 
 impl Served {
-    /// Ends the process the way a crash does: no signal handler runs, so
-    /// nothing is released.
     fn hard_kill(mut self) {
         self.0.kill().unwrap();
         self.0.wait().unwrap();
@@ -35,8 +30,6 @@ impl Served {
     }
 }
 
-/// Starts the `clave` executable serving `data` under `instance` and
-/// returns it with the address it bound.
 fn serve(data: &Path, instance: &str, seal: bool) -> (Served, String) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_clave"));
     command.args([
@@ -93,9 +86,8 @@ fn poll_until(what: &str, timeout: Duration, mut ready: impl FnMut() -> bool) {
     }
 }
 
-/// A fresh loopback host serving no Publisher Declaration, so its pull
-/// ends at the first-contact rejection of WIST-2 §5 step 0 as soon as it
-/// is claimed. It carries no port, which WIST-2 §4's Canonical Host bars.
+/// Its pull ends at WIST-2 §5 step 0's first-contact rejection once
+/// claimed. It carries no port, which WIST-2 §4's Canonical Host bars.
 fn unreachable_host() -> String {
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let nth = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

@@ -508,9 +508,6 @@ fn predecessor_retrieval_suspends_without_rejection_and_resumes_after_restart() 
     assert_eq!(db.url_tip(&host, URL).unwrap(), Some(last));
 }
 
-/// Reseals the Log from `epochs` — `(sealed_at, Entries)` per height —
-/// so a fixture can replace what the retained history says and still
-/// hold a tree its Checkpoints state.
 fn replace_epochs(data: &std::path::Path, epochs: &[(String, Vec<Value>)]) {
     use wist_core::epoch;
     let key = clave::keys::load(&data.join("keys/seed")).unwrap();

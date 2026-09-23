@@ -4,8 +4,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Configures a Witness that answers every submission with 500 after
-/// `delay`, which holds a seal open that long after its commit.
 fn slow_witness(db: &Db, sk: &wist_core::crypto::SigningKey, delay: Duration) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();

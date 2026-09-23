@@ -9,11 +9,6 @@ use crate::error::{Error, Result};
 use std::path::Path;
 use wist_core::crypto::SigningKey;
 
-/// Commits a prepared Epoch — the leaves it appends to the tree, its
-/// Checkpoint and the acceptance, schedule, withdrawal and Declaration
-/// rows — then runs the distribution stage: the Entries and the tree's
-/// hashes reach their paths, the Checkpoint is archived and published,
-/// the Witnesses are asked to cosign it and the Snapshot is rebuilt.
 pub(super) fn epoch(
     db: &Db,
     data_dir: &Path,

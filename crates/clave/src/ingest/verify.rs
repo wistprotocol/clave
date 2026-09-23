@@ -1,19 +1,11 @@
-//! Stage 3: state-independent verification. Every check here reads only
-//! the fetched bytes and the references the coordinator hands in, holds
-//! no store connection and returns a bundle of results the coordinator
-//! applies in the pull's order.
 use crate::declaration::{self, delta::SizeCaps};
 use serde_json::Value;
 use wist_core::objects::{DeltaEnvelope, FeedEnvelope, Publisher, PublisherEnvelope, PublisherKey};
 
 use super::feed;
 
-/// The Key Set sources one sealed Page resolves through: each applicable
-/// Declaration's sealing instant, `seq` and keys.
 pub(super) type SealedSources = [(i64, u64, Vec<PublisherKey>)];
 
-/// A recovery window's version: the hashes of its prior, owner and
-/// chain-head Declarations and the Epoch it opened at, if it has.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) struct WindowRef {
     pub prior: String,
@@ -22,9 +14,6 @@ pub(super) struct WindowRef {
     pub opened_epoch: Option<i64>,
 }
 
-/// The Declaration version a Delta or Label was verified under: the
-/// hash and `seq` of the domain's accepted Declaration, its recovery
-/// window if one is open, and the admission sources they yield.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(super) struct DeclarationRef {
     pub hash: Option<String>,
@@ -34,16 +23,11 @@ pub(super) struct DeclarationRef {
 }
 
 impl DeclarationRef {
-    /// Whether `other` names the same Declaration version.
     pub fn same_version(&self, other: &DeclarationRef) -> bool {
         self.hash == other.hash && self.seq == other.seq && self.window == other.window
     }
 }
 
-/// The references one Delta attempt is issued with: the Declaration
-/// version, the size caps and clock allowance of the parameter schedule
-/// at the attempt's one clock sample, and the height that schedule was
-/// read at.
 pub(super) struct IssuedRefs {
     pub decl: DeclarationRef,
     pub sizes: SizeCaps,
@@ -96,8 +80,6 @@ impl IssuedRefs {
     }
 }
 
-/// A fetched Feed or Label Feed page's field and domain checks, which
-/// precede any signature check.
 pub(super) struct PageChecks {
     pub fields: Result<FeedEnvelope, &'static str>,
     pub domain_matches: bool,
@@ -139,11 +121,9 @@ pub(super) fn sealed_page(declarations: &SealedSources, doc: &Value, generated_a
     })
 }
 
-/// WIST-2 §3.2 target rule: a read `next` is fetched only when it is
-/// byte-identical to its Normalized URL and begins with the requested
-/// Canonical Host's well-known prefix. The scheme is re-derived per host
-/// so a loopback deployment can follow the https URLs a Publisher writes
-/// into sealed pages.
+/// WIST-2 §3.2 target rule. The scheme is re-derived per host so a loopback
+/// deployment can follow the https URLs a Publisher writes into sealed
+/// pages.
 pub(super) fn next_page_url(next: &str, host: &str, allow_http: bool) -> Option<String> {
     let prefix = format!("https://{host}/.well-known/wist/");
     if !next.starts_with(&prefix)
@@ -158,8 +138,6 @@ pub(super) fn next_page_url(next: &str, host: &str, allow_http: bool) -> Option<
     ))
 }
 
-/// A first-contact Declaration's checks: WIST-1 §5.1 evaluation, its
-/// domain against the pulled host and a first key to record.
 pub(super) fn initial_declaration(value: &Value, host: &str) -> Result<Publisher, String> {
     let publisher = declaration::evaluate_initial(value)
         .map_err(|(code, detail)| format!("{code}: {detail}"))?;
@@ -172,24 +150,17 @@ pub(super) fn initial_declaration(value: &Value, host: &str) -> Result<Publisher
     Ok(publisher)
 }
 
-/// The facts a Delta file yields once it passed every state-independent
-/// check.
 pub(super) struct VerifiedDelta {
     pub envelope: DeltaEnvelope,
 }
 
-/// Why a Delta file does not decode to an Envelope: canonicalization is a
-/// store-independent failure of the whole pull, a decoding failure one of
-/// this Delta.
 pub(super) enum Undecoded {
     Canonical(wist_core::Error),
     Envelope(String),
 }
 
-/// A Delta file's state-independent checks under the size caps and the
-/// clock its attempt was issued with, in the order admission applies
-/// them. Authority is checked apart, since it reads the admission
-/// sources, which a Declaration refresh can change.
+/// In the order admission applies them. Authority is checked apart, since
+/// a Declaration refresh can change the admission sources it reads.
 pub(super) struct DeltaChecks {
     pub association: Result<(), &'static str>,
     pub static_fields: Result<(), &'static str>,
@@ -249,7 +220,6 @@ pub(super) fn payload(
     crate::payload::validate(doc, commitment, &delta.delta.publisher, sizes).map(|_| ())
 }
 
-/// Whether a fetched Label Feed file is a Label or a dispute.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum LabelKind {
     Label,
@@ -265,10 +235,8 @@ impl LabelKind {
     }
 }
 
-/// A Label Feed file's state-independent checks: its kind, whether it
-/// carries the listed ID and, for a Label, WIST-2 §3.3's validation under
-/// the Declaration it was issued with. A dispute's validation reads the
-/// sealed Labels and happens at admission.
+/// WIST-2 §3.3 validation for a Label; a dispute's reads the sealed Labels
+/// and happens at admission.
 pub(super) struct LabelChecks {
     pub kind: Option<LabelKind>,
     pub id_matches: bool,

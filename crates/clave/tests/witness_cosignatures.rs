@@ -9,16 +9,11 @@ use wist_core::crypto::SigningKey;
 const SEAL_START: i64 = 1_786_276_800;
 const WITNESS_NAME: &str = "witness.example";
 
-/// How a fake Witness answers `add-checkpoint`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Behavior {
-    /// 200 with a Cosignature over the note text.
     Cosign,
-    /// 409 with the size it claims to hold, then 200.
     ConflictThenCosign(u64),
-    /// 200 with a Cosignature under another key.
     WrongKey,
-    /// The connection is refused: nothing listens.
     Down,
 }
 

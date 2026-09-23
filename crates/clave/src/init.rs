@@ -6,9 +6,6 @@ use std::path::Path;
 use wist_core::envelope::sign_envelope;
 use wist_core::objects::{Anchor, GenesisKey};
 
-/// Initializes a data directory and returns the signed-note verifier
-/// key of its genesis Aggregator key, the form in which the key is
-/// configured at a Witness (WIST-3 §3.4).
 pub fn run(log_id: &str, data_dir: &Path) -> Result<String> {
     std::fs::create_dir_all(data_dir)?;
 

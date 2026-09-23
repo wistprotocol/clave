@@ -16,7 +16,6 @@ fn read(data: &Path, path: &str) -> Vec<u8> {
     std::fs::read(data.join(path.trim_start_matches('/'))).unwrap_or_else(|e| panic!("{path}: {e}"))
 }
 
-/// Reads the tree the Log serves at `tree_size` back from its tiles.
 fn served_tiles(data: &Path, tree_size: u64) -> tiles::TileSet {
     let mut set = tiles::TileSet::new();
     for tile in tiles::required_tiles(tree_size) {
@@ -26,11 +25,7 @@ fn served_tiles(data: &Path, tree_size: u64) -> tiles::TileSet {
     set
 }
 
-/// Verifies a Log's static files on their own, as a Consumer holding the
-/// Log Anchor does: the head Checkpoint, every archived Checkpoint from
-/// Epoch 0, the consistency of consecutive sizes computed from the
-/// served tiles, and each Epoch's Entries against the root its
-/// Checkpoint states (WIST-3 §4, §5, §6).
+/// WIST-3 §4, §5, §6: verified as a Consumer holding the Log Anchor does.
 fn verify_static_log(data: &Path, log_id: &str, key: &AggregatorKey) -> Vec<Checkpoint> {
     let head = Checkpoint::parse(&String::from_utf8(read(data, "/checkpoint")).unwrap()).unwrap();
     let tree = served_tiles(data, head.tree_size());

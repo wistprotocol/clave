@@ -11,14 +11,10 @@ const REQUEST_TIMEOUT_SECS: u64 = 30;
 /// URL it has already fetched.
 const MAX_REDIRECTS: usize = 5;
 
-/// The bound on one fetched Declaration, Feed page or Mirror list: no
-/// protocol object of those kinds approaches it, and a response above it
-/// is refused while it streams.
 pub const OBJECT_CAP_BYTES: u64 = 1 << 20;
 
 const READ_CHUNK_BYTES: usize = 16 * 1024;
 
-/// A name lookup, injectable so tests can script what a host resolves to.
 pub type Lookup = Arc<dyn Fn(&str) -> std::io::Result<Vec<IpAddr>> + Send + Sync>;
 
 fn system_lookup(host: &str) -> std::io::Result<Vec<IpAddr>> {
@@ -28,8 +24,8 @@ fn system_lookup(host: &str) -> std::io::Result<Vec<IpAddr>> {
         .collect())
 }
 
-/// A loopback literal, `localhost` or a name under `.localhost`, which
-/// RFC 6761 §6.3 resolves to loopback by definition.
+/// RFC 6761 §6.3: `localhost` and names under `.localhost` resolve to
+/// loopback.
 fn is_loopback_host(host: &str) -> bool {
     host.eq_ignore_ascii_case("localhost")
         || host
@@ -101,12 +97,6 @@ fn ipv6_class(ip: Ipv6Addr, allow_loopback: bool) -> Option<&'static str> {
     }
 }
 
-/// The destination policy: a fetch connects only to a public unicast
-/// address. Loopback is allowed under the loopback HTTP opt-in, the one
-/// exception documented for running the stack on one machine; private,
-/// link-local, shared, multicast, documentation, benchmarking, reserved
-/// and unspecified addresses are never fetch destinations, whether named
-/// by a literal, by a redirect or by what a name resolves to.
 pub fn destination_allowed(ip: IpAddr, allow_loopback: bool) -> Result<()> {
     let class = match ip {
         IpAddr::V4(ip) => ipv4_class(ip, allow_loopback),
@@ -197,8 +187,6 @@ fn redirect_allowed(from: &url::Url, to: &url::Url, scope: &[String], allow_http
         .any(|h| h == target)
 }
 
-/// A transport error with its causes, since the destination policy and
-/// the resolver report through the connector's error chain.
 fn describe(error: reqwest::Error) -> String {
     let mut message = error.to_string();
     let mut source = std::error::Error::source(&error);
@@ -241,8 +229,6 @@ fn read_bounded(
     Ok(body)
 }
 
-/// One posted request's answer: its status, its declared media type and
-/// its body, whether or not the status is a success.
 pub struct PostResponse {
     pub status: u16,
     pub content_type: Option<String>,
@@ -264,8 +250,6 @@ impl Client {
         Self::build(allow_http, builder, Arc::new(system_lookup))
     }
 
-    /// A client whose name resolution goes through `lookup` before the
-    /// destination policy, so a test can script what a host resolves to.
     pub fn with_lookup(allow_http: bool, lookup: Lookup) -> Client {
         Self::build(allow_http, reqwest::blocking::Client::builder(), lookup)
     }
@@ -319,10 +303,6 @@ impl Client {
         self.get_bytes_bounded(url, &[], OBJECT_CAP_BYTES)
     }
 
-    /// Posts `body` to `url` through the scheme guard and the
-    /// destination policy, following no redirect, and reads at most
-    /// `limit` bytes of the response whatever its status, so a caller
-    /// that acts on a refusal reads what the refusal states.
     pub fn post_bounded(&self, url: &str, body: Vec<u8>, limit: u64) -> Result<PostResponse> {
         let parsed =
             url::Url::parse(url).map_err(|e| Error::Fetch(format!("invalid URL {url}: {e}")))?;
@@ -346,9 +326,6 @@ impl Client {
         })
     }
 
-    /// Fetches `url` through the scheme guard, the destination policy on
-    /// every hop and the redirect rules, reading at most `limit` bytes of
-    /// the final response before refusing it.
     pub fn get_bytes_bounded(
         &self,
         url: &str,

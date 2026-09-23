@@ -7,8 +7,6 @@ use common::{
 
 const SEAL_START: i64 = 1_786_276_800;
 
-/// A URL just under the default `url_cap_bytes`, so a handful of Deltas
-/// fill the smallest Epoch size cap the Registry admits.
 fn long_url(index: usize) -> String {
     format!("https://example.com/{index:04}/{}", "p".repeat(2000))
 }

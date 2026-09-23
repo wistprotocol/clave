@@ -1,6 +1,3 @@
-//! The Log's single RFC 6962 tree as the store holds it: the leaf data
-//! per index and the tile hashes that extend the tree without rehashing
-//! history (WIST-3 §4, §6).
 use crate::error::{Error, Result};
 use rusqlite::{Connection, OptionalExtension};
 use std::cell::RefCell;
@@ -18,8 +15,6 @@ fn merkle_failure(error: wist_core::error::Error) -> Error {
 
 type TileCache = BTreeMap<(u8, u64), Vec<[u8; 32]>>;
 
-/// A `HashReader` over the stored tiles, caching each tile it reads for
-/// the length of one computation.
 pub struct StoredTree<'a> {
     conn: &'a Connection,
     cache: RefCell<TileCache>,
@@ -80,8 +75,6 @@ pub(super) fn read_tile(conn: &Connection, level: u8, index: u64) -> Result<Opti
         .transpose()
 }
 
-/// The root the tree reaches when `leaves` are appended at `previous_size`,
-/// computed without writing anything.
 pub(super) fn root_after_appending(
     conn: &Connection,
     previous_size: u64,
@@ -91,8 +84,6 @@ pub(super) fn root_after_appending(
     merkle::root_after_appending(&prior, previous_size, leaves).map_err(merkle_failure)
 }
 
-/// Appends `leaves` at `previous_size`, rewriting every tile whose leaf
-/// range the appended leaves reach, and returns the new root.
 pub(super) fn append(
     conn: &Connection,
     previous_size: u64,
@@ -146,7 +137,6 @@ pub(super) fn put_entries(
     Ok(())
 }
 
-/// The leaf data of the leaves in `[from, to)`, in leaf order.
 pub(super) fn entry_range(conn: &Connection, from: u64, to: u64) -> Result<Vec<Vec<u8>>> {
     let mut statement = conn.prepare(
         "SELECT entry_json FROM log_entries WHERE leaf_index >= ?1 AND leaf_index < ?2 ORDER BY leaf_index",

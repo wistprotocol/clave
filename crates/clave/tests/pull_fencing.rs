@@ -6,8 +6,6 @@ use std::time::Duration;
 
 const ALL: usize = clave::db::PARTITIONS as usize;
 
-/// Serves the publisher directory, signalling the first Delta request and
-/// holding it for `hold` before answering.
 fn serve_holding_deltas(
     listener: std::net::TcpListener,
     dir: std::path::PathBuf,
@@ -152,8 +150,6 @@ fn a_pull_whose_partition_is_taken_over_mid_pull_writes_nothing_and_the_new_hold
     assert!(db.scheduled_pull(&host).unwrap().is_some());
 }
 
-/// Serves the publisher directory, recording every request path and
-/// holding the first Delta request for `hold` before answering.
 fn serve_recording_holding_deltas(
     listener: std::net::TcpListener,
     dir: std::path::PathBuf,

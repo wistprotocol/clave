@@ -1,9 +1,4 @@
-//! WIST-3 §5: the Aggregator submits each Checkpoint to the Witnesses it
-//! uses through the C2SP witness protocol's `add-checkpoint` call and
-//! republishes the Checkpoint with the Cosignatures returned. A Witness
-//! that refuses, answers with another size or cannot be reached never
-//! blocks or fails a seal: the attempt is reported and made again on the
-//! next distribution run.
+//! WIST-3 §5, through the C2SP witness protocol's `add-checkpoint` call.
 use crate::db::{Db, WitnessRow};
 use crate::error::{Error, Result};
 use crate::fetch::Client;
@@ -13,15 +8,11 @@ use std::path::Path;
 use wist_core::checkpoint::{self, witness_key_id, Checkpoint, SignatureLine, WITNESS_KEY_TYPE};
 use wist_core::crypto::{hex_encode, PublicKey};
 
-/// The bound on one `add-checkpoint` response: a few Cosignature lines
-/// or a decimal tree size, never more.
 pub const RESPONSE_CAP_BYTES: u64 = 1 << 16;
 
 const SIZE_CONTENT_TYPE: &str = "text/x.tlog.size";
 
-/// The `<name>+<hex key ID>+<base64 key>` verifier-key string a Witness
-/// publishes, in the Ed25519 cosignature/v1 type of the signed-note
-/// format (key type 0x04).
+/// The signed-note Ed25519 cosignature/v1 type (key type 0x04).
 pub fn parse_verifier_key(encoded: &str) -> Result<(String, PublicKey)> {
     let invalid = |detail: &str| Error::Governance(format!("witness verifier key: {detail}"));
     let parts: Vec<&str> = encoded.splitn(3, '+').collect();
@@ -46,8 +37,6 @@ pub fn parse_verifier_key(encoded: &str) -> Result<(String, PublicKey)> {
     Ok((name.to_owned(), key))
 }
 
-/// The verifier-key string of a Witness the store holds, the form in
-/// which it was configured.
 pub fn verifier_key(name: &str, key: &PublicKey) -> String {
     let mut encoded = vec![WITNESS_KEY_TYPE];
     encoded.extend_from_slice(&key.to_bytes());
@@ -62,8 +51,6 @@ fn submission_url(base_url: &str) -> String {
     format!("{}/add-checkpoint", base_url.trim_end_matches('/'))
 }
 
-/// The `add-checkpoint` request body: `old <size>`, the Consistency
-/// Proof's hashes one base64 line each, a blank line, then the note.
 pub fn request_body(old_size: u64, proof: &[[u8; 32]], note: &str) -> Vec<u8> {
     let mut body = format!("old {old_size}\n");
     for hash in proof {
@@ -75,8 +62,8 @@ pub fn request_body(old_size: u64, proof: &[[u8; 32]], note: &str) -> Vec<u8> {
     body.into_bytes()
 }
 
-/// The Cosignature lines a 200 response carries, each verified under the
-/// Witness's key over the note text before it is accepted (WIST-3 §5).
+/// WIST-3 §5: each line is verified under the Witness's key over the note
+/// text before it is accepted.
 fn accepted_lines(
     witness: &WitnessRow,
     key: &PublicKey,
@@ -107,7 +94,6 @@ fn accepted_lines(
     Ok(lines)
 }
 
-/// The tree size a 409 response states, as `text/x.tlog.size`.
 fn stated_size(content_type: Option<&str>, body: &[u8]) -> Result<u64> {
     if !content_type.is_some_and(|value| value.starts_with(SIZE_CONTENT_TYPE)) {
         return Err(Error::Governance(
@@ -120,10 +106,8 @@ fn stated_size(content_type: Option<&str>, body: &[u8]) -> Result<u64> {
         .ok_or_else(|| Error::Governance("a Witness stated a size that is not a number".into()))
 }
 
-/// What one `add-checkpoint` exchange produced.
 enum Exchange {
     Cosigned(Vec<SignatureLine>),
-    /// The Witness holds another size than the proof ran from.
     Conflict(u64),
 }
 
@@ -158,8 +142,6 @@ fn call(
     }
 }
 
-/// Submits the head Checkpoint to one Witness, retrying once from the
-/// size a 409 states, and returns the Cosignature lines it accepted.
 fn submit_to(
     db: &Db,
     client: &Client,
@@ -196,9 +178,6 @@ fn submit_to(
     }
 }
 
-/// Submits the head Checkpoint to every configured Witness, appending
-/// each verified Cosignature to the stored note and rewriting the files
-/// that carry it. Returns the names that cosigned.
 pub fn submit_head(db: &Db, client: &Client, data_dir: &Path) -> Result<Vec<String>> {
     let witnesses = db.witnesses()?;
     if witnesses.is_empty() {
@@ -238,10 +217,9 @@ pub fn submit_head(db: &Db, client: &Client, data_dir: &Path) -> Result<Vec<Stri
             if held.contains(&line.encode()) {
                 continue;
             }
-            // WIST-3 §5: a note carries at most sixteen signature lines,
-            // and the Aggregator MUST NOT publish one carrying more. The
-            // Log's own lines come first and stay; the Cosignatures past
-            // the cap are dropped in the order they were obtained.
+            // WIST-3 §5: a note carries at most sixteen signature lines, and the
+            // Aggregator MUST NOT publish one carrying more. The Log's own lines
+            // stay; Cosignatures past the cap are dropped in the order obtained.
             if updated.signatures().len() >= checkpoint::MAX_SIGNATURE_LINES {
                 dropped += 1;
                 continue;

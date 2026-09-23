@@ -37,8 +37,6 @@ pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_unix: i64) -> Result<S
     )
 }
 
-/// How long a sealer's lease lasts and how often the sealer renews it
-/// while a seal runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LeaseTerms {
     pub lease_seconds: i64,
@@ -54,11 +52,8 @@ impl Default for LeaseTerms {
     }
 }
 
-/// Runs `work` while a separate thread, on its own connection, renews
-/// `owner`'s sealer lease at `token` every `terms.renewal`, so a seal
-/// longer than the lease keeps it. Renewal stops when `work` returns or
-/// finds the lease taken over, after which the seal's fenced writes and
-/// file publication fail.
+/// Renewal runs on its own connection in a separate thread so a seal
+/// longer than the lease keeps it.
 pub(crate) fn under_renewed_lease<T>(
     db_path: &Path,
     owner: &str,
@@ -85,11 +80,6 @@ pub(crate) fn under_renewed_lease<T>(
     })
 }
 
-/// Seals the next Epoch at `now_unix` as `owner` under the Log's sealer
-/// lease: takes the lease unless another process holds it live, seals and
-/// distributes fenced by it while renewing it, then releases it. While
-/// another holder's lease is live nothing is sealed and an error names
-/// the holder.
 pub fn run_leased(
     db_path: &Path,
     data_dir: &Path,
@@ -109,7 +99,6 @@ pub fn run_leased(
     )
 }
 
-/// `run_leased` under the lease length and renewal cadence of `terms`.
 pub fn run_leased_with(
     db_path: &Path,
     data_dir: &Path,
@@ -137,8 +126,6 @@ pub fn run_leased_with(
     sealed
 }
 
-/// Seals the next Epoch and distributes it, submitting its Checkpoint to
-/// the configured Witnesses through `client`.
 pub fn run_with_client(
     db: &Db,
     data_dir: &Path,

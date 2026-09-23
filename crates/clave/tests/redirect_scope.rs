@@ -13,9 +13,6 @@ use std::sync::{Arc, Mutex};
 const FEED: &str = "/.well-known/wist/feed.json";
 const PUBLISHER: &str = "/.well-known/wist/publisher.json";
 
-/// Serves the publisher directory to `localhost` and `www.localhost`,
-/// answering the Feed request on `localhost` with a redirect to
-/// `www.localhost`, and records every request with its host.
 fn serve_redirecting(
     listener: std::net::TcpListener,
     dir: std::path::PathBuf,
@@ -61,11 +58,6 @@ fn serve_redirecting(
     requests
 }
 
-/// Serves `declarations` in order for `publisher.json`, the last one for
-/// every further request, other paths from `dir`, and records each
-/// request with its host. A `publisher.json` request on `localhost` after
-/// a Payload request — the Delta retry's request alone — is redirected to
-/// `www.localhost`.
 fn serve_retry_redirect(
     listener: std::net::TcpListener,
     dir: std::path::PathBuf,

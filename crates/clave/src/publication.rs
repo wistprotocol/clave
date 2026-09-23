@@ -1,9 +1,6 @@
-//! WIST-3 §5 and §6: the distribution stage. A sealed Epoch's Entries
-//! reach their entry bundles and the tree its tiles before the Epoch's
-//! Checkpoint is archived, and the head Checkpoint is written last, so
-//! `/checkpoint` never names a tree size whose Entries no path serves.
-//! A run interrupted anywhere is finished by the next one from the
-//! Epochs the store has committed but not marked published.
+//! WIST-3 §5, §6: entry bundles and tiles are written before the Epoch's
+//! Checkpoint is archived, and the head Checkpoint last, so `/checkpoint`
+//! never names a tree size whose Entries no path serves.
 use crate::db::Db;
 use crate::error::{Error, Result};
 use std::io::Write;
@@ -11,9 +8,7 @@ use std::path::{Path, PathBuf};
 use wist_core::checkpoint::Checkpoint;
 use wist_core::tiles::{self, TILE_WIDTH};
 
-/// Writes `bytes` to `path` through a sibling temporary file, syncing the
-/// file and then its directory, so the path holds either the previous
-/// content or all of the new one.
+/// The path holds either the previous content or all of the new one.
 pub fn write_durable(path: &Path, bytes: &[u8]) -> Result<()> {
     let directory = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(directory)?;
@@ -31,7 +26,6 @@ pub fn write_durable(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// The file under `data_dir` that serves a path of the static layout.
 pub fn served(data_dir: &Path, path: &str) -> PathBuf {
     data_dir.join(path.trim_start_matches('/'))
 }
@@ -56,12 +50,8 @@ fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<bool> {
     Ok(true)
 }
 
-/// Lays out the tree at size `to`: every entry bundle and tile whose
-/// leaves the range `[from, to)` reaches is recomputed and rewritten
-/// where it differs, every partial one the size requires is rewritten
-/// where it differs, and any other required file the disk has lost is
-/// restored. A partial tile or bundle is removed once the full one at
-/// its index exists (WIST-3 §6).
+/// WIST-3 §6: a partial tile or bundle is removed once the full one at its
+/// index exists.
 fn publish_tree(db: &Db, data_dir: &Path, from: u64, to: u64) -> Result<bool> {
     let mut wrote = false;
     for bundle in tiles::required_entry_bundles(to) {
@@ -116,8 +106,6 @@ fn publish_tree(db: &Db, data_dir: &Path, from: u64, to: u64) -> Result<bool> {
     Ok(wrote)
 }
 
-/// Removes the directory of partial files at a tile or bundle index,
-/// named by the `.p/<width>` path any of its partials carries.
 fn remove_partials(data_dir: &Path, partial_path: &str) -> Result<()> {
     let directory = served(data_dir, partial_path);
     let Some(directory) = directory.parent() else {
@@ -129,8 +117,6 @@ fn remove_partials(data_dir: &Path, partial_path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Publishes one committed Epoch: its Entries and the tree's hashes
-/// first, then the Checkpoint's archive copy, then the head.
 fn publish_epoch(db: &Db, data_dir: &Path, epoch_number: u64, note: &str) -> Result<bool> {
     let checkpoint = Checkpoint::parse(note).map_err(|e| Error::Seal(e.to_string()))?;
     if checkpoint.epoch_number() != epoch_number {
@@ -145,8 +131,6 @@ fn publish_epoch(db: &Db, data_dir: &Path, epoch_number: u64, note: &str) -> Res
     Ok(wrote)
 }
 
-/// Lowest height first; returns the heights published. A connection whose
-/// lease was taken over writes no file.
 pub fn finish_committed(db: &Db, data_dir: &Path) -> Result<Vec<u64>> {
     db.check_fence()?;
     let mut published = Vec::new();
@@ -159,13 +143,9 @@ pub fn finish_committed(db: &Db, data_dir: &Path) -> Result<Vec<u64>> {
     Ok(published)
 }
 
-/// Re-signs every unsealed document a key removed at or below the store's
-/// head signed (WIST-3 §3.4), before a Checkpoint at that head is served
-/// to verify them against, then finishes every publication the store
-/// committed to that the disk does not hold, lowest height first, then
-/// restores any file of the head Epoch a crash, a torn write or a deletion
-/// left wrong. Returns the heights it wrote Epoch files for. On a
-/// connection fenced by a lease that was taken over it writes no file.
+/// WIST-3 §3.4: unsealed documents a key removed at or below the head
+/// signed are re-signed before a Checkpoint at that head is served to
+/// verify them against.
 pub fn recover(db: &Db, data_dir: &Path) -> Result<Vec<u64>> {
     db.check_fence()?;
     crate::snapshot::resign_unsealed(db, data_dir)?;
@@ -180,9 +160,7 @@ pub fn recover(db: &Db, data_dir: &Path) -> Result<Vec<u64>> {
     Ok(republished)
 }
 
-/// Rewrites the files that carry a Checkpoint whose signature lines have
-/// changed: the archive copy and, where it is the head, `/checkpoint`.
-/// The note text is untouched (WIST-3 §6).
+/// WIST-3 §6: the note text is untouched; only its signature lines changed.
 pub fn republish_checkpoint(db: &Db, data_dir: &Path, epoch_number: u64, note: &str) -> Result<()> {
     db.check_fence()?;
     write_durable(&archive_path(data_dir, epoch_number), note.as_bytes())?;

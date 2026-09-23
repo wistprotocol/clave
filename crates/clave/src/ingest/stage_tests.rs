@@ -15,8 +15,6 @@ fn sign(body: &Value, kind: &str) -> Value {
     wist_core::envelope::sign_envelope(body, kind, &kid(), &signing_key()).unwrap()
 }
 
-/// What the Site's server observed and how slowly it answers, in
-/// milliseconds per request path.
 #[derive(Default)]
 struct Origin {
     delay_ms: std::sync::atomic::AtomicU64,
@@ -64,7 +62,6 @@ impl Origin {
     }
 }
 
-/// A Publisher's well-known directory served on loopback.
 struct Site {
     dir: tempfile::TempDir,
     host: String,
@@ -145,7 +142,6 @@ impl Site {
         .unwrap()
     }
 
-    /// Publishes a Delta for `url` with its Payload and returns its ID.
     fn delta(&self, url: &str, extract: &str, prev: Option<&str>, observed_at: &str) -> String {
         let salt = wist_core::crypto::b64u_encode(&[5u8; 16]);
         let content = serde_json::json!({
@@ -191,15 +187,11 @@ impl Site {
         self.write("feed.json", &self.feed_doc(ids, generated_at, next));
     }
 
-    /// Publishes sealed Page `number`, whose `next` names the Page below
-    /// it.
     fn page(&self, number: u64, ids: &[String], generated_at: &str) {
         let doc = self.feed_doc(ids, generated_at, number.checked_sub(1));
         self.write(&format!("feed/{number}.json"), &doc);
     }
 
-    /// Publishes a Label Feed listing `ids` and, for each, a file that is
-    /// neither a Label nor a dispute.
     fn label_feed(&self, ids: &[String], generated_at: &str) {
         let doc = self.feed_doc(ids, generated_at, None);
         self.write("label-feed.json", &doc);
@@ -211,7 +203,6 @@ impl Site {
         }
     }
 
-    /// Replaces a Delta's Payload with one its commitment does not cover.
     fn tamper_payload(&self, id: &str) {
         let path = format!("payloads/{}.json", &id[7..]);
         let mut payload = self.read(&path);
@@ -220,8 +211,6 @@ impl Site {
     }
 }
 
-/// An initialized Log whose store already holds the Site's Declaration,
-/// sealed so that sealed Pages resolve a Key Set.
 struct Log {
     data: tempfile::TempDir,
     db: Db,
@@ -239,8 +228,6 @@ impl Log {
         Log::new().onboarded(site)
     }
 
-    /// Pins a Public Suffix List under which `com` and `localhost` are
-    /// public suffixes.
     fn with_suffix_list() -> Log {
         let log = Log::new();
         let file = log.data.path().join("suffixes.dat");
@@ -339,8 +326,6 @@ fn start_run(db: &Db, host: &str, now: &str) -> PullRun {
     .unwrap()
 }
 
-/// A pull run again after an interruption re-reads what it had not
-/// admitted, so this leaves out the rejection log and the bytes read.
 fn admitted_state(log: &Log) -> Vec<String> {
     let conn = rusqlite::Connection::open(log.path()).unwrap();
     let mut dump = Vec::new();
@@ -406,10 +391,6 @@ fn queue_writes(log: &Log) -> i64 {
         .unwrap()
 }
 
-/// A Site whose pull walks a sealed Page and the live Feed, admits a
-/// Delta whose predecessor it must retrieve, rejects one whose Payload
-/// does not match its commitment, and walks a Label Feed listing a file
-/// that is neither a Label nor a dispute.
 fn walked_site() -> (Site, [String; 4]) {
     let site = Site::new();
     let paged = site.delta("https://localhost/a", "paged", None, "2026-08-09T10:00:00Z");
@@ -1002,8 +983,6 @@ fn a_decided_delta_payload_or_label_holds_no_fetched_bytes_while_its_run_is_open
     );
 }
 
-/// Records the most rows and Envelope octets a domain's walk cursor held
-/// at once.
 fn track_cursor_peak(log: &Log) {
     rusqlite::Connection::open(log.path())
         .unwrap()
@@ -1028,8 +1007,6 @@ fn cursor_peak(log: &Log) -> (u64, u64) {
         .unwrap()
 }
 
-/// A live Feed over sealed Pages 3 to 0, each listing one Delta; the IDs
-/// are returned newest first.
 fn paged_site() -> (Site, Vec<String>) {
     let site = Site::new();
     let ids: Vec<String> = (0..5)
@@ -1182,8 +1159,6 @@ fn claim_all(db: &Db) -> Vec<crate::db::PullTask> {
     }
 }
 
-/// Ends `task`'s pull suspended while `unit`'s budget for the day is
-/// spent, which defers its resumption to the next UTC day.
 fn defer_resume(db: &Db, task: &crate::db::PullTask, unit: &str) {
     let (day, domain) = (&NOW[..10], task.domain.as_str());
     let budget = registry::effective(db, "ingest_budget_bytes_day", NOW).unwrap();
@@ -1388,7 +1363,6 @@ fn opening_a_pull_releases_a_crashed_run_s_reservation_and_wakes_a_sibling_resum
     assert_eq!(due_at(db, sibling), WAKE_NOW);
 }
 
-/// A Feed listing twelve Deltas, oldest first.
 fn listed_site() -> (Site, Vec<String>) {
     let site = Site::new();
     let ids: Vec<String> = (0..12)

@@ -1,8 +1,6 @@
-//! WIST-3 §3.4: the Aggregator's own Log keys. Every key after the
-//! Anchor's genesis key is admitted in band by an `aggregator_key_add`
-//! Registry Update and retired by an `aggregator_key_remove`, both signed
-//! under a key valid at the height below the Epoch that seals them, and
-//! neither sealed when §3.4 makes it a key-act failure.
+//! WIST-3 §3.4: every key after the Anchor's genesis key is admitted by an
+//! `aggregator_key_add` and retired by an `aggregator_key_remove`, each
+//! signed under a key valid at the height below the Epoch that seals it.
 use crate::db::Db;
 use crate::error::{Error, Result};
 use crate::keys::{self, Store};
@@ -26,19 +24,15 @@ pub struct RemoveReport {
     pub update_id: String,
 }
 
-/// One Aggregator key as `list` reports it.
 #[derive(Debug)]
 pub struct Listing {
     pub key_id: String,
     pub note_key_id: String,
-    /// The height that admitted the key, absent while the queued
-    /// `aggregator_key_add` naming it is unsealed.
     pub added_height: Option<u64>,
     pub removed_height: Option<u64>,
     pub held: bool,
 }
 
-/// A key act queued and not yet sealed, as the pending queue holds it.
 struct Queued {
     action: String,
     key_id: String,
@@ -71,9 +65,8 @@ fn queued_key_acts(db: &Db) -> Result<Vec<Queued>> {
     Ok(acts)
 }
 
-/// WIST-3 §3.4's admitted set as it will stand when the next Epoch seals:
-/// every `key_id` the registry carries, removed keys included, and every
-/// `key_id` a queued addition names.
+/// WIST-3 §3.4's admitted set once the queued acts seal, removed keys
+/// included.
 fn admitted(store: &Store, queued: &[Queued]) -> Vec<String> {
     store
         .keys()
@@ -104,9 +97,8 @@ fn admitted_note_key_ids(store: &Store, queued: &[Queued]) -> Vec<String> {
         .collect()
 }
 
-/// The `key_id`s valid at the height of the next Epoch once the queued key
-/// acts apply: what the Epoch's own Checkpoint would be signed under
-/// (WIST-3 §3.4, §5).
+/// WIST-3 §3.4, §5: the keys the next Epoch's Checkpoint would be signed
+/// under.
 fn valid_after_queue(store: &Store, queued: &[Queued], height: u64) -> Vec<String> {
     let mut valid: Vec<String> = store
         .valid_at(height)
@@ -131,8 +123,6 @@ fn whole_second(unix: i64) -> Result<String> {
         .to_string())
 }
 
-/// The `key_id` a generated key takes: `log<n>` for the least `n` above 1
-/// that no admitted key, queued addition or held seed already uses.
 fn next_key_id(store: &Store, queued: &[Queued]) -> String {
     let taken = |candidate: &str| {
         admitted(store, queued).iter().any(|key| key == candidate)
@@ -147,10 +137,8 @@ fn next_key_id(store: &Store, queued: &[Queued]) -> String {
         .expect("the key_id space is unbounded")
 }
 
-/// Generates an Aggregator key in the data directory's key store and
-/// queues the `aggregator_key_add` that admits it. The seed reaches disk
-/// before the act is queued, so no sealed act ever names a key this
-/// Aggregator cannot sign with.
+/// The seed reaches disk before the act is queued, so no sealed act ever
+/// names a key this Aggregator cannot sign with.
 pub fn add(db: &Db, data_dir: &Path, now_unix: i64) -> Result<AddReport> {
     let store = Store::open(data_dir, db)?;
     let height = keys::head_height(db)?;
@@ -195,9 +183,8 @@ pub fn add(db: &Db, data_dir: &Path, now_unix: i64) -> Result<AddReport> {
     })
 }
 
-/// Queues the `aggregator_key_remove` that retires `key_id`, refusing
-/// every removal WIST-3 §3.4 makes a key-act failure or that would leave
-/// the next Epoch without a valid Checkpoint.
+/// Refuses every removal WIST-3 §3.4 makes a key-act failure or that would
+/// leave the next Epoch without a valid Checkpoint.
 pub fn remove(db: &Db, data_dir: &Path, key_id: &str, now_unix: i64) -> Result<RemoveReport> {
     let store = Store::open(data_dir, db)?;
     let height = keys::head_height(db)?;
@@ -249,8 +236,6 @@ fn enqueue(db: &Db, key_id: &str, signing: &SigningKey, update: Value) -> Result
     Ok(update_id)
 }
 
-/// Every Aggregator key the Log has admitted, followed by the keys a
-/// queued addition generated and no Epoch has admitted.
 pub fn list(db: &Db, data_dir: &Path) -> Result<Vec<Listing>> {
     let store = Store::open(data_dir, db)?;
     let log_id = store.log_id().to_owned();

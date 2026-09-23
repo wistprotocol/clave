@@ -16,8 +16,7 @@ fn read_request(stream: &mut TcpStream) -> String {
     String::from_utf8_lossy(&buffer).into_owned()
 }
 
-/// Streams a chunked body until the peer stops reading, counting what
-/// was written; the body would run to `ceiling` bytes if read whole.
+/// `ceiling` is in bytes.
 fn stream_until_refused(ceiling: usize) -> (u16, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -230,10 +229,7 @@ fn spec_path(rel: &str) -> std::path::PathBuf {
         .join(rel)
 }
 
-/// WIST-2 §8 (ADR-0044) through the spec's fetch-bounds vector: every
-/// address class the fetcher refuses, the loopback opt-in, resolver
-/// answers refused whole, and the octets read of each object under two
-/// parameter maps.
+/// WIST-2 §8 (ADR-0044), through the spec's fetch-bounds vector.
 #[test]
 fn fetch_bounds_vector() {
     let vector: serde_json::Value = serde_json::from_slice(

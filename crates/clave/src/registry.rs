@@ -21,8 +21,6 @@ pub fn validate(name: &str, value: i64, lookup: impl Fn(&str) -> i64) -> Result<
 
 pub use wist_core::timestamp::LOG_TIMESTAMP_MIN_S;
 
-/// The whole-second UTC spelling of an instant anywhere in the Log's
-/// four-digit-year range, the inverse of `unix`.
 pub fn instant(unix_s: i64) -> Result<String> {
     wist_core::timestamp::instant(unix_s).map_err(|e| Error::ParamChange(e.to_string()))
 }

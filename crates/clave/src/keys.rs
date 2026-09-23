@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 use wist_core::crypto::{b64u_encode, hex_encode, PublicKey, SigningKey};
 use wist_core::objects::AggregatorKeyEntry;
 
-/// The `key_id` `init` gives the Log's genesis Aggregator key.
 pub const GENESIS_KEY_ID: &str = "log1";
 
 pub fn generate() -> ([u8; 32], SigningKey) {
@@ -49,9 +48,6 @@ pub fn load_seed(path: &Path) -> Result<[u8; 32]> {
         .map_err(|_| Error::Key("seed file must be exactly 32 bytes".into()))
 }
 
-/// The file a key's 32-octet seed occupies in the data directory's key
-/// store: `keys/seed` for the Anchor's genesis key, `keys/<key_id>.seed`
-/// for every key an `aggregator_key_add` admits.
 pub fn seed_path(data_dir: &Path, key_id: &str, genesis_key_id: &str) -> PathBuf {
     if key_id == genesis_key_id {
         data_dir.join("keys/seed")
@@ -67,9 +63,6 @@ fn is_seed_file_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
-/// One Aggregator key of the Log as the data directory knows it: the
-/// registry tuple the replayed Log establishes (WIST-3 §3.4, §7) and the
-/// private key where the key store holds it.
 pub struct Key {
     pub key_id: String,
     pub public_key: PublicKey,
@@ -101,9 +94,6 @@ impl Key {
     }
 }
 
-/// The data directory's Aggregator keys: every key the Log has admitted,
-/// with the private keys the key store holds for them, plus the keys a
-/// queued `aggregator_key_add` generated and no Epoch has admitted yet.
 pub struct Store {
     log_id: String,
     genesis_key_id: String,
@@ -184,16 +174,12 @@ impl Store {
         })
     }
 
-    /// Whether the key store holds the private key of `public_key`, under
-    /// any `key_id` and at any validity.
     pub fn holds(&self, public_key: &PublicKey) -> bool {
         self.seeds
             .iter()
             .any(|(_, seed)| SigningKey::from_seed(seed).public() == *public_key)
     }
 
-    /// The private key the key store holds for `key_id`, where its public
-    /// key is the one the registry binds to that `key_id`.
     pub fn signing_for(&self, key_id: &str, public_key: &PublicKey) -> Option<SigningKey> {
         self.seeds
             .iter()
@@ -214,8 +200,6 @@ impl Store {
         &self.keys
     }
 
-    /// The keys a queued `aggregator_key_add` generated, which no Epoch
-    /// has admitted yet.
     pub fn unadmitted(&self) -> &[(String, PublicKey)] {
         &self.unadmitted
     }
@@ -227,8 +211,6 @@ impl Store {
             .collect()
     }
 
-    /// The held private keys valid at `height`, in ascending order of the
-    /// height that admitted them and then of `key_id`.
     pub fn signers_at(&self, height: u64) -> Vec<&Key> {
         self.keys
             .iter()
@@ -236,8 +218,6 @@ impl Store {
             .collect()
     }
 
-    /// The one held key that signs a document this Aggregator publishes
-    /// at `height`: the first of `signers_at`.
     pub fn signer_at(&self, height: u64) -> Result<&Key> {
         self.signers_at(height).into_iter().next().ok_or_else(|| {
             Error::Key(format!(
@@ -247,17 +227,14 @@ impl Store {
     }
 }
 
-/// The height a document this Aggregator signs now authenticates at: the
-/// Log's current head, or 0 for a Log whose Epoch 0 is not sealed, where
-/// the genesis key alone is valid (WIST-3 §3.4).
+/// WIST-3 §3.4: 0 before Epoch 0 is sealed, where the genesis key alone is
+/// valid.
 pub fn head_height(db: &Db) -> Result<u64> {
     Ok(db.last_epoch()?.map_or(0, |head| head.epoch_number))
 }
 
-/// WIST-3 §3.4: the held Aggregator key a document this Aggregator signs
-/// now is signed with, and the `key_id` that document names — one valid at
-/// the Log's head height, the height at which a Consumer verifies every
-/// unsealed document and the height a key act queued now authenticates at.
+/// WIST-3 §3.4: a key valid at the Log's head height, at which a Consumer
+/// verifies every unsealed document and a key act queued now authenticates.
 pub fn head_signer(data_dir: &Path, db: &Db) -> Result<(String, SigningKey)> {
     let store = Store::open(data_dir, db)?;
     let key = store.signer_at(head_height(db)?)?;

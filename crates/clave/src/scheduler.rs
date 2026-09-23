@@ -8,8 +8,6 @@ use std::time::Duration;
 
 const MAX_GRACE_SECONDS: i64 = 60;
 const RETRY_AFTER_READ_FAILURE: Duration = Duration::from_secs(1);
-/// How often the sealer lease's holder renews it and another process
-/// looks whether it has lapsed.
 const LEASE_RENEWAL_SECONDS: i64 = SEALER_LEASE_SECONDS / 3;
 const RETRY_INTERVAL_SECONDS: i64 = 5;
 
@@ -19,24 +17,18 @@ struct Attempt {
     at: i64,
 }
 
-/// What the sealing scheduler does next, as a Unix second on the cadence
-/// grid.
+/// Instants are Unix seconds on the cadence grid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
     SealNow(i64),
     SleepUntil(i64),
 }
 
-/// How long after a grid instant its Epoch may still be sealed at it:
-/// half the cadence, at most 60 seconds.
 pub fn grace(cadence: i64) -> i64 {
     (cadence / 2).min(MAX_GRACE_SECONDS)
 }
 
-/// Seals the grid instant `now_unix` falls in when it is after the last
-/// sealed instant and its grace has not passed; otherwise waits for the
-/// next grid instant after both. A missed instant is skipped, never
-/// sealed late (WIST-3 §3.2).
+/// WIST-3 §3.2: a missed instant is skipped, never sealed late.
 pub fn next_seal(last_sealed_unix: Option<i64>, cadence: i64, now_unix: i64) -> Decision {
     let instant = now_unix.div_euclid(cadence) * cadence;
     if last_sealed_unix.is_none_or(|last| instant > last) && now_unix - instant <= grace(cadence) {
@@ -46,8 +38,6 @@ pub fn next_seal(last_sealed_unix: Option<i64>, cadence: i64, now_unix: i64) -> 
     Decision::SleepUntil((floor.div_euclid(cadence) + 1) * cadence)
 }
 
-/// The last Epoch's `sealed_at` and the `epoch_cadence_seconds` in force
-/// there, or at `now_unix` before the first Epoch.
 fn grid(db: &Db, now_unix: i64) -> Result<(Option<i64>, i64)> {
     let last = db
         .last_epoch()?
@@ -163,13 +153,8 @@ async fn sleep_until(instant: i64) {
     }
 }
 
-/// Seals an Epoch at every grid instant reached while serving and holding
-/// the Log's sealer lease as `owner`, re-reading the lease, the last Epoch
-/// and the cadence before each decision and at least every
-/// `LEASE_RENEWAL_SECONDS`. An instant whose seal failed is retried while its
-/// grace lasts (WIST-3 §3.2) and never sealed late. Every seal and
-/// publication is fenced by the lease's token, so work begun after another
-/// process took the lease over writes nothing.
+/// WIST-3 §3.2: a failed seal is retried while its instant's grace lasts
+/// and never sealed late.
 pub async fn run(db_path: PathBuf, data_dir: PathBuf, client: Arc<Client>, owner: Arc<str>) {
     let mut attempt: Option<Attempt> = None;
     loop {

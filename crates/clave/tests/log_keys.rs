@@ -1,6 +1,4 @@
-//! WIST-3 §3.4 and §5, WIST-4 §5.1: the Aggregator's own key rotation —
-//! the acts it seals, the ones it refuses, the Checkpoints and documents
-//! the resulting key set signs, and the replay that reads them back.
+//! WIST-3 §3.4 and §5, WIST-4 §5.1: the Aggregator's own key rotation.
 mod common;
 
 use common::spec_dir;
@@ -40,8 +38,6 @@ impl Log {
         self.seal_at(SEAL_START + height as i64 * 3600)
     }
 
-    /// Seals at a whole day past `SEAL_START`, so each Epoch lands under a
-    /// Snapshot date of its own.
     fn seal_on_day(&self, day: i64) -> clave::seal::SealReport {
         self.seal_at(SEAL_START + day * 86_400)
     }
@@ -82,8 +78,6 @@ impl Log {
             .collect()
     }
 
-    /// The signers `checkpoint_height`'s Checkpoint verifies under, judged
-    /// against the keys named.
     fn signers(&self, checkpoint_height: u64, key_ids: &[&str]) -> Vec<String> {
         let note = self.checkpoint(checkpoint_height);
         let verification =
@@ -414,8 +408,6 @@ fn the_state_file_key_tuples_authenticate_from_the_anchor_and_carry_the_accepted
     );
 }
 
-/// Leaves the key table as a store written before it carried the acts
-/// each `aggregator_key` tuple states (WIST-3 §7).
 fn forget_key_acts(log: &Log) {
     rusqlite::Connection::open(log.path().join("clave.sqlite"))
         .unwrap()
@@ -464,8 +456,6 @@ fn a_store_whose_entries_do_not_reproduce_its_key_registry_is_refused() {
     );
 }
 
-/// Every unsealed Aggregator-signed document the data directory serves,
-/// paired with the envelope member its signature covers (WIST-3 §3.4).
 fn unsealed_documents(data_dir: &Path) -> Vec<(String, &'static str)> {
     let mut documents = vec![
         ("snapshots/index.json".to_string(), "index"),
@@ -588,8 +578,6 @@ fn a_pass_interrupted_between_documents_is_finished_by_the_next_publication_repa
     log.seal_on_day(2);
     let settled = std::fs::read(log.path().join("snapshots/2026-08-09/state.json")).unwrap();
 
-    // A pass that stopped after the state file, before the manifest that
-    // carries its sha256, and before the index.
     std::fs::write(
         log.path().join("snapshots/2026-08-09/manifest.json"),
         &stale_manifest,
@@ -611,8 +599,6 @@ fn a_pass_interrupted_between_documents_is_finished_by_the_next_publication_repa
         wist_core::crypto::hex_encode(&Sha256::digest(&settled))
     );
 
-    // A pass that stopped before the state file, leaving a manifest the
-    // head signs and the state file it describes re-signed away from it.
     std::fs::write(
         log.path().join("snapshots/2026-08-09/state.json"),
         &stale_state,
@@ -832,9 +818,6 @@ fn a_queued_key_act_seals_after_a_restart_between_queueing_and_sealing() {
     assert_eq!(log.verify_history().unwrap(), 2);
 }
 
-/// Builds a Log from one `aggregator-keys.json` history — its Anchor and
-/// its Epochs with the exact Checkpoints the vector publishes — and reads
-/// it back through the Aggregator's history reader.
 fn replay_vector_history(history: &Value) -> (tempfile::TempDir, clave::db::Db, Vec<Value>) {
     let data = tempfile::tempdir().unwrap();
     let log_id = history["log_id"].as_str().unwrap();

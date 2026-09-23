@@ -706,7 +706,6 @@ fn a_ping_moves_a_scheduled_pull_earlier_never_later_and_takes_no_new_slot() {
     assert_eq!(ping("third.example"), 503);
 }
 
-/// Serves `dir` after `delay` on every request.
 fn serve_static_slow(listener: std::net::TcpListener, dir: std::path::PathBuf, delay: Duration) {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -926,9 +925,6 @@ fn sealed_epochs(data_dir: &Path) -> Vec<clave::db::EpochRow> {
     (0..).map_while(|n| db.epoch_at(n).unwrap()).collect()
 }
 
-/// A Log whose sealed history put `cadence` in force: Epoch 0 seals the
-/// `parameter_change` eight days ago and Epoch 1 seals at its effective
-/// instant a day ago, both on the prior hourly grid.
 fn init_with_cadence(data_dir: &Path, cadence: i64) {
     clave::init::run("127.0.0.1:0", data_dir).unwrap();
     let db = clave::db::Db::open(&data_dir.join("clave.sqlite")).unwrap();

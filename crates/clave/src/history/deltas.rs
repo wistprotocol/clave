@@ -86,7 +86,6 @@ impl DeltaSource {
         self.sealed_at_s
     }
 
-    /// The root of the tree at the Epoch that sealed this Delta.
     pub fn epoch_root(&self) -> &str {
         &self.epoch_root
     }

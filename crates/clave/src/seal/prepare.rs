@@ -14,17 +14,12 @@ use wist_core::envelope::sign_envelope;
 use wist_core::objects::{AggregatorKeyEntry, ChangeType};
 use wist_core::{jcs, merkle, tiles};
 
-/// One Epoch prepared for publication: its Checkpoint, the leaves it
-/// appends to the tree, the rows its commit writes and the effects its
-/// publication applies.
 pub(super) struct PreparedEpoch {
     pub(super) log_id: String,
-    /// The held Aggregator keys valid at this Epoch's height, each of which
-    /// signs its Checkpoint (WIST-3 §3.4, §5), the first of which signs the
+    /// WIST-3 §3.4, §5: every key signs the Checkpoint; the first signs the
     /// Snapshot documents.
     pub(super) signers: Vec<SigningKey>,
-    /// The §7 `aggregator_key` tuples this Epoch leaves, removed keys
-    /// included.
+    /// WIST-3 §7: removed keys included.
     pub(super) key_entries: Vec<AggregatorKeyEntry>,
     pub(super) entries: Vec<Value>,
     pub(super) octets: u64,
@@ -43,8 +38,6 @@ pub(super) struct PreparedEpoch {
     pub(super) record_updates: Vec<OwnedRecordUpsert>,
 }
 
-/// A recovery window open after this Epoch, as the sealed-window row
-/// records it (WIST-1 §5.2).
 pub(super) struct SealedWindow {
     pub(super) domain: String,
     pub(super) head: Vec<u8>,
@@ -54,11 +47,6 @@ pub(super) struct SealedWindow {
     pub(super) window_end: String,
 }
 
-/// Prepares the next Epoch at the cadence slot `now_unix` falls in:
-/// replays the history, settles and diverts recovery, orders and bounds
-/// the pending Entries, revalidates them and applies governance, then
-/// signs the Epoch. Writes only the diversions, settlements and
-/// retirements the preparation itself decides.
 pub(super) fn epoch(
     db: &Db,
     data_dir: &Path,
@@ -336,8 +324,6 @@ pub(super) struct GovernanceOutcome {
     pub(super) suffix_lists: Vec<String>,
     pub(super) dropped: Vec<String>,
     pub(super) dropped_rowids: Vec<i64>,
-    /// The Aggregator key registry this Epoch's accepted key acts leave
-    /// (WIST-3 §3.4).
     pub(super) key_registry: Registry,
 }
 
@@ -422,16 +408,10 @@ pub(crate) fn validate_pending_parameter(
 /// under the Key Set WIST-1 §5.2 resolves at the sealing Epoch — the
 /// highest-`seq` Declaration sealed at a height at or below it, this
 /// Epoch's own Declarations included (WIST-3 §3.2 applies them first).
-/// One whose signing key a Declaration accepted since the pull has
-/// retired is WIST1-E02, reported and not sealed.
-/// WIST-3 §3.2: an Epoch MUST NOT carry more than
-/// `domain_epoch_entries_max` `publisher_delta`, `label` and `dispute`
-/// Entries of one Registrable Domain under the snapshot in force at it
-/// (WIST-4 §3.1), nor more than `labeler_epoch_entries_max` `label` and
-/// `dispute` Entries of one. The surplus waits its turn in acceptance
-/// order, and WIST-4 §6.4's inclusion ceiling runs from the Epoch an
-/// Entry's turn arrives in — the first with room for it — which is
-/// recorded here.
+/// WIST-3 §3.2: the per-Registrable-Domain caps apply under the snapshot
+/// in force (WIST-4 §3.1); the surplus waits its turn in acceptance order,
+/// and WIST-4 §6.4's inclusion ceiling runs from the Epoch its turn arrives
+/// in.
 pub(super) fn fit_to_domain_cap(
     db: &Db,
     peeked: Vec<PendingEntryRow>,
@@ -639,11 +619,9 @@ pub(super) fn revalidate_queued_deltas(
     Ok((kept, dropped_rowids, dropped))
 }
 
-/// WIST-4 §5.1 through core's withdrawal replay: the act must verify under
-/// the Log key and name a Delta sealed at or below this Epoch — one this
-/// Epoch seals or one the store already holds — whose signed publisher is
-/// the subject; a failing act is dropped with its code, and a repeated
-/// withdrawal seals and changes nothing.
+/// WIST-4 §5.1: the act must verify under the Log key and name a Delta
+/// sealed at or below this Epoch whose signed publisher is the subject; a
+/// repeated withdrawal seals and changes nothing.
 fn check_withdrawal(
     db: &Db,
     replay: &mut wist_core::withdrawal::WithdrawalReplay,
@@ -690,11 +668,8 @@ fn check_withdrawal(
     }
 }
 
-/// WIST-3 §3.4 and §5: the held private keys valid at this Epoch's height,
-/// in ascending order of the height that admitted them and then of
-/// `key_id`. Every one of them signs the Epoch's Checkpoint, so an Epoch
-/// that admits a key is signed by the key it replaces and by the new one,
-/// and one that removes a key is not signed by the removed key.
+/// WIST-3 §3.4, §5: ordered by admitting height, then `key_id`; every one
+/// signs the Checkpoint.
 fn held_signers(
     data_dir: &Path,
     db: &Db,
@@ -729,14 +704,9 @@ fn held_signers(
     Ok(signers)
 }
 
-/// WIST-3 §3.4: evaluates this Epoch's key acts against the registry the
-/// Epochs below it establish, in canonical Entry order, and refuses to
-/// seal what a Consumer would not apply. Returns the registry the accepted
-/// acts produce, one disposition per Registry Update of the Epoch, and the
-/// positions of the removals held back because the Epoch's accepted
-/// removals would otherwise leave no key valid at its height, which gives
-/// the Epoch no valid Checkpoint: the removal at the highest Entry index
-/// is held back first, so the earliest ones still apply.
+/// WIST-3 §3.4: acts are evaluated in canonical Entry order. When the
+/// accepted removals would leave no key valid at this height, the removal
+/// at the highest Entry index is held back first.
 fn evaluate_key_acts(
     base: &Registry,
     epoch_number: u64,
@@ -782,8 +752,8 @@ fn evaluate_key_acts(
     }
 }
 
-/// The reason a key act is not sealed, in the code a Consumer replaying
-/// the Log would give it (WIST-3 §3.4, WIST-4 §5.1).
+/// The code a Consumer replaying the Log would give (WIST-3 §3.4, WIST-4
+/// §5.1).
 fn key_act_refusal(update: &Value, outcome: &Outcome) -> String {
     let action = update["action"].as_str().unwrap_or("key act");
     let subject = update["subject"].as_str().unwrap_or("without a subject");
@@ -953,9 +923,8 @@ pub(super) fn enforce_governance(
     Ok(out)
 }
 
-/// WIST-3 §6: an Epoch's size is the octets its Entries occupy in entry
-/// bundles — each Entry's JCS serialization plus two — and it must not
-/// exceed the `epoch_cap_bytes` in force.
+/// WIST-3 §6: an Epoch's octets, each Entry's JCS serialization plus two,
+/// must not exceed the `epoch_cap_bytes` in force.
 pub(super) fn fit_to_cap(
     entries: Vec<SealEntry>,
     cap: i64,
@@ -1051,9 +1020,8 @@ impl SealEntry {
 }
 
 /// WIST-3 §3.3: an Entry whose JCS serialization exceeds 65 535 octets
-/// does not fit a leaf of an entry bundle and is never sealed. It is
-/// held out of the Epoch here, the last point at which the Aggregator
-/// still decides membership, and reported with the Epoch's drops.
+/// never fits an entry-bundle leaf. It is held out here, the last point at
+/// which the Aggregator still decides membership.
 pub(super) fn hold_out_oversize_entries(
     entries: Vec<SealEntry>,
 ) -> (Vec<SealEntry>, Vec<SealEntry>) {

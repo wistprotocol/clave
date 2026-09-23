@@ -23,25 +23,8 @@ pub const OVERLOAD_RETRY_AFTER_SECS: u64 = 30;
 pub const BACKLOG_EPOCHS: u32 = 2;
 pub const BACKLOG_ENTRIES: u64 = 1 << 20;
 pub const PREFETCH_OBJECTS: u32 = 4;
-/// The instance name a `serve` without `--instance` runs under.
 pub const DEFAULT_INSTANCE: &str = "primary";
 
-/// The bounds `serve` applies to pulls and Pings: at most
-/// `max_concurrent_ingests` pulls run at once and at most
-/// `max_pending_ingests` Pings wait in the pull schedule; a Ping for a
-/// domain neither waiting nor being pulled beyond that bound is refused
-/// with 503 and a Retry-After, never queued. The dispatcher holds at most
-/// `max_partitions` pull partitions and pulls only their domains. With
-/// `seal` set, an Epoch is sealed at every grid instant reached while
-/// serving and holding the Log's sealer lease. `instance` names this
-/// process's place in the store: it owns the leases recorded under that
-/// name and holds an exclusive file lock on it for its lifetime, so a
-/// restart resumes its predecessor's place instead of waiting for the
-/// leases to lapse, and two processes on one store take distinct names.
-/// While the entries waiting to be sealed reach `backlog_entries`, or
-/// `backlog_epochs` times the `epoch_cap_bytes` in force, the dispatcher
-/// claims only `baseline` and `retry` pulls. Each pull runs under
-/// `pull_limits`.
 #[derive(Debug, Clone)]
 pub struct ServeOptions {
     pub instance: String,
@@ -72,15 +55,8 @@ impl Default for ServeOptions {
     }
 }
 
-/// One `serve` process's exclusive hold on its instance name, an OS file
-/// lock on `<data_dir>/instance-<name>.lock` released when the process
-/// ends however it ends.
 struct InstanceLock(#[allow(dead_code)] std::fs::File);
 
-/// Takes `instance`'s file lock under `data_dir`, failing at once while
-/// another process holds it. The name is restricted to a single path
-/// component of ASCII letters, digits, `-`, `_` and `.` so it names one
-/// file inside the data directory.
 fn lock_instance(data_dir: &std::path::Path, instance: &str) -> Result<InstanceLock> {
     let named = !instance.is_empty()
         && instance != "."
@@ -110,8 +86,6 @@ fn lock_instance(data_dir: &std::path::Path, instance: &str) -> Result<InstanceL
     Ok(InstanceLock(file))
 }
 
-/// The longest the dispatcher sleeps before it looks for due pulls again
-/// when nothing wakes it.
 const DISPATCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[derive(Clone)]
@@ -130,18 +104,15 @@ struct IngestRequest {
     host: String,
 }
 
-/// WIST-3 §6 and [tlog-tiles]: the head Checkpoint and the archive are
-/// text served without caching, since both are rewritten — the head at
-/// every Epoch, an archived note whenever a Cosignature is added.
+/// WIST-3 §6, [tlog-tiles]: served without caching, since the head and the
+/// archive are rewritten.
 const NOTE_CONTENT_TYPE: &str = "text/plain; charset=utf-8";
 const NO_CACHE: &str = "no-store";
-/// A full tile or entry bundle never changes once written, so it is
-/// cached as the immutable file it is.
 const TILE_CONTENT_TYPE: &str = "application/octet-stream";
 const IMMUTABLE_CACHE: &str = "public, max-age=604800, immutable";
 
-/// Resolves a served path under `root`, refusing any component that is
-/// not an ordinary name so no request reaches outside the directory.
+/// Refuses any component that is not an ordinary name, so no request
+/// reaches outside `root`.
 fn under(root: &std::path::Path, relative: &str) -> Option<PathBuf> {
     let mut path = root.to_path_buf();
     for component in std::path::Path::new(relative).components() {
@@ -184,10 +155,6 @@ async fn checkpoint_handler(State(state): State<AppState>) -> axum::response::Re
     .await
 }
 
-/// Serves `/tile/<L>/<N>` and `/tile/entries/<N>`, full ones as the
-/// immutable files they are and partial ones — the `.p/<W>` paths a head
-/// size requires — without caching, because they stop being served once
-/// the full tile exists.
 async fn tile_handler(
     State(state): State<AppState>,
     Path(rest): Path<String>,
@@ -320,11 +287,6 @@ async fn ingest_handler(State(state): State<AppState>, body: Bytes) -> axum::res
     }
 }
 
-/// Runs `task` to completion and schedules the domain's next pull, every
-/// write fenced by the partition token the task was claimed under: once
-/// another dispatcher has taken the partition over, the pull writes
-/// nothing more and leaves the domain, and whatever its run committed, to
-/// the new holder.
 fn pull(state: &AppState, owner: &str, task: &PullTask) {
     let Ok(db) = Db::connect(&state.db_path) else {
         return;
@@ -385,12 +347,6 @@ impl DispatchBounds {
     }
 }
 
-/// Claims due pulls whenever a worker slot is free, woken by each Ping,
-/// each finished pull and at least every `DISPATCH_INTERVAL`; renews its
-/// partition leases and the leases of the pulls it runs, takes over
-/// lapsed partitions up to `max_partitions` and returns lapsed pulls to
-/// the schedule, apart from the domains it is running, which no pass
-/// claims or returns while their pulls are in flight here.
 async fn dispatch(state: AppState, owner: Arc<str>, bounds: DispatchBounds) {
     let running = Arc::new(Mutex::new(HashSet::<String>::new()));
     let mut ping_next = true;
@@ -583,7 +539,6 @@ pub fn run_with_options(
     })
 }
 
-/// Resolves on Ctrl-C and, on Unix, on SIGTERM.
 async fn shutdown_signal() {
     #[cfg(unix)]
     {

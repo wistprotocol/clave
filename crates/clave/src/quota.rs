@@ -10,8 +10,8 @@ pub fn quota_q(db: &Db, at: &str) -> Result<i64> {
     registry::effective(db, "quota_base", at)
 }
 
-/// The quota left to the Registrable Domain of `host` under the snapshot
-/// in force at `at` (WIST-4 §3.1), shared by every host under it.
+/// WIST-4 §3.1: the Registrable Domain under the snapshot in force at `at`,
+/// shared by every host under it.
 pub fn quota_remaining(db: &Db, host: &str, at: &str) -> Result<i64> {
     let day = at.get(..10).unwrap_or(at);
     let unit = crate::suffix_list::unit_at(db, host, at)?;

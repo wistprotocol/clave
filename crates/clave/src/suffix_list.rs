@@ -1,7 +1,5 @@
-//! WIST-4 §3.1: the Public Suffix List snapshot pinned in the Log by a
-//! `suffix_list_update`, served at `/log/suffix-lists/<hex>.dat`, and the
-//! Registrable Domain every quota, ingest budget and Epoch capacity is
-//! keyed on under the snapshot in force.
+//! WIST-4 §3.1: every quota, ingest budget and Epoch capacity is keyed on
+//! the Registrable Domain under the Public Suffix List snapshot in force.
 use crate::db::Db;
 use crate::error::{Error, Result};
 use crate::WIST_VERSION;
@@ -21,8 +19,6 @@ pub fn file_path(data_dir: &Path, identifier: &str) -> PathBuf {
     data_dir.join("log/suffix-lists").join(format!("{hex}.dat"))
 }
 
-/// Holds a snapshot's octets in the store and beside the Log, and queues
-/// the `suffix_list_update` naming them for the next Epoch.
 pub fn pin(
     db: &Db,
     data_dir: &Path,
@@ -78,23 +74,18 @@ fn load(db: &Db, identifier: &str) -> Result<Arc<SuffixList>> {
     Ok(list)
 }
 
-/// The snapshot in force at the instant `at`: the one named by the most
-/// recent accepted act sealed at or before it.
 pub fn in_force_at(db: &Db, at: &str) -> Result<Option<Arc<SuffixList>>> {
     db.suffix_list_in_force_at(at)?
         .map(|(identifier, _)| load(db, &identifier))
         .transpose()
 }
 
-/// The snapshot in force at Epoch `epoch_number`: the one named by the
-/// most recent accepted act sealed below it.
 pub fn in_force_at_epoch(db: &Db, epoch_number: u64) -> Result<Option<Arc<SuffixList>>> {
     db.suffix_list_in_force_at_epoch(epoch_number)?
         .map(|(identifier, _)| load(db, &identifier))
         .transpose()
 }
 
-/// The accounting unit of a Canonical Host at the instant `at`.
 pub fn unit_at(db: &Db, host: &str, at: &str) -> Result<String> {
     Ok(suffix_list::registrable_domain(host, in_force_at(db, at)?.as_deref()).domain)
 }

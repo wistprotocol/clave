@@ -1,12 +1,8 @@
-//! The store's schema and the migrations a reopened store applies before
-//! any routine operation reads it.
 use super::Mutation;
 use crate::error::{Error, Result};
 use rusqlite::{Connection, OptionalExtension};
 
-/// Applies the schema, the lease tables, the run disposition rename, the added columns, the acceptance-order clock, the
-/// key-act backfill and the url_tips key migration, each idempotent on a
-/// current store.
+/// Each migration is idempotent on a current store.
 pub(super) fn migrate(conn: &Connection) -> Result<()> {
     refuse_superseded_layout(conn)?;
     conn.execute_batch(SCHEMA)?;
@@ -32,11 +28,6 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// A store written before the Log became one growing tree keys its
-/// Blocks by a per-Block hash and holds no leaf data; its Blocks cannot
-/// be replayed into a tree, so it is refused rather than half-migrated.
-/// A later store that still names that table `blocks` and its columns
-/// after `block` is refused the same way.
 fn refuse_superseded_layout(conn: &Connection) -> Result<()> {
     let hash_chain: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM pragma_table_info('blocks') WHERE name = 'block_hash')",
@@ -142,13 +133,9 @@ struct KeyRow {
     holds_removing_act: bool,
 }
 
-/// WIST-3 §7: every `aggregator_key` tuple but the genesis key's carries
-/// the accepted `aggregator_key_add` that admitted it, and every removed
-/// key's carries the accepted `aggregator_key_remove` that retired it. A
-/// store written before the key table held the acts recovers both by
-/// replaying the Entries it has sealed from the one key of its table that
-/// no sealed act admits; a table that replay does not reproduce is refused
-/// rather than served as tuples without acts.
+/// WIST-3 §7: every `aggregator_key` tuple but the genesis key's carries the
+/// accepted `aggregator_key_add` that admitted it, and every removed key's
+/// the `aggregator_key_remove` that retired it.
 fn backfill_key_acts(conn: &Connection) -> Result<()> {
     let mut statement = conn.prepare(
         "SELECT key_id, public_key, added_epoch, removed_epoch, adding_act IS NOT NULL, removing_act IS NOT NULL FROM aggregator_keys ORDER BY key_id",

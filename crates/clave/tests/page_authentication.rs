@@ -277,8 +277,6 @@ fn repeated_declaration_entries_bound_the_first_next_page_source() {
     fixture.probe("2026-08-09T12:30:00Z", &K2_SEED, true);
 }
 
-/// A domain whose open recovery window holds a competitor Declaration
-/// beside the owner's branch, carrying the page key a settlement excludes.
 fn contested_recovery() -> Fixture {
     let fixture = Fixture::new();
     let mut initial = current_declaration(&fixture.publisher)["publisher"].clone();
@@ -356,8 +354,6 @@ fn cursor_pages(fixture: &Fixture) -> i64 {
         .unwrap()
 }
 
-/// The noise counted, whether nothing was accepted, the last rejection
-/// code and whether the live Delta was admitted.
 fn excluded_page_disposition(held: bool) -> (Option<&'static str>, bool, Option<String>, bool) {
     const CUT: &str = "2026-08-09T13:30:00Z";
     const WINDOW_END: &str = "2026-08-16T13:00:00Z";

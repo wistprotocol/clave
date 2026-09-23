@@ -2,9 +2,6 @@
 
 use std::fs;
 
-/// Seals `entries` as Epoch `epoch_number` of the Log in `data_dir` and
-/// distributes it, for fixtures that build a Log directly rather than
-/// through admission.
 pub fn seal_fixture_epoch(
     db: &clave::db::Db,
     data_dir: &std::path::Path,
@@ -39,10 +36,6 @@ pub fn seal_fixture_epoch(
     row
 }
 
-/// Seals the Epochs a vector carries — each
-/// `{"checkpoint": <note>, "entries": [...]}` — from an empty tree,
-/// signing every Checkpoint with `sk` under the data directory's
-/// `log_id`, and returns the head.
 pub fn seal_vector_epochs(
     db: &clave::db::Db,
     data_dir: &std::path::Path,
@@ -85,15 +78,11 @@ pub fn seal_vector_epochs(
     head.expect("a vector carries at least one Epoch")
 }
 
-/// The signed note of the Checkpoint the Log's static files publish as
-/// the head.
 pub fn head_checkpoint(data_dir: &std::path::Path) -> wist_core::checkpoint::Checkpoint {
     let note = fs::read_to_string(data_dir.join("checkpoint")).unwrap();
     wist_core::checkpoint::Checkpoint::parse(&note).unwrap()
 }
 
-/// The Entries of Epoch `epoch_number`, read back from the entry bundles
-/// the Log serves.
 pub fn served_entries(data_dir: &std::path::Path, from: u64, to: u64) -> Vec<serde_json::Value> {
     let serving = fs::read_to_string(data_dir.join("checkpoint"))
         .ok()
@@ -152,7 +141,6 @@ pub fn key_entry_public(public_b64u: &str, valid_from: &str) -> serde_json::Valu
     .unwrap()
 }
 
-/// Rebinds a key entry to another public key, keeping its window.
 pub fn rekey(entry: &mut serde_json::Value, public_b64u: &str) {
     entry["x"] = public_b64u.into();
     entry["kid"] = wist_core::objects::publisher::thumbprint(public_b64u).into();

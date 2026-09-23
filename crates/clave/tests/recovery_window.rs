@@ -594,8 +594,6 @@ fn a_delta_pending_when_the_window_opens_is_queued_not_sealed() {
         rejection_codes(&r)
     );
 
-    // The window settles against the recovery chain head, which is where
-    // a Delta under the superseded key is rejected in the open.
     clave::seal::run(&r.db, r.data.path(), &r.sk, T0 + 8 * DAY).unwrap();
     assert!(
         rejection_codes(&r).contains(&"WIST1-E13".to_string()),
@@ -636,8 +634,6 @@ fn a_sealed_page_signed_by_a_since_retired_key_still_verifies() {
         "2026-08-09T15:00:00Z",
         &K2_SEED,
     );
-    // The Page was cut before the rotation and is never re-signed, so it
-    // still carries k1's signature.
     write_feed_page_signed(
         &r.p,
         &r.host,
@@ -758,8 +754,6 @@ fn fixed_recovery_bindings_survive_followers_reopen_migration_and_settlement() {
         let ids: Vec<_> = cases
             .iter()
             .map(|(name, seed, at, _)| {
-                // "wrong" names an authorized entry but is signed by another
-                // key, the one case that separates E01 from E02.
                 let signer = if *name == "wrong" { &X1_SEED } else { *seed };
                 add_delta_signed_as(
                     &r.p,

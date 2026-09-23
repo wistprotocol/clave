@@ -1,10 +1,3 @@
-//! The persisted state of each pull in progress: one run per domain with
-//! its phase, remaining work and item queue; every object the run fetched
-//! with its status, its bytes and the references it was verified under;
-//! the Declaration retries and predecessor retrievals it used; and, per
-//! domain and walk, the pages walked so far. WIST-2 §5's resumption is a
-//! later pull, so a run an interrupted pull left open is dropped, while
-//! the walk cursor outlives it.
 use super::Db;
 use crate::error::{Error, Result};
 use rusqlite::{Connection, OptionalExtension};
@@ -21,20 +14,13 @@ pub(super) fn create(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// How far a run has come.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Phase {
-    /// Declaration discovery and the Feed walk.
     Walk,
-    /// The walked Delta IDs, in the run's queue.
     Deltas,
-    /// The Label Feed walk.
     Labels,
-    /// The walked Label and dispute IDs, in the run's queue.
     LabelItems,
-    /// Every step ran; the run waits to be closed.
     Closing,
-    /// The pull ended early at a recorded rejection.
     Aborted,
 }
 
@@ -63,9 +49,6 @@ impl Phase {
     }
 }
 
-/// Where a fetched object stands: its request issued with the budget
-/// reserved, its response persisted, verified, admitted or rejected by
-/// admission, or its request failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Status {
     Issued,
@@ -104,14 +87,11 @@ impl Status {
         })
     }
 
-    /// Whether admission is done with the object, so the next occurrence
-    /// of its ID is a new attempt.
     pub(crate) fn is_final(self) -> bool {
         matches!(self, Status::Admitted | Status::Rejected)
     }
 }
 
-/// A run as its row records it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PullRun {
     pub run_id: i64,
@@ -126,35 +106,29 @@ pub(crate) struct PullRun {
     pub unseen_any: bool,
     pub suspended: bool,
     pub chain_pos: i64,
-    /// The height sealed Pages resolve their Key Sets at.
     pub pages_epoch: Option<u64>,
     pub queue: Vec<String>,
     pub position: usize,
     pub ended: Option<String>,
 }
 
-/// One object of a run as its row records it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PullObject {
     pub url: String,
     pub status: Status,
     pub raw: Option<Vec<u8>>,
-    /// The bytes reserved while issued, and debited once fetched.
+    /// Octets: reserved while issued, debited once fetched.
     pub debited: u64,
     pub checks_json: Option<String>,
     pub refs_json: Option<String>,
 }
 
-/// A page walked into a domain's cursor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WalkPage {
     pub url: String,
     pub generated_at: String,
     pub ids: Vec<String>,
-    /// The target the page's `next` names under the target rule, if any.
     pub next_url: Option<String>,
-    /// The Envelope octets the page was authenticated as; `None` in a store
-    /// written before the cursor retained them.
     pub raw: Option<Vec<u8>>,
 }
 
@@ -180,7 +154,6 @@ fn page_of((url, generated_at, ids, next_url, raw): WalkRow) -> Result<WalkPage>
     })
 }
 
-/// How a fetch that was issued ended, as persisted.
 pub(crate) enum Settled<'a> {
     Body(&'a [u8]),
     Bounded(u64),
@@ -279,7 +252,6 @@ pub(crate) struct Credit {
     pub bytes: u64,
 }
 
-/// The fresh run of a pull of `domain` at `now`.
 pub(crate) struct NewRun<'a> {
     pub domain: &'a str,
     pub now: &'a str,
@@ -296,11 +268,8 @@ impl Db {
         Ok(self.replace_pull_run(run)?.0)
     }
 
-    /// Opens a fresh run of a pull of `run.domain`, dropping one an earlier
-    /// pull left open and returning its unsettled reservations to the
-    /// budget: WIST-2 §5's resumption is a later pull, and WIST-1 §3.4
-    /// gives a new attempt a new clock and schedule. The walk cursor
-    /// outlives the run.
+    /// WIST-2 §5: resumption is a later pull, and WIST-1 §3.4 gives a new
+    /// attempt a new clock and schedule. The walk cursor outlives the run.
     pub(crate) fn replace_pull_run(&self, run: &NewRun<'_>) -> Result<(PullRun, Vec<Credit>)> {
         let tx = self.mutation()?;
         let token = self.fence.map(|fence| match fence {
@@ -329,13 +298,10 @@ impl Db {
         Ok((started, credited))
     }
 
-    /// The run `run_id`, if it is still open.
     pub(crate) fn pull_run(&self, run_id: i64) -> Result<Option<PullRun>> {
         run_by(&self.conn, "run_id = ?1", [run_id])
     }
 
-    /// Records `run`'s phase, remaining work, flags, position and `ended`,
-    /// not its queue: rewriting that per item costs its length squared.
     pub(crate) fn update_pull_run(&self, run: &PullRun) -> Result<()> {
         self.execute(
             "UPDATE pull_runs SET phase = ?2, work_bytes = ?3, work_objects = ?4, feed_retry_used = ?5, unseen_any = ?6, suspended = ?7, chain_pos = ?8, position = ?9, ended = ?10 WHERE run_id = ?1",
@@ -363,7 +329,6 @@ impl Db {
         Ok(())
     }
 
-    /// Drops run `run_id` with its objects and attempts.
     pub(crate) fn delete_pull_run(&self, run_id: i64) -> Result<Vec<Credit>> {
         self.write(|conn| delete_run(conn, run_id))
     }
@@ -403,9 +368,6 @@ impl Db {
             .transpose()
     }
 
-    /// The highest attempt number run `run_id` holds for the item `id` of
-    /// `kind`, whose object IDs are `<id>#<attempt>`, with that attempt's
-    /// status.
     pub(crate) fn latest_pull_attempt(
         &self,
         run_id: i64,
@@ -435,8 +397,6 @@ impl Db {
         Ok(latest)
     }
 
-    /// Records an object fetched outside the budget unless the run already
-    /// holds it; returns whether it was recorded.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_pull_object(
         &self,
@@ -463,10 +423,6 @@ impl Db {
         )? == 1)
     }
 
-    /// Issues a metered request: records the object as issued with `limit`
-    /// bytes reserved in the budget of `unit` for `day`, or moves an
-    /// issued object's reservation to `limit`, crediting the row it held
-    /// when that row differs, in one transaction.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn reserve_pull_object(
         &self,
@@ -518,11 +474,6 @@ impl Db {
             .is_some())
     }
 
-    /// Persists how an issued metered request ended and settles its
-    /// reservation, on the meter row the request was issued against, to
-    /// the bytes actually debited, with `run`'s remaining work, in one
-    /// transaction. Returns `None`, writing nothing, when the object is
-    /// no longer issued, as when the same result is delivered twice.
     pub(crate) fn settle_pull_object_crediting(
         &self,
         run: &PullRun,
@@ -610,8 +561,6 @@ impl Db {
         )?)
     }
 
-    /// Moves an object from one of `from` to `to`, recording `checks`
-    /// when given; returns whether it moved.
     pub(crate) fn advance_pull_object(
         &self,
         run_id: i64,
@@ -636,7 +585,6 @@ impl Db {
         Ok(moved)
     }
 
-    /// Records the references an object's attempt was issued with.
     pub(crate) fn set_pull_object_refs(
         &self,
         run_id: i64,
@@ -651,9 +599,6 @@ impl Db {
         Ok(())
     }
 
-    /// Enters an object into the run's report as `report` — `accepted`,
-    /// `queued`, `label` or a rejection code — after every entry before
-    /// it, recording the row when the run holds none.
     pub(crate) fn report_pull_object(
         &self,
         run_id: i64,
@@ -674,8 +619,6 @@ impl Db {
         tx.commit()
     }
 
-    /// The run's report entries in the order they were entered, each as
-    /// the object ID and what it reports.
     pub(crate) fn pull_report(&self, run_id: i64) -> Result<Vec<(String, String)>> {
         Ok(self
             .conn
@@ -684,7 +627,6 @@ impl Db {
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    /// Whether run `run_id` used the attempt `kind` for `id`.
     pub(crate) fn pull_attempted(&self, run_id: i64, kind: &str, id: &str) -> Result<bool> {
         Ok(self
             .conn
@@ -713,7 +655,6 @@ impl Db {
         Ok(())
     }
 
-    /// Page `idx` of `domain`'s `feed` walk, if walked.
     pub(crate) fn walk_page(&self, domain: &str, feed: &str, idx: u32) -> Result<Option<WalkPage>> {
         self.conn
             .query_row(
@@ -749,7 +690,6 @@ impl Db {
         Ok(())
     }
 
-    /// The pages `domain`'s `feed` walk holds, in walk order.
     pub(crate) fn walk_pages(&self, domain: &str, feed: &str) -> Result<Vec<WalkPage>> {
         let rows = self
             .conn
@@ -759,7 +699,6 @@ impl Db {
         rows.into_iter().map(page_of).collect()
     }
 
-    /// Drops the pages a walk that ended before `pages` left behind.
     pub(crate) fn trim_walk(&self, domain: &str, feed: &str, pages: u32) -> Result<()> {
         self.execute(
             "DELETE FROM pull_walk WHERE domain = ?1 AND feed = ?2 AND idx >= ?3",
@@ -768,8 +707,6 @@ impl Db {
         Ok(())
     }
 
-    /// Drops `domain`'s cursor for one walk, once the items it fed have
-    /// been processed.
     pub(crate) fn clear_walk(&self, domain: &str, feed: &str) -> Result<()> {
         self.execute(
             "DELETE FROM pull_walk WHERE domain = ?1 AND feed = ?2",

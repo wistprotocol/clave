@@ -602,15 +602,16 @@ A lease's owner is the instance name `serve --instance <name>` runs
 under, `primary` by default, and the process holds an exclusive file
 lock on `<data dir>/instance-<name>.lock` for its lifetime: a second
 process under the same name refuses to start, naming the lock, and a
-second process on one store takes another name. A process that starts
-under the name it ran under before re-takes, in one transaction, every
-partition lease and the sealer lease recorded under that name,
-incrementing each token — which fences out anything the earlier
-incarnation left running — and returns those partitions' pulls to the
-schedule as `retry` due at once. A process killed without releasing its
-leases is therefore succeeded at once by its restart rather than after
-its own leases lapse. `clave seal` takes the sealer lease under an owner
-unique to its process and its start.
+second process on one store takes another name. The name is a single
+path component of ASCII letters, digits, `-`, `_` and `.`. A process
+that starts under the name it ran under before re-takes, in one
+transaction, every partition lease and the sealer lease recorded under
+that name, incrementing each token — which fences out anything the
+earlier incarnation left running — and returns those partitions' pulls
+to the schedule as `retry` due at once. A process killed without
+releasing its leases is therefore succeeded at once by its restart
+rather than after its own leases lapse. `clave seal` takes the sealer
+lease under an owner unique to its process and its start.
 
 A pull runs fenced by its partition and token. Every write transaction
 it begins, including its completion, first checks under the write lock

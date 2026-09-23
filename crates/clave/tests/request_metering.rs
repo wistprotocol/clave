@@ -7,7 +7,6 @@ use common::{
 use std::path::Path;
 
 const DAY: i64 = 86_400;
-/// An instant on the Epoch cadence grid every seal in this file sits on.
 const SEAL_START: i64 = 1_786_276_800;
 const CADENCE: i64 = 3_600;
 
@@ -27,9 +26,6 @@ fn item_len(p: &common::TestPub, id: &str) -> i64 {
         + file_len(p, &format!("payloads/{}.json", &id[7..]))
 }
 
-/// Pulls `host` with a clock standing at `before` until `first` is
-/// accepted and at `after` from then on, so every request after it is
-/// issued on the far side of the crossing.
 fn pull_across(
     db: &Db,
     client: &clave::fetch::Client,

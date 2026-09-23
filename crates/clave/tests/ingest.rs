@@ -615,8 +615,6 @@ fn an_unsealed_prev_is_retrieved_before_the_delta_naming_it() {
     let url = format!("https://{host}/a");
     let first = add_delta(&p, &url, "alpha body", None);
     let second = add_delta(&p, &url, "beta body", Some(&first));
-    // The Feed lists only the newer Delta; the older one is reachable at
-    // its own deltas/<id>.json.
     write_feed(
         &p,
         &host,

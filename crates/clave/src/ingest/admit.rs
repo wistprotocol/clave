@@ -1,7 +1,3 @@
-//! Stage 4: stateful admission. Each function is one fenced write
-//! transaction that both changes the Log's state and records how far the
-//! run has come, so a repeated occurrence of an item within the pull
-//! neither repeats an admission nor loses one.
 use crate::db::{Db, Phase, PullRun, Status, WalkPage};
 use crate::declaration::{self, Decision};
 use crate::error::Result;
@@ -13,7 +9,6 @@ use super::fetch_stage::{Attempt, ObjectKey, Walk};
 use super::verify::{DeclarationRef, IssuedRefs, LabelKind};
 use super::IngestReport;
 
-/// Records a rejection at the domain's status endpoint.
 pub(super) fn reject(
     db: &Db,
     domain: &str,
@@ -25,7 +20,6 @@ pub(super) fn reject(
     db.insert_rejection(domain, code, now, id, Some(detail))
 }
 
-/// Whether a walk's page lists an ID the domain has not seen.
 pub(super) fn unseen(db: &Db, host: &str, walk: Walk, ids: &[String]) -> Result<bool> {
     for id in ids {
         let seen = match walk {
@@ -39,8 +33,8 @@ pub(super) fn unseen(db: &Db, host: &str, walk: Walk, ids: &[String]) -> Result<
     Ok(false)
 }
 
-/// WIST-1 §5.2: applies a recovery settlement that is due before an
-/// admission decision under the domain's open window.
+/// WIST-1 §5.2: a settlement due is applied before an admission decision
+/// under the open window.
 pub(super) fn settle_if_due(
     db: &Db,
     data_dir: &Path,
@@ -111,8 +105,6 @@ fn accepted_recovery_head(
     Ok(head)
 }
 
-/// Marks the request `key` stood for as made, whatever it returned: the
-/// Feed and Page retry a pull shares, or a Delta ID's one retry.
 fn consume(db: &Db, run: &mut PullRun, key: &ObjectKey) -> Result<()> {
     match key {
         ObjectKey::Declaration {
@@ -137,16 +129,12 @@ fn consume(db: &Db, run: &mut PullRun, key: &ObjectKey) -> Result<()> {
     Ok(())
 }
 
-/// Records that the request `key` stood for was made and returned
-/// nothing usable, so the attempt it carried is spent.
 pub(super) fn consume_attempt(db: &Db, run: &mut PullRun, key: &ObjectKey) -> Result<()> {
     let mutation = db.mutation()?;
     consume(db, run, key)?;
     mutation.commit()
 }
 
-/// Records a first-contact Declaration that passed its checks as the
-/// domain's accepted one.
 pub(super) fn onboard(
     db: &Db,
     run: &mut PullRun,
@@ -164,10 +152,7 @@ pub(super) fn onboard(
     mutation.commit()
 }
 
-/// WIST-1 §§5.1–5.2: evaluates a fetched Declaration against the domain's
-/// chain and records what it establishes, after any recovery settlement
-/// due first, and spends the attempt the request carried. Returns the
-/// Declaration the domain holds afterwards.
+/// WIST-1 §§5.1–5.2, after any recovery settlement due first.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn admit_declaration(
     db: &Db,
@@ -271,8 +256,6 @@ pub(super) fn admit_declaration(
     Ok(current_doc)
 }
 
-/// Ends the pull at a recorded rejection: nothing further is fetched and
-/// the run waits to be closed.
 pub(super) fn abort(
     db: &Db,
     run: &mut PullRun,
@@ -319,9 +302,6 @@ fn refuse_page(
     Ok(())
 }
 
-/// Refuses a Label Feed page: the rejection is recorded and the walk ends
-/// with the pages before it, leaving the Feed walk that completed before
-/// it untouched.
 pub(super) fn reject_page(
     db: &Db,
     run: &PullRun,
@@ -352,13 +332,8 @@ pub(super) fn stop_walk(
     mutation.commit()
 }
 
-/// Admits an authenticated page to its walk: a live page's `generated_at`
-/// is compared and retained (WIST-2 §3.2, `WIST2-E05`), the page's IDs
-/// are diffed against those seen, its `next` target is recorded and the
-/// page joins the domain's walk cursor with what the walk reads from it
-/// and the `raw` octets it was authenticated as.
-/// `next` is the target rule's result for the page's `next`, if it has
-/// one. `None` means the page was refused and its rejection recorded.
+/// WIST-2 §3.2 (`WIST2-E05`): a live page's `generated_at` is compared and
+/// retained.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn admit_page(
     db: &Db,
@@ -440,33 +415,21 @@ pub(super) fn admit_page(
     Ok(Some((walked, unseen)))
 }
 
-/// Leaves the item at `index` behind without deciding it again, which is
-/// what a second delivery of a decision the run already made asks for.
 fn past(db: &Db, run: &mut PullRun, index: usize, mutation: crate::db::Mutation<'_>) -> Result<()> {
     run.position = index + 1;
     db.update_pull_run(run)?;
     mutation.commit()
 }
 
-/// One listed Delta, Label or dispute the run refuses, with the objects
-/// its attempt holds.
 pub(super) struct Refusal<'a> {
-    /// The item's position in the run's queue.
     pub index: usize,
     pub id: &'a str,
     pub kind: &'static str,
-    /// The item's object ID in the run.
     pub slot: &'a str,
-    /// A further object of the attempt the refusal ends, such as its
-    /// Payload or the predecessor it could not retrieve.
     pub consumed: Option<(&'static str, String)>,
-    /// Whether the attempt's one predecessor retrieval is spent.
     pub resolved_prev: bool,
 }
 
-/// Rejects one listed item, records the rejection at the domain's status
-/// endpoint and enters it in the run's report. A second delivery of the
-/// same rejection writes nothing.
 pub(super) fn reject_item(
     db: &Db,
     run: &mut PullRun,
@@ -513,8 +476,8 @@ pub(super) fn reject_item(
     mutation.commit()
 }
 
-/// Puts a retrieved predecessor before the Delta that named it, so the
-/// chain is admitted in order (WIST-2 §5 step 3).
+/// WIST-2 §5 step 3: a retrieved predecessor is admitted before the Delta
+/// that named it.
 pub(super) fn splice_predecessor(
     db: &Db,
     run: &mut PullRun,
@@ -531,8 +494,6 @@ pub(super) fn splice_predecessor(
     mutation.commit()
 }
 
-/// Which reference a Delta attempt was issued with no longer holds at
-/// admission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Staleness {
     Declaration,
@@ -540,19 +501,13 @@ pub(super) enum Staleness {
     Schedule,
 }
 
-/// How a verified Delta's admission ended.
 pub(super) enum Admission {
     Accepted,
-    /// Accepted for sealing under an open recovery window.
     Queued,
-    /// A reference the Delta was verified under changed; nothing was
-    /// written and the attempt is re-issued.
     Stale(Staleness),
-    /// The run already decided this attempt; nothing was written.
     Duplicate,
 }
 
-/// The objects one Delta attempt holds.
 pub(super) struct DeltaItem<'a> {
     pub index: usize,
     pub id: &'a str,
@@ -560,10 +515,9 @@ pub(super) struct DeltaItem<'a> {
     pub payload_slot: Option<&'a str>,
 }
 
-/// Accepts a verified Delta, with its Payload file, after revalidating in
-/// the same transaction the references it was verified under: the
-/// Declaration version, the URL's chain tip and, when an Epoch was sealed
-/// since, the size caps and clock allowance at the attempt's clock.
+/// The references the Delta was verified under are revalidated in the
+/// admitting transaction, the size caps and clock allowance only when an
+/// Epoch was sealed since.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn admit_delta(
     db: &Db,
@@ -628,8 +582,6 @@ pub(super) fn admit_delta(
     Ok(outcome)
 }
 
-/// Re-issues a stale attempt at its position with the references it is
-/// verified under again, and its predecessor retrieval restored.
 pub(super) fn reissue(
     db: &Db,
     run: &PullRun,
@@ -643,21 +595,13 @@ pub(super) fn reissue(
     mutation.commit()
 }
 
-/// How a Label or dispute's admission ended.
 pub(super) enum LabelAdmission {
     Admitted,
     Rejected,
-    /// The Declaration it was validated under changed; nothing was
-    /// written.
     Stale,
-    /// The run already decided this Label; nothing was written.
     Duplicate,
 }
 
-/// Queues a Label or dispute that passed its checks for sealing, or
-/// records its rejection, after revalidating the Declaration version it
-/// was checked under; a dispute is validated here against the sealed
-/// Labels.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn admit_label(
     db: &Db,
@@ -734,10 +678,6 @@ pub(super) fn admit_label(
     Ok(admission)
 }
 
-/// Ends a walk and enters `phase` with the items the walk yielded, in
-/// one transaction. `keep` is how many pages the walk read, beyond which
-/// an earlier walk's pages are dropped; `None` drops the whole cursor,
-/// which the items it fed no longer need.
 pub(super) fn end_walk(
     db: &Db,
     run: &mut PullRun,
@@ -760,10 +700,6 @@ pub(super) fn end_walk(
     mutation.commit()
 }
 
-/// Closes run `run_id`: rebuilds its report from the objects it admitted
-/// and rejected, records whether the walk suspended and, when the pull
-/// ran to its end, the pull instant and WIST-2 §7's noise disposition,
-/// then drops the run's persisted state.
 pub(super) fn close_run(db: &Db, run_id: i64) -> Result<IngestReport> {
     let mutation = db.mutation()?;
     let run = db

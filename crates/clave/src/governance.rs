@@ -35,9 +35,8 @@ fn is_delta_id(id: &str) -> bool {
         .is_some_and(|h| h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
-/// WIST-4 §5.1 and WIST-3 §6.2: queues a `payload_withdrawal` naming a
-/// Delta of `domain` the Log has accepted; the seal checks that the Delta
-/// is sealed at or below the act's Epoch before the act is sealed.
+/// WIST-4 §5.1, WIST-3 §6.2: the seal checks that the Delta is sealed at or
+/// below the act's Epoch before the act is sealed.
 pub fn withdraw(
     db: &Db,
     sk: &SigningKey,
