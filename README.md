@@ -235,7 +235,12 @@ thread and settles it as its own request would have been settled; a
 prefetched file already landed is still processed once the pull's wall
 time is spent, since no request begins it. A pull that ends, suspends
 or fails first joins and settles every prefetch still in flight, so no
-fetch thread outlives the pull and no reservation stays issued. Payloads,
+fetch thread outlives the pull and no reservation stays issued. What a
+suspended pull fetched but had not admitted — the prefetched files it
+never reached and a predecessor chain retrieved up to the limit — is
+settled and debited with its run, whose closure drops the octets, and
+the next pull requests and debits it again; the prefetched share of
+that repetition is at most `prefetch_bytes`. Payloads,
 Label files and pages are fetched on demand.
 
 A fetch connects only to a public unicast address. Loopback addresses are
@@ -666,8 +671,12 @@ read at. Each Delta's persistence is one immediate write transaction that
 first revalidates those references and the URL's chain tip, the caps only
 when an Epoch was sealed since; on any change it writes nothing, and the
 stored Delta and its verified Payload are verified again under fresh
-references at the same clock, so a concurrent seal or admission cannot be
-bypassed. A Label or dispute revalidates its Declaration the same way. Every
+references at the same clock, so an Epoch sealed meanwhile, a recovery
+window another process settled or a concurrent admission cannot be
+bypassed. An amendment sealed after the issue is not effective at the
+issued clock (WIST-4 §5 places `effective_at` at least the grace period
+after its Epoch's `sealed_at`), so an Epoch sealed between issue and
+admission re-issues the attempt at unchanged caps. A Label or dispute revalidates its Declaration the same way. Every
 top-level write transaction begins immediately, taking the write lock
 before its reads.
 
@@ -1586,6 +1595,13 @@ cargo test
 Conformance tests read the spec repo's schemas/vectors from `../spec`
 (sibling checkout) by default, or from `WIST_SPEC_DIR` if set. Building also
 resolves `wist-core` from `../core` — both must be sibling checkouts.
+
+The ingestion fault cases — a worker lost with its pull leased, a
+partition taken over while its pull runs, and a Ping, a seal or a
+recovery settlement landing while a Delta is in flight — are
+`crates/clave/tests/ingestion_faults.rs`, a test binary of its own:
+Cargo runs test binaries one at a time, so their load never runs beside
+the timing-sensitive dispatch tests in `tests/serve.rs`.
 
 ## Known deviations
 

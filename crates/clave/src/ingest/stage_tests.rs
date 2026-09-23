@@ -1523,3 +1523,113 @@ fn a_pull_suspended_with_prefetches_in_flight_joins_and_settles_them_before_it_r
         assert!(log.db.is_delta_seen_for(id, &site.host).unwrap());
     }
 }
+
+#[test]
+fn a_pull_after_a_suspension_requests_and_debits_again_the_prefetched_delta_files_it_never_reached()
+{
+    let site = Site::new();
+    let mut chain = None;
+    for n in 0..11 {
+        chain = Some(site.delta(
+            "https://localhost/chain",
+            "chained",
+            chain.as_deref(),
+            &format!("2026-08-09T10:{n:02}:00Z"),
+        ));
+    }
+    let mut ids = vec![chain.unwrap()];
+    for n in 0..8 {
+        ids.push(site.delta(
+            &format!("https://localhost/{n}"),
+            "listed",
+            None,
+            "2026-08-09T11:00:00Z",
+        ));
+    }
+    site.feed(&ids, NOW, None);
+    let metered = |served: Vec<String>| {
+        served
+            .into_iter()
+            .filter(|path| !path.ends_with("/publisher.json"))
+            .collect::<Vec<_>>()
+    };
+    let octets = |paths: &[String]| -> i64 {
+        paths
+            .iter()
+            .map(|path| {
+                std::fs::metadata(site.dir.path().join(path.trim_start_matches('/')))
+                    .unwrap()
+                    .len() as i64
+            })
+            .sum()
+    };
+
+    let control = Log::onboard(&site);
+    let unit = crate::suffix_list::unit_at(&control.db, &site.host, NOW).unwrap();
+    let spent = |log: &Log| log.db.ingest_bytes(&unit, &NOW[..10]).unwrap();
+    let before = spent(&control);
+    let report = control.pull_with(&site, PREFETCHING).unwrap();
+    assert!(!report.suspended);
+    let uninterrupted = spent(&control) - before;
+
+    let log = Log::onboard(&site);
+    let before = spent(&log);
+    site.origin.take_served();
+    let run_id = log.open_pull(
+        &site,
+        PullLimits {
+            work_objects: 16,
+            ..PREFETCHING
+        },
+    );
+    assert!(log.db.pull_run(run_id).unwrap().unwrap().suspended);
+    let prefetched = ids[1..5]
+        .iter()
+        .map(|id| {
+            log.db
+                .pull_object(run_id, "delta", &format!("{id}#0"))
+                .unwrap()
+                .map(|object| object.status)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        prefetched,
+        [Some(Status::Fetched); 4],
+        "the prefetched Delta files landed and the walk never reached them"
+    );
+    admit::close_run(&log.db, run_id).unwrap();
+    let suspended = metered(site.origin.take_served());
+    let resumed = log.pull_with(&site, PREFETCHING).unwrap();
+    assert!(!resumed.suspended);
+    let later = metered(site.origin.take_served());
+    let interrupted = spent(&log) - before;
+
+    let prefetched: Vec<String> = ids[1..5]
+        .iter()
+        .map(|id| format!("/.well-known/wist/deltas/{}.json", &id[7..]))
+        .collect();
+    for path in &prefetched {
+        assert_eq!(
+            suspended
+                .iter()
+                .chain(&later)
+                .filter(|p| *p == path)
+                .count(),
+            2,
+            "{path} is requested by both pulls"
+        );
+    }
+    let refetched: Vec<String> = suspended
+        .iter()
+        .filter(|path| later.contains(path))
+        .cloned()
+        .collect();
+    assert_eq!(
+        interrupted - uninterrupted,
+        octets(&refetched),
+        "the two pulls are debited the octets of every file the second one requested again beyond one uninterrupted pull"
+    );
+    assert!(prefetched.iter().all(|path| refetched.contains(path)));
+    assert!(octets(&prefetched) <= PREFETCHING.prefetch_bytes as i64);
+    assert_eq!(admitted_state(&log), admitted_state(&control));
+}
