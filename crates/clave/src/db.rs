@@ -1,6 +1,7 @@
 use crate::error::{Error, Result};
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use wist_core::objects::{AggregatorKeyEntry, PublisherState, StatusRejection};
 
@@ -309,6 +310,50 @@ fn exec_set_url_tip(conn: &Connection, url: &str, domain: &str, tip: &str) -> Re
         (url, domain, tip),
     )?;
     Ok(())
+}
+
+fn exec_set_sealed_url_tip(conn: &Connection, url: &str, domain: &str, tip: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO sealed_url_tips(url, domain, tip) VALUES (?1, ?2, ?3) ON CONFLICT(domain, url) DO UPDATE SET tip = excluded.tip",
+        (url, domain, tip),
+    )?;
+    Ok(())
+}
+
+fn epoch_chain_tips(entries: &[Value]) -> Result<Vec<(String, String, String)>> {
+    let mut chains: BTreeMap<(String, String), BTreeMap<String, Option<String>>> = BTreeMap::new();
+    for entry in entries
+        .iter()
+        .filter(|entry| entry["type"] == "publisher_delta")
+    {
+        let body = &entry["body"]["delta"];
+        let unreadable = || Error::Seal("a sealed Delta lacks its publisher or URL".into());
+        let domain = wist_core::delta::publisher(body).map_err(|_| unreadable())?;
+        let url = body["url"]
+            .as_str()
+            .filter(|url| !url.is_empty())
+            .ok_or_else(unreadable)?;
+        let id = wist_core::delta::delta_id(body)?;
+        let prev = body["prev"].as_str().map(str::to_string);
+        let chain = chains.entry((domain.into(), url.into())).or_default();
+        if chain.insert(id, prev).is_some() {
+            return Err(Error::Seal(format!(
+                "the Epoch repeats a Delta of {domain} {url}"
+            )));
+        }
+    }
+    let mut tips = Vec::with_capacity(chains.len());
+    for ((domain, url), chain) in chains {
+        let prevs: BTreeSet<&String> = chain.values().flatten().collect();
+        let mut candidates = chain.keys().filter(|id| !prevs.contains(id));
+        let (Some(tip), None) = (candidates.next(), candidates.next()) else {
+            return Err(Error::Seal(format!(
+                "the Epoch's Deltas for {domain} {url} do not form a single chain"
+            )));
+        };
+        tips.push((domain, url, tip.clone()));
+    }
+    Ok(tips)
 }
 
 fn exec_upsert_record(conn: &Connection, r: &RecordUpsert, sealed_at: &str) -> Result<()> {
@@ -1403,6 +1448,7 @@ impl Db {
                 signers.len()
             )));
         }
+        let chain_tips = epoch_chain_tips(entries)?;
         let tx = self.mutation()?;
         for rowid in sealed_rowids {
             tx.execute("DELETE FROM pending_entries WHERE rowid = ?1", [rowid])?;
@@ -1479,6 +1525,9 @@ impl Db {
         )?;
         for r in records {
             exec_upsert_record(&tx, r, sealed_at)?;
+        }
+        for (domain, url, tip) in &chain_tips {
+            exec_set_sealed_url_tip(&tx, url, domain, tip)?;
         }
         for d in declarations {
             exec_retain_declaration_seq(&tx, d.domain, d.seq)?;
@@ -2027,6 +2076,16 @@ impl Db {
         let mut stmt = self
             .conn
             .prepare("SELECT domain, url, tip FROM url_tips ORDER BY domain, url")?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn list_sealed_url_tips(&self) -> Result<Vec<(String, String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT domain, url, tip FROM sealed_url_tips ORDER BY domain, url")?;
         let rows = stmt
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;

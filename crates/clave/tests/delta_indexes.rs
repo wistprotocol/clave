@@ -38,6 +38,82 @@ impl Fixture {
         seal_fixture_epoch(&self.db, self.directory.path(), height, &at, &entries);
     }
 
+    fn append_unsealable(&self, entries: Vec<Value>) {
+        self.append(
+            entries
+                .iter()
+                .filter(|entry| entry["type"] != "publisher_delta")
+                .cloned()
+                .collect(),
+        );
+        let head = self.db.last_epoch().unwrap().unwrap();
+        let height = head.epoch_number as i64;
+        let mut ordered = entries;
+        wist_core::epoch::sort_entries(&mut ordered).unwrap();
+        let connection = self.connection();
+        let previous: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM log_entries WHERE epoch_number < ?1",
+                [height],
+                |row| row.get(0),
+            )
+            .unwrap();
+        connection
+            .execute("DELETE FROM log_entries WHERE epoch_number = ?1", [height])
+            .unwrap();
+        for (offset, entry) in ordered.iter().enumerate() {
+            connection
+                .execute(
+                    "INSERT INTO log_entries(leaf_index, epoch_number, entry_json) VALUES (?1, ?2, ?3)",
+                    (previous + offset as i64, height, jcs::canonicalize(entry).unwrap()),
+                )
+                .unwrap();
+        }
+        let leaves: Vec<[u8; 32]> = connection
+            .prepare("SELECT entry_json FROM log_entries ORDER BY leaf_index")
+            .unwrap()
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))
+            .unwrap()
+            .map(|bytes| merkle::leaf_hash(&bytes.unwrap()))
+            .collect();
+        let tiles = wist_core::tiles::TileSet::build(&leaves);
+        connection.execute("DELETE FROM log_tiles", []).unwrap();
+        for tile in wist_core::tiles::required_tiles(leaves.len() as u64) {
+            connection
+                .execute(
+                    "INSERT INTO log_tiles(level, tile_index, hashes) VALUES (?1, ?2, ?3)",
+                    (
+                        i64::from(tile.level),
+                        tile.index as i64,
+                        wist_core::tiles::encode_tile(tiles.tile(tile.level, tile.index).unwrap()),
+                    ),
+                )
+                .unwrap();
+        }
+        let anchor = clave::history::anchor(self.directory.path()).unwrap();
+        let mut checkpoint = wist_core::checkpoint::Checkpoint::new(
+            &anchor.log_id,
+            leaves.len() as u64,
+            merkle::merkle_root(&leaves),
+            head.epoch_number,
+            &head.sealed_at,
+        )
+        .unwrap();
+        checkpoint.sign(&clave::keys::load(&self.directory.path().join("keys/seed")).unwrap());
+        connection
+            .execute(
+                "UPDATE epochs SET tree_size = ?1, root = ?2, note = ?3, epoch_bytes = ?4 WHERE epoch_number = ?5",
+                (
+                    leaves.len() as i64,
+                    checkpoint.root_token(),
+                    checkpoint.encode(),
+                    wist_core::epoch::epoch_octets(&ordered).unwrap() as i64,
+                    height,
+                ),
+            )
+            .unwrap();
+    }
+
     fn legacy(&self) {
         self.connection()
             .execute_batch("DROP TABLE delta_index_reconciliation;")
@@ -305,7 +381,7 @@ fn log_signature_does_not_authorize_a_forged_delta_or_wrong_scope() {
         if fault == "duplicate" {
             entries.push(entry(body));
         }
-        f.append(entries);
+        f.append_unsealable(entries);
         f.db.insert_seen_delta("residue", &publisher.domain)
             .unwrap();
         f.legacy();
@@ -836,4 +912,131 @@ fn observation_history_stays_with_its_publisher_through_identity_reset() {
             assert!(f.reopen().err().unwrap().to_string().contains("WIST1-E07"));
         }
     }
+}
+
+#[test]
+fn reopening_a_store_without_sealed_tips_backfills_them_from_the_log() {
+    let f = Fixture::new();
+    let publisher = make_publisher("example.com");
+    let url = "https://example.com/";
+    let (first, first_body) = delta(&publisher, url, "first", None);
+    let (second, second_body) = delta(&publisher, url, "second", Some(&first));
+    f.append(vec![declaration(&publisher), entry(first_body)]);
+    f.append(vec![entry(second_body)]);
+    let (third, third_body) = delta(&publisher, url, "third", Some(&second));
+    f.db.record_accepted_delta(&publisher.domain, &third, &third_body, 0, url, &third)
+        .unwrap();
+    f.connection()
+        .execute_batch("DROP TABLE sealed_url_tips;")
+        .unwrap();
+    for _ in 0..2 {
+        let db = f.reopen().unwrap();
+        assert_eq!(
+            db.list_sealed_url_tips().unwrap(),
+            vec![(publisher.domain.clone(), url.to_string(), second.clone())]
+        );
+        assert_eq!(
+            db.url_tip(&publisher.domain, url).unwrap(),
+            Some(third.clone())
+        );
+    }
+}
+
+#[test]
+fn sealing_records_the_chain_tip_whatever_the_entry_order() {
+    let f = Fixture::new();
+    let publisher = make_publisher("example.com");
+    let url = "https://example.com/";
+    let (first, first_body) = delta(&publisher, url, "first", None);
+    let (second, second_body) = (0..100)
+        .map(|n| delta(&publisher, url, &format!("second {n}"), Some(&first)))
+        .find(|(_, body)| {
+            merkle::leaf_hash(&jcs::canonicalize(&entry(body.clone())).unwrap())
+                < merkle::leaf_hash(&jcs::canonicalize(&entry(first_body.clone())).unwrap())
+        })
+        .expect("a successor stored before its predecessor");
+    f.append(vec![
+        declaration(&publisher),
+        entry(first_body),
+        entry(second_body),
+    ]);
+    assert_eq!(
+        f.db.list_sealed_url_tips().unwrap(),
+        vec![(publisher.domain.clone(), url.to_string(), second)]
+    );
+}
+
+#[test]
+fn sealing_a_forked_or_repeated_chain_is_refused() {
+    for fault in ["fork", "duplicate"] {
+        let f = Fixture::new();
+        let publisher = make_publisher("example.com");
+        let url = "https://example.com/";
+        let (_, body) = delta(&publisher, url, "root", None);
+        let extra = if fault == "fork" {
+            delta(&publisher, url, "fork", None).1
+        } else {
+            body.clone()
+        };
+        let mut entries = vec![declaration(&publisher), entry(body), entry(extra)];
+        wist_core::epoch::sort_entries(&mut entries).unwrap();
+        let sk = clave::keys::load(&f.directory.path().join("keys/seed")).unwrap();
+        let anchor = clave::history::anchor(f.directory.path()).unwrap();
+        let height =
+            f.db.last_epoch()
+                .unwrap()
+                .map_or(0, |head| head.epoch_number + 1);
+        let at = jiff::Timestamp::from_second(START + height as i64 * 3600)
+            .unwrap()
+            .to_string();
+        let result = f.db.commit_seal(
+            &sk,
+            &anchor.log_id,
+            &[],
+            height,
+            &at,
+            &entries,
+            wist_core::epoch::epoch_octets(&entries).unwrap(),
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        assert!(
+            matches!(result, Err(clave::Error::Seal(_))),
+            "{fault}: {:?}",
+            result.map(|row| row.epoch_number)
+        );
+        assert_eq!(
+            f.db.last_epoch().unwrap().map(|head| head.epoch_number),
+            height.checked_sub(1),
+            "{fault}"
+        );
+        assert!(f.db.list_sealed_url_tips().unwrap().is_empty(), "{fault}");
+    }
+}
+
+#[test]
+fn a_rewritten_fixture_epoch_of_valid_entries_restores() {
+    let f = Fixture::new();
+    let publisher = make_publisher("example.com");
+    let url = "https://example.com/";
+    let (id, body) = delta(&publisher, url, "root", None);
+    f.append_unsealable(vec![declaration(&publisher), entry(body)]);
+    f.connection()
+        .execute_batch("DELETE FROM seen_deltas; DELETE FROM url_tips;")
+        .unwrap();
+    f.legacy();
+    let db = f.reopen().unwrap();
+    assert_eq!(
+        db.url_tip(&publisher.domain, url).unwrap(),
+        Some(id.clone())
+    );
+    assert_eq!(
+        db.list_sealed_url_tips().unwrap(),
+        vec![(publisher.domain.clone(), url.to_string(), id)]
+    );
 }

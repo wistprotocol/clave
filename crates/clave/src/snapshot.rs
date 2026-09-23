@@ -426,7 +426,7 @@ struct ReadState {
     head: EpochRow,
     signer: (String, SigningKey),
     records: Vec<RecordRow>,
-    url_tips: Vec<(String, String, String)>,
+    sealed_tips: Vec<(String, String, String)>,
     withdrawals: Vec<WithdrawalState>,
     parameters: Vec<(String, i64, String)>,
     suffix_list: Option<(String, u64)>,
@@ -466,7 +466,7 @@ fn read_state(db: &Db, data_dir: &Path, head: EpochRow) -> Result<ReadState> {
     Ok(ReadState {
         signer: crate::keys::head_signer(data_dir, db)?,
         records,
-        url_tips: db.list_url_tips()?,
+        sealed_tips: db.list_sealed_url_tips()?,
         parameters: db.parameter_state(&head.sealed_at)?,
         suffix_list: db.suffix_list_at_epoch(head.epoch_number)?,
         labels,
@@ -550,10 +550,10 @@ fn build_state(read: &ReadState) -> Result<(SnapshotState, String)> {
             sealing_height: *sealing_height,
         }));
     }
-    // WIST-3 §7: a `record` tuple exists for every key the chain-tip
-    // table holds, a deleted URL included — a chain never restarts, so a
-    // resuming Consumer needs the tip to reject a fork of it.
-    for (publisher, url, tip) in &read.url_tips {
+    // WIST-3 §7: a `record` tuple carries the newest sealed Delta of each
+    // chain at `tree_size`, a deleted URL included; admitted but unsealed
+    // Deltas are not part of the state.
+    for (publisher, url, tip) in &read.sealed_tips {
         entries.push(StateEntry::Record(RecordEntry {
             publisher: publisher.clone(),
             url: url.clone(),

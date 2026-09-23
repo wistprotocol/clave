@@ -35,6 +35,11 @@ impl Db {
                 indexes.apply(&epoch, &declarations)?;
             }
         }
+        let sealed_tips: Vec<((String, String), String)> = indexes
+            .tips
+            .iter()
+            .map(|(pair, tip)| (pair.clone(), tip.id.clone()))
+            .collect();
         let mut statement = tx.prepare(
             "SELECT domain, entry_json, acceptance_order, NULL, NULL FROM pending_entries WHERE entry_type = 'publisher_delta' UNION ALL SELECT domain, entry_json, acceptance_order, delta_id, url FROM queued_deltas ORDER BY acceptance_order",
         )?;
@@ -62,12 +67,17 @@ impl Db {
         }
         drop(rows);
         drop(statement);
-        tx.execute_batch("DELETE FROM seen_deltas; DELETE FROM url_tips;")?;
+        tx.execute_batch(
+            "DELETE FROM seen_deltas; DELETE FROM url_tips; DELETE FROM sealed_url_tips;",
+        )?;
         for (id, domain) in indexes.seen {
             super::exec_insert_seen_delta(&tx, &id, &domain)?;
         }
         for ((domain, url), tip) in indexes.tips {
             super::exec_set_url_tip(&tx, &url, &domain, &tip.id)?;
+        }
+        for ((domain, url), tip) in sealed_tips {
+            super::exec_set_sealed_url_tip(&tx, &url, &domain, &tip)?;
         }
         tx.execute("INSERT INTO delta_index_reconciliation VALUES (1)", [])?;
         tx.commit()?;

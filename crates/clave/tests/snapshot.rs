@@ -485,3 +485,77 @@ fn the_state_artifact_carries_every_kind_with_live_instances() {
         .unwrap()
         .is_none());
 }
+
+fn record_tips(data: &std::path::Path, at: i64) -> Vec<(String, String)> {
+    let date = &jiff::Timestamp::from_second(at).unwrap().to_string()[..10];
+    let state_env: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(data.join(format!("snapshots/{date}/state.json"))).unwrap(),
+    )
+    .unwrap();
+    let state: wist_core::objects::SnapshotState =
+        serde_json::from_value(state_env["state"].clone()).unwrap();
+    state
+        .entries
+        .iter()
+        .filter_map(|e| match e {
+            StateEntry::Record(r) => Some((r.url.clone(), r.delta_id.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_snapshot_names_the_sealed_chain_tip_not_the_admitted_one() {
+    let (listener, host, client) = reserve_addr();
+    let p = make_publisher_with_scope(&host, &["example.com"]);
+    let url = "https://example.com/page";
+    let unsealed_url = "https://example.com/unsealed";
+    let first = add_delta(&p, url, "first body", None);
+    write_feed(
+        &p,
+        &host,
+        std::slice::from_ref(&first),
+        "2026-08-09T12:00:00Z",
+    );
+    serve_static(listener, p.dir.path().to_path_buf());
+
+    let data = tempfile::tempdir().unwrap();
+    clave::init::run(&host, data.path()).unwrap();
+    let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
+    db.set_param("epoch_cadence_seconds", 1).unwrap();
+    clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
+    let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
+    clave::seal::run(&db, data.path(), &sk, SEAL_START).unwrap();
+
+    let second = add_delta(&p, url, "second body", Some(&first));
+    let orphan = add_delta(&p, unsealed_url, "unsealed body", None);
+    write_feed(
+        &p,
+        &host,
+        &[first.clone(), second.clone(), orphan.clone()],
+        "2026-08-09T13:00:00Z",
+    );
+    let report =
+        clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T13:00:00Z").unwrap();
+    assert!(report.accepted.contains(&second), "{report:?}");
+    assert!(report.accepted.contains(&orphan), "{report:?}");
+    assert_eq!(db.url_tip(&host, url).unwrap(), Some(second.clone()));
+    assert_eq!(
+        db.url_tip(&host, unsealed_url).unwrap(),
+        Some(orphan.clone())
+    );
+
+    clave::snapshot::produce(&data.path().join("clave.sqlite"), data.path()).unwrap();
+    let tips = record_tips(data.path(), SEAL_START);
+    assert_eq!(tips, vec![(url.to_string(), first.clone())]);
+
+    clave::seal::run(&db, data.path(), &sk, SEAL_START + 3600).unwrap();
+    clave::snapshot::produce(&data.path().join("clave.sqlite"), data.path()).unwrap();
+    let tips = record_tips(data.path(), SEAL_START + 3600);
+    assert!(tips.contains(&(url.to_string(), second)), "{tips:?}");
+    assert!(
+        tips.contains(&(unsealed_url.to_string(), orphan)),
+        "{tips:?}"
+    );
+    assert_eq!(tips.len(), 2, "{tips:?}");
+}

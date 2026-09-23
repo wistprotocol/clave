@@ -5,6 +5,7 @@ use rusqlite::{Connection, OptionalExtension};
 /// Each migration is idempotent on a current store.
 pub(super) fn migrate(conn: &Connection) -> Result<()> {
     refuse_superseded_layout(conn)?;
+    reconcile_for_sealed_tips(conn)?;
     conn.execute_batch(SCHEMA)?;
     super::leases::create(conn)?;
     super::pull_runs::create(conn)?;
@@ -52,6 +53,20 @@ fn refuse_superseded_layout(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn reconcile_for_sealed_tips(conn: &Connection) -> Result<()> {
+    let table_exists = |name: &str| -> Result<bool> {
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            [name],
+            |row| row.get(0),
+        )?)
+    };
+    if !table_exists("sealed_url_tips")? && table_exists("delta_index_reconciliation")? {
+        conn.execute("DELETE FROM delta_index_reconciliation", [])?;
+    }
+    Ok(())
+}
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS publishers(domain TEXT PRIMARY KEY, declaration_json BLOB NOT NULL, key_id TEXT NOT NULL, public_key TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'new', last_pull_at TEXT, declaration_fetched_at TEXT);
 CREATE TABLE IF NOT EXISTS declaration_floors(domain TEXT PRIMARY KEY, seq INTEGER NOT NULL CHECK(typeof(seq) = 'integer' AND seq BETWEEN 0 AND 9007199254740991));
@@ -67,6 +82,7 @@ CREATE TABLE IF NOT EXISTS aggregator_keys(note_key_id TEXT PRIMARY KEY, key_id 
 CREATE TABLE IF NOT EXISTS rejections(domain TEXT NOT NULL, code TEXT NOT NULL, at TEXT NOT NULL, delta_id TEXT, detail TEXT);
 CREATE TABLE IF NOT EXISTS params(name TEXT PRIMARY KEY, value INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS url_tips(url TEXT NOT NULL, domain TEXT NOT NULL, tip TEXT NOT NULL, PRIMARY KEY(domain, url));
+CREATE TABLE IF NOT EXISTS sealed_url_tips(url TEXT NOT NULL, domain TEXT NOT NULL, tip TEXT NOT NULL, PRIMARY KEY(domain, url));
 CREATE TABLE IF NOT EXISTS param_changes(parameter TEXT NOT NULL, value INTEGER NOT NULL, effective_at TEXT NOT NULL, epoch_number INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS noise_pings(domain TEXT NOT NULL, day TEXT NOT NULL, count INTEGER NOT NULL, PRIMARY KEY(domain, day));
 CREATE TABLE IF NOT EXISTS ingest_meter(domain TEXT NOT NULL, day TEXT NOT NULL, bytes INTEGER NOT NULL, PRIMARY KEY(domain, day));
