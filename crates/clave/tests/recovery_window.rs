@@ -365,6 +365,7 @@ fn recovery_flow_queues_settles_and_rejects_superseded_deltas() {
     assert_eq!(r.db.count_pending_entries("registry_update").unwrap(), 0);
 
     let sealed_at_b1 = jiff::Timestamp::from_second(T0 + 7200).unwrap().to_string();
+    clave::snapshot::produce(&r.data.path().join("clave.sqlite"), r.data.path()).unwrap();
     let state_raw = std::fs::read(
         r.data
             .path()

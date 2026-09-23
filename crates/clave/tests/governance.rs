@@ -51,6 +51,8 @@ fn payload_withdrawal_removes_payload_record_and_stale_snapshots() {
     let r = rig(&["https://example.com/a"]);
     let id = &r.ids[0];
     clave::seal::run(&r.db, r.data.path(), &r.sk, NOW).unwrap();
+    let db_path = r.data.path().join("clave.sqlite");
+    clave::snapshot::produce(&db_path, r.data.path()).unwrap();
 
     let hex = id.strip_prefix("sha256:").unwrap();
     let payload_path = r.data.path().join("payloads").join(format!("{hex}.json"));
@@ -88,22 +90,29 @@ fn payload_withdrawal_removes_payload_record_and_stale_snapshots() {
         !first_snapshot_dir.exists(),
         "snapshot containing withdrawn content must stop being served"
     );
+    let listed = |data: &std::path::Path| -> Vec<String> {
+        let index: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(data.join("snapshots/index.json")).unwrap())
+                .unwrap();
+        index["index"]["snapshots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["snapshot_date"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert!(listed(r.data.path()).is_empty());
+    clave::snapshot::produce(&db_path, r.data.path()).unwrap();
     let new_snapshot_dir = r
         .data
         .path()
         .join("snapshots")
         .join(&ts(NOW + 2 * DAY)[..10]);
     assert!(new_snapshot_dir.exists());
-    let index: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(r.data.path().join("snapshots/index.json")).unwrap())
-            .unwrap();
-    let dates: Vec<&str> = index["index"]["snapshots"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|e| e["snapshot_date"].as_str().unwrap())
-        .collect();
-    assert_eq!(dates, vec![&ts(NOW + 2 * DAY)[..10]]);
+    assert_eq!(
+        listed(r.data.path()),
+        vec![ts(NOW + 2 * DAY)[..10].to_string()]
+    );
 }
 
 #[test]

@@ -111,6 +111,7 @@ fn snapshot_state_carries_amended_parameters_with_their_effective_instant() {
     clave::param_change::run(&db, &sk, "feed_window", 500, Some(&effective_at), NOW).unwrap();
     clave::seal::run(&db, data.path(), &sk, NOW).unwrap();
     clave::seal::run(&db, data.path(), &sk, NOW + 7 * DAY).unwrap();
+    clave::snapshot::produce(&data.path().join("clave.sqlite"), data.path()).unwrap();
 
     let snapdir = std::fs::read_dir(data.path().join("snapshots"))
         .unwrap()

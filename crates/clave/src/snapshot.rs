@@ -1,11 +1,11 @@
-use crate::db::{Db, RecordRow};
+use crate::db::{Db, EpochRow, RecordRow, WithdrawalState};
 use crate::error::{Error, Result};
-use crate::history::declarations::Domain;
+use crate::history::declarations::{Declarations, DeclarationsReplay};
 use crate::WIST_VERSION;
 use rusqlite::Connection;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use wist_core::crypto::{hex_encode, SigningKey};
 use wist_core::envelope::sign_envelope;
@@ -38,16 +38,26 @@ struct Tier1Row {
     links: Vec<String>,
 }
 
-fn load_tier1_rows(data_dir: &Path, records: &[RecordRow]) -> Vec<Tier1Row> {
+/// WIST-3 §7: a party missing a Payload that was never withdrawn reports
+/// that rather than emit a Snapshot silently missing a record.
+fn load_tier1_rows(data_dir: &Path, records: &[&RecordRow]) -> Result<Vec<Tier1Row>> {
     let mut rows = Vec::with_capacity(records.len());
     for r in records {
         let hex = r.delta_id.strip_prefix("sha256:").unwrap_or(&r.delta_id);
-        let Ok(bytes) = std::fs::read(data_dir.join("payloads").join(format!("{hex}.json"))) else {
-            continue;
-        };
-        let Ok(payload) = crate::json::parse(&bytes) else {
-            continue;
-        };
+        let bytes = std::fs::read(data_dir.join("payloads").join(format!("{hex}.json"))).map_err(
+            |error| {
+                Error::Snapshot(format!(
+                    "the Payload of live record {} cannot be read: {error}",
+                    r.delta_id
+                ))
+            },
+        )?;
+        let payload: Value = crate::json::parse(&bytes).map_err(|error| {
+            Error::Snapshot(format!(
+                "the Payload of live record {} does not parse: {error}",
+                r.delta_id
+            ))
+        })?;
         let extract = payload["content"]["extract"]
             .as_str()
             .unwrap_or_default()
@@ -68,7 +78,7 @@ fn load_tier1_rows(data_dir: &Path, records: &[RecordRow]) -> Vec<Tier1Row> {
             links,
         });
     }
-    rows
+    Ok(rows)
 }
 
 fn write_parquet_strings(
@@ -350,7 +360,7 @@ fn record_projection(r: &RecordRow) -> Value {
     })
 }
 
-fn build_tier0(dir: &Path, records: &[RecordRow]) -> Result<Vec<u8>> {
+fn build_tier0(dir: &Path, records: &[&RecordRow]) -> Result<Vec<u8>> {
     std::fs::create_dir_all(dir)?;
     let sqlite_path = dir.join("index.sqlite");
     if sqlite_path.exists() {
@@ -372,23 +382,35 @@ fn build_tier0(dir: &Path, records: &[RecordRow]) -> Result<Vec<u8>> {
     Ok(std::fs::read(&sqlite_path)?)
 }
 
-fn build_state(
-    db: &Db,
-    data_dir: &Path,
-    epoch_number: u64,
-    tree_size: u64,
-    records: &[RecordRow],
-    domains: &BTreeMap<String, Domain>,
-) -> Result<(SnapshotState, String)> {
-    let head_sealed_at = db
-        .last_epoch()?
-        .map(|b| b.sealed_at)
-        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
+struct ReadState {
+    head: EpochRow,
+    signer: (String, SigningKey),
+    records: Vec<RecordRow>,
+    url_tips: Vec<(String, String, String)>,
+    withdrawals: Vec<WithdrawalState>,
+    parameters: Vec<(String, i64, String)>,
+    suffix_list: Option<(String, u64)>,
+    labels: Vec<LabelEntry>,
+    disputes: Vec<DisputeEntry>,
+    labelers: Vec<LabelerRow>,
+    key_entries: Vec<AggregatorKeyEntry>,
+    shard_count: u64,
+    declarations: Declarations,
+}
 
-    let mut entries = Vec::with_capacity(2 + domains.len() + records.len());
-    // WIST-3 §7: one `aggregator_key` tuple per admitted key, removed keys
-    // included, so a resuming Consumer judges a Checkpoint at or below the
-    // Snapshot under the keys valid at its height (§3.4).
+fn read_state(db: &Db, data_dir: &Path, head: EpochRow) -> Result<ReadState> {
+    let withdrawals = db.withdrawal_state()?;
+    let withdrawn: HashSet<&str> = withdrawals
+        .iter()
+        .map(|(delta_id, _, _)| delta_id.as_str())
+        .collect();
+    let live: Vec<RecordRow> = db
+        .list_records()?
+        .into_iter()
+        .filter(|record| !withdrawn.contains(record.delta_id.as_str()))
+        .collect();
+    let records = prefer_one_publisher(db, live)?;
+    let (labels, disputes, labelers) = label_state(db, &head.sealed_at)?;
     let mut key_entries = db.aggregator_key_entries()?;
     if key_entries.is_empty() {
         let anchor = crate::history::anchor(data_dir)?;
@@ -401,23 +423,50 @@ fn build_state(
             removing_act: None,
         });
     }
-    entries.extend(key_entries.into_iter().map(StateEntry::AggregatorKey));
-    for (name, value, effective_at) in db.parameter_state(&head_sealed_at)? {
+    Ok(ReadState {
+        signer: crate::keys::head_signer(data_dir, db)?,
+        records,
+        url_tips: db.list_url_tips()?,
+        parameters: db.parameter_state(&head.sealed_at)?,
+        suffix_list: db.suffix_list_at_epoch(head.epoch_number)?,
+        labels,
+        disputes,
+        labelers,
+        key_entries,
+        shard_count: db.param("snapshot_shard_count").unwrap_or(1).max(1) as u64,
+        declarations: Declarations::reconstruct(db, data_dir, Some(head.clone()))?,
+        withdrawals,
+        head,
+    })
+}
+
+fn build_state(read: &ReadState) -> Result<(SnapshotState, String)> {
+    let domains = read.declarations.domains();
+    let mut entries = Vec::with_capacity(2 + domains.len() + read.records.len());
+    // WIST-3 §7: one `aggregator_key` tuple per admitted key, removed keys
+    // included, so a resuming Consumer judges a Checkpoint at or below the
+    // Snapshot under the keys valid at its height (§3.4).
+    entries.extend(
+        read.key_entries
+            .iter()
+            .cloned()
+            .map(StateEntry::AggregatorKey),
+    );
+    for (name, value, effective_at) in &read.parameters {
         entries.push(StateEntry::Parameter(ParameterEntry {
-            name,
-            effective_at,
-            value,
+            name: name.clone(),
+            effective_at: effective_at.clone(),
+            value: *value,
         }));
     }
-    if let Some((identifier, sealing_height)) = db.suffix_list_at_epoch(epoch_number)? {
+    if let Some((identifier, sealing_height)) = &read.suffix_list {
         entries.push(StateEntry::SuffixList(SuffixListEntry {
-            identifier,
-            sealing_height,
+            identifier: identifier.clone(),
+            sealing_height: *sealing_height,
         }));
     }
-    let (labels, disputes, _) = label_state(db, &head_sealed_at)?;
-    entries.extend(labels.into_iter().map(StateEntry::Label));
-    entries.extend(disputes.into_iter().map(StateEntry::Dispute));
+    entries.extend(read.labels.iter().cloned().map(StateEntry::Label));
+    entries.extend(read.disputes.iter().cloned().map(StateEntry::Dispute));
     for (domain, state) in domains {
         let current = state.current();
         entries.push(StateEntry::Declaration(DeclarationEntry {
@@ -454,21 +503,21 @@ fn build_state(
             head_height: window.head().position().epoch_number,
         }));
     }
-    for (delta_id, publisher, sealing_height) in db.withdrawal_state()? {
+    for (delta_id, publisher, sealing_height) in &read.withdrawals {
         entries.push(StateEntry::Withdrawal(WithdrawalEntry {
-            delta_id,
-            publisher,
-            sealing_height,
+            delta_id: delta_id.clone(),
+            publisher: publisher.clone(),
+            sealing_height: *sealing_height,
         }));
     }
     // WIST-3 §7: a `record` tuple exists for every key the chain-tip
     // table holds, a deleted URL included — a chain never restarts, so a
     // resuming Consumer needs the tip to reject a fork of it.
-    for (publisher, url, tip) in db.list_url_tips()? {
+    for (publisher, url, tip) in &read.url_tips {
         entries.push(StateEntry::Record(RecordEntry {
-            publisher,
-            url,
-            delta_id: tip,
+            publisher: publisher.clone(),
+            url: url.clone(),
+            delta_id: tip.clone(),
         }));
     }
 
@@ -481,59 +530,84 @@ fn build_state(
     Ok((
         SnapshotState {
             wist_version: WIST_VERSION.to_string(),
-            tree_size,
+            tree_size: read.head.tree_size,
             entries,
         },
         digest,
     ))
 }
 
-fn update_index(
-    data_dir: &Path,
-    snapshot_date: &str,
-    tree_size: u64,
-    content_digest_value: &str,
-    key_id: &str,
-    sk: &SigningKey,
-) -> Result<()> {
-    let index_path = data_dir.join("snapshots/index.json");
-    let mut snapshots = if index_path.exists() {
-        let bytes = std::fs::read(&index_path)?;
-        let doc: Value = crate::json::parse(&bytes)?;
-        let inner = doc
-            .get("index")
-            .cloned()
-            .ok_or_else(|| Error::Snapshot("existing index.json missing 'index'".into()))?;
-        let index: SnapshotIndex = serde_json::from_value(inner)?;
-        index.snapshots
-    } else {
-        Vec::new()
-    };
-    snapshots.retain(|e| e.snapshot_date != snapshot_date);
-    snapshots.push(SnapshotIndexEntry {
-        snapshot_date: snapshot_date.to_string(),
-        tree_size,
-        manifest_url: format!("/snapshots/{snapshot_date}/manifest.json"),
-        content_digest: content_digest_value.to_string(),
-    });
-    snapshots.sort_by(|a, b| b.snapshot_date.cmp(&a.snapshot_date));
+fn served_manifest(directory: &Path) -> Option<SnapshotManifest> {
+    let bytes = std::fs::read(directory.join("manifest.json")).ok()?;
+    let document: Value = crate::json::parse(&bytes).ok()?;
+    let manifest: SnapshotManifest =
+        serde_json::from_value(document.get("manifest")?.clone()).ok()?;
+    let named = directory.file_name().and_then(|name| name.to_str());
+    (named == Some(manifest.snapshot_date.as_str())).then_some(manifest)
+}
 
+fn served_entries(data_dir: &Path) -> Result<Vec<SnapshotIndexEntry>> {
+    let mut snapshots = Vec::new();
+    for directory in snapshot_directories(data_dir) {
+        let Some(manifest) = served_manifest(&directory) else {
+            std::fs::remove_dir_all(&directory)?;
+            continue;
+        };
+        snapshots.push(SnapshotIndexEntry {
+            manifest_url: format!("/snapshots/{}/manifest.json", manifest.snapshot_date),
+            snapshot_date: manifest.snapshot_date,
+            tree_size: manifest.tree_size,
+            content_digest: manifest.content_digest,
+        });
+    }
+    snapshots.sort_by(|a, b| b.snapshot_date.cmp(&a.snapshot_date));
+    Ok(snapshots)
+}
+
+fn index_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("snapshots/index.json")
+}
+
+fn listed_entries(data_dir: &Path) -> Option<Vec<SnapshotIndexEntry>> {
+    let document = served_document(&index_path(data_dir)).ok()??;
+    let index: SnapshotIndex = serde_json::from_value(document.get("index")?.clone()).ok()?;
+    Some(index.snapshots)
+}
+
+fn same_entries(listed: &[SnapshotIndexEntry], served: &[SnapshotIndexEntry]) -> bool {
+    let values = |entries: &[SnapshotIndexEntry]| -> Vec<Option<Value>> {
+        entries
+            .iter()
+            .map(|entry| serde_json::to_value(entry).ok())
+            .collect()
+    };
+    values(listed) == values(served)
+}
+
+/// WIST-3 §6: the index lists exactly the Snapshots served, so an entry
+/// leaves it when its Snapshot stops being served.
+fn regenerate_index(db: &Db, data_dir: &Path, always: bool) -> Result<()> {
+    let snapshots = served_entries(data_dir)?;
+    if !always {
+        let unchanged = match listed_entries(data_dir) {
+            Some(listed) => same_entries(&listed, &snapshots),
+            None => snapshots.is_empty() && !index_path(data_dir).exists(),
+        };
+        if unchanged {
+            return Ok(());
+        }
+    }
     let updated_at = jiff::Timestamp::from_second(jiff::Timestamp::now().as_second())
         .map_err(|_| Error::Snapshot("current time out of range".into()))?
         .to_string();
-
     let index = SnapshotIndex {
         wist_version: WIST_VERSION.to_string(),
         updated_at,
         snapshots,
     };
-    let index_value = serde_json::to_value(&index)?;
-    let envelope = sign_envelope(&index_value, "index", key_id, sk)?;
-    if let Some(parent) = index_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&index_path, serde_json::to_vec(&envelope)?)?;
-    Ok(())
+    let (key_id, sk) = crate::keys::head_signer(data_dir, db)?;
+    let envelope = sign_envelope(&serde_json::to_value(&index)?, "index", &key_id, &sk)?;
+    crate::publication::write_durable(&index_path(data_dir), &serde_json::to_vec(&envelope)?)
 }
 
 fn snapshot_directories(data_dir: &Path) -> Vec<PathBuf> {
@@ -711,61 +785,50 @@ fn prefer_one_publisher(db: &Db, records: Vec<RecordRow>) -> Result<Vec<RecordRo
         .collect())
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn build(
-    db: &Db,
+fn build_staged(
+    read: &ReadState,
     data_dir: &Path,
-    epoch_number: u64,
-    tree_size: u64,
-    root_hash: &str,
+    staged: &Path,
     snapshot_date: &str,
-    domains: &BTreeMap<String, Domain>,
 ) -> Result<()> {
-    let (key_id, sk) = crate::keys::head_signer(data_dir, db)?;
-    let sk = &sk;
-    let records = prefer_one_publisher(db, db.list_records()?)?;
-    let snapshot_dir = data_dir.join("snapshots").join(snapshot_date);
-
-    let shard_count = db.param("snapshot_shard_count").unwrap_or(1).max(1) as u64;
+    let (key_id, sk) = (&read.signer.0, &read.signer.1);
+    let shard_count = read.shard_count;
     let sharded = shard_count > 1;
-    let mut partitions: Vec<Vec<RecordRow>> = (0..shard_count).map(|_| Vec::new()).collect();
-    let mut whole_projection = Vec::with_capacity(records.len());
-    for r in records {
-        whole_projection.push(record_projection(&r));
+    let mut partitions: Vec<Vec<&RecordRow>> = (0..shard_count).map(|_| Vec::new()).collect();
+    let mut whole_projection = Vec::with_capacity(read.records.len());
+    for r in &read.records {
+        whole_projection.push(record_projection(r));
         partitions[shard_index(&r.publisher, shard_count) as usize].push(r);
     }
     let content_digest_value = content_digest(&whole_projection)?;
 
-    let head_sealed_at = db
-        .last_epoch()?
-        .map(|b| b.sealed_at)
-        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
-    let (label_rows, dispute_rows, labeler_rows) = label_state(db, &head_sealed_at)?;
     let mut files = Vec::new();
     let mut shard_digests = Vec::new();
-    let mut all_records = Vec::new();
     for (i, shard_records) in partitions.into_iter().enumerate() {
         let (prefix, shard_field) = if sharded {
             (format!("shard-{i}/"), Some(i as u64))
         } else {
             (String::new(), None)
         };
-        let shard_base = snapshot_dir.join(prefix.trim_end_matches('/'));
+        let shard_base = staged.join(prefix.trim_end_matches('/'));
         let sqlite_bytes = build_tier0(&shard_base.join("tier0"), &shard_records)?;
-        let tier1_rows = load_tier1_rows(data_dir, &shard_records);
+        let tier1_rows = load_tier1_rows(data_dir, &shard_records)?;
         let (extracts_bytes, links_bytes) = build_tier1(&shard_base.join("tier1"), &tier1_rows)?;
         let in_shard = |domain: &str| !sharded || shard_index(domain, shard_count) as usize == i;
-        let shard_labels: Vec<LabelEntry> = label_rows
+        let shard_labels: Vec<LabelEntry> = read
+            .labels
             .iter()
             .filter(|l| in_shard(&l.labeler))
             .cloned()
             .collect();
-        let shard_disputes: Vec<DisputeEntry> = dispute_rows
+        let shard_disputes: Vec<DisputeEntry> = read
+            .disputes
             .iter()
             .filter(|d| in_shard(&d.disputant))
             .cloned()
             .collect();
-        let shard_labelers: Vec<LabelerRow> = labeler_rows
+        let shard_labelers: Vec<LabelerRow> = read
+            .labelers
             .iter()
             .filter(|r| in_shard(&r.labeler))
             .cloned()
@@ -793,27 +856,25 @@ pub fn build(
             });
         }
         if sharded {
-            let projection: Vec<Value> = shard_records.iter().map(record_projection).collect();
+            let projection: Vec<Value> =
+                shard_records.iter().map(|r| record_projection(r)).collect();
             shard_digests.push(content_digest(&projection)?);
         }
-        all_records.extend(shard_records);
     }
-    let records = all_records;
 
-    let (state, state_digest_value) =
-        build_state(db, data_dir, epoch_number, tree_size, &records, domains)?;
+    let (state, state_digest_value) = build_state(read)?;
     let state_value = serde_json::to_value(&state)?;
-    let state_envelope = sign_envelope(&state_value, "state", &key_id, sk)?;
+    let state_envelope = sign_envelope(&state_value, "state", key_id, sk)?;
     let state_bytes = serde_json::to_vec(&state_envelope)?;
-    std::fs::write(snapshot_dir.join("state.json"), &state_bytes)?;
+    std::fs::write(staged.join("state.json"), &state_bytes)?;
 
     let manifest = SnapshotManifest {
         wist_version: WIST_VERSION.to_string(),
         snapshot_date: snapshot_date.to_string(),
-        epoch_number,
-        tree_size,
-        root_hash: root_hash.to_string(),
-        content_digest: content_digest_value.clone(),
+        epoch_number: read.head.epoch_number,
+        tree_size: read.head.tree_size,
+        root_hash: read.head.root.clone(),
+        content_digest: content_digest_value,
         state: SnapshotStateFile {
             path: "state.json".to_string(),
             sha256: sha256_hex(&state_bytes),
@@ -827,20 +888,290 @@ pub fn build(
         files,
     };
     let manifest_value = serde_json::to_value(&manifest)?;
-    let manifest_envelope = sign_envelope(&manifest_value, "manifest", &key_id, sk)?;
+    let manifest_envelope = sign_envelope(&manifest_value, "manifest", key_id, sk)?;
     std::fs::write(
-        snapshot_dir.join("manifest.json"),
+        staged.join("manifest.json"),
         serde_json::to_vec(&manifest_envelope)?,
     )?;
+    sync_tree(staged)
+}
 
-    update_index(
-        data_dir,
+fn sync_directory(path: &Path) -> Result<()> {
+    std::fs::File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+fn sync_tree(path: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            sync_tree(&entry.path())?;
+        } else {
+            std::fs::File::open(entry.path())?.sync_all()?;
+        }
+    }
+    sync_directory(path)
+}
+
+fn remove_tree(path: &Path) -> Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+        _ => Ok(()),
+    }
+}
+
+fn clear_directory(path: &Path) -> Result<()> {
+    let entries = match std::fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            remove_tree(&entry.path())?;
+        } else {
+            match std::fs::remove_file(entry.path()) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(error.into())
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+pub const STAGING_DIRECTORY: &str = "snapshot-build";
+const PRODUCER_LOCK: &str = "snapshot-build.lock";
+const SWAP_LOCK: &str = "snapshot-swap.lock";
+
+fn staging(data_dir: &Path) -> PathBuf {
+    data_dir.join(STAGING_DIRECTORY)
+}
+
+fn lock(path: &Path, wait: bool) -> Result<Option<std::fs::File>> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path)?;
+    let operation = if wait {
+        rustix::fs::FlockOperation::LockExclusive
+    } else {
+        rustix::fs::FlockOperation::NonBlockingLockExclusive
+    };
+    match rustix::fs::flock(&file, operation) {
+        Ok(()) => Ok(Some(file)),
+        Err(errno) if !wait && errno == rustix::io::Errno::WOULDBLOCK => Ok(None),
+        Err(errno) => Err(std::io::Error::from(errno).into()),
+    }
+}
+
+fn swap_lock(data_dir: &Path) -> Result<std::fs::File> {
+    lock(&data_dir.join(SWAP_LOCK), true)?
+        .ok_or_else(|| Error::Snapshot("the Snapshot swap lock was not taken".into()))
+}
+
+fn reconcile_locked(db: &Db, data_dir: &Path, clear_staging: bool) -> Result<()> {
+    if clear_staging {
+        clear_directory(&staging(data_dir))?;
+    }
+    let _swap = swap_lock(data_dir)?;
+    regenerate_index(db, data_dir, false)
+}
+
+/// Staging is left alone while a producer holds its lock: the producer
+/// owns it and finishes or abandons its build itself.
+pub fn reconcile(db: &Db, data_dir: &Path) -> Result<()> {
+    let producer = lock(&data_dir.join(PRODUCER_LOCK), false)?;
+    reconcile_locked(db, data_dir, producer.is_some())
+}
+
+/// WIST-3 §6.2, §7: every served Snapshot and every staged build may carry
+/// the withdrawn content, so all are removed and the index lists none.
+pub(crate) fn withdraw_served(db: &Db, data_dir: &Path) -> Result<()> {
+    clear_directory(&staging(data_dir))?;
+    let _swap = swap_lock(data_dir)?;
+    clear_directory(&data_dir.join("snapshots"))?;
+    regenerate_index(db, data_dir, true)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    Built {
+        epoch_number: u64,
+        tree_size: u64,
+        snapshot_date: String,
+    },
+    Current {
+        epoch_number: u64,
+    },
+    Superseded {
+        built: u64,
+        withdrawal_height: u64,
+    },
+    Unsealed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    Reading,
+    Read,
+    FilesWritten,
+    Swapped,
+    Indexed,
+}
+
+pub fn produce(db_path: &Path, data_dir: &Path) -> Result<Outcome> {
+    produce_with(db_path, data_dir, &mut |_| Ok(()))
+}
+
+fn served_epoch(data_dir: &Path) -> Result<Option<u64>> {
+    let Some(newest) = listed_entries(data_dir).and_then(|listed| listed.into_iter().next()) else {
+        return Ok(None);
+    };
+    let manifest = served_document(&data_dir.join(newest.manifest_url.trim_start_matches('/')))?;
+    Ok(manifest
+        .as_ref()
+        .and_then(|manifest| manifest.pointer("/manifest/epoch_number"))
+        .and_then(Value::as_u64))
+}
+
+fn superseding(db: &Db, built: u64) -> Result<Option<u64>> {
+    Ok(db
+        .withdrawal_state()?
+        .into_iter()
+        .map(|(_, _, sealing_height)| sealing_height)
+        .filter(|sealing_height| *sealing_height > built)
+        .max())
+}
+
+/// Both paths are in the data directory, so on one filesystem.
+fn swap_in(staged: &Path, target: &Path) -> Result<()> {
+    if !target.exists() {
+        std::fs::rename(staged, target)?;
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        match rustix::fs::renameat_with(
+            rustix::fs::CWD,
+            staged,
+            rustix::fs::CWD,
+            target,
+            rustix::fs::RenameFlags::EXCHANGE,
+        ) {
+            Ok(()) => return remove_tree(staged),
+            Err(errno)
+                if errno != rustix::io::Errno::INVAL
+                    && errno != rustix::io::Errno::NOSYS
+                    && errno != rustix::io::Errno::OPNOTSUPP =>
+            {
+                return Err(std::io::Error::from(errno).into());
+            }
+            Err(_) => {}
+        }
+    }
+    let replaced = staged.with_extension("replaced");
+    remove_tree(&replaced)?;
+    std::fs::rename(target, &replaced)?;
+    std::fs::rename(staged, target)?;
+    remove_tree(&replaced)
+}
+
+pub fn produce_with(
+    db_path: &Path,
+    data_dir: &Path,
+    observe: &mut dyn FnMut(Phase) -> Result<()>,
+) -> Result<Outcome> {
+    let producer_lock = data_dir.join(PRODUCER_LOCK);
+    let Some(_producer) = lock(&producer_lock, false)? else {
+        return Err(Error::Snapshot(format!(
+            "another Snapshot producer holds {}; wait for it to finish",
+            producer_lock.display()
+        )));
+    };
+    let db = Db::connect(db_path)?;
+    reconcile_locked(&db, data_dir, true)?;
+
+    let served = served_epoch(data_dir)?;
+    let Some(head) = db.last_epoch()? else {
+        return Ok(Outcome::Unsealed);
+    };
+    if served == Some(head.epoch_number) {
+        return Ok(Outcome::Current {
+            epoch_number: head.epoch_number,
+        });
+    }
+
+    let read = db.consistent_read(|db| {
+        let head = db
+            .last_epoch()?
+            .ok_or_else(|| Error::Snapshot("the sealed head is absent".into()))?;
+        observe(Phase::Reading)?;
+        read_state(db, data_dir, head)
+    })?;
+    observe(Phase::Read)?;
+
+    let built = read.head.epoch_number;
+    let snapshot_date = read
+        .head
+        .sealed_at
+        .get(..10)
+        .unwrap_or(&read.head.sealed_at)
+        .to_string();
+    let staged = staging(data_dir).join(built.to_string());
+    remove_tree(&staged)?;
+    std::fs::create_dir_all(&staged)?;
+    if let Err(error) = build_staged(&read, data_dir, &staged, &snapshot_date) {
+        if let Some(withdrawal_height) = superseding(&db, built)? {
+            remove_tree(&staged)?;
+            return Ok(Outcome::Superseded {
+                built,
+                withdrawal_height,
+            });
+        }
+        return Err(error);
+    }
+    sync_directory(&staging(data_dir))?;
+    observe(Phase::FilesWritten)?;
+
+    let _swap = swap_lock(data_dir)?;
+    if let Some(withdrawal_height) = superseding(&db, built)? {
+        remove_tree(&staged)?;
+        return Ok(Outcome::Superseded {
+            built,
+            withdrawal_height,
+        });
+    }
+    if !staged.is_dir() {
+        let withdrawal_height = db
+            .withdrawal_state()?
+            .into_iter()
+            .map(|(_, _, sealing_height)| sealing_height)
+            .max()
+            .unwrap_or(built);
+        return Ok(Outcome::Superseded {
+            built,
+            withdrawal_height,
+        });
+    }
+    let served_root = data_dir.join("snapshots");
+    std::fs::create_dir_all(&served_root)?;
+    swap_in(&staged, &served_root.join(&snapshot_date))?;
+    sync_directory(&served_root)?;
+    sync_directory(&staging(data_dir))?;
+    observe(Phase::Swapped)?;
+
+    regenerate_index(&db, data_dir, true)?;
+    observe(Phase::Indexed)?;
+    Ok(Outcome::Built {
+        epoch_number: built,
+        tree_size: read.head.tree_size,
         snapshot_date,
-        tree_size,
-        &content_digest_value,
-        &key_id,
-        sk,
-    )
+    })
 }
 
 #[cfg(test)]

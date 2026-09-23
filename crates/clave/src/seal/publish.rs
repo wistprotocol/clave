@@ -131,7 +131,7 @@ pub(super) fn epoch(
         })
         .collect();
     let signer_refs: Vec<&SigningKey> = signers.iter().collect();
-    let sealed = db.commit_seal_under(
+    db.commit_seal_under(
         &signer_refs,
         Some(&key_entries),
         &log_id,
@@ -194,30 +194,8 @@ pub(super) fn epoch(
             let _ = std::fs::remove_file(data_dir.join("payloads").join(format!("{hex}.json")));
             db.delete_record_by_delta(delta_id)?;
         }
-        let snapshots_dir = data_dir.join("snapshots");
-        if let Ok(dir) = std::fs::read_dir(&snapshots_dir) {
-            for entry in dir.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    std::fs::remove_dir_all(&path)?;
-                } else {
-                    std::fs::remove_file(&path)?;
-                }
-            }
-        }
+        crate::snapshot::withdraw_served(db, data_dir)?;
     }
-
-    db.check_fence()?;
-    let snapshot_date = sealed_at.get(..10).unwrap_or(&sealed_at).to_string();
-    crate::snapshot::build(
-        db,
-        data_dir,
-        epoch_number,
-        sealed.tree_size,
-        &sealed.root,
-        &snapshot_date,
-        projection.domains(),
-    )?;
 
     Ok(SealReport {
         epoch_number,

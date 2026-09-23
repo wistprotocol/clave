@@ -44,7 +44,9 @@ impl Log {
 
     fn seal_at(&self, now_unix: i64) -> clave::seal::SealReport {
         let (_, signer) = clave::keys::head_signer(self.path(), &self.db).unwrap();
-        clave::seal::run(&self.db, self.path(), &signer, now_unix).unwrap()
+        let report = clave::seal::run(&self.db, self.path(), &signer, now_unix).unwrap();
+        clave::snapshot::produce(&self.path().join("clave.sqlite"), self.path()).unwrap();
+        report
     }
 
     fn reopen(&mut self) {

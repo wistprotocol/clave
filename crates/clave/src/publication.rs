@@ -148,6 +148,7 @@ pub fn finish_committed(db: &Db, data_dir: &Path) -> Result<Vec<u64>> {
 /// verify them against.
 pub fn recover(db: &Db, data_dir: &Path) -> Result<Vec<u64>> {
     db.check_fence()?;
+    crate::snapshot::reconcile(db, data_dir)?;
     crate::snapshot::resign_unsealed(db, data_dir)?;
     let mut republished = finish_committed(db, data_dir)?;
     if let Some((epoch_number, note)) = db.head_publication()? {

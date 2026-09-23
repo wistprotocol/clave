@@ -12,6 +12,7 @@ fn state_entries(data: &std::path::Path) -> Vec<serde_json::Value> {
     let read = |path: &std::path::Path| -> serde_json::Value {
         serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
     };
+    clave::snapshot::produce(&data.join("clave.sqlite"), data).unwrap();
     let index = read(&data.join("snapshots/index.json"));
     let manifest_url = index["index"]["snapshots"][0]["manifest_url"]
         .as_str()

@@ -373,6 +373,20 @@ impl Db {
         Ok(changed)
     }
 
+    pub fn consistent_read<T>(&self, read: impl FnOnce(&Db) -> Result<T>) -> Result<T> {
+        self.conn.execute_batch("BEGIN")?;
+        match read(self) {
+            Ok(value) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(value)
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
     fn execute(&self, sql: &str, params: impl rusqlite::Params) -> Result<usize> {
         self.write(|conn| Ok(conn.execute(sql, params)?))
     }

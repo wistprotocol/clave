@@ -155,14 +155,21 @@ async fn sleep_until(instant: i64) {
 
 /// WIST-3 §3.2: a failed seal is retried while its instant's grace lasts
 /// and never sealed late.
-pub async fn run(db_path: PathBuf, data_dir: PathBuf, client: Arc<Client>, owner: Arc<str>) {
+pub async fn run(
+    db_path: PathBuf,
+    data_dir: PathBuf,
+    client: Arc<Client>,
+    owner: Arc<str>,
+    sealed: Arc<tokio::sync::Notify>,
+) {
     let mut attempt: Option<Attempt> = None;
     loop {
-        let (store, data, client, holder) = (
+        let (store, data, client, holder, sealed) = (
             db_path.clone(),
             data_dir.clone(),
             client.clone(),
             owner.clone(),
+            sealed.clone(),
         );
         let passed = tokio::task::spawn_blocking(move || {
             let now_unix = jiff::Timestamp::now().as_second();
@@ -172,7 +179,11 @@ pub async fn run(db_path: PathBuf, data_dir: PathBuf, client: Arc<Client>, owner
                 &holder,
                 now_unix,
                 attempt,
-                |instant, token| seal_at(&store, &data, &client, instant, &holder, token),
+                |instant, token| {
+                    seal_at(&store, &data, &client, instant, &holder, token)?;
+                    sealed.notify_one();
+                    Ok(())
+                },
             )
         })
         .await;

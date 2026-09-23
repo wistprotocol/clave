@@ -155,7 +155,7 @@ fn a_seal_longer_than_its_lease_keeps_the_lease_by_renewal_and_completes() {
         0,
         "the rival took the lease mid-seal"
     );
-    assert!(snapshot_index(data.path()));
+    assert!(clave::publication::head_path(data.path()).exists());
     assert_eq!(db.sealer_lease().unwrap().token, 1);
 }
 

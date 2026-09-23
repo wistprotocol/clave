@@ -41,6 +41,21 @@ fn snapshot_build_produces_verifiable_tier0_state_and_signed_artifacts() {
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
     let report = clave::seal::run(&db, data.path(), &sk, SEAL_START).unwrap();
     assert_eq!(report.epoch_number, 0);
+    assert_eq!(
+        std::fs::read_dir(data.path().join("snapshots"))
+            .map(|entries| entries.count())
+            .unwrap_or(0),
+        0,
+        "sealing publishes the Checkpoint only"
+    );
+    assert_eq!(
+        clave::snapshot::produce(&data.path().join("clave.sqlite"), data.path()).unwrap(),
+        clave::snapshot::Outcome::Built {
+            epoch_number: 0,
+            tree_size: db.last_epoch().unwrap().unwrap().tree_size,
+            snapshot_date: "2026-08-09".to_string(),
+        }
+    );
 
     let head = db.last_epoch().unwrap().unwrap();
     let epoch_root = head.root.clone();
@@ -183,7 +198,7 @@ fn snapshot_build_produces_verifiable_tier0_state_and_signed_artifacts() {
 }
 
 #[test]
-fn snapshot_index_replaces_same_date_entry_on_reseal() {
+fn an_empty_same_day_epoch_replaces_the_snapshot_with_the_same_content_digest() {
     let (listener, host, client) = reserve_addr();
     let p = make_publisher_with_scope(&host, &["example.com"]);
     let id1 = add_delta(&p, "https://example.com/alpha", "alpha body", None);
@@ -202,9 +217,33 @@ fn snapshot_index_replaces_same_date_entry_on_reseal() {
     clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
 
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
+    let db_path = data.path().join("clave.sqlite");
+    let manifest = || -> serde_json::Value {
+        serde_json::from_slice(
+            &std::fs::read(data.path().join("snapshots/2026-08-09/manifest.json")).unwrap(),
+        )
+        .unwrap()
+    };
     clave::seal::run(&db, data.path(), &sk, SEAL_START).unwrap();
+    clave::snapshot::produce(&db_path, data.path()).unwrap();
+    let first = manifest();
     let r1 = clave::seal::run(&db, data.path(), &sk, SEAL_START + 3600).unwrap();
     assert_eq!(r1.epoch_number, 1);
+    assert_eq!(r1.entry_count, 0);
+    assert!(matches!(
+        clave::snapshot::produce(&db_path, data.path()).unwrap(),
+        clave::snapshot::Outcome::Built {
+            epoch_number: 1,
+            ..
+        }
+    ));
+    let second = manifest();
+    assert_eq!(second["manifest"]["epoch_number"], 1);
+    assert_eq!(first["manifest"]["epoch_number"], 0);
+    assert_eq!(
+        second["manifest"]["content_digest"],
+        first["manifest"]["content_digest"]
+    );
 
     let idx: serde_json::Value =
         serde_json::from_slice(&std::fs::read(data.path().join("snapshots/index.json")).unwrap())
@@ -246,6 +285,7 @@ fn tier1_fixture(shards: Option<i64>) -> (common::TestPub, tempfile::TempDir, St
     clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
     clave::seal::run(&db, data.path(), &sk, SEAL_START).unwrap();
+    clave::snapshot::produce(&data.path().join("clave.sqlite"), data.path()).unwrap();
     (p, data, host, id)
 }
 
@@ -385,6 +425,7 @@ fn the_state_artifact_carries_every_kind_with_live_instances() {
     clave::seal::run(&db, data.path(), &sk, SEAL_START + 3600).unwrap();
 
     clave::seal::run(&db, data.path(), &sk, SEAL_START + 7200).unwrap();
+    clave::snapshot::produce(&data.path().join("clave.sqlite"), data.path()).unwrap();
     let date = &jiff::Timestamp::from_second(SEAL_START + 7200)
         .unwrap()
         .to_string()[..10];

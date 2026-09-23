@@ -91,6 +91,7 @@ impl Rig {
             jcs::canonicalize(history.domains()[&self.host].current().envelope()).unwrap(),
             jcs::canonicalize(declaration).unwrap()
         );
+        clave::snapshot::produce(&self.data.path().join("clave.sqlite"), self.data.path()).unwrap();
         let raw = std::fs::read(
             self.data
                 .path()

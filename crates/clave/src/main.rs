@@ -66,6 +66,15 @@ enum Command {
         /// http, as `serve --allow-http` does for Publishers.
         #[arg(long = "allow-http")]
         allow_http: bool,
+        /// Seal and publish the Checkpoint without producing the Snapshot.
+        #[arg(long = "no-snapshot")]
+        no_snapshot: bool,
+    },
+    /// Builds the Snapshot at the sealed head unless the served one is
+    /// already at it.
+    Snapshot {
+        #[arg(long)]
+        data: PathBuf,
     },
     VerifyHistory {
         #[arg(long)]
@@ -150,6 +159,34 @@ enum LogKeyCommand {
     },
 }
 
+fn produce_snapshot(
+    db_path: &std::path::Path,
+    data: &std::path::Path,
+    timed: bool,
+) -> Result<(), clave::Error> {
+    let started = std::time::Instant::now();
+    let outcome = clave::snapshot::produce(db_path, data)?;
+    let took = started.elapsed().as_millis();
+    match outcome {
+        clave::snapshot::Outcome::Built {
+            epoch_number,
+            snapshot_date,
+            ..
+        } => println!("snapshot built at epoch {epoch_number} for {snapshot_date} in {took} ms"),
+        clave::snapshot::Outcome::Current { epoch_number } => {
+            println!("snapshot current at epoch {epoch_number}")
+        }
+        clave::snapshot::Outcome::Superseded {
+            withdrawal_height, ..
+        } => println!("snapshot superseded by a withdrawal at epoch {withdrawal_height}"),
+        clave::snapshot::Outcome::Unsealed => println!("snapshot not built: no Epoch sealed"),
+    }
+    if timed {
+        println!("snapshot took {took} ms");
+    }
+    Ok(())
+}
+
 fn main() -> Result<(), clave::Error> {
     let cli = Cli::parse();
     match cli.command {
@@ -212,6 +249,7 @@ fn main() -> Result<(), clave::Error> {
             data,
             at,
             allow_http,
+            no_snapshot,
         } => {
             let db_path = data.join("clave.sqlite");
             let db = clave::db::Db::open(&db_path)?;
@@ -221,6 +259,7 @@ fn main() -> Result<(), clave::Error> {
                 None => jiff::Timestamp::now().as_second(),
             };
             let client = clave::fetch::Client::new(allow_http);
+            let started = std::time::Instant::now();
             let report = clave::seal::run_leased(
                 &db_path,
                 &data,
@@ -229,6 +268,7 @@ fn main() -> Result<(), clave::Error> {
                 now_unix,
                 &clave::db::process_owner(),
             )?;
+            let sealing = started.elapsed();
             let head = db
                 .last_epoch()?
                 .ok_or_else(|| clave::Error::Seal("the sealed Epoch is absent".into()))?;
@@ -242,6 +282,13 @@ fn main() -> Result<(), clave::Error> {
             for late in &report.late {
                 println!("late inclusion: {late}");
             }
+            println!("seal took {} ms", sealing.as_millis());
+            if !no_snapshot {
+                produce_snapshot(&db_path, &data, true)?;
+            }
+        }
+        Command::Snapshot { data } => {
+            produce_snapshot(&data.join("clave.sqlite"), &data, false)?;
         }
         Command::VerifyHistory { data } => {
             let db = clave::db::Db::open(&data.join("clave.sqlite"))?;

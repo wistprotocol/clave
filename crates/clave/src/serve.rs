@@ -498,13 +498,22 @@ pub fn run_with_options(
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
+        let sealed = Arc::new(tokio::sync::Notify::new());
         let sealing = options.seal.then(|| {
-            tokio::spawn(crate::scheduler::run(
-                bg_state.db_path.clone(),
-                bg_data.clone(),
-                bg_state.client.clone(),
-                owner.clone(),
-            ))
+            [
+                tokio::spawn(crate::scheduler::run(
+                    bg_state.db_path.clone(),
+                    bg_data.clone(),
+                    bg_state.client.clone(),
+                    owner.clone(),
+                    sealed.clone(),
+                )),
+                tokio::spawn(produce_snapshots(
+                    bg_state.db_path.clone(),
+                    bg_data.clone(),
+                    sealed,
+                )),
+            ]
         });
         let dispatching = tokio::spawn(dispatch(
             bg_state,
@@ -524,7 +533,7 @@ pub fn run_with_options(
             .with_graceful_shutdown(shutdown_signal())
             .await?;
         // The leases are released only once no pass can take them again.
-        for task in sealing.into_iter().chain([dispatching]) {
+        for task in sealing.into_iter().flatten().chain([dispatching]) {
             task.abort();
             let _ = task.await;
         }
@@ -537,6 +546,26 @@ pub fn run_with_options(
         .map_err(|e| Error::Io(std::io::Error::other(e)))??;
         Ok::<(), Error>(())
     })
+}
+
+const SNAPSHOT_FALLBACK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+async fn produce_snapshots(db_path: PathBuf, data_dir: PathBuf, sealed: Arc<tokio::sync::Notify>) {
+    loop {
+        let (store, data) = (db_path.clone(), data_dir.clone());
+        let produced =
+            tokio::task::spawn_blocking(move || crate::snapshot::produce(&store, &data)).await;
+        match produced {
+            Ok(Ok(crate::snapshot::Outcome::Superseded { .. })) => continue,
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => tracing::warn!(%error, "Snapshot production failed"),
+            Err(error) => tracing::warn!(%error, "Snapshot production failed"),
+        }
+        tokio::select! {
+            _ = sealed.notified() => {}
+            _ = tokio::time::sleep(SNAPSHOT_FALLBACK_INTERVAL) => {}
+        }
+    }
 }
 
 async fn shutdown_signal() {

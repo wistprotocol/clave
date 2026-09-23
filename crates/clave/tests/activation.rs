@@ -85,6 +85,7 @@ impl Harness {
         let read = |path: &std::path::Path| -> Value {
             serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
         };
+        clave::snapshot::produce(&self.data.path().join("clave.sqlite"), self.data.path()).unwrap();
         let index = read(&self.data.path().join("snapshots/index.json"));
         let manifest_url = index["index"]["snapshots"][0]["manifest_url"]
             .as_str()

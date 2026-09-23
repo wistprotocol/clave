@@ -13,14 +13,17 @@ Snapshots over HTTP for Consumer sync.
 Subcommands: `init` (generate the log's genesis key and local store, and
 print the signed-note verifier key a Witness is configured with),
 `serve` (HTTP ingest + read endpoints; seals an Epoch at every cadence
-grid instant unless `--no-seal`, under the store instance name
-`--instance <name>` gives it), `seal` (append the next Epoch's
-Entries to the tree and publish its Checkpoint at the wall clock floored
-to the accepted cadence grid, or at `--at <whole-second UTC instant>` for
-a test Log that advances Log time faster than the clock), `witness`
+grid instant and produces Snapshots unless `--no-seal`, under the store
+instance name `--instance <name>` gives it), `seal` (append the next
+Epoch's Entries to the tree and publish its Checkpoint at the wall clock
+floored to the accepted cadence grid, or at `--at <whole-second UTC
+instant>` for a test Log that advances Log time faster than the clock,
+then produce the Snapshot at the new head unless `--no-snapshot`;
+it prints the seal's and the production's wall time), `witness`
 (maintain the Witnesses each sealed Checkpoint is submitted to),
-`snapshot` (build a signed, verifiable
-point-in-time index for cold-start sync), `param-change` (queue a signed
+`snapshot` (produce the signed, verifiable point-in-time Snapshot at the
+sealed head for cold-start sync, see [Snapshot production](#snapshot-production)),
+`param-change` (queue a signed
 `parameter_change` Registry Update, WIST-4 §5: bounds and combination
 rules checked, `effective_at` held past the grace period, applied to the
 live parameter set once its Epoch seals and the effective instant passes;
@@ -28,9 +31,9 @@ a change whose grace window lapses while queued is dropped from the Epoch
 and reported by `seal`), `withdraw` (queue a `payload_withdrawal`, WIST-4
 §5.1 and WIST-3 §6.2: at sealing the act replays through core's
 withdrawal engine under the Log key, seals only beside or above the
-Delta it names, deletes the Payload, drops the record, stops serving
-snapshots that still contain it and leaves a `withdrawal` tuple in every
-later Snapshot state; a repeated withdrawal seals and changes nothing),
+Delta it names, deletes the Payload, drops the record, removes every
+served and staged Snapshot, rewrites the index without them and leaves a
+`withdrawal` tuple in every later Snapshot state; a repeated withdrawal seals and changes nothing),
 `suffix-list` (pin a Public Suffix List file, WIST-4 §3.1: the octets are
 held in the store and served at `/log/suffix-lists/<hex>.dat` without
 expiry, and the queued `suffix_list_update` seals in the next Epoch and
@@ -351,8 +354,8 @@ removed on the run that first writes the full one. `seal` and `serve`
 start by running distribution, which finishes every interrupted
 publication and restores any file of the head Epoch the disk has lost or
 left torn; lower Epochs are checked by `verify-history` and reopening,
-not at every start. Snapshot files follow the same seal outside that
-record.
+not at every start. Snapshots are produced separately, as described
+under [Snapshot production](#snapshot-production).
 
 The served layout is:
 
@@ -363,7 +366,7 @@ The served layout is:
 /log/checkpoints/<epoch_number>   (every Checkpoint published)
 /log/anchor.json /log/mirrors.json /log/suffix-lists/<hex>.dat
 /payloads/<delta-id-hex>.json
-/snapshots/...
+/snapshots/index.json /snapshots/<date>/...
 ```
 
 `serve` sends `/checkpoint` and the archive as
@@ -373,6 +376,46 @@ Cosignature is added. Full tiles and entry bundles are
 `application/octet-stream` with `public, max-age=604800, immutable`;
 partial ones carry the same media type without caching, because they
 stop being served once the full tile exists.
+
+## Snapshot production
+
+A seal publishes the Checkpoint only; the Snapshot at the sealed head is
+produced afterwards by `seal` (unless `--no-snapshot`), by `clave snapshot
+--data <dir>`, or by `serve`'s producer task, which runs at start, after
+each successful seal and every 60 seconds, and retries at once when a
+withdrawal supersedes its build. `--no-seal` instances never produce. One
+producer runs per data directory at a time, holding an exclusive lock on
+`snapshot-build.lock`; a second one fails naming it. Production prints one
+of `snapshot built at epoch N for <date> in M ms`, `snapshot current at
+epoch N` (the newest served Snapshot is already at the head), `snapshot
+superseded by a withdrawal at epoch H` or `snapshot not built: no Epoch
+sealed`.
+
+A producer reads the head Epoch and every input of the build (records
+with withdrawn Deltas excluded, chain tips, withdrawals, parameters,
+suffix list, Labels, Aggregator keys, the Declaration replay) in one
+SQLite read transaction, so pulls and seals committing meanwhile are
+neither blocked nor included. A live record whose Payload is missing or
+does not parse fails the build with an error naming its `delta_id`
+(WIST-3 §7). The files are written and synced into the staging directory
+`snapshot-build/<epoch number>/`, outside `/snapshots` and never served,
+then swapped into `snapshots/<date>/` by one rename, or by an atomic
+directory exchange where that date is already served. The index is then
+regenerated from the manifests on disk, newest date first, and written
+through a synced temporary file. The check for a withdrawal sealed above
+the build's Epoch, the swap and the index write hold
+`snapshot-swap.lock`, as does a withdrawal seal's removal; such a
+withdrawal abandons the build instead of swapping it in.
+
+Every start of `seal` and `serve`, and every seal, reconciles the served
+tree before re-signing it: an abandoned staging directory is removed
+unless a producer holds its lock, a Snapshot directory without a readable
+manifest for its date is removed, and `snapshots/index.json` is
+regenerated when it is unparsable, missing while Snapshots are served, or
+lists other entries than the manifests present (WIST-3 §6). A withdrawal
+seal removes every served Snapshot and the staging area, then writes an
+index listing none; the next production rebuilds without the withdrawn
+content.
 
 ## Witness cosignatures
 
@@ -690,14 +733,14 @@ separate thread on its own connection renews the lease at the same
 cadence and token, so a seal longer than the lease keeps it. A seal
 runs fenced by the lease's token: its transaction begins by checking
 the token under the write lock, and every file-writing stage after the
-commit (distribution, Witness submission, withdrawal removal, the
-Snapshot) checks it again, so a sealer whose lease was taken over
+commit (distribution, Witness submission, withdrawal removal) checks it
+again, so a sealer whose lease was taken over
 commits no Epoch, or publishes no further file after its commit.
 `clave seal` takes the lease when it is unowned or lapsed, seals under
 it with the same renewal and releases it; while another process holds
 a live lease it fails, naming the holder and the lease's end. On Ctrl-C
 or SIGTERM `serve` stops accepting requests, finishes those in flight,
-stops its dispatcher and sealing passes and only then releases its
+stops its dispatcher, sealing passes and Snapshot producer and only then releases its
 partition and sealer leases, so no pass takes a lease again after the
 release and another process takes them over at once; a partition's next
 holder still increments its token, fencing out any pull left running.
@@ -1116,8 +1159,9 @@ Database mutations for a seal share one transaction, including queue movement,
 status rejections, stored recovery state and the committed Epoch head. A failed
 Declaration candidate rolls those changes back. Missing or corrupt pinned
 history stops sealing before settlement. Epoch/checkpoint file publication and
-Snapshot generation do not share SQLite's transaction; crash recovery across
-those stores remains a separate requirement. The history reader also rejects
+Snapshot production do not share SQLite's transaction; Snapshot production
+recovers as described under [Snapshot production](#snapshot-production), and
+crash recovery across the other stores remains a separate requirement. The history reader also rejects
 prefixes produced off the signed cadence grid by local cadence overrides.
 
 Admission's predecessor choices, accepted sequence floor and deadline

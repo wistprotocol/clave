@@ -382,6 +382,7 @@ fn snapshot_parameters_include_pending_amendments_and_only_the_winning_ties() {
         .unwrap();
     let winning = last["body"]["update"]["details"]["value"].as_i64().unwrap();
     let date = &ts(NOW)[..10];
+    clave::snapshot::produce(&data.path().join("clave.sqlite"), data.path()).unwrap();
     let state: Value = serde_json::from_slice(
         &std::fs::read(data.path().join(format!("snapshots/{date}/state.json"))).unwrap(),
     )
