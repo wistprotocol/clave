@@ -168,3 +168,77 @@ fn a_withdrawal_interrupted_at_any_commit_is_applied_before_its_checkpoint_is_se
         );
     }
 }
+
+#[test]
+fn a_removal_applied_under_a_running_producer_leaves_its_build_intact() {
+    use crate::snapshot::{Mode, Outcome, Phase};
+
+    for commits in 0.. {
+        let (site, log, id) = withdrawn_log();
+        log.db.set_param("snapshot_shard_count", 2).unwrap();
+        crate::db::interrupt::after(commits);
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            seal(&log, "2026-08-09T14:00:00Z")
+        }));
+        assert!(
+            !crate::db::interrupt::disarm(),
+            "no commit leaves the withdrawal sealed with its removal pending"
+        );
+        assert!(interrupted.is_err());
+        let Some(height) = withdrawal_height(&log, &id) else {
+            continue;
+        };
+        if log.db.pending_removals().unwrap().is_empty() {
+            continue;
+        }
+        let mut applied = false;
+        let outcome = crate::snapshot::produce_with(
+            &log.path(),
+            log.data.path(),
+            Mode::Incremental,
+            &mut |phase| {
+                if phase == Phase::ShardWritten(0) {
+                    crate::publication::finish_committed(&log.db, log.data.path())?;
+                    applied = true;
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(applied);
+        assert!(
+            matches!(outcome, Outcome::Built { epoch_number, .. } if epoch_number == height),
+            "{outcome:?}"
+        );
+        assert!(!payload_path(&log, &id).exists());
+        assert!(log.db.get_record(URL, &site.host).unwrap().is_none());
+        assert!(log.db.pending_removals().unwrap().is_empty());
+        assert_eq!(head_epoch(&log), height);
+
+        let dates = served_directories(&log);
+        assert_eq!(dates, vec!["2026-08-09".to_string()]);
+        assert_eq!(listed_dates(&log), dates);
+        let served = log.data.path().join("snapshots").join(&dates[0]);
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(served.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest["manifest"]["epoch_number"], height);
+        for file in manifest["manifest"]["files"].as_array().unwrap() {
+            let path = served.join(file["path"].as_str().unwrap());
+            let bytes = std::fs::read(&path).unwrap_or_else(|_| {
+                panic!("the manifest lists {} but it is not served", path.display())
+            });
+            assert_eq!(bytes.len() as u64, file["bytes"].as_u64().unwrap());
+            assert!(
+                !bytes.windows(BODY.len()).any(|window| window == BODY),
+                "{} holds the withdrawn content",
+                path.display()
+            );
+        }
+        assert!(
+            std::fs::read_dir(log.data.path().join(crate::snapshot::STAGING_DIRECTORY))
+                .map(|entries| entries.count() == 0)
+                .unwrap_or(true)
+        );
+        break;
+    }
+}

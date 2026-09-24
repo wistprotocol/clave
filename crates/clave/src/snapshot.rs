@@ -981,17 +981,25 @@ fn build_staged(
             files: Vec::new(),
         };
         let entry = shard_cache(data_dir).join(shard.to_string());
+        // A withdrawal purges cache entries under the swap lock, so the
+        // fingerprint check and the links it authorizes stay under it too.
         let cached = match mode {
-            Mode::Incremental => reusable(&entry, &fingerprint),
+            Mode::Incremental => {
+                let _swap = swap_lock(data_dir)?;
+                let cached = reusable(&entry, &fingerprint);
+                if cached.is_some() {
+                    for (path, _) in TIER_FILES {
+                        match link_or_copy(&entry.join(path), &shard_base.join(path))? {
+                            Placed::Linked(bytes) => cost.bytes_reused += bytes,
+                            Placed::Copied(bytes) => cost.bytes_written += bytes,
+                        }
+                    }
+                }
+                cached
+            }
             Mode::Full => None,
         };
         if let Some(cached) = cached {
-            for (path, _) in TIER_FILES {
-                match link_or_copy(&entry.join(path), &shard_base.join(path))? {
-                    Placed::Linked(bytes) => cost.bytes_reused += bytes,
-                    Placed::Copied(bytes) => cost.bytes_written += bytes,
-                }
-            }
             fingerprint.files = cached;
         } else {
             let sqlite_bytes = build_tier0(&shard_base.join("tier0"), &shard_records)?;
@@ -1260,9 +1268,13 @@ pub(crate) fn apply_pending_removals(db: &Db, data_dir: &Path) -> Result<bool> {
 }
 
 /// WIST-3 §6.2, §7: every served Snapshot and every staged build may carry
-/// the withdrawn content, so all are removed and the index lists none.
+/// the withdrawn content, so all are removed and the index lists none. A
+/// build under a live producer is left to it: below the withdrawal's height
+/// it is abandoned under the swap lock, at or above it the content is gone.
 fn withdraw_served(db: &Db, data_dir: &Path, publishers: &[&str]) -> Result<()> {
-    clear_directory(&staging(data_dir))?;
+    if let Some(_producer) = lock(&data_dir.join(PRODUCER_LOCK), false)? {
+        clear_directory(&staging(data_dir))?;
+    }
     let _swap = swap_lock(data_dir)?;
     clear_directory(&data_dir.join("snapshots"))?;
     for (_, path) in cache_entries(data_dir)? {
