@@ -95,6 +95,7 @@ CREATE TABLE IF NOT EXISTS label_feed_observations(domain TEXT PRIMARY KEY, gene
 CREATE TABLE IF NOT EXISTS suffix_lists(sha256 TEXT PRIMARY KEY, octets BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS suffix_list_acts(rowid INTEGER PRIMARY KEY AUTOINCREMENT, epoch_number INTEGER NOT NULL, sha256 TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS withdrawals(delta_id TEXT PRIMARY KEY, domain TEXT NOT NULL, update_id TEXT NOT NULL, epoch_number INTEGER NOT NULL, sealed_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS pending_removals(delta_id TEXT PRIMARY KEY, domain TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS recovery_windows(domain TEXT PRIMARY KEY, declaration_json BLOB NOT NULL, prior_declaration_json BLOB NOT NULL, owner_declaration_json BLOB NOT NULL, opened_epoch INTEGER, window_end TEXT);
 CREATE TABLE IF NOT EXISTS recovery_settlements(domain TEXT NOT NULL, owner_hash TEXT NOT NULL, PRIMARY KEY(domain, owner_hash));
 CREATE TABLE IF NOT EXISTS sealed_declarations(domain TEXT NOT NULL, seq INTEGER NOT NULL, epoch_number INTEGER NOT NULL, sealed_at TEXT NOT NULL, declaration_json BLOB NOT NULL, PRIMARY KEY(domain, seq));

@@ -7,6 +7,8 @@ use wist_core::crypto::SigningKey;
 
 mod prepare;
 mod publish;
+#[cfg(test)]
+mod withdrawal_tests;
 
 pub(crate) use prepare::validate_pending_parameter;
 

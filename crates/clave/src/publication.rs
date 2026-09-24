@@ -131,8 +131,11 @@ fn publish_epoch(db: &Db, data_dir: &Path, epoch_number: u64, note: &str) -> Res
     Ok(wrote)
 }
 
+/// WIST-3 §6.2: a withdrawal's removal precedes the Checkpoint at its
+/// height, so no served head names content still served.
 pub fn finish_committed(db: &Db, data_dir: &Path) -> Result<Vec<u64>> {
     db.check_fence()?;
+    crate::snapshot::apply_pending_removals(db, data_dir)?;
     let mut published = Vec::new();
     for (epoch_number, note) in db.unpublished_publications()? {
         db.check_fence()?;

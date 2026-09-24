@@ -186,17 +186,7 @@ pub(super) fn epoch(
     if let Err(error) = crate::witness::submit_head(db, client, data_dir) {
         tracing::warn!(%error, "witness submission did not complete");
     }
-
     db.check_fence()?;
-    if !withdrawals.is_empty() {
-        for delta_id in withdrawals.iter().map(|w| &w.delta_id) {
-            let hex = delta_id.strip_prefix("sha256:").unwrap_or(delta_id);
-            let _ = std::fs::remove_file(data_dir.join("payloads").join(format!("{hex}.json")));
-            db.delete_record_by_delta(delta_id)?;
-        }
-        let publishers: Vec<&str> = withdrawals.iter().map(|w| w.domain.as_str()).collect();
-        crate::snapshot::withdraw_served(db, data_dir, &publishers)?;
-    }
 
     Ok(SealReport {
         epoch_number,

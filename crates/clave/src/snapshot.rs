@@ -1239,9 +1239,29 @@ pub fn reconcile(db: &Db, data_dir: &Path) -> Result<()> {
     reconcile_locked(db, data_dir, producer.is_some())
 }
 
+pub(crate) fn apply_pending_removals(db: &Db, data_dir: &Path) -> Result<bool> {
+    let pending = db.pending_removals()?;
+    if pending.is_empty() {
+        return Ok(false);
+    }
+    db.check_fence()?;
+    for (delta_id, _) in &pending {
+        let hex = delta_id.strip_prefix("sha256:").unwrap_or(delta_id);
+        remove_path(&data_dir.join("payloads").join(format!("{hex}.json")))?;
+    }
+    let publishers: Vec<&str> = pending.iter().map(|(_, domain)| domain.as_str()).collect();
+    withdraw_served(db, data_dir, &publishers)?;
+    let delta_ids: Vec<String> = pending.into_iter().map(|(delta_id, _)| delta_id).collect();
+    db.clear_pending_removals(&delta_ids)?;
+    if !db.truncate_wal()? {
+        tracing::warn!("a reader kept the write-ahead log from being truncated after a withdrawal");
+    }
+    Ok(true)
+}
+
 /// WIST-3 §6.2, §7: every served Snapshot and every staged build may carry
 /// the withdrawn content, so all are removed and the index lists none.
-pub(crate) fn withdraw_served(db: &Db, data_dir: &Path, publishers: &[&str]) -> Result<()> {
+fn withdraw_served(db: &Db, data_dir: &Path, publishers: &[&str]) -> Result<()> {
     clear_directory(&staging(data_dir))?;
     let _swap = swap_lock(data_dir)?;
     clear_directory(&data_dir.join("snapshots"))?;

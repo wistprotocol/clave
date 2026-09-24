@@ -62,15 +62,15 @@ impl Origin {
     }
 }
 
-struct Site {
+pub(crate) struct Site {
     dir: tempfile::TempDir,
-    host: String,
+    pub(crate) host: String,
     client: Client,
     origin: std::sync::Arc<Origin>,
 }
 
 impl Site {
-    fn new() -> Site {
+    pub(crate) fn new() -> Site {
         Site::at("localhost")
     }
 
@@ -142,7 +142,13 @@ impl Site {
         .unwrap()
     }
 
-    fn delta(&self, url: &str, extract: &str, prev: Option<&str>, observed_at: &str) -> String {
+    pub(crate) fn delta(
+        &self,
+        url: &str,
+        extract: &str,
+        prev: Option<&str>,
+        observed_at: &str,
+    ) -> String {
         let salt = wist_core::crypto::b64u_encode(&[5u8; 16]);
         let content = serde_json::json!({
             "extract": extract, "links": {"total": 0, "urls": []},
@@ -183,7 +189,7 @@ impl Site {
         )
     }
 
-    fn feed(&self, ids: &[String], generated_at: &str, next: Option<u64>) {
+    pub(crate) fn feed(&self, ids: &[String], generated_at: &str, next: Option<u64>) {
         self.write("feed.json", &self.feed_doc(ids, generated_at, next));
     }
 
@@ -211,9 +217,9 @@ impl Site {
     }
 }
 
-struct Log {
-    data: tempfile::TempDir,
-    db: Db,
+pub(crate) struct Log {
+    pub(crate) data: tempfile::TempDir,
+    pub(crate) db: Db,
 }
 
 impl Log {
@@ -224,7 +230,7 @@ impl Log {
         Log { data, db }
     }
 
-    fn onboard(site: &Site) -> Log {
+    pub(crate) fn onboard(site: &Site) -> Log {
         Log::new().onboarded(site)
     }
 
@@ -267,11 +273,11 @@ impl Log {
         Log { data, db }
     }
 
-    fn path(&self) -> std::path::PathBuf {
+    pub(crate) fn path(&self) -> std::path::PathBuf {
         self.data.path().join("clave.sqlite")
     }
 
-    fn pull(&self, site: &Site) -> Result<IngestReport> {
+    pub(crate) fn pull(&self, site: &Site) -> Result<IngestReport> {
         run(&self.db, &site.client, self.data.path(), &site.host, NOW)
     }
 

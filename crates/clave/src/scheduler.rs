@@ -92,7 +92,7 @@ fn report_failure(what: &str, err: impl std::fmt::Display) {
 
 fn finish_publications(db_path: &Path, data_dir: &Path, owner: &str, token: i64) -> Result<()> {
     let db = Db::connect(db_path)?.fenced(Fence::Sealer { token });
-    if db.unpublished_publications()?.is_empty() {
+    if db.unpublished_publications()?.is_empty() && db.pending_removals()?.is_empty() {
         return Ok(());
     }
     crate::seal::under_renewed_lease(

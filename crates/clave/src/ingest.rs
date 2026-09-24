@@ -13,7 +13,7 @@ mod admit;
 mod feed;
 mod fetch_stage;
 #[cfg(test)]
-mod stage_tests;
+pub(crate) mod stage_tests;
 mod verify;
 
 use fetch_stage::{Attempt, FetchRequest, ObjectKey, Outcome, Walk};

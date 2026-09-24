@@ -438,11 +438,17 @@ unless a producer holds its lock, a Snapshot directory without a readable
 manifest for its date is removed, and `snapshots/index.json` is
 regenerated when it is unparsable, missing while Snapshots are served, or
 lists other entries than the manifests present (WIST-3 §6). A withdrawal
-seal removes every served Snapshot, the staging area and the
-`snapshot-shards/` entries of the withdrawn Deltas' Publisher shards, then
-writes an index listing none; the next production rebuilds those shards
-without the withdrawn content. Reconciliation without a running producer
-also removes unfinished `snapshot-shards/*.new/` entries.
+seal's transaction drops the withdrawn record and records the removal
+still owed; before any Checkpoint is published, the owed removal deletes
+the Payload file, every served Snapshot, the staging area and the
+`snapshot-shards/` entries of the withdrawn Deltas' Publisher shards,
+writes an index listing none, then marks itself done and truncates the
+store's write-ahead log. A removal interrupted before it was marked done
+runs again at the next seal or start of `serve`, so no served Checkpoint
+is at or above a withdrawal's height while its content is served; the
+next production rebuilds those shards without the withdrawn content.
+Reconciliation without a running producer also removes unfinished
+`snapshot-shards/*.new/` entries.
 
 ## Witness cosignatures
 
@@ -760,7 +766,7 @@ separate thread on its own connection renews the lease at the same
 cadence and token, so a seal longer than the lease keeps it. A seal
 runs fenced by the lease's token: its transaction begins by checking
 the token under the write lock, and every file-writing stage after the
-commit (distribution, Witness submission, withdrawal removal) checks it
+commit (withdrawal removal, distribution, Witness submission) checks it
 again, so a sealer whose lease was taken over
 commits no Epoch, or publishes no further file after its commit.
 `clave seal` takes the lease when it is unowned or lapsed, seals under

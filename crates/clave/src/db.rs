@@ -457,6 +457,7 @@ impl Db {
         conn.busy_timeout(std::time::Duration::from_millis(5000))?;
         let _mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
         conn.pragma_update(None, "synchronous", "FULL")?;
+        conn.pragma_update(None, "secure_delete", "ON")?;
         Ok(Db { conn, fence: None })
     }
 
@@ -1550,10 +1551,17 @@ impl Db {
             )?;
         }
         for w in withdrawals {
-            tx.execute(
+            let first = tx.execute(
                 "INSERT OR IGNORE INTO withdrawals(delta_id, domain, update_id, epoch_number, sealed_at) VALUES (?1, ?2, ?3, ?4, ?5)",
                 (w.delta_id, w.domain, w.update_id, epoch_number as i64, sealed_at),
-            )?;
+            )? == 1;
+            tx.execute("DELETE FROM records WHERE delta_id = ?1", [w.delta_id])?;
+            if first {
+                tx.execute(
+                    "INSERT OR IGNORE INTO pending_removals(delta_id, domain) VALUES (?1, ?2)",
+                    (w.delta_id, w.domain),
+                )?;
+            }
         }
         for identifier in suffix_lists {
             tx.execute(
@@ -1898,9 +1906,35 @@ impl Db {
             .map_err(Error::Db)
     }
 
-    pub fn delete_record_by_delta(&self, delta_id: &str) -> Result<()> {
-        self.execute("DELETE FROM records WHERE delta_id = ?1", [delta_id])?;
-        Ok(())
+    pub fn pending_removals(&self) -> Result<Vec<(String, String)>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT delta_id, domain FROM pending_removals ORDER BY delta_id")?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn clear_pending_removals(&self, delta_ids: &[String]) -> Result<()> {
+        self.write(|conn| {
+            for delta_id in delta_ids {
+                conn.execute(
+                    "DELETE FROM pending_removals WHERE delta_id = ?1",
+                    [delta_id],
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    /// False: a reader kept the log, and the deleted content its pages
+    /// hold, from being truncated.
+    pub fn truncate_wal(&self) -> Result<bool> {
+        let busy: i64 = self
+            .conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+        Ok(busy == 0)
     }
 
     pub fn largest_epoch_bytes(&self) -> Result<u64> {
@@ -2415,7 +2449,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn open_sets_wal_journal_full_synchronous_and_busy_timeout() {
+    fn open_sets_wal_journal_full_synchronous_secure_delete_and_busy_timeout() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
         let mode: String = db
@@ -2428,6 +2462,11 @@ pub(crate) mod tests {
             .query_row("PRAGMA synchronous", [], |row| row.get(0))
             .unwrap();
         assert_eq!(synchronous, 2);
+        let secure_delete: i64 = db
+            .conn
+            .query_row("PRAGMA secure_delete", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(secure_delete, 1);
         let timeout: i64 = db
             .conn
             .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
