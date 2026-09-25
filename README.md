@@ -426,7 +426,8 @@ in full every build. The cache lies outside `/snapshots` and is never
 served. Each entry holds the tier files and `fingerprint.json` (shard
 count, shard, Epoch, both digests, each file's `sha256` and `bytes`); an
 entry is reused only when its fingerprint parses, matches and every file
-has its listed length. Entries of rebuilt shards are replaced under
+has its listed length and `sha256`, so damage to the cache never reaches
+a manifest. Entries of rebuilt shards are replaced under
 `snapshot-swap.lock` after the withdrawal check and before the swap,
 through `<shard>.new/` with the fingerprint written last; entries at or
 above the shard count are removed. After `snapshot-shards/` is deleted,

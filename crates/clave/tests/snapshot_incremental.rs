@@ -7,6 +7,7 @@ use common::{
     write_feed_signed, TestPub, K1_SEED, K2_SEED,
 };
 use serde_json::{json, Value};
+use sha2::Digest;
 use std::collections::BTreeMap;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -760,6 +761,27 @@ fn a_cache_entry_with_a_truncated_or_missing_file_is_not_reused() {
     assert_eq!(log.produce_built(Mode::Incremental), 1);
     assert_eq!(log.served_inodes(0), reused);
     assert_same_snapshot(&log.capture(), &log.full_rebuild());
+}
+
+#[test]
+fn a_cache_entry_with_a_same_length_corrupted_file_is_not_reused() {
+    let mut log = built_log(2);
+    let damaged = log.cache_entry(0).join("tier1/links.parquet");
+    let mut bytes = std::fs::read(&damaged).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xff;
+    std::fs::write(&damaged, &bytes).unwrap();
+    let reused = log.entry_inodes(1);
+    log.seal();
+    assert_eq!(log.produce_built(Mode::Incremental), 1);
+    assert_eq!(log.served_inodes(1), reused);
+    let captured = log.capture();
+    for file in captured.manifest["manifest"]["files"].as_array().unwrap() {
+        let path = file["path"].as_str().unwrap();
+        let digest = wist_core::crypto::hex_encode(&sha2::Sha256::digest(&captured.files[path]));
+        assert_eq!(file["sha256"].as_str().unwrap(), digest, "{path}");
+    }
+    assert_same_snapshot(&captured, &log.full_rebuild());
 }
 
 #[test]

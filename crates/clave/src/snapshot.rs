@@ -885,8 +885,15 @@ fn reusable(entry: &Path, wanted: &Fingerprint) -> Option<Vec<CachedFile>> {
                 file.path == path
                     && std::fs::metadata(entry.join(path))
                         .is_ok_and(|meta| meta.is_file() && meta.len() == file.bytes)
+                    && file_sha256_hex(&entry.join(path)).is_ok_and(|hash| hash == file.sha256)
             });
     matches.then_some(cached.files)
+}
+
+fn file_sha256_hex(path: &Path) -> std::io::Result<String> {
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut std::fs::File::open(path)?, &mut hasher)?;
+    Ok(hex_encode(&hasher.finalize()))
 }
 
 #[derive(Debug, Default)]
