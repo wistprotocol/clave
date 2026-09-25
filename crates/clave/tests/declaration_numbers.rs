@@ -92,12 +92,9 @@ impl Rig {
             jcs::canonicalize(declaration).unwrap()
         );
         clave::snapshot::produce(&self.data.path().join("clave.sqlite"), self.data.path()).unwrap();
-        let raw = std::fs::read(
-            self.data
-                .path()
-                .join(format!("snapshots/{}/state.json", &at[..10])),
-        )
-        .unwrap();
+        let raw =
+            std::fs::read(common::served_snapshot(self.data.path(), &at[..10]).join("state.json"))
+                .unwrap();
         let state: Value = serde_json::from_slice(&raw).unwrap();
         envelope::verify_envelope(&state, "state", &self.key.public()).unwrap();
         let state: wist_core::objects::SnapshotState =

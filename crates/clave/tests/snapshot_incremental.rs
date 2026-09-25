@@ -267,7 +267,7 @@ impl Log {
     }
 
     fn served_dir(&self) -> PathBuf {
-        self.path().join("snapshots").join(DATE)
+        common::served_snapshot(self.path(), DATE)
     }
 
     fn served_file(&self, shard: u64, file: &str) -> PathBuf {
@@ -785,15 +785,32 @@ fn a_cache_entry_with_a_same_length_corrupted_file_is_not_reused() {
 }
 
 #[test]
-fn a_full_rebuild_of_an_unchanged_head_rebuilds_every_shard_and_matches() {
+fn a_full_rebuild_at_a_served_head_builds_nothing() {
     let log = built_log(2);
-    let incremental = log.capture();
+    let served = common::tree_bytes(&log.path().join("snapshots"));
+    let entries: Vec<Vec<u64>> = (0..2).map(|shard| log.entry_inodes(shard)).collect();
+    let head = log.db.last_epoch().unwrap().unwrap().epoch_number;
+    assert_eq!(
+        log.produce(Mode::Full),
+        Outcome::Current { epoch_number: head }
+    );
+    for (shard, before) in entries.iter().enumerate() {
+        assert_eq!(&log.entry_inodes(shard as u64), before);
+    }
+    assert_eq!(common::tree_bytes(&log.path().join("snapshots")), served);
+}
+
+#[test]
+fn a_full_rebuild_of_a_new_empty_epoch_rebuilds_every_shard_and_matches() {
+    let mut log = built_log(2);
+    log.seal();
     let entries: Vec<Vec<u64>> = (0..2).map(|shard| log.entry_inodes(shard)).collect();
     assert_eq!(log.produce_built(Mode::Full), 2);
     for (shard, before) in entries.iter().enumerate() {
         assert_ne!(&log.entry_inodes(shard as u64), before);
     }
-    assert_same_snapshot(&incremental, &log.capture());
+    let full = log.capture();
+    assert_same_snapshot(&full, &log.full_rebuild());
 }
 
 #[test]
@@ -874,7 +891,8 @@ fn a_new_delta_build_reads_the_payloads_of_its_rebuilt_shard_only() {
 
 #[test]
 fn a_full_build_reuses_nothing_and_reads_every_payload() {
-    let log = built_log(2);
+    let mut log = built_log(2);
+    log.seal();
     let cost = log.produce_cost(Mode::Full);
     let ids: Vec<String> = log
         .primary

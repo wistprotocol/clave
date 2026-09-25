@@ -113,12 +113,7 @@ fn snapshot_state_carries_amended_parameters_with_their_effective_instant() {
     clave::seal::run(&db, data.path(), &sk, NOW + 7 * DAY).unwrap();
     clave::snapshot::produce(&data.path().join("clave.sqlite"), data.path()).unwrap();
 
-    let snapdir = std::fs::read_dir(data.path().join("snapshots"))
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .find(|e| e.path().is_dir())
-        .expect("a snapshot directory")
-        .path();
+    let snapdir = common::newest_served_snapshot(data.path());
     let state_bytes = std::fs::read(snapdir.join("state.json")).unwrap();
     let state_env: serde_json::Value = serde_json::from_slice(&state_bytes).unwrap();
     let state: wist_core::objects::SnapshotState =

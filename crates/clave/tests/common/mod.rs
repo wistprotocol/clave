@@ -107,6 +107,59 @@ pub fn served_entries(data_dir: &std::path::Path, from: u64, to: u64) -> Vec<ser
     wist_core::epoch::parse_entries(&leaves).unwrap()
 }
 
+pub fn listed_snapshots(data_dir: &std::path::Path) -> Vec<serde_json::Value> {
+    let document: serde_json::Value =
+        serde_json::from_slice(&fs::read(data_dir.join("snapshots/index.json")).unwrap()).unwrap();
+    document["index"]["snapshots"].as_array().unwrap().clone()
+}
+
+pub fn listed_snapshot_directory(
+    data_dir: &std::path::Path,
+    entry: &serde_json::Value,
+) -> std::path::PathBuf {
+    let url = entry["manifest_url"].as_str().unwrap();
+    data_dir.join(
+        url.trim_start_matches('/')
+            .strip_suffix("/manifest.json")
+            .unwrap(),
+    )
+}
+
+pub fn served_snapshot(data_dir: &std::path::Path, date: &str) -> std::path::PathBuf {
+    let entry = listed_snapshots(data_dir)
+        .into_iter()
+        .find(|entry| entry["snapshot_date"] == date)
+        .unwrap_or_else(|| panic!("no Snapshot of {date} is listed"));
+    listed_snapshot_directory(data_dir, &entry)
+}
+
+pub fn newest_served_snapshot(data_dir: &std::path::Path) -> std::path::PathBuf {
+    let entry = listed_snapshots(data_dir)
+        .into_iter()
+        .next()
+        .expect("a Snapshot is listed");
+    listed_snapshot_directory(data_dir, &entry)
+}
+
+pub fn tree_bytes(
+    root: &std::path::Path,
+) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    let mut files = std::collections::BTreeMap::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                let bytes = fs::read(&path).unwrap();
+                files.insert(path.strip_prefix(root).unwrap().to_path_buf(), bytes);
+            }
+        }
+    }
+    files
+}
+
 pub fn spec_dir() -> std::path::PathBuf {
     std::env::var_os("WIST_SPEC_DIR")
         .map(std::path::PathBuf::from)

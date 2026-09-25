@@ -218,7 +218,12 @@ fn a_removal_applied_under_a_running_producer_leaves_its_build_intact() {
         let dates = served_directories(&log);
         assert_eq!(dates, vec!["2026-08-09".to_string()]);
         assert_eq!(listed_dates(&log), dates);
-        let served = log.data.path().join("snapshots").join(&dates[0]);
+        let served = log
+            .data
+            .path()
+            .join("snapshots")
+            .join(&dates[0])
+            .join(crate::snapshot::epoch_directory(height));
         let manifest: serde_json::Value =
             serde_json::from_slice(&std::fs::read(served.join("manifest.json")).unwrap()).unwrap();
         assert_eq!(manifest["manifest"]["epoch_number"], height);

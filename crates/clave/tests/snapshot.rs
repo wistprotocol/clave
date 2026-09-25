@@ -91,7 +91,10 @@ fn snapshot_build_produces_verifiable_tier0_state_and_signed_artifacts() {
     let entry = &snapshots[0];
     assert_eq!(entry["snapshot_date"], "2026-08-09");
     assert_eq!(entry["tree_size"], head.tree_size);
-    assert_eq!(entry["manifest_url"], "/snapshots/2026-08-09/manifest.json");
+    assert_eq!(
+        entry["manifest_url"],
+        "/snapshots/2026-08-09/000000000/manifest.json"
+    );
 
     let man_path = data.path().join(
         entry["manifest_url"]
@@ -252,9 +255,10 @@ fn attest_and_delete_deltas_reach_the_snapshot_records() {
     let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
     db.set_param("epoch_cadence_seconds", 1).unwrap();
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
-    let snapshot_dir = data.path().join("snapshots/2026-08-09");
+    let snapshot_dir = || common::served_snapshot(data.path(), "2026-08-09");
     let manifest = || -> serde_json::Value {
-        serde_json::from_slice(&std::fs::read(snapshot_dir.join("manifest.json")).unwrap()).unwrap()
+        serde_json::from_slice(&std::fs::read(snapshot_dir().join("manifest.json")).unwrap())
+            .unwrap()
     };
     let digest_of = |records: &[clave::db::RecordRow]| {
         let values: Vec<serde_json::Value> = records.iter().map(record_projection).collect();
@@ -268,7 +272,7 @@ fn attest_and_delete_deltas_reach_the_snapshot_records() {
     clave::snapshot::produce(&data.path().join("clave.sqlite"), data.path()).unwrap();
     let first = manifest();
     assert_eq!(
-        tier0_records(&snapshot_dir),
+        tier0_records(&snapshot_dir()),
         [
             (
                 "https://example.com/alpha".to_string(),
@@ -295,7 +299,7 @@ fn attest_and_delete_deltas_reach_the_snapshot_records() {
     let second = manifest();
     assert_eq!(second["manifest"]["epoch_number"], 1);
     assert_eq!(
-        tier0_records(&snapshot_dir),
+        tier0_records(&snapshot_dir()),
         [(
             "https://example.com/alpha".to_string(),
             alpha.clone(),
@@ -334,7 +338,7 @@ fn attest_and_delete_deltas_reach_the_snapshot_records() {
     clave::snapshot::produce(&data.path().join("clave.sqlite"), data.path()).unwrap();
     let third = manifest();
     assert_eq!(
-        tier0_records(&snapshot_dir),
+        tier0_records(&snapshot_dir()),
         [
             (
                 "https://example.com/alpha".to_string(),
@@ -355,7 +359,7 @@ fn attest_and_delete_deltas_reach_the_snapshot_records() {
 }
 
 #[test]
-fn an_empty_same_day_epoch_replaces_the_snapshot_with_the_same_content_digest() {
+fn an_empty_same_day_epoch_gets_its_own_directory_and_leaves_the_first_byte_identical() {
     let (listener, host, client) = reserve_addr();
     let p = make_publisher_with_scope(&host, &["example.com"]);
     let id1 = add_delta(&p, "https://example.com/alpha", "alpha body", None);
@@ -375,15 +379,15 @@ fn an_empty_same_day_epoch_replaces_the_snapshot_with_the_same_content_digest() 
 
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
     let db_path = data.path().join("clave.sqlite");
-    let manifest = || -> serde_json::Value {
-        serde_json::from_slice(
-            &std::fs::read(data.path().join("snapshots/2026-08-09/manifest.json")).unwrap(),
-        )
-        .unwrap()
+    let first_dir = data.path().join("snapshots/2026-08-09/000000000");
+    let second_dir = data.path().join("snapshots/2026-08-09/000000001");
+    let manifest = |dir: &std::path::Path| -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap()
     };
     clave::seal::run(&db, data.path(), &sk, SEAL_START).unwrap();
     clave::snapshot::produce(&db_path, data.path()).unwrap();
-    let first = manifest();
+    let first_files = common::tree_bytes(&first_dir);
+    let first = manifest(&first_dir);
     let r1 = clave::seal::run(&db, data.path(), &sk, SEAL_START + 3600).unwrap();
     assert_eq!(r1.epoch_number, 1);
     assert_eq!(r1.entry_count, 0);
@@ -394,7 +398,8 @@ fn an_empty_same_day_epoch_replaces_the_snapshot_with_the_same_content_digest() 
             ..
         }
     ));
-    let second = manifest();
+    let second = manifest(&second_dir);
+    assert_eq!(common::tree_bytes(&first_dir), first_files);
     assert_eq!(second["manifest"]["epoch_number"], 1);
     assert_eq!(first["manifest"]["epoch_number"], 0);
     assert_eq!(
@@ -407,12 +412,17 @@ fn an_empty_same_day_epoch_replaces_the_snapshot_with_the_same_content_digest() 
             .unwrap();
     wist_core::envelope::verify_envelope(&idx, "index", &sk.public()).unwrap();
     let snapshots = idx["index"]["snapshots"].as_array().unwrap();
+    let urls: Vec<&str> = snapshots
+        .iter()
+        .map(|entry| entry["manifest_url"].as_str().unwrap())
+        .collect();
     assert_eq!(
-        snapshots.len(),
-        1,
-        "same-day reseal must replace, not duplicate, the index entry"
+        urls,
+        vec![
+            "/snapshots/2026-08-09/000000001/manifest.json",
+            "/snapshots/2026-08-09/000000000/manifest.json",
+        ]
     );
-    assert_eq!(snapshots[0]["snapshot_date"], "2026-08-09");
     assert_eq!(
         snapshots[0]["tree_size"],
         db.last_epoch().unwrap().unwrap().tree_size
@@ -468,7 +478,7 @@ fn read_parquet_rows(path: &std::path::Path) -> Vec<Vec<String>> {
 #[test]
 fn snapshot_includes_tier1_extracts_and_link_graph() {
     let (_p, data, host, id) = tier1_fixture(None);
-    let dir = data.path().join("snapshots/2026-08-09");
+    let dir = common::served_snapshot(data.path(), "2026-08-09");
 
     let extracts = read_parquet_rows(&dir.join("tier1/extracts.parquet"));
     assert_eq!(
@@ -514,7 +524,7 @@ fn snapshot_includes_tier1_extracts_and_link_graph() {
 #[test]
 fn sharded_snapshot_declares_count_digests_and_shard_labels() {
     let (_p, data, host, _id) = tier1_fixture(Some(2));
-    let dir = data.path().join("snapshots/2026-08-09");
+    let dir = common::served_snapshot(data.path(), "2026-08-09");
     let manifest: serde_json::Value =
         serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
     let m = &manifest["manifest"];
@@ -587,7 +597,7 @@ fn the_state_artifact_carries_every_kind_with_live_instances() {
         .unwrap()
         .to_string()[..10];
     let state_env: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(data.path().join(format!("snapshots/{date}/state.json"))).unwrap(),
+        &std::fs::read(common::served_snapshot(data.path(), date).join("state.json")).unwrap(),
     )
     .unwrap();
     let state: wist_core::objects::SnapshotState =
@@ -627,7 +637,7 @@ fn the_state_artifact_carries_every_kind_with_live_instances() {
 fn record_tips(data: &std::path::Path, at: i64) -> Vec<(String, String)> {
     let date = &jiff::Timestamp::from_second(at).unwrap().to_string()[..10];
     let state_env: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(data.join(format!("snapshots/{date}/state.json"))).unwrap(),
+        &std::fs::read(common::served_snapshot(data, date).join("state.json")).unwrap(),
     )
     .unwrap();
     let state: wist_core::objects::SnapshotState =

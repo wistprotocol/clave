@@ -104,7 +104,15 @@ impl Log {
     }
 
     fn state(&self, snapshot_date: &str) -> Value {
-        self.document(&format!("snapshots/{snapshot_date}/state.json"))
+        self.document(&format!("{}/state.json", self.snapshot(snapshot_date)))
+    }
+
+    fn snapshot(&self, snapshot_date: &str) -> String {
+        common::served_snapshot(self.path(), snapshot_date)
+            .strip_prefix(self.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
     }
 
     fn document(&self, path: &str) -> Value {
@@ -253,11 +261,14 @@ fn removing_the_genesis_key_leaves_every_later_document_verifiable_under_the_rem
     let remaining = log.public_key("log2");
     wist_core::envelope::verify_envelope(&state, "state", &remaining).unwrap();
     for (path, inner) in [
-        ("snapshots/2026-08-09/manifest.json", "manifest"),
-        ("snapshots/index.json", "index"),
+        (
+            format!("{}/manifest.json", log.snapshot("2026-08-09")),
+            "manifest",
+        ),
+        ("snapshots/index.json".to_string(), "index"),
     ] {
         let doc: Value =
-            serde_json::from_slice(&std::fs::read(log.path().join(path)).unwrap()).unwrap();
+            serde_json::from_slice(&std::fs::read(log.path().join(&path)).unwrap()).unwrap();
         assert_eq!(doc["sig"]["key_id"], "log2", "{path}");
         wist_core::envelope::verify_envelope(&doc, inner, &remaining).unwrap();
     }
@@ -463,16 +474,20 @@ fn unsealed_documents(data_dir: &Path) -> Vec<(String, &'static str)> {
         ("snapshots/index.json".to_string(), "index"),
         ("log/mirrors.json".to_string(), "mirrors"),
     ];
-    let mut dates: Vec<String> = std::fs::read_dir(data_dir.join("snapshots"))
-        .unwrap()
-        .flatten()
-        .filter(|entry| entry.path().is_dir())
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+    let mut directories: Vec<String> = common::listed_snapshots(data_dir)
+        .iter()
+        .map(|entry| {
+            common::listed_snapshot_directory(data_dir, entry)
+                .strip_prefix(data_dir)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
         .collect();
-    dates.sort();
-    for date in dates {
-        documents.push((format!("snapshots/{date}/state.json"), "state"));
-        documents.push((format!("snapshots/{date}/manifest.json"), "manifest"));
+    directories.sort();
+    for directory in directories {
+        documents.push((format!("{directory}/state.json"), "state"));
+        documents.push((format!("{directory}/manifest.json"), "manifest"));
     }
     documents
 }
@@ -501,7 +516,8 @@ fn removing_a_key_re_signs_every_unsealed_document_it_signed_and_still_serves() 
             "{path} is signed by the genesis key before its removal"
         );
     }
-    let before = log.document("snapshots/2026-08-09/manifest.json")["manifest"].clone();
+    let before =
+        log.document(&format!("{}/manifest.json", log.snapshot("2026-08-09")))["manifest"].clone();
     let mirror_urls = log.document("log/mirrors.json")["mirrors"].clone();
 
     clave::log_key::remove(&log.db, log.path(), "log1", SEAL_START + 86_400).unwrap();
@@ -514,7 +530,8 @@ fn removing_a_key_re_signs_every_unsealed_document_it_signed_and_still_serves() 
         wist_core::envelope::verify_envelope(&document, inner, &remaining)
             .unwrap_or_else(|error| panic!("{path}: {error}"));
     }
-    let after = log.document("snapshots/2026-08-09/manifest.json")["manifest"].clone();
+    let after =
+        log.document(&format!("{}/manifest.json", log.snapshot("2026-08-09")))["manifest"].clone();
     assert_eq!(after["content_digest"], before["content_digest"]);
     assert_eq!(
         after["state"]["state_digest"],
@@ -527,8 +544,12 @@ fn removing_a_key_re_signs_every_unsealed_document_it_signed_and_still_serves() 
         "re-signing states no new Mirror list"
     );
     for date in ["2026-08-09", "2026-08-10", "2026-08-11"] {
-        let manifest = log.document(&format!("snapshots/{date}/manifest.json"));
-        let state = std::fs::read(log.path().join(format!("snapshots/{date}/state.json"))).unwrap();
+        let manifest = log.document(&format!("{}/manifest.json", log.snapshot(date)));
+        let state = std::fs::read(
+            log.path()
+                .join(format!("{}/state.json", log.snapshot(date))),
+        )
+        .unwrap();
         assert_eq!(
             manifest["manifest"]["state"]["sha256"],
             wist_core::crypto::hex_encode(&Sha256::digest(&state)),
@@ -571,17 +592,29 @@ fn a_pass_interrupted_between_documents_is_finished_by_the_next_publication_repa
     .unwrap();
     clave::log_key::add(&log.db, log.path(), SEAL_START).unwrap();
     log.seal_on_day(1);
-    let stale_state = std::fs::read(log.path().join("snapshots/2026-08-09/state.json")).unwrap();
-    let stale_manifest =
-        std::fs::read(log.path().join("snapshots/2026-08-09/manifest.json")).unwrap();
+    let stale_state = std::fs::read(
+        log.path()
+            .join(format!("{}/state.json", log.snapshot("2026-08-09"))),
+    )
+    .unwrap();
+    let stale_manifest = std::fs::read(
+        log.path()
+            .join(format!("{}/manifest.json", log.snapshot("2026-08-09"))),
+    )
+    .unwrap();
     let stale_index = std::fs::read(log.path().join("snapshots/index.json")).unwrap();
 
     clave::log_key::remove(&log.db, log.path(), "log1", SEAL_START + 86_400).unwrap();
     log.seal_on_day(2);
-    let settled = std::fs::read(log.path().join("snapshots/2026-08-09/state.json")).unwrap();
+    let settled = std::fs::read(
+        log.path()
+            .join(format!("{}/state.json", log.snapshot("2026-08-09"))),
+    )
+    .unwrap();
 
     std::fs::write(
-        log.path().join("snapshots/2026-08-09/manifest.json"),
+        log.path()
+            .join(format!("{}/manifest.json", log.snapshot("2026-08-09"))),
         &stale_manifest,
     )
     .unwrap();
@@ -589,28 +622,34 @@ fn a_pass_interrupted_between_documents_is_finished_by_the_next_publication_repa
     clave::publication::recover(&log.db, log.path()).unwrap();
     let remaining = log.public_key("log2");
     for (path, inner) in [
-        ("snapshots/2026-08-09/manifest.json", "manifest"),
-        ("snapshots/index.json", "index"),
+        (
+            format!("{}/manifest.json", log.snapshot("2026-08-09")),
+            "manifest",
+        ),
+        ("snapshots/index.json".to_string(), "index"),
     ] {
-        let document = log.document(path);
+        let document = log.document(&path);
         assert_eq!(document["sig"]["key_id"], "log2", "{path}");
         wist_core::envelope::verify_envelope(&document, inner, &remaining).unwrap();
     }
     assert_eq!(
-        log.document("snapshots/2026-08-09/manifest.json")["manifest"]["state"]["sha256"],
+        log.document(&format!("{}/manifest.json", log.snapshot("2026-08-09")))["manifest"]["state"]
+            ["sha256"],
         wist_core::crypto::hex_encode(&Sha256::digest(&settled))
     );
 
     std::fs::write(
-        log.path().join("snapshots/2026-08-09/state.json"),
+        log.path()
+            .join(format!("{}/state.json", log.snapshot("2026-08-09"))),
         &stale_state,
     )
     .unwrap();
-    let mut manifest = log.document("snapshots/2026-08-09/manifest.json");
+    let mut manifest = log.document(&format!("{}/manifest.json", log.snapshot("2026-08-09")));
     manifest["manifest"]["state"]["sha256"] = json!("0".repeat(64));
     let second = log.signing_key("log2");
     std::fs::write(
-        log.path().join("snapshots/2026-08-09/manifest.json"),
+        log.path()
+            .join(format!("{}/manifest.json", log.snapshot("2026-08-09"))),
         serde_json::to_vec(
             &wist_core::envelope::sign_envelope(&manifest["manifest"], "manifest", "log2", &second)
                 .unwrap(),
@@ -620,11 +659,16 @@ fn a_pass_interrupted_between_documents_is_finished_by_the_next_publication_repa
     .unwrap();
     clave::publication::recover(&log.db, log.path()).unwrap();
     assert_eq!(
-        std::fs::read(log.path().join("snapshots/2026-08-09/state.json")).unwrap(),
+        std::fs::read(
+            log.path()
+                .join(format!("{}/state.json", log.snapshot("2026-08-09")))
+        )
+        .unwrap(),
         settled
     );
     assert_eq!(
-        log.document("snapshots/2026-08-09/manifest.json")["manifest"]["state"]["sha256"],
+        log.document(&format!("{}/manifest.json", log.snapshot("2026-08-09")))["manifest"]["state"]
+            ["sha256"],
         wist_core::crypto::hex_encode(&Sha256::digest(&settled))
     );
 }

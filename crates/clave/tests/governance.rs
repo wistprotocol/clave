@@ -57,7 +57,7 @@ fn payload_withdrawal_removes_payload_record_and_stale_snapshots() {
     let hex = id.strip_prefix("sha256:").unwrap();
     let payload_path = r.data.path().join("payloads").join(format!("{hex}.json"));
     assert!(payload_path.exists());
-    let first_snapshot_dir = r.data.path().join("snapshots").join(&ts(NOW)[..10]);
+    let first_snapshot_dir = common::served_snapshot(r.data.path(), &ts(NOW)[..10]);
     assert!(first_snapshot_dir.exists());
     assert!(r
         .db
@@ -103,11 +103,7 @@ fn payload_withdrawal_removes_payload_record_and_stale_snapshots() {
     };
     assert!(listed(r.data.path()).is_empty());
     clave::snapshot::produce(&db_path, r.data.path()).unwrap();
-    let new_snapshot_dir = r
-        .data
-        .path()
-        .join("snapshots")
-        .join(&ts(NOW + 2 * DAY)[..10]);
+    let new_snapshot_dir = common::served_snapshot(r.data.path(), &ts(NOW + 2 * DAY)[..10]);
     assert!(new_snapshot_dir.exists());
     assert_eq!(
         listed(r.data.path()),

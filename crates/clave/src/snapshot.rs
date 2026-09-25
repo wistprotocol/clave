@@ -577,31 +577,164 @@ fn build_state(read: &ReadState) -> Result<(SnapshotState, String)> {
     ))
 }
 
+pub const SUPERSEDED_DIRECTORY: &str = "snapshot-superseded";
+pub const SUPERSEDED_GRACE_SECONDS: i64 = 24 * 60 * 60;
+
+pub fn epoch_directory(epoch_number: u64) -> String {
+    format!("{epoch_number:09}")
+}
+
+fn snapshot_date_of(head: &EpochRow) -> String {
+    head.sealed_at
+        .get(..10)
+        .unwrap_or(&head.sealed_at)
+        .to_string()
+}
+
+fn served_directory(data_dir: &Path, snapshot_date: &str, epoch_number: u64) -> PathBuf {
+    data_dir
+        .join("snapshots")
+        .join(snapshot_date)
+        .join(epoch_directory(epoch_number))
+}
+
+fn superseded_marker(data_dir: &Path, snapshot_date: &str, epoch_number: u64) -> PathBuf {
+    data_dir
+        .join(SUPERSEDED_DIRECTORY)
+        .join(snapshot_date)
+        .join(epoch_directory(epoch_number))
+}
+
 fn served_manifest(directory: &Path) -> Option<SnapshotManifest> {
     let bytes = std::fs::read(directory.join("manifest.json")).ok()?;
     let document: Value = crate::json::parse(&bytes).ok()?;
     let manifest: SnapshotManifest =
         serde_json::from_value(document.get("manifest")?.clone()).ok()?;
-    let named = directory.file_name().and_then(|name| name.to_str());
-    (named == Some(manifest.snapshot_date.as_str())).then_some(manifest)
+    let epoch = directory.file_name().and_then(|name| name.to_str());
+    let date = directory
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str());
+    (date == Some(manifest.snapshot_date.as_str())
+        && epoch == Some(epoch_directory(manifest.epoch_number).as_str()))
+    .then_some(manifest)
 }
 
-fn served_entries(data_dir: &Path) -> Result<Vec<SnapshotIndexEntry>> {
-    let mut snapshots = Vec::new();
-    for directory in snapshot_directories(data_dir) {
-        let Some(manifest) = served_manifest(&directory) else {
-            std::fs::remove_dir_all(&directory)?;
+fn superseded_expired(superseded_at: jiff::Timestamp, now: jiff::Timestamp) -> bool {
+    now.as_second() - superseded_at.as_second() >= SUPERSEDED_GRACE_SECONDS
+}
+
+fn superseded_at(data_dir: &Path, manifest: &SnapshotManifest) -> Option<jiff::Timestamp> {
+    let marker = superseded_marker(data_dir, &manifest.snapshot_date, manifest.epoch_number);
+    std::fs::read_to_string(marker).ok()?.trim().parse().ok()
+}
+
+struct ServedPlan {
+    entries: Vec<SnapshotIndexEntry>,
+    removals: Vec<PathBuf>,
+}
+
+fn plan_served(data_dir: &Path, now: jiff::Timestamp) -> Result<ServedPlan> {
+    let mut served: Vec<SnapshotManifest> = Vec::new();
+    let mut removals = Vec::new();
+    for directory in snapshot_date_children(data_dir)? {
+        match directory
+            .is_dir()
+            .then(|| served_manifest(&directory))
+            .flatten()
+        {
+            Some(manifest) => served.push(manifest),
+            None => removals.push(directory),
+        }
+    }
+    let mut newest: BTreeMap<String, u64> = BTreeMap::new();
+    for manifest in &served {
+        let epoch = newest.entry(manifest.snapshot_date.clone()).or_default();
+        *epoch = (*epoch).max(manifest.epoch_number);
+    }
+    let mut kept = Vec::new();
+    for manifest in served {
+        let marker = superseded_marker(data_dir, &manifest.snapshot_date, manifest.epoch_number);
+        if newest.get(&manifest.snapshot_date) == Some(&manifest.epoch_number) {
+            remove_path(&marker)?;
+            kept.push(manifest);
             continue;
-        };
-        snapshots.push(SnapshotIndexEntry {
-            manifest_url: format!("/snapshots/{}/manifest.json", manifest.snapshot_date),
+        }
+        match superseded_at(data_dir, &manifest) {
+            Some(at) if superseded_expired(at, now) => {
+                removals.push(served_directory(
+                    data_dir,
+                    &manifest.snapshot_date,
+                    manifest.epoch_number,
+                ));
+                continue;
+            }
+            Some(_) => {}
+            None => crate::publication::write_durable(&marker, now.to_string().as_bytes())?,
+        }
+        kept.push(manifest);
+    }
+    kept.sort_by(|a, b| {
+        b.snapshot_date
+            .cmp(&a.snapshot_date)
+            .then(b.epoch_number.cmp(&a.epoch_number))
+    });
+    let entries = kept
+        .into_iter()
+        .map(|manifest| SnapshotIndexEntry {
+            manifest_url: format!(
+                "/snapshots/{}/{}/manifest.json",
+                manifest.snapshot_date,
+                epoch_directory(manifest.epoch_number)
+            ),
             snapshot_date: manifest.snapshot_date,
             tree_size: manifest.tree_size,
             content_digest: manifest.content_digest,
-        });
+        })
+        .collect();
+    Ok(ServedPlan { entries, removals })
+}
+
+fn remove_unlisted(data_dir: &Path, removals: &[PathBuf]) -> Result<()> {
+    for path in removals {
+        remove_path(path)?;
     }
-    snapshots.sort_by(|a, b| b.snapshot_date.cmp(&a.snapshot_date));
-    Ok(snapshots)
+    remove_empty_children(&data_dir.join("snapshots"))?;
+    for (date, date_path) in children(&data_dir.join(SUPERSEDED_DIRECTORY))? {
+        for (name, marker) in children(&date_path)? {
+            if !data_dir.join("snapshots").join(&date).join(&name).is_dir() {
+                remove_path(&marker)?;
+            }
+        }
+    }
+    remove_empty_children(&data_dir.join(SUPERSEDED_DIRECTORY))
+}
+
+fn children(path: &Path) -> Result<Vec<(String, PathBuf)>> {
+    let entries = match std::fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut listed = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        listed.push((
+            entry.file_name().to_string_lossy().into_owned(),
+            entry.path(),
+        ));
+    }
+    listed.sort();
+    Ok(listed)
+}
+
+fn remove_empty_children(path: &Path) -> Result<()> {
+    for (_, child) in children(path)? {
+        if child.is_dir() && std::fs::read_dir(&child)?.next().is_none() {
+            remove_tree(&child)?;
+        }
+    }
+    Ok(())
 }
 
 fn index_path(data_dir: &Path) -> PathBuf {
@@ -624,43 +757,53 @@ fn same_entries(listed: &[SnapshotIndexEntry], served: &[SnapshotIndexEntry]) ->
     values(listed) == values(served)
 }
 
-/// WIST-3 §6: the index lists exactly the Snapshots served, so an entry
-/// leaves it when its Snapshot stops being served.
 fn regenerate_index(db: &Db, data_dir: &Path, always: bool) -> Result<()> {
-    let snapshots = served_entries(data_dir)?;
-    if !always {
-        let unchanged = match listed_entries(data_dir) {
+    regenerate_index_at(db, data_dir, always, jiff::Timestamp::now())
+}
+
+fn regenerate_index_at(db: &Db, data_dir: &Path, always: bool, now: jiff::Timestamp) -> Result<()> {
+    let ServedPlan {
+        entries: snapshots,
+        removals,
+    } = plan_served(data_dir, now)?;
+    let unchanged = !always
+        && match listed_entries(data_dir) {
             Some(listed) => same_entries(&listed, &snapshots),
             None => snapshots.is_empty() && !index_path(data_dir).exists(),
         };
-        if unchanged {
-            return Ok(());
+    if !unchanged {
+        let updated_at = jiff::Timestamp::from_second(now.as_second())
+            .map_err(|_| Error::Snapshot("current time out of range".into()))?
+            .to_string();
+        let index = SnapshotIndex {
+            wist_version: WIST_VERSION.to_string(),
+            updated_at,
+            snapshots,
+        };
+        let (key_id, sk) = crate::keys::head_signer(data_dir, db)?;
+        let envelope = sign_envelope(&serde_json::to_value(&index)?, "index", &key_id, &sk)?;
+        crate::publication::write_durable(&index_path(data_dir), &serde_json::to_vec(&envelope)?)?;
+    }
+    // WIST-3 §6: an index entry is removed before its Snapshot's files.
+    remove_unlisted(data_dir, &removals)
+}
+
+fn snapshot_date_children(data_dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut listed = Vec::new();
+    for (_, date) in children(&data_dir.join("snapshots"))? {
+        if date.is_dir() {
+            listed.extend(children(&date)?.into_iter().map(|(_, path)| path));
         }
     }
-    let updated_at = jiff::Timestamp::from_second(jiff::Timestamp::now().as_second())
-        .map_err(|_| Error::Snapshot("current time out of range".into()))?
-        .to_string();
-    let index = SnapshotIndex {
-        wist_version: WIST_VERSION.to_string(),
-        updated_at,
-        snapshots,
-    };
-    let (key_id, sk) = crate::keys::head_signer(data_dir, db)?;
-    let envelope = sign_envelope(&serde_json::to_value(&index)?, "index", &key_id, &sk)?;
-    crate::publication::write_durable(&index_path(data_dir), &serde_json::to_vec(&envelope)?)
+    Ok(listed)
 }
 
 fn snapshot_directories(data_dir: &Path) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(data_dir.join("snapshots")) else {
-        return Vec::new();
-    };
-    let mut directories: Vec<PathBuf> = entries
-        .flatten()
-        .map(|entry| entry.path())
+    snapshot_date_children(data_dir)
+        .unwrap_or_default()
+        .into_iter()
         .filter(|path| path.is_dir())
-        .collect();
-    directories.sort();
-    directories
+        .collect()
 }
 
 fn served_document(path: &Path) -> Result<Option<Value>> {
@@ -1284,6 +1427,7 @@ fn withdraw_served(db: &Db, data_dir: &Path, publishers: &[&str]) -> Result<()> 
     }
     let _swap = swap_lock(data_dir)?;
     clear_directory(&data_dir.join("snapshots"))?;
+    clear_directory(&data_dir.join(SUPERSEDED_DIRECTORY))?;
     for (_, path) in cache_entries(data_dir)? {
         let affected = read_fingerprint(&path).is_none_or(|fingerprint| {
             publishers.iter().any(|publisher| {
@@ -1335,17 +1479,6 @@ pub fn produce(db_path: &Path, data_dir: &Path) -> Result<Outcome> {
     produce_with(db_path, data_dir, Mode::Incremental, &mut |_| Ok(()))
 }
 
-fn served_epoch(data_dir: &Path) -> Result<Option<u64>> {
-    let Some(newest) = listed_entries(data_dir).and_then(|listed| listed.into_iter().next()) else {
-        return Ok(None);
-    };
-    let manifest = served_document(&data_dir.join(newest.manifest_url.trim_start_matches('/')))?;
-    Ok(manifest
-        .as_ref()
-        .and_then(|manifest| manifest.pointer("/manifest/epoch_number"))
-        .and_then(Value::as_u64))
-}
-
 fn superseding(db: &Db, built: u64) -> Result<Option<u64>> {
     Ok(db
         .withdrawal_state()?
@@ -1353,39 +1486,6 @@ fn superseding(db: &Db, built: u64) -> Result<Option<u64>> {
         .map(|(_, _, sealing_height)| sealing_height)
         .filter(|sealing_height| *sealing_height > built)
         .max())
-}
-
-/// Both paths are in the data directory, so on one filesystem.
-fn swap_in(staged: &Path, target: &Path) -> Result<()> {
-    if !target.exists() {
-        std::fs::rename(staged, target)?;
-        return Ok(());
-    }
-    #[cfg(target_os = "linux")]
-    {
-        match rustix::fs::renameat_with(
-            rustix::fs::CWD,
-            staged,
-            rustix::fs::CWD,
-            target,
-            rustix::fs::RenameFlags::EXCHANGE,
-        ) {
-            Ok(()) => return remove_tree(staged),
-            Err(errno)
-                if errno != rustix::io::Errno::INVAL
-                    && errno != rustix::io::Errno::NOSYS
-                    && errno != rustix::io::Errno::OPNOTSUPP =>
-            {
-                return Err(std::io::Error::from(errno).into());
-            }
-            Err(_) => {}
-        }
-    }
-    let replaced = staged.with_extension("replaced");
-    remove_tree(&replaced)?;
-    std::fs::rename(target, &replaced)?;
-    std::fs::rename(staged, target)?;
-    remove_tree(&replaced)
 }
 
 pub fn produce_with(
@@ -1404,11 +1504,11 @@ pub fn produce_with(
     let db = Db::connect(db_path)?;
     reconcile_locked(&db, data_dir, true)?;
 
-    let served = served_epoch(data_dir)?;
     let Some(head) = db.last_epoch()? else {
         return Ok(Outcome::Unsealed);
     };
-    if mode == Mode::Incremental && served == Some(head.epoch_number) {
+    let served = served_directory(data_dir, &snapshot_date_of(&head), head.epoch_number);
+    if served_manifest(&served).is_some() {
         return Ok(Outcome::Current {
             epoch_number: head.epoch_number,
         });
@@ -1424,12 +1524,7 @@ pub fn produce_with(
     observe(Phase::Read)?;
 
     let built = read.head.epoch_number;
-    let snapshot_date = read
-        .head
-        .sealed_at
-        .get(..10)
-        .unwrap_or(&read.head.sealed_at)
-        .to_string();
+    let snapshot_date = snapshot_date_of(&read.head);
     let staged = staging(data_dir).join(built.to_string());
     remove_tree(&staged)?;
     std::fs::create_dir_all(&staged)?;
@@ -1478,12 +1573,21 @@ pub fn produce_with(
             withdrawal_height,
         });
     }
+    let target = served_directory(data_dir, &snapshot_date, built);
+    if target.exists() {
+        remove_tree(&staged)?;
+        return Ok(Outcome::Current {
+            epoch_number: built,
+        });
+    }
     // Under the swap lock and after the superseding check: a withdrawal seal
     // either abandons this build or runs after it and removes its shard.
     cost.cache_bytes_written = update_cache(data_dir, &staged, read.shard_count, &rebuilt)?;
     let served_root = data_dir.join("snapshots");
-    std::fs::create_dir_all(&served_root)?;
-    swap_in(&staged, &served_root.join(&snapshot_date))?;
+    let date_root = served_root.join(&snapshot_date);
+    std::fs::create_dir_all(&date_root)?;
+    std::fs::rename(&staged, &target)?;
+    sync_directory(&date_root)?;
     sync_directory(&served_root)?;
     sync_directory(&staging(data_dir))?;
     observe(Phase::Swapped)?;
@@ -1556,6 +1660,22 @@ mod tests {
             &declarations,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn a_superseded_snapshot_expires_when_the_grace_period_has_fully_elapsed() {
+        let at = jiff::Timestamp::from_second(T0).unwrap();
+        let after = |seconds: i64| jiff::Timestamp::from_second(T0 + seconds).unwrap();
+        assert!(!superseded_expired(at, at));
+        assert!(!superseded_expired(at, after(SUPERSEDED_GRACE_SECONDS - 1)));
+        assert!(superseded_expired(at, after(SUPERSEDED_GRACE_SECONDS)));
+    }
+
+    #[test]
+    fn an_epoch_directory_is_the_epoch_zero_padded_to_nine_digits() {
+        assert_eq!(epoch_directory(0), "000000000");
+        assert_eq!(epoch_directory(24), "000000024");
+        assert_eq!(epoch_directory(1_234_567_890), "1234567890");
     }
 
     #[test]

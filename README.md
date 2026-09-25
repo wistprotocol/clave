@@ -366,7 +366,7 @@ The served layout is:
 /log/checkpoints/<epoch_number>   (every Checkpoint published)
 /log/anchor.json /log/mirrors.json /log/suffix-lists/<hex>.dat
 /payloads/<delta-id-hex>.json
-/snapshots/index.json /snapshots/<date>/...
+/snapshots/index.json /snapshots/<date>/<epoch_number>/...
 ```
 
 `serve` sends `/checkpoint` and the archive as
@@ -382,15 +382,16 @@ stop being served once the full tile exists.
 A seal publishes the Checkpoint only; the Snapshot at the sealed head is
 produced afterwards by `seal` (unless `--no-snapshot`), by `clave snapshot
 --data <dir>` (`--rebuild` rebuilds every shard instead of reusing
-unchanged ones, at the head even when the served Snapshot is current),
-or by `serve`'s producer task, which runs at start, after each
+unchanged ones), or by `serve`'s producer task, which runs at start, after each
 successful seal and every 60 seconds, and retries at once when a
 withdrawal supersedes its build. `--no-seal` instances never produce. One
 producer runs per data directory at a time, holding an exclusive lock on
 `snapshot-build.lock`; a second one fails naming it. Production prints one
 of `snapshot built at epoch N for <date> in M ms, K of S shards rebuilt`,
 `snapshot current at
-epoch N` (the newest served Snapshot is already at the head), `snapshot
+epoch N` (a Snapshot of the head Epoch is already served; with or
+without `--rebuild`, nothing is built, and regenerating a served
+Snapshot means sealing a new Epoch), `snapshot
 superseded by a withdrawal at epoch H` or `snapshot not built: no Epoch
 sealed`. A built Snapshot is followed by `snapshot bytes written N`
 (bytes the build wrote into the staging directory: rebuilt tier files,
@@ -408,13 +409,27 @@ neither blocked nor included. A live record whose Payload is missing or
 does not parse fails the build with an error naming its `delta_id`
 (WIST-3 §7). The files are written and synced into the staging directory
 `snapshot-build/<epoch number>/`, outside `/snapshots` and never served,
-then swapped into `snapshots/<date>/` by one rename, or by an atomic
-directory exchange where that date is already served. The index is then
-regenerated from the manifests on disk, newest date first, and written
-through a synced temporary file. The check for a withdrawal sealed above
+then moved by one rename into `snapshots/<date>/<epoch>/`, the Epoch
+zero-padded to nine digits (WIST-3 §6). That directory does not exist
+before the rename, and a served directory is never rewritten: a later
+Epoch sealed on the same date gets its own directory. The index is then
+regenerated from the manifests on disk, newest date first and the
+higher Epoch first within a date, and written through a synced
+temporary file. The check for a withdrawal sealed above
 the build's Epoch, the swap and the index write hold
 `snapshot-swap.lock`, as does a withdrawal seal's removal; such a
 withdrawal abandons the build instead of swapping it in.
+
+A Snapshot superseded by a later one of the same date stays served and
+listed for 24 hours (`SUPERSEDED_GRACE_SECONDS`), so a Consumer that
+read the index before the newer Snapshot was swapped in finishes its
+download. The index regeneration that first sees the older Snapshot
+superseded records that instant in `snapshot-superseded/<date>/<epoch>`,
+outside `/snapshots`; a reconciliation at or after 24 hours past it
+rewrites the index without the entry, then removes the directory and the
+marker. A missing or unreadable marker is rewritten with the current
+time. Snapshots of earlier dates stay served until a withdrawal removes
+them.
 
 Tier files are reused per shard (unsharded: one shard). A shard whose
 record projections (WIST-3 §7 `content_digest` over the shard) and
@@ -435,13 +450,15 @@ the next build rebuilds every shard.
 
 Every start of `seal` and `serve`, and every seal, reconciles the served
 tree before re-signing it: an abandoned staging directory is removed
-unless a producer holds its lock, a Snapshot directory without a readable
-manifest for its date is removed, and `snapshots/index.json` is
+unless a producer holds its lock, `snapshots/index.json` is
 regenerated when it is unparsable, missing while Snapshots are served, or
-lists other entries than the manifests present (WIST-3 §6). A withdrawal
+lists other entries than the manifests present (WIST-3 §6), and then an
+entry under `snapshots/<date>/` that is not a directory holding a
+readable manifest of that date and Epoch is removed, as is a superseded
+Snapshot past its grace period. A withdrawal
 seal's transaction drops the withdrawn record and records the removal
 still owed; before any Checkpoint is published, the owed removal deletes
-the Payload file, every served Snapshot, the staging area and the
+the Payload file, every served Snapshot, every grace-period marker, the staging area and the
 `snapshot-shards/` entries of the withdrawn Deltas' Publisher shards,
 writes an index listing none, then marks itself done and truncates the
 store's write-ahead log. A removal interrupted before it was marked done

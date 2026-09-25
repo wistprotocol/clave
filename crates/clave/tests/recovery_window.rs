@@ -367,9 +367,7 @@ fn recovery_flow_queues_settles_and_rejects_superseded_deltas() {
     let sealed_at_b1 = jiff::Timestamp::from_second(T0 + 7200).unwrap().to_string();
     clave::snapshot::produce(&r.data.path().join("clave.sqlite"), r.data.path()).unwrap();
     let state_raw = std::fs::read(
-        r.data
-            .path()
-            .join(format!("snapshots/{}/state.json", &sealed_at_b1[..10])),
+        common::served_snapshot(r.data.path(), &sealed_at_b1[..10]).join("state.json"),
     )
     .unwrap();
     let state: serde_json::Value = serde_json::from_slice(&state_raw).unwrap();
