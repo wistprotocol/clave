@@ -2,9 +2,9 @@ mod common;
 
 use clave::snapshot::{shard_index, Mode, Outcome, Phase, SHARD_CACHE_DIRECTORY};
 use common::{
-    add_delta, add_delta_signed, current_declaration, declaration_hash, key_entry,
-    make_publisher_with_scope, serve_static, write_declaration, write_feed, write_feed_signed,
-    TestPub, K1_SEED, K2_SEED,
+    add_attest, add_delete, add_delta, add_delta_signed, current_declaration, declaration_hash,
+    key_entry, make_publisher_with_scope, serve_static, write_declaration, write_feed,
+    write_feed_signed, TestPub, K1_SEED, K2_SEED,
 };
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -156,6 +156,23 @@ impl Log {
         let site = self.site(primary);
         let url = format!("https://{}/{path}", site.scope);
         let id = add_delta(&site.publisher, &url, &format!("body of {url}"), None);
+        site.ids.push(id.clone());
+        write_feed(&site.publisher, &site.publisher.domain, &site.ids, &now);
+        let domain = site.publisher.domain.clone();
+        assert_eq!(self.ingest(&domain).accepted, vec![id.clone()]);
+        id
+    }
+
+    fn continue_chain(
+        &mut self,
+        primary: bool,
+        prev: &str,
+        delta: fn(&TestPub, &str, &str) -> String,
+    ) -> String {
+        let now = self.now();
+        let site = self.site(primary);
+        let url = format!("https://{}/a", site.scope);
+        let id = delta(&site.publisher, &url, prev);
         site.ids.push(id.clone());
         write_feed(&site.publisher, &site.publisher.domain, &site.ids, &now);
         let domain = site.publisher.domain.clone();
@@ -464,6 +481,61 @@ fn a_new_delta_rebuilds_only_its_publishers_shard() {
         incremental.rows[&format!("shard-{changed}/tier0/index.sqlite")].len(),
         2
     );
+    assert_same_snapshot(&incremental, &log.full_rebuild());
+}
+
+fn tier0_rows(captured: &Captured, shard: u64) -> &Vec<Vec<String>> {
+    &captured.rows[&format!("shard-{shard}/tier0/index.sqlite")]
+}
+
+#[test]
+fn an_attest_rebuilds_only_its_publishers_shard_and_moves_the_records_freshness() {
+    let mut log = built_log(2);
+    let changed = log.shard_of(&log.other_domain());
+    let kept = log.shard_of(PRIMARY);
+    let (kept_before, changed_before) = (log.entry_inodes(kept), log.entry_inodes(changed));
+    let anchor = log.other.ids[0].clone();
+    let before = log.capture();
+    log.continue_chain(false, &anchor, add_attest);
+    log.seal();
+    assert_eq!(log.produce_built(Mode::Incremental), 1);
+    assert_eq!(log.served_inodes(kept), kept_before);
+    assert_ne!(log.entry_inodes(changed), changed_before);
+    let incremental = log.capture();
+    let (row_before, row_after) = (
+        &tier0_rows(&before, changed)[0],
+        &tier0_rows(&incremental, changed)[0],
+    );
+    assert_eq!(tier0_rows(&incremental, changed).len(), 1);
+    assert_eq!(row_after[0], row_before[0], "the URL");
+    assert_eq!(row_after[2], anchor, "the anchor Delta stays");
+    assert_ne!(
+        row_after[3], row_before[3],
+        "observed_at moves to the attest's"
+    );
+    assert_ne!(
+        incremental.manifest["manifest"]["content_digest"],
+        before.manifest["manifest"]["content_digest"]
+    );
+    assert_same_snapshot(&incremental, &log.full_rebuild());
+}
+
+#[test]
+fn a_delete_rebuilds_only_its_publishers_shard_and_excludes_the_record() {
+    let mut log = built_log(2);
+    let changed = log.shard_of(&log.other_domain());
+    let kept = log.shard_of(PRIMARY);
+    let (kept_before, changed_before) = (log.entry_inodes(kept), log.entry_inodes(changed));
+    let anchor = log.other.ids[0].clone();
+    log.continue_chain(false, &anchor, add_delete);
+    log.seal();
+    assert_eq!(log.produce_built(Mode::Incremental), 1);
+    assert_eq!(log.served_inodes(kept), kept_before);
+    assert_ne!(log.entry_inodes(changed), changed_before);
+    let incremental = log.capture();
+    assert!(tier0_rows(&incremental, changed).is_empty());
+    assert_eq!(log.tier1_records(changed), 0);
+    assert_eq!(tier0_rows(&incremental, kept).len(), 1);
     assert_same_snapshot(&incremental, &log.full_rebuild());
 }
 

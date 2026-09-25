@@ -202,36 +202,70 @@ pub fn add_delta_with_links(
     });
     if let Some(pv) = prev {
         delta["prev"] = pv.into();
-        if let Ok(raw) = fs::read(
-            p.dir
-                .path()
-                .join(format!(".well-known/wist/deltas/{}.json", &pv[7..])),
-        ) {
-            let predecessor: serde_json::Value = serde_json::from_slice(&raw).unwrap();
-            let at = predecessor["delta"]["observed_at"]
-                .as_str()
-                .unwrap()
-                .parse::<jiff::Timestamp>()
-                .unwrap();
-            delta["observed_at"] = at
-                .checked_add(jiff::SignedDuration::from_secs(1))
-                .unwrap()
-                .to_string()
-                .into();
+        if let Some(at) = successor_observed_at(p, pv) {
+            delta["observed_at"] = at.into();
         }
     }
-    let id = wist_core::delta::delta_id(&delta).unwrap();
-    let env = wist_core::envelope::sign_envelope(&delta, "delta", &p.kid, &p.sk).unwrap();
-    let hex = id.strip_prefix("sha256:").unwrap();
-    let wk = p.dir.path().join(".well-known/wist");
+    let id = store_delta(p, &delta);
     fs::write(
-        wk.join(format!("deltas/{hex}.json")),
-        serde_json::to_vec(&env).unwrap(),
+        p.dir
+            .path()
+            .join(format!(".well-known/wist/payloads/{}.json", &id[7..])),
+        serde_json::to_vec(&payload).unwrap(),
     )
     .unwrap();
+    id
+}
+
+/// An `attest` Delta continuing `prev`, observed one second after it.
+pub fn add_attest(p: &TestPub, url: &str, prev: &str) -> String {
+    add_content_free_delta(p, url, "attest", prev)
+}
+
+/// A `delete` Delta continuing `prev`, observed one second after it.
+pub fn add_delete(p: &TestPub, url: &str, prev: &str) -> String {
+    add_content_free_delta(p, url, "delete", prev)
+}
+
+fn add_content_free_delta(p: &TestPub, url: &str, change_type: &str, prev: &str) -> String {
+    let delta = serde_json::json!({
+        "wist_version": "1.0.0", "publisher": p.domain, "url": url,
+        "change_type": change_type,
+        "observed_at": successor_observed_at(p, prev).expect("the predecessor Delta is on the site"),
+        "prev": prev,
+        "meta": {"lang": "en"}
+    });
+    store_delta(p, &delta)
+}
+
+fn successor_observed_at(p: &TestPub, prev: &str) -> Option<String> {
+    let raw = fs::read(
+        p.dir
+            .path()
+            .join(format!(".well-known/wist/deltas/{}.json", &prev[7..])),
+    )
+    .ok()?;
+    let predecessor: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    let at = predecessor["delta"]["observed_at"]
+        .as_str()
+        .unwrap()
+        .parse::<jiff::Timestamp>()
+        .unwrap();
+    Some(
+        at.checked_add(jiff::SignedDuration::from_secs(1))
+            .unwrap()
+            .to_string(),
+    )
+}
+
+fn store_delta(p: &TestPub, delta: &serde_json::Value) -> String {
+    let id = wist_core::delta::delta_id(delta).unwrap();
+    let env = wist_core::envelope::sign_envelope(delta, "delta", &p.kid, &p.sk).unwrap();
     fs::write(
-        wk.join(format!("payloads/{hex}.json")),
-        serde_json::to_vec(&payload).unwrap(),
+        p.dir
+            .path()
+            .join(format!(".well-known/wist/deltas/{}.json", &id[7..])),
+        serde_json::to_vec(&env).unwrap(),
     )
     .unwrap();
     id

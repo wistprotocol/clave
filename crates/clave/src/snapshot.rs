@@ -1500,7 +1500,7 @@ pub fn produce_with(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::RecordUpsert;
+    use crate::db::{RecordChange, RecordUpsert};
 
     const T0: i64 = 1_800_000_000;
 
@@ -1532,7 +1532,7 @@ mod tests {
             &ts(sealed_unix),
             &[],
             0,
-            &[RecordUpsert {
+            &[RecordChange::Upsert(RecordUpsert {
                 url,
                 publisher,
                 delta_id: &format!("sha256:{:064x}", epoch),
@@ -1540,7 +1540,7 @@ mod tests {
                 title: "t",
                 abstract_text: None,
                 lang: "en",
-            }],
+            })],
             &[],
             &[],
             &[],

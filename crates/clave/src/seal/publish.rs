@@ -1,9 +1,9 @@
-use super::prepare::PreparedEpoch;
+use super::prepare::{OwnedRecordChange, PreparedEpoch};
 use super::SealReport;
 use crate::db::Mutation;
 use crate::db::{
-    Db, ParamChangeRow, RecordUpsert, SealedDeclarationRow, SealedDisputeRow, SealedLabelRow,
-    WithdrawalRow,
+    Db, ParamChangeRow, RecordChange, RecordUpsert, SealedDeclarationRow, SealedDisputeRow,
+    SealedLabelRow, WithdrawalRow,
 };
 use crate::error::{Error, Result};
 use std::path::Path;
@@ -36,16 +36,36 @@ pub(super) fn epoch(
         windows,
         record_updates,
     } = prepared;
-    let records: Vec<RecordUpsert> = record_updates
+    let records: Vec<RecordChange> = record_updates
         .iter()
-        .map(|r| RecordUpsert {
-            url: &r.url,
-            publisher: &r.publisher,
-            delta_id: &r.delta_id,
-            observed_at: &r.observed_at,
-            title: &r.title,
-            abstract_text: r.abstract_text.as_deref(),
-            lang: &r.lang,
+        .map(|change| match change {
+            OwnedRecordChange::Upsert {
+                url,
+                publisher,
+                delta_id,
+                observed_at,
+                title,
+                abstract_text,
+                lang,
+            } => RecordChange::Upsert(RecordUpsert {
+                url,
+                publisher,
+                delta_id,
+                observed_at,
+                title,
+                abstract_text: abstract_text.as_deref(),
+                lang,
+            }),
+            OwnedRecordChange::Attest {
+                url,
+                publisher,
+                observed_at,
+            } => RecordChange::Attest {
+                url,
+                publisher,
+                observed_at,
+            },
+            OwnedRecordChange::Delete { url, publisher } => RecordChange::Delete { url, publisher },
         })
         .collect();
     let param_changes: Vec<ParamChangeRow> = accepted_changes

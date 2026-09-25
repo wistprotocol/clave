@@ -2,7 +2,10 @@ mod common;
 
 const SEAL_START: i64 = 1_786_276_800;
 
-use common::{add_delta, make_publisher_with_scope, reserve_addr, serve_static, write_feed};
+use common::{
+    add_attest, add_delete, add_delta, make_publisher_with_scope, reserve_addr, serve_static,
+    write_feed,
+};
 use sha2::{Digest, Sha256};
 use wist_core::objects::StateEntry;
 
@@ -213,6 +216,141 @@ fn snapshot_build_produces_verifiable_tier0_state_and_signed_artifacts() {
         state.entries.len(),
         3,
         "no parameter is amended here, and WIST-3 §7 does not restate Registry defaults"
+    );
+}
+
+fn tier0_records(snapshot_dir: &std::path::Path) -> Vec<(String, String, String)> {
+    let conn = rusqlite::Connection::open_with_flags(
+        snapshot_dir.join("tier0/index.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let mut statement = conn
+        .prepare("SELECT url, delta_id, observed_at FROM records ORDER BY url")
+        .unwrap();
+    let rows = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap();
+    rows.map(Result::unwrap).collect()
+}
+
+/// WIST-3 §7: an `attest` moves a record's `observed_at` and keeps its
+/// anchor, a `delete` excludes the URL from every later Snapshot, and a
+/// `new` naming the `delete` as `prev` brings the URL back under the new anchor.
+#[test]
+fn attest_and_delete_deltas_reach_the_snapshot_records() {
+    let (listener, host, client) = reserve_addr();
+    let p = make_publisher_with_scope(&host, &["example.com"]);
+    let alpha = add_delta(&p, "https://example.com/alpha", "alpha body", None);
+    let beta = add_delta(&p, "https://example.com/beta", "beta body", None);
+    let mut ids = vec![alpha.clone(), beta.clone()];
+    write_feed(&p, &host, &ids, "2026-08-09T12:00:00Z");
+    serve_static(listener, p.dir.path().to_path_buf());
+
+    let data = tempfile::tempdir().unwrap();
+    clave::init::run(&host, data.path()).unwrap();
+    let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
+    db.set_param("epoch_cadence_seconds", 1).unwrap();
+    let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
+    let snapshot_dir = data.path().join("snapshots/2026-08-09");
+    let manifest = || -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(snapshot_dir.join("manifest.json")).unwrap()).unwrap()
+    };
+    let digest_of = |records: &[clave::db::RecordRow]| {
+        let values: Vec<serde_json::Value> = records.iter().map(record_projection).collect();
+        wist_core::snapshot::content_digest(&values).unwrap()
+    };
+
+    let report =
+        clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
+    assert_eq!(report.accepted.len(), 2);
+    clave::seal::run(&db, data.path(), &sk, SEAL_START).unwrap();
+    clave::snapshot::produce(&data.path().join("clave.sqlite"), data.path()).unwrap();
+    let first = manifest();
+    assert_eq!(
+        tier0_records(&snapshot_dir),
+        [
+            (
+                "https://example.com/alpha".to_string(),
+                alpha.clone(),
+                "2026-08-09T12:00:00Z".to_string()
+            ),
+            (
+                "https://example.com/beta".to_string(),
+                beta.clone(),
+                "2026-08-09T12:00:00Z".to_string()
+            ),
+        ]
+    );
+
+    let attest = add_attest(&p, "https://example.com/alpha", &alpha);
+    let delete = add_delete(&p, "https://example.com/beta", &beta);
+    ids.extend([attest.clone(), delete.clone()]);
+    write_feed(&p, &host, &ids, "2026-08-09T12:30:00Z");
+    let report =
+        clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:30:00Z").unwrap();
+    assert_eq!(report.accepted, [attest.clone(), delete.clone()]);
+    clave::seal::run(&db, data.path(), &sk, SEAL_START + 3600).unwrap();
+    clave::snapshot::produce(&data.path().join("clave.sqlite"), data.path()).unwrap();
+    let second = manifest();
+    assert_eq!(second["manifest"]["epoch_number"], 1);
+    assert_eq!(
+        tier0_records(&snapshot_dir),
+        [(
+            "https://example.com/alpha".to_string(),
+            alpha.clone(),
+            "2026-08-09T12:00:01Z".to_string()
+        )],
+        "the attest keeps alpha's anchor and moves its freshness; the delete excludes beta"
+    );
+    let records = db.list_records().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(second["manifest"]["content_digest"], digest_of(&records));
+    assert_ne!(
+        second["manifest"]["content_digest"],
+        first["manifest"]["content_digest"]
+    );
+    assert!(
+        db.list_sealed_url_tips().unwrap().contains(&(
+            host.clone(),
+            "https://example.com/beta".to_string(),
+            delete.clone()
+        )),
+        "the chain tip survives the delete"
+    );
+
+    let beta_again = add_delta(
+        &p,
+        "https://example.com/beta",
+        "beta body again",
+        Some(&delete),
+    );
+    ids.push(beta_again.clone());
+    write_feed(&p, &host, &ids, "2026-08-09T13:30:00Z");
+    let report =
+        clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T13:30:00Z").unwrap();
+    assert_eq!(report.accepted, std::slice::from_ref(&beta_again));
+    clave::seal::run(&db, data.path(), &sk, SEAL_START + 7200).unwrap();
+    clave::snapshot::produce(&data.path().join("clave.sqlite"), data.path()).unwrap();
+    let third = manifest();
+    assert_eq!(
+        tier0_records(&snapshot_dir),
+        [
+            (
+                "https://example.com/alpha".to_string(),
+                alpha,
+                "2026-08-09T12:00:01Z".to_string()
+            ),
+            (
+                "https://example.com/beta".to_string(),
+                beta_again,
+                "2026-08-09T12:00:02Z".to_string()
+            ),
+        ]
+    );
+    assert_eq!(
+        third["manifest"]["content_digest"],
+        digest_of(&db.list_records().unwrap())
     );
 }
 

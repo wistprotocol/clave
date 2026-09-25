@@ -35,7 +35,7 @@ pub(super) struct PreparedEpoch {
     pub(super) entry_count: u64,
     pub(super) projection: Projection,
     pub(super) windows: Vec<SealedWindow>,
-    pub(super) record_updates: Vec<OwnedRecordUpsert>,
+    pub(super) record_updates: Vec<OwnedRecordChange>,
 }
 
 pub(super) struct SealedWindow {
@@ -1036,14 +1036,25 @@ pub(super) struct DeltaApply {
     prev: Option<String>,
 }
 
-pub(super) struct OwnedRecordUpsert {
-    pub(super) url: String,
-    pub(super) publisher: String,
-    pub(super) delta_id: String,
-    pub(super) observed_at: String,
-    pub(super) title: String,
-    pub(super) abstract_text: Option<String>,
-    pub(super) lang: String,
+pub(super) enum OwnedRecordChange {
+    Upsert {
+        url: String,
+        publisher: String,
+        delta_id: String,
+        observed_at: String,
+        title: String,
+        abstract_text: Option<String>,
+        lang: String,
+    },
+    Attest {
+        url: String,
+        publisher: String,
+        observed_at: String,
+    },
+    Delete {
+        url: String,
+        publisher: String,
+    },
 }
 
 pub(super) fn entry_type_rank(entry_type: &str) -> usize {
@@ -1107,7 +1118,7 @@ pub(super) fn resolve_record_updates(
     data_dir: &Path,
     size_caps: &crate::declaration::delta::SizeCaps,
     seal_entries: &[SealEntry],
-) -> Result<Vec<OwnedRecordUpsert>> {
+) -> Result<Vec<OwnedRecordChange>> {
     let mut deltas = Vec::new();
     for e in seal_entries {
         if e.entry_type != "publisher_delta" {
@@ -1126,9 +1137,25 @@ pub(super) fn resolve_record_updates(
     for d in chain_order(deltas) {
         let delta: wist_core::objects::Delta =
             serde_json::from_slice(&jcs::canonicalize(&d.body["delta"])?)?;
-        if !matches!(delta.change_type, ChangeType::New | ChangeType::Update)
-            || delta.payload.is_none()
-        {
+        match delta.change_type {
+            ChangeType::Attest => {
+                updates.push(OwnedRecordChange::Attest {
+                    url: delta.url,
+                    publisher: delta.publisher,
+                    observed_at: delta.observed_at,
+                });
+                continue;
+            }
+            ChangeType::Delete => {
+                updates.push(OwnedRecordChange::Delete {
+                    url: delta.url,
+                    publisher: delta.publisher,
+                });
+                continue;
+            }
+            ChangeType::New | ChangeType::Update => {}
+        }
+        if delta.payload.is_none() {
             continue;
         }
         let hex = d.id.strip_prefix("sha256:").unwrap_or(&d.id);
@@ -1147,7 +1174,7 @@ pub(super) fn resolve_record_updates(
                 d.id
             ))
         })?;
-        updates.push(OwnedRecordUpsert {
+        updates.push(OwnedRecordChange::Upsert {
             url: delta.url,
             publisher: delta.publisher,
             delta_id: d.id,

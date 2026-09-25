@@ -249,6 +249,21 @@ pub struct RecordUpsert<'a> {
     pub lang: &'a str,
 }
 
+/// WIST-3 §7 materialization in the Epoch's chain order; a `Delete` leaves
+/// the chain tip in `sealed_url_tips`.
+pub enum RecordChange<'a> {
+    Upsert(RecordUpsert<'a>),
+    Attest {
+        url: &'a str,
+        publisher: &'a str,
+        observed_at: &'a str,
+    },
+    Delete {
+        url: &'a str,
+        publisher: &'a str,
+    },
+}
+
 fn exec_insert_publisher(
     conn: &Connection,
     domain: &str,
@@ -372,6 +387,30 @@ fn exec_upsert_record(conn: &Connection, r: &RecordUpsert, sealed_at: &str) -> R
         ),
     )?;
     Ok(())
+}
+
+fn exec_record_change(conn: &Connection, change: &RecordChange, sealed_at: &str) -> Result<()> {
+    match change {
+        RecordChange::Upsert(r) => exec_upsert_record(conn, r, sealed_at),
+        RecordChange::Attest {
+            url,
+            publisher,
+            observed_at,
+        } => {
+            conn.execute(
+                "UPDATE records SET observed_at = ?3, sealed_at = ?4 WHERE url = ?1 AND publisher = ?2",
+                (url, publisher, observed_at, sealed_at),
+            )?;
+            Ok(())
+        }
+        RecordChange::Delete { url, publisher } => {
+            conn.execute(
+                "DELETE FROM records WHERE url = ?1 AND publisher = ?2",
+                (url, publisher),
+            )?;
+            Ok(())
+        }
+    }
 }
 
 pub type Publication = (u64, String);
@@ -1388,7 +1427,7 @@ impl Db {
         sealed_at: &str,
         entries: &[Value],
         epoch_bytes: u64,
-        records: &[RecordUpsert],
+        records: &[RecordChange],
         param_changes: &[ParamChangeRow],
         withdrawals: &[WithdrawalRow],
         suffix_lists: &[String],
@@ -1429,7 +1468,7 @@ impl Db {
         sealed_at: &str,
         entries: &[Value],
         epoch_bytes: u64,
-        records: &[RecordUpsert],
+        records: &[RecordChange],
         param_changes: &[ParamChangeRow],
         withdrawals: &[WithdrawalRow],
         suffix_lists: &[String],
@@ -1524,8 +1563,8 @@ impl Db {
                 epoch_bytes as i64,
             ),
         )?;
-        for r in records {
-            exec_upsert_record(&tx, r, sealed_at)?;
+        for change in records {
+            exec_record_change(&tx, change, sealed_at)?;
         }
         for (domain, url, tip) in &chain_tips {
             exec_set_sealed_url_tip(&tx, url, domain, tip)?;
@@ -2734,7 +2773,7 @@ pub(crate) mod tests {
             "2026-08-09T00:00:00Z",
             &[],
             0,
-            &[RecordUpsert {
+            &[RecordChange::Upsert(RecordUpsert {
                 url: "https://example.com/x",
                 publisher: "example.com",
                 delta_id: "sha256:a",
@@ -2742,7 +2781,7 @@ pub(crate) mod tests {
                 title: "t",
                 abstract_text: None,
                 lang: "en",
-            }],
+            })],
             &[],
             &[],
             &[],
