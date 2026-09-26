@@ -890,20 +890,35 @@ fn a_slow_domain_yields_its_slot_and_lighter_domains_go_first() {
     };
     let started = std::time::Instant::now();
     assert_eq!(ping(&addr, "localhost"), 202);
+    let deadline = started + Duration::from_secs(90);
+    while store(tmp.path())
+        .scheduled_pull("localhost")
+        .unwrap()
+        .is_some()
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the slow domain's pull never started"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
     for host in fast_hosts {
         assert_eq!(ping(&addr, host), 202);
     }
-    let deadline = started + Duration::from_secs(10);
     let mut waiting = fast_hosts.to_vec();
     while !waiting.is_empty() {
         waiting.retain(|host| last_pull_at(host).is_none());
         assert!(
             std::time::Instant::now() < deadline || waiting.is_empty(),
-            "{waiting:?} waited on the slow domain's pull"
+            "{waiting:?} were never pulled"
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    let deadline = started + Duration::from_secs(90);
+    assert!(
+        last_pull_at("localhost").is_none(),
+        "the lighter domains waited for the whole of the slow domain's pull"
+    );
+    let deadline = started + Duration::from_secs(180);
     while last_pull_at("localhost").is_none() {
         assert!(
             std::time::Instant::now() < deadline,
