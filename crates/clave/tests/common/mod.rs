@@ -607,3 +607,45 @@ pub fn serve_crossing(
     });
     crossed
 }
+
+pub fn loopback_client() -> clave::fetch::Client {
+    clave::fetch::Client::with_builder(true, reqwest::blocking::Client::builder().no_proxy())
+}
+
+pub fn list_signed_mirrors(
+    data_dir: &std::path::Path,
+    key_id: &str,
+    sk: &wist_core::crypto::SigningKey,
+    urls: &[String],
+    now_unix: i64,
+) {
+    let inner = serde_json::json!({
+        "wist_version": clave::WIST_VERSION,
+        "updated_at": jiff::Timestamp::from_second(now_unix).unwrap().to_string(),
+        "mirror_urls": urls,
+    });
+    let envelope = wist_core::envelope::sign_envelope(&inner, "mirrors", key_id, sk).unwrap();
+    fs::create_dir_all(data_dir.join("log")).unwrap();
+    fs::write(
+        data_dir.join("log/mirrors.json"),
+        serde_json::to_vec(&envelope).unwrap(),
+    )
+    .unwrap();
+}
+
+pub fn serve_not_found() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            let app = axum::Router::new()
+                .fallback(|| async { (axum::http::StatusCode::NOT_FOUND, Vec::<u8>::new()) });
+            axum::serve(tokio::net::TcpListener::from_std(listener).unwrap(), app)
+                .await
+                .unwrap();
+        });
+    });
+    url
+}

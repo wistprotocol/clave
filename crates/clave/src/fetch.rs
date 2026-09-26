@@ -332,6 +332,29 @@ impl Client {
         subdomain_scope: &[String],
         limit: u64,
     ) -> Result<Vec<u8>> {
+        let resp = self.final_response(url, subdomain_scope)?;
+        if !resp.status().is_success() {
+            return Err(Error::Fetch(format!("HTTP {} for {url}", resp.status())));
+        }
+        read_bounded(resp, limit, url)
+    }
+
+    pub fn get_bytes_unless_absent(&self, url: &str, limit: u64) -> Result<Option<Vec<u8>>> {
+        let resp = self.final_response(url, &[])?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(Error::Fetch(format!("HTTP {} for {url}", resp.status())));
+        }
+        read_bounded(resp, limit, url).map(Some)
+    }
+
+    fn final_response(
+        &self,
+        url: &str,
+        subdomain_scope: &[String],
+    ) -> Result<reqwest::blocking::Response> {
         let mut parsed =
             url::Url::parse(url).map_err(|e| Error::Fetch(format!("invalid URL {url}: {e}")))?;
         guard_target(&parsed, self.allow_http)?;
@@ -372,10 +395,7 @@ impl Client {
             parsed = target;
             hops += 1;
         };
-        if !resp.status().is_success() {
-            return Err(Error::Fetch(format!("HTTP {} for {url}", resp.status())));
-        }
-        read_bounded(resp, limit, url)
+        Ok(resp)
     }
 }
 

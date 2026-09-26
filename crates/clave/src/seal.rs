@@ -1,5 +1,6 @@
 use crate::db::{Db, Fence, SEALER_LEASE_SECONDS};
 use crate::error::{Error, Result};
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
@@ -135,8 +136,26 @@ pub fn run_with_client(
     client: &crate::fetch::Client,
     now_unix: i64,
 ) -> Result<SealReport> {
+    run_confirming(db, data_dir, sk, client, now_unix, &mut HashSet::new())
+}
+
+pub(crate) fn run_confirming(
+    db: &Db,
+    data_dir: &Path,
+    sk: &SigningKey,
+    client: &crate::fetch::Client,
+    now_unix: i64,
+    confirmed: &mut HashSet<String>,
+) -> Result<SealReport> {
+    let unconfirmed: Vec<String> = crate::mirrors::list(data_dir)?
+        .into_iter()
+        .filter(|url| !confirmed.contains(url))
+        .collect();
+    crate::publication::confirm_mirrors(db, data_dir, client, &unconfirmed)?;
     crate::publication::recover(db, data_dir)?;
     let mutation = db.mutation()?;
     let prepared = prepare::epoch(db, data_dir, sk, now_unix)?;
-    publish::epoch(db, data_dir, client, mutation, prepared)
+    let report = publish::epoch(db, data_dir, client, mutation, prepared)?;
+    confirmed.extend(unconfirmed);
+    Ok(report)
 }

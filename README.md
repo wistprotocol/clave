@@ -377,6 +377,68 @@ Cosignature is added. Full tiles and entry bundles are
 partial ones carry the same media type without caching, because they
 stop being served once the full tile exists.
 
+## Restored stores and published heights
+
+Two validly signed Checkpoints of one Log stating the same `epoch_number`
+and a different tree size, root hash or `sealed_at` are Equivocation
+(WIST-3 §5), and nothing withdraws a published Checkpoint. A store
+restored from a backup taken before the last published Checkpoint would
+seal that height again, so `clave` never signs or publishes a Checkpoint
+while a different or higher Checkpoint of its Log is published.
+
+Before every distribution pass — at `seal` and `serve` start, before and
+after every seal, and before a Cosignature rewrites a Checkpoint file —
+the store's head Epoch is compared with the data directory. The published
+height is the higher of the `epoch_number` of `/checkpoint`, when it
+parses as a Checkpoint, and the highest name in `/log/checkpoints/` made
+of at least nine ASCII digits; other names are ignored. The pass is
+refused, with nothing written, when that height is above the store's
+head (a store with no Epoch is below a published Epoch 0), or when
+`/checkpoint` or the archived file at the head's `epoch_number` parses
+with signed note text — every line the signature covers, not the
+signature lines, since Cosignatures differ — other than the store's. A
+file named above the head refuses by its name alone. A file at or below
+the head that is missing, torn or unparseable is repaired from the store,
+as described above. Signatures are not checked: a restored store may
+predate the key that signed a later Checkpoint. `serve` therefore does
+not start, with or without `--no-seal`, while the refusal holds.
+
+Before sealing, each listed Mirror's `<base URL>checkpoint` is fetched,
+bounded at 65 536 octets. A `404` passes, as does a Checkpoint of this
+Log at or below the store's head whose signed note text equals the
+store's at equal height; a Checkpoint above the head or different at the
+head refuses. Any other answer — a connection failure, timeout, other
+status, an oversized or unparseable body, another Log's Checkpoint —
+refuses as unconfirmed, because a seal cannot be undone and a refusal
+costs one grid instant. `seal` consults every listed Mirror on every run.
+Since the store commits before anything is published, a Mirror can only
+be ahead after the store is replaced, which needs a restart; `serve`
+therefore remembers, for the life of the process, each Mirror a
+successful seal confirmed, and consults only listed Mirrors it has not
+confirmed, so a Mirror listed later is consulted at the next seal. A
+refused seal confirms no Mirror. No flag, environment variable or
+setting overrides either refusal.
+
+The refusal names the published height and the file or Mirror URL that
+holds it. To recover:
+
+1. Restore a backup whose head is at or above the published height.
+2. When no such backup exists, end the Log and start a successor Log
+   with a new `log_id` whose Anchor's `predecessor` names the final
+   published Epoch and its root hash (WIST-3 §3.4). Never seal the old
+   Log below its published height.
+3. A Mirror that is permanently gone stops being consulted once it is
+   removed from the signed Mirror list with `clave mirror --remove`.
+
+The comparison protects against restoring an older store by accident,
+not against an operator who deletes published files. The store and the
+published files share the data directory, so a restore that replaces the
+whole directory with an older copy removes the newer Checkpoints with the
+store and leaves only a listed Mirror to reveal the published height:
+keep the published files of the replaced directory and copy its
+`/checkpoint` and `/log/checkpoints/` over the restored ones before
+starting `clave`.
+
 ## Snapshot production
 
 A seal publishes the Checkpoint only; the Snapshot at the sealed head is
@@ -1362,8 +1424,10 @@ restored signer can publish and seal new Deltas using that same Feed timestamp.
 
 Existing databases have no retained Feed observations to reconstruct; protection
 starts at the first authenticated live Feed after upgrade. Backups must preserve
-this table to preserve its observations. General crash recovery, backup restore
-and concurrent pull serialization remain separate requirements.
+this table to preserve its observations. General crash recovery and concurrent
+pull serialization remain separate requirements; a restored store is refused
+sealing and publication below the published height, as described under
+[Restored stores and published heights](#restored-stores-and-published-heights).
 
 ## Page source verification
 

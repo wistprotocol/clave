@@ -44,7 +44,14 @@ impl Log {
 
     fn seal_at(&self, now_unix: i64) -> clave::seal::SealReport {
         let (_, signer) = clave::keys::head_signer(self.path(), &self.db).unwrap();
-        let report = clave::seal::run(&self.db, self.path(), &signer, now_unix).unwrap();
+        let report = clave::seal::run_with_client(
+            &self.db,
+            self.path(),
+            &signer,
+            &common::loopback_client(),
+            now_unix,
+        )
+        .unwrap();
         clave::snapshot::produce(&self.path().join("clave.sqlite"), self.path()).unwrap();
         report
     }
@@ -294,6 +301,13 @@ fn removing_the_genesis_key_leaves_every_later_document_verifiable_under_the_rem
             .unwrap();
     assert_eq!(mirrors["sig"]["key_id"], "log2");
     wist_core::envelope::verify_envelope(&mirrors, "mirrors", &remaining).unwrap();
+    common::list_signed_mirrors(
+        log.path(),
+        &key_id,
+        &signer,
+        &[common::serve_not_found()],
+        SEAL_START + 7200,
+    );
 
     clave::param_change::run(
         &log.db,
@@ -498,14 +512,13 @@ fn removing_a_key_re_signs_every_unsealed_document_it_signed_and_still_serves() 
     log.seal_on_day(0);
     let (genesis_key_id, genesis) = clave::keys::head_signer(log.path(), &log.db).unwrap();
     assert_eq!(genesis_key_id, "log1");
-    clave::mirrors::add(
+    common::list_signed_mirrors(
         log.path(),
         &genesis_key_id,
         &genesis,
-        "https://mirror.example/",
+        &[common::serve_not_found()],
         SEAL_START,
-    )
-    .unwrap();
+    );
 
     clave::log_key::add(&log.db, log.path(), SEAL_START).unwrap();
     log.seal_on_day(1);
@@ -582,14 +595,13 @@ fn a_pass_interrupted_between_documents_is_finished_by_the_next_publication_repa
     let log = Log::new();
     log.seal_on_day(0);
     let (genesis_key_id, genesis) = clave::keys::head_signer(log.path(), &log.db).unwrap();
-    clave::mirrors::add(
+    common::list_signed_mirrors(
         log.path(),
         &genesis_key_id,
         &genesis,
-        "https://mirror.example/",
+        &[common::serve_not_found()],
         SEAL_START,
-    )
-    .unwrap();
+    );
     clave::log_key::add(&log.db, log.path(), SEAL_START).unwrap();
     log.seal_on_day(1);
     let stale_state = std::fs::read(

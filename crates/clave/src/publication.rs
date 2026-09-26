@@ -38,6 +38,172 @@ pub fn archive_path(data_dir: &Path, epoch_number: u64) -> PathBuf {
     served(data_dir, &wist_core::checkpoint::archive_path(epoch_number))
 }
 
+pub const MIRROR_HEAD_CAP_BYTES: u64 = 65_536;
+
+const ARCHIVE_NAME_MIN_DIGITS: usize = 9;
+
+fn published_at(path: &Path) -> Result<Option<Checkpoint>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(String::from_utf8(bytes)
+            .ok()
+            .and_then(|note| Checkpoint::parse(&note).ok())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn highest_archived(data_dir: &Path) -> Result<Option<(u64, PathBuf)>> {
+    let archive = archive_path(data_dir, 0);
+    let Some(directory) = archive.parent() else {
+        return Ok(None);
+    };
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let mut highest: Option<(u64, PathBuf)> = None;
+    for entry in entries {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if name.len() < ARCHIVE_NAME_MIN_DIGITS || !name.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let epoch_number = name.parse::<u64>().unwrap_or(u64::MAX);
+        let path = entry.path();
+        if highest.as_ref().is_none_or(|(held, held_path)| {
+            epoch_number > *held || (epoch_number == *held && path < *held_path)
+        }) {
+            highest = Some((epoch_number, path));
+        }
+    }
+    Ok(highest)
+}
+
+fn ahead(holder: String, published: u64, store_head: Option<u64>) -> Error {
+    Error::PublishedAhead {
+        holder,
+        published,
+        store_head,
+    }
+}
+
+fn stored_head(db: &Db) -> Result<Option<(u64, String)>> {
+    db.head_publication()?
+        .map(|(epoch_number, note)| {
+            let text = Checkpoint::parse(&note)
+                .map_err(|e| Error::Seal(e.to_string()))?
+                .note_text();
+            Ok((epoch_number, text))
+        })
+        .transpose()
+}
+
+/// WIST-3 §5: a second validly signed Checkpoint at a published
+/// `epoch_number` is Equivocation.
+pub fn guard_published(db: &Db, data_dir: &Path) -> Result<()> {
+    let store = stored_head(db)?;
+    let store_head = store.as_ref().map(|(epoch_number, _)| *epoch_number);
+    let head_file = head_path(data_dir);
+    let head_checkpoint = published_at(&head_file)?;
+    let mut highest = head_checkpoint
+        .as_ref()
+        .map(|checkpoint| (checkpoint.epoch_number(), head_file.clone()));
+    if let Some((epoch_number, path)) = highest_archived(data_dir)? {
+        if highest
+            .as_ref()
+            .is_none_or(|(held, _)| epoch_number >= *held)
+        {
+            highest = Some((epoch_number, path));
+        }
+    }
+    if let Some((published, path)) = highest {
+        if store_head.is_none_or(|head| published > head) {
+            return Err(ahead(path.display().to_string(), published, store_head));
+        }
+    }
+    let Some((epoch_number, stored_text)) = store else {
+        return Ok(());
+    };
+    let archived = archive_path(data_dir, epoch_number);
+    if published_at(&archived)?.is_some_and(|checkpoint| checkpoint.note_text() != stored_text) {
+        return Err(ahead(
+            archived.display().to_string(),
+            epoch_number,
+            store_head,
+        ));
+    }
+    if head_checkpoint.is_some_and(|checkpoint| {
+        checkpoint.epoch_number() == epoch_number && checkpoint.note_text() != stored_text
+    }) {
+        return Err(ahead(
+            head_file.display().to_string(),
+            epoch_number,
+            store_head,
+        ));
+    }
+    Ok(())
+}
+
+fn confirm_mirror(
+    client: &crate::fetch::Client,
+    base_url: &str,
+    origin: &str,
+    store: Option<&(u64, String)>,
+) -> Result<()> {
+    let url = format!("{base_url}checkpoint");
+    let unconfirmed = |reason: String| Error::MirrorUnconfirmed {
+        url: url.clone(),
+        reason,
+    };
+    let body = match client.get_bytes_unless_absent(&url, MIRROR_HEAD_CAP_BYTES) {
+        Ok(None) => return Ok(()),
+        Ok(Some(body)) => body,
+        Err(error) => return Err(unconfirmed(error.to_string())),
+    };
+    let note = String::from_utf8(body)
+        .map_err(|_| unconfirmed("it answered with bytes that are not text".into()))?;
+    let published = Checkpoint::parse(&note)
+        .map_err(|e| unconfirmed(format!("it answered with no Checkpoint: {e}")))?;
+    if published.origin() != origin {
+        return Err(unconfirmed(format!(
+            "it serves a Checkpoint of Log {:?}, not of {origin:?}",
+            published.origin()
+        )));
+    }
+    let store_head = store.map(|(epoch_number, _)| *epoch_number);
+    let refuse = || ahead(url.clone(), published.epoch_number(), store_head);
+    match store {
+        None => Err(refuse()),
+        Some((head, _)) if published.epoch_number() > *head => Err(refuse()),
+        Some((head, text))
+            if published.epoch_number() == *head && published.note_text() != *text =>
+        {
+            Err(refuse())
+        }
+        Some(_) => Ok(()),
+    }
+}
+
+pub fn confirm_mirrors(
+    db: &Db,
+    data_dir: &Path,
+    client: &crate::fetch::Client,
+    mirror_urls: &[String],
+) -> Result<()> {
+    if mirror_urls.is_empty() {
+        return Ok(());
+    }
+    let origin = crate::history::anchor(data_dir)?.log_id;
+    let store = stored_head(db)?;
+    for base_url in mirror_urls {
+        confirm_mirror(client, base_url, &origin, store.as_ref())?;
+    }
+    Ok(())
+}
+
 fn meets(range: (u64, u64), from: u64, to: u64) -> bool {
     range.0 < to && from < range.1
 }
@@ -135,6 +301,7 @@ fn publish_epoch(db: &Db, data_dir: &Path, epoch_number: u64, note: &str) -> Res
 /// height, so no served head names content still served.
 pub fn finish_committed(db: &Db, data_dir: &Path) -> Result<Vec<u64>> {
     db.check_fence()?;
+    guard_published(db, data_dir)?;
     crate::snapshot::apply_pending_removals(db, data_dir)?;
     let mut published = Vec::new();
     for (epoch_number, note) in db.unpublished_publications()? {
@@ -151,6 +318,7 @@ pub fn finish_committed(db: &Db, data_dir: &Path) -> Result<Vec<u64>> {
 /// verify them against.
 pub fn recover(db: &Db, data_dir: &Path) -> Result<Vec<u64>> {
     db.check_fence()?;
+    guard_published(db, data_dir)?;
     crate::snapshot::reconcile(db, data_dir)?;
     crate::snapshot::resign_unsealed(db, data_dir)?;
     let mut republished = finish_committed(db, data_dir)?;
@@ -167,6 +335,7 @@ pub fn recover(db: &Db, data_dir: &Path) -> Result<Vec<u64>> {
 /// WIST-3 §6: the note text is untouched; only its signature lines changed.
 pub fn republish_checkpoint(db: &Db, data_dir: &Path, epoch_number: u64, note: &str) -> Result<()> {
     db.check_fence()?;
+    guard_published(db, data_dir)?;
     write_durable(&archive_path(data_dir, epoch_number), note.as_bytes())?;
     if db
         .head_publication()?

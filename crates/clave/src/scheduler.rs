@@ -1,9 +1,10 @@
 use crate::db::{Db, Fence, SEALER_LEASE_SECONDS};
 use crate::error::{Error, Result};
 use crate::fetch::Client;
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const MAX_GRACE_SECONDS: i64 = 60;
@@ -58,6 +59,7 @@ fn seal_at(
     instant: i64,
     owner: &str,
     token: i64,
+    confirmed: &mut HashSet<String>,
 ) -> Result<()> {
     let db = Db::connect(db_path)?.fenced(Fence::Sealer { token });
     let (_, sk) = crate::keys::head_signer(data_dir, &db)?;
@@ -66,7 +68,7 @@ fn seal_at(
         owner,
         token,
         crate::seal::LeaseTerms::default(),
-        || crate::seal::run_with_client(&db, data_dir, &sk, client, instant),
+        || crate::seal::run_confirming(&db, data_dir, &sk, client, instant, confirmed),
     )?;
     let mut out = std::io::stdout().lock();
     let _ = writeln!(
@@ -163,13 +165,15 @@ pub async fn run(
     sealed: Arc<tokio::sync::Notify>,
 ) {
     let mut attempt: Option<Attempt> = None;
+    let confirmed = Arc::new(Mutex::new(HashSet::new()));
     loop {
-        let (store, data, client, holder, sealed) = (
+        let (store, data, client, holder, sealed, confirmed) = (
             db_path.clone(),
             data_dir.clone(),
             client.clone(),
             owner.clone(),
             sealed.clone(),
+            confirmed.clone(),
         );
         let passed = tokio::task::spawn_blocking(move || {
             let now_unix = jiff::Timestamp::now().as_second();
@@ -180,7 +184,20 @@ pub async fn run(
                 now_unix,
                 attempt,
                 |instant, token| {
-                    seal_at(&store, &data, &client, instant, &holder, token)?;
+                    let mut confirmed = confirmed.lock().unwrap_or_else(|poisoned| {
+                        let mut forgotten = poisoned.into_inner();
+                        forgotten.clear();
+                        forgotten
+                    });
+                    seal_at(
+                        &store,
+                        &data,
+                        &client,
+                        instant,
+                        &holder,
+                        token,
+                        &mut confirmed,
+                    )?;
                     sealed.notify_one();
                     Ok(())
                 },
@@ -247,7 +264,17 @@ mod tests {
             OWNER,
             T + 5,
             attempt,
-            |instant, token| seal_at(&db_path, data.path(), &client, instant, OWNER, token),
+            |instant, token| {
+                seal_at(
+                    &db_path,
+                    data.path(),
+                    &client,
+                    instant,
+                    OWNER,
+                    token,
+                    &mut HashSet::new(),
+                )
+            },
         )
         .unwrap();
         let epoch = db.last_epoch().unwrap().unwrap();
@@ -348,6 +375,106 @@ mod tests {
         assert_eq!(db.last_epoch().unwrap().unwrap().epoch_number, 0);
         assert!(!crate::publication::head_path(data.path()).exists());
         assert_eq!(db.unpublished_publications().unwrap().len(), 1);
+    }
+
+    fn not_found_mirror() -> (String, Arc<Mutex<Vec<String>>>) {
+        use std::io::{BufRead, BufReader};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut line = String::new();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                if reader.read_line(&mut line).is_err() {
+                    continue;
+                }
+                let mut header = String::new();
+                while reader.read_line(&mut header).is_ok_and(|read| read > 2) {
+                    header.clear();
+                }
+                recorded.lock().unwrap().push(line.trim_end().to_owned());
+                let _ = stream.write_all(
+                    b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                );
+            }
+        });
+        (url, requests)
+    }
+
+    fn list_mirrors(data: &Path, urls: &[&str]) {
+        std::fs::write(
+            data.join("log/mirrors.json"),
+            serde_json::to_vec(&serde_json::json!({"mirrors": {"mirror_urls": urls}})).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn scheduled_seal(
+        db_path: &Path,
+        data: &Path,
+        instant: i64,
+        confirmed: &mut HashSet<String>,
+    ) -> Result<()> {
+        let client = Client::with_builder(true, reqwest::blocking::Client::builder().no_proxy());
+        let db = Db::connect(db_path)?;
+        let token = db.hold_sealer_lease(OWNER, instant)?.unwrap();
+        seal_at(db_path, data, &client, instant, OWNER, token, confirmed)
+    }
+
+    #[test]
+    fn the_scheduler_consults_a_confirmed_mirror_once_and_a_mirror_listed_later_at_the_next_seal() {
+        let data = tempfile::tempdir().unwrap();
+        let (db_path, db) = log(data.path());
+        let (first, first_requests) = not_found_mirror();
+        let (second, second_requests) = not_found_mirror();
+        list_mirrors(data.path(), &[&first]);
+        let mut confirmed = HashSet::new();
+
+        scheduled_seal(&db_path, data.path(), T, &mut confirmed).unwrap();
+        scheduled_seal(&db_path, data.path(), T + HOUR, &mut confirmed).unwrap();
+        assert_eq!(first_requests.lock().unwrap().len(), 1);
+
+        list_mirrors(data.path(), &[&first, &second]);
+        scheduled_seal(&db_path, data.path(), T + 2 * HOUR, &mut confirmed).unwrap();
+        scheduled_seal(&db_path, data.path(), T + 3 * HOUR, &mut confirmed).unwrap();
+
+        assert_eq!(
+            *first_requests.lock().unwrap(),
+            ["GET /checkpoint HTTP/1.1"]
+        );
+        assert_eq!(
+            *second_requests.lock().unwrap(),
+            ["GET /checkpoint HTTP/1.1"]
+        );
+        assert_eq!(db.last_epoch().unwrap().unwrap().epoch_number, 3);
+        assert_eq!(confirmed, HashSet::from([first, second]));
+    }
+
+    #[test]
+    fn a_refused_mirror_check_confirms_no_mirror() {
+        let data = tempfile::tempdir().unwrap();
+        let (db_path, db) = log(data.path());
+        let (answering, requests) = not_found_mirror();
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let unreachable = format!("http://{}/", closed.local_addr().unwrap());
+        drop(closed);
+        list_mirrors(data.path(), &[&answering, &unreachable]);
+        let mut confirmed = HashSet::new();
+
+        let refused = scheduled_seal(&db_path, data.path(), T, &mut confirmed);
+
+        assert!(
+            matches!(refused, Err(Error::MirrorUnconfirmed { .. })),
+            "{refused:?}"
+        );
+        assert!(confirmed.is_empty());
+        assert!(db.last_epoch().unwrap().is_none());
+        list_mirrors(data.path(), &[&answering]);
+        scheduled_seal(&db_path, data.path(), T + HOUR, &mut confirmed).unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 2);
     }
 
     #[test]

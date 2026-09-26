@@ -517,6 +517,15 @@ fn replace_epochs(data: &std::path::Path, epochs: &[(String, Vec<Value>)]) {
         .unwrap()
         .execute_batch("DELETE FROM epochs; DELETE FROM log_entries; DELETE FROM log_tiles;")
         .unwrap();
+    let head = data.join("checkpoint");
+    if head.exists() {
+        std::fs::remove_file(head).unwrap();
+    }
+    for directory in [data.join("log/checkpoints"), data.join("tile")] {
+        if directory.exists() {
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
     let db = Db::connect(&database).unwrap();
     for (height, (sealed_at, entries)) in epochs.iter().enumerate() {
         let mut ordered = entries.clone();
