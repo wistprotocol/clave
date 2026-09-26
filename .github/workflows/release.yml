@@ -1,0 +1,43 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+env:
+  TARGET: x86_64-unknown-linux-musl
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: clave }
+      - uses: actions/checkout@v4
+        with: { repository: wistprotocol/core, path: core }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: x86_64-unknown-linux-musl }
+      - run: sudo apt-get update -q && sudo apt-get install -y -q musl-tools
+      - name: crate version equals the tag
+        working-directory: clave
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "clave") | .version')
+          [ "v$version" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME, crate version $version"; exit 1; }
+      - run: cargo build --release --locked --target "$TARGET" -p clave
+        working-directory: clave
+      - name: package
+        working-directory: clave
+        run: |
+          bin=target/$TARGET/release/clave
+          reported=$("$bin" --version)
+          [ "$reported" = "clave ${GITHUB_REF_NAME#v}" ] || { echo "binary reports '$reported'"; exit 1; }
+          asset=clave-$GITHUB_REF_NAME-$TARGET.tar.gz
+          mkdir dist
+          tar -czf "dist/$asset" --owner=0 --group=0 --numeric-owner -C "$(dirname "$bin")" clave
+          (cd dist && sha256sum "$asset" > SHA256SUMS && cat SHA256SUMS)
+      - name: publish
+        working-directory: clave
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          case $GITHUB_REF_NAME in *-*) prerelease=--prerelease ;; *) prerelease= ;; esac
+          gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" $prerelease \
+            --notes "Built against wist-core $(git -C ../core rev-parse HEAD)." dist/*

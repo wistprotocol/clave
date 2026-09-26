@@ -1699,6 +1699,22 @@ recovery settlement landing while a Delta is in flight — are
 Cargo runs test binaries one at a time, so their load never runs beside
 the timing-sensitive dispatch tests in `tests/serve.rs`.
 
+## Releases
+
+A release is a Git tag `v<version>` equal to the crate version in
+`crates/clave/Cargo.toml`. Pushing the tag runs
+`.github/workflows/release.yml`: it builds `x86_64-unknown-linux-musl`
+against the current `wistprotocol/core` default branch, checks that the
+binary's `clave --version` reports the tag's version, and attaches
+`clave-<tag>-x86_64-unknown-linux-musl.tar.gz` (the `clave` binary at the
+archive root) and `SHA256SUMS` (`<sha256>  <asset>` lines) to a GitHub
+release named after the tag, whose notes name the core commit built. A
+tag with a `-` suffix publishes a pre-release.
+
+To cut a release: set the version in `crates/clave/Cargo.toml`, run
+`cargo build` so `Cargo.lock` records it, commit, tag `v<version>` and
+push the commit and the tag.
+
 ## Known deviations
 
 The following transport setting supports integration tests:
