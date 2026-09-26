@@ -315,7 +315,8 @@ fn pull(state: &AppState, owner: &str, task: &PullTask) {
             );
         }
         Err(Error::Fenced) => {}
-        Err(_) => {
+        Err(err) => {
+            eprintln!("pull of {} failed: {err}", task.domain);
             let now = jiff::Timestamp::now().as_second();
             let _ = db.complete_pull(
                 task,
