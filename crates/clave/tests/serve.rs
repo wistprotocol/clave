@@ -5,6 +5,8 @@ use common::{
 };
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 fn free_addr() -> SocketAddr {
@@ -727,6 +729,38 @@ fn serve_static_slow(listener: std::net::TcpListener, dir: std::path::PathBuf, d
     });
 }
 
+fn serve_static_held(
+    listener: std::net::TcpListener,
+    dir: std::path::PathBuf,
+    held: Arc<AtomicBool>,
+) -> Arc<AtomicUsize> {
+    let received = Arc::new(AtomicUsize::new(0));
+    let counter = received.clone();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let body = std::fs::read(dir.join(uri.path().trim_start_matches('/')));
+                let held = held.clone();
+                async move {
+                    while held.load(Ordering::SeqCst) {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    match body {
+                        Ok(bytes) => (axum::http::StatusCode::OK, bytes),
+                        Err(_) => (axum::http::StatusCode::NOT_FOUND, Vec::new()),
+                    }
+                }
+            });
+            axum::serve(tokio::net::TcpListener::from_std(listener).unwrap(), app)
+                .await
+                .unwrap();
+        });
+    });
+    received
+}
+
 #[test]
 fn a_slow_domain_blocks_neither_other_domains_nor_status() {
     let slow_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -746,11 +780,9 @@ fn a_slow_domain_blocks_neither_other_domains_nor_status() {
         std::slice::from_ref(&fast_id),
         "2026-08-09T12:00:00Z",
     );
-    serve_static_slow(
-        slow_listener,
-        slow.dir.path().to_path_buf(),
-        Duration::from_secs(1),
-    );
+    let held = Arc::new(AtomicBool::new(true));
+    let slow_requests =
+        serve_static_held(slow_listener, slow.dir.path().to_path_buf(), held.clone());
     serve_static(fast_listener, fast.dir.path().to_path_buf());
     let transport = clave::fetch::Client::with_builder(
         true,
@@ -764,54 +796,46 @@ fn a_slow_domain_blocks_neither_other_domains_nor_status() {
     clave::init::run("127.0.0.1:0", tmp.path()).unwrap();
     let addr = spawn_server_with_client(tmp.path(), transport);
     let c = reqwest::blocking::Client::new();
-    let ping = |host: &str| {
-        c.post(format!("{addr}/ingest"))
-            .json(&serde_json::json!({"host": host}))
-            .send()
-            .unwrap()
-            .status()
+    let last_pull_at = |host: &str| {
+        let r = c.get(format!("{addr}/status/{host}")).send().unwrap();
+        if r.status() != 200 {
+            return None;
+        }
+        let status: serde_json::Value = r.json().unwrap();
+        status["last_pull_at"].as_str().map(str::to_string)
     };
     let started = std::time::Instant::now();
-    assert_eq!(ping("localhost"), 202);
-    assert_eq!(ping("www.localhost"), 202);
+    assert_eq!(ping(&addr, "localhost"), 202);
+    // Shorter than the fetch request timeout, so the held request is still open when released.
+    let deadline = started + Duration::from_secs(20);
+    while slow_requests.load(Ordering::SeqCst) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the slow domain's pull never started"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(ping(&addr, "www.localhost"), 202);
     let status = c
         .get(format!("{addr}/status/unknown.example"))
         .send()
         .unwrap()
         .status();
     assert_eq!(status, 404);
-    assert!(
-        started.elapsed() < Duration::from_millis(1500),
-        "pings and status waited on the slow pull: {:?}",
-        started.elapsed()
-    );
-    let deadline = started + Duration::from_millis(1800);
-    loop {
-        let r = c
-            .get(format!("{addr}/status/www.localhost"))
-            .send()
-            .unwrap();
-        if r.status() == 200 {
-            let status: serde_json::Value = r.json().unwrap();
-            if status["last_pull_at"].is_string() {
-                break;
-            }
-        }
+    while last_pull_at("www.localhost").is_none() {
         assert!(
             std::time::Instant::now() < deadline,
             "the fast domain's pull waited on the slow one"
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        let r = c.get(format!("{addr}/status/localhost")).send().unwrap();
-        if r.status() == 200 {
-            let status: serde_json::Value = r.json().unwrap();
-            if status["last_pull_at"].is_string() {
-                break;
-            }
-        }
+    assert!(
+        last_pull_at("localhost").is_none(),
+        "the slow domain's pull ended while its server withheld the response"
+    );
+    held.store(false, Ordering::SeqCst);
+    let deadline = started + Duration::from_secs(90);
+    while last_pull_at("localhost").is_none() {
         assert!(
             std::time::Instant::now() < deadline,
             "the slow domain's pull never completed"
