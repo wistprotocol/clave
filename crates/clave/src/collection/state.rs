@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use wist_core::declarations::Declarations;
+use wist_core::objects::status::{RejectionCondition, StatusRejection};
 use wist_core::withdrawal::WithdrawalReplay;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,11 +77,42 @@ pub struct AcceptedCatalog {
     pub eligibility: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Discard {
+    pub condition: RejectionCondition,
+    pub catalog: String,
+    pub change_list: String,
+}
+
+pub const CHAIN_DISCARDED: &str = "WIST2-E08";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscardedChain {
+    pub at: String,
+    pub discard: Discard,
+}
+
+impl DiscardedChain {
+    pub fn rejection(&self, collection: &str) -> StatusRejection {
+        StatusRejection {
+            code: CHAIN_DISCARDED.into(),
+            at: self.at.clone(),
+            id: Some(self.discard.catalog.clone()),
+            collection: Some(collection.into()),
+            urls: None,
+            condition: Some(self.discard.condition),
+            change_list: Some(self.discard.change_list.clone()),
+            detail: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CollectionState {
     pub latest: Option<SealedCatalog>,
     pub accepted: Option<AcceptedCatalog>,
     pub left_chain: bool,
+    pub discarded_chain: Option<DiscardedChain>,
     pub catalog_file: Option<ServedFile>,
 }
 

@@ -1,23 +1,24 @@
+use super::list::{self, ListStep, Listing, Target};
 use super::site::{Answer, Held, Object, Request, Site};
+pub use super::state::Discard;
 use super::state::{
     AcceptedCatalog, Admission, CollectionState, Discovered, ItemKind, ListItem, Place,
-    QueuedCatalog, ServedFile, State, WaitingUrl,
+    QueuedCatalog, ServedFile, State, WaitingUrl, CHAIN_DISCARDED,
 };
 use crate::error::{Error, Result};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use wist_core::catalog::{self, Attempt, Fetch, Pull, Window};
 use wist_core::collection::{self, Limits};
 use wist_core::constants::CATALOG_FILE_READ_MAX_BYTES;
-use wist_core::crypto::{hex_encode, PublicKey};
+use wist_core::crypto::PublicKey;
 use wist_core::declaration::{self, Decision};
 use wist_core::declarations::{Declarations, Domain, Projection};
 use wist_core::item::{self, SizeCaps};
 use wist_core::objects::{Catalog, PageItem, Publisher};
 use wist_core::parameters::WIRE_INTEGER_MAX;
-use wist_core::tree::{self, TreeBounds, TreeFetch, Walk};
+use wist_core::tree::TreeBounds;
 
 /// WIST-1 §5.2, Sources of a pull: a pending head stays pending at every pull.
 const NEVER_ACTIVATES: i64 = WIRE_INTEGER_MAX;
@@ -111,13 +112,6 @@ pub enum CatalogOutcome {
     Refused,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Discard {
-    pub condition: &'static str,
-    pub catalog: String,
-    pub change_list: String,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ItemOutcome {
     Admitted,
@@ -154,6 +148,7 @@ pub struct CatalogReport {
     pub dropped: Vec<String>,
     pub sources: Vec<String>,
     pub tree_files_fetched: Vec<String>,
+    pub list: Option<ListStep>,
     pub chain: Option<Discard>,
     pub base: bool,
     pub key: Option<String>,
@@ -172,6 +167,7 @@ impl CatalogReport {
             dropped: Vec::new(),
             sources: Vec::new(),
             tree_files_fetched: Vec::new(),
+            list: None,
             chain: None,
             base: false,
             key: None,
@@ -190,7 +186,7 @@ impl CatalogReport {
     pub fn codes_recorded(&self) -> Vec<&'static str> {
         self.chain
             .iter()
-            .map(|_| "WIST2-E08")
+            .map(|_| CHAIN_DISCARDED)
             .chain(self.codes.iter().copied())
             .collect()
     }
@@ -479,7 +475,9 @@ fn read_declaration(
             Some(file) => file.octets,
             None => return Ok((stopped("not_fetched"), Vec::new())),
         },
-        Answer::Failed | Answer::Suspended => return Ok((stopped("not_fetched"), Vec::new())),
+        Answer::Failed | Answer::Oversized | Answer::Suspended | Answer::Interrupted => {
+            return Ok((stopped("not_fetched"), Vec::new()))
+        }
     };
     let Ok(fetched) = crate::json::parse(&octets) else {
         return Ok((stopped("WIST1-E05"), Vec::new()));
@@ -649,8 +647,10 @@ fn pull_collection(
         report
     };
     let octets = match answer {
-        Answer::Suspended => return Ok(CatalogReport::new(name, CatalogOutcome::Suspended)),
-        Answer::Failed => return Ok(unavailable()),
+        Answer::Suspended | Answer::Interrupted => {
+            return Ok(CatalogReport::new(name, CatalogOutcome::Suspended))
+        }
+        Answer::Failed | Answer::Oversized => return Ok(unavailable()),
         Answer::NotModified => match stored {
             Some(file) => file.octets,
             None => return Ok(unavailable()),
@@ -781,7 +781,15 @@ fn pull_collection(
     let signer =
         signer.ok_or_else(|| Error::History("an accepted Catalog has no signer".into()))?;
     report.sources = accepting.iter().map(|source| source.hash.clone()).collect();
-    let list = match obtain_list(state, site, held, context, name, &catalog, &mut report)? {
+    let target = Target {
+        publisher,
+        at: context.at,
+        parameters: context.parameters,
+        name,
+        catalog: &catalog,
+        catalog_id: &catalog_id,
+    };
+    let list = match list::obtain(state, site, held, &target, &mut report)? {
         Listing::Listed(list) => list,
         Listing::Refused => return Ok(report.refused(vec![TREE_REFUSED])),
         Listing::Suspended => {
@@ -889,106 +897,6 @@ fn unjudged(list: &[Value]) -> Result<Vec<ListItem>> {
             })
         })
         .collect()
-}
-
-pub enum Chain {
-    NotRead,
-    Listed(Vec<Value>),
-    Discarded(Discard),
-}
-
-enum Listing {
-    Listed(Vec<Value>),
-    Refused,
-    Suspended,
-}
-
-fn read_chain(
-    _state: &mut State,
-    _site: &mut impl Site,
-    _held: &mut impl Held,
-    _context: &Context<'_>,
-    _name: &str,
-    _catalog: &Catalog,
-) -> Result<Chain> {
-    Ok(Chain::NotRead)
-}
-
-fn obtain_list(
-    state: &mut State,
-    site: &mut impl Site,
-    held: &mut impl Held,
-    context: &Context<'_>,
-    name: &str,
-    catalog: &Catalog,
-    report: &mut CatalogReport,
-) -> Result<Listing> {
-    let publisher = context.publisher;
-    if let Some(list) = held.list_with_root(publisher, name, catalog.size, &catalog.root)? {
-        return Ok(Listing::Listed(list));
-    }
-    match read_chain(state, site, held, context, name, catalog)? {
-        Chain::Listed(list) => return Ok(Listing::Listed(list)),
-        Chain::Discarded(discard) => report.chain = Some(discard),
-        Chain::NotRead => {}
-    }
-    let bounds = context.parameters.tree_bounds()?;
-    let mut fetched = Vec::new();
-    let mut failure = None;
-    let walk = tree::walk(catalog, &bounds, |hex| {
-        match fetch_tree_file(site, held, publisher, name, hex, &bounds, &mut fetched) {
-            Ok(answer) => answer,
-            Err(error) => {
-                failure = Some(error);
-                TreeFetch::Suspended
-            }
-        }
-    });
-    if let Some(error) = failure {
-        return Err(error);
-    }
-    fetched.sort();
-    report.tree_files_fetched = fetched;
-    Ok(match walk {
-        Walk::Listed(list) => Listing::Listed(list),
-        Walk::Refused(_) => Listing::Refused,
-        Walk::Suspended => Listing::Suspended,
-    })
-}
-
-fn fetch_tree_file(
-    site: &mut impl Site,
-    held: &mut impl Held,
-    publisher: &str,
-    name: &str,
-    hex: &str,
-    bounds: &TreeBounds,
-    fetched: &mut Vec<String>,
-) -> Result<TreeFetch> {
-    if let Some(octets) = held.tree_file(publisher, name, hex)? {
-        return Ok(TreeFetch::Octets(octets));
-    }
-    let answer = site.fetch(&Request {
-        object: Object::TreeFile {
-            collection: name,
-            hex,
-        },
-        bound: bounds.tree_file_cap_bytes(),
-        validator: None,
-    })?;
-    if answer == Answer::Suspended {
-        return Ok(TreeFetch::Suspended);
-    }
-    fetched.push(hex.to_owned());
-    let Answer::Octets { octets, .. } = answer else {
-        return Ok(TreeFetch::Failed);
-    };
-    if octets.len() as u64 <= bounds.tree_file_cap_bytes()
-        && hex_encode(&Sha256::digest(&octets)) == hex
-    {
-        held.hold_tree_file(publisher, name, hex, &octets)?;
-    }
-    Ok(TreeFetch::Octets(octets))
 }
 
 fn item_report(url: &str, item_id: &str, outcome: ItemOutcome) -> ItemReport {
@@ -1136,7 +1044,7 @@ fn judge_item(
         validator: None,
     })?;
     Ok(Some(match answer {
-        Answer::Suspended => return Ok(None),
+        Answer::Suspended | Answer::Interrupted => return Ok(None),
         Answer::Octets { octets, .. } if octets.len() as u64 <= bound => {
             match item::judge_payload_octets(&page_item, &octets, caps) {
                 Ok(()) => {

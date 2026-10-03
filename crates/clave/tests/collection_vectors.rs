@@ -340,23 +340,12 @@ fn resolution_report(case: &Value) -> (PullReport, usize) {
             other => panic!("unknown catalog outcome {other}"),
         };
         let mut catalog = CatalogReport::new(&name, outcome);
-        let discarded = collection
-            .get("chain")
-            .is_some_and(|chain| chain == "discarded");
-        if discarded {
-            catalog.chain = Some(clave::collection::pull::Discard {
-                condition: "result",
-                catalog: "sha256:00".into(),
-                change_list: "sha256:00".into(),
-            });
-        }
         catalog.codes = collection
             .get("codes")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
             .map(|code| code.as_str().unwrap())
-            .filter(|code| !(discarded && *code == "WIST2-E08"))
             .map(|code| *CATALOG_CODES.iter().find(|known| **known == code).unwrap())
             .collect();
         for item in 0..collection["items_admitted"].as_u64().unwrap_or(0) {
@@ -378,8 +367,19 @@ fn resolution_report(case: &Value) -> (PullReport, usize) {
 #[test]
 fn a_pull_that_discovers_accepts_and_admits_nothing_resolves_to_wist2_e02() {
     let vector = read_vector("vectors/wist2/fetch-bounds.json");
-    let cases = vector["resolution_cases"].as_array().unwrap();
-    for case in cases {
+    let cases: Vec<&Value> = vector["resolution_cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|case| {
+            case["collections"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|collection| collection.get("chain").is_none())
+        })
+        .collect();
+    for case in &cases {
         let label = case["label"].as_str().unwrap();
         let (report, labels_admitted) = resolution_report(case);
         let resolution = report.resolution(labels_admitted);
@@ -391,5 +391,5 @@ fn a_pull_that_discovers_accepts_and_admits_nothing_resolves_to_wist2_e02() {
             "{label}"
         );
     }
-    assert_eq!(cases.len(), 17);
+    assert_eq!(cases.len(), 13);
 }

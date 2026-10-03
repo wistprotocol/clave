@@ -48,7 +48,9 @@ pub enum Answer {
     },
     NotModified,
     Failed,
+    Oversized,
     Suspended,
+    Interrupted,
 }
 
 pub trait Site {
@@ -79,6 +81,8 @@ pub trait Held {
         catalog: &Value,
         items: &[Value],
     ) -> Result<()>;
+
+    fn holds_list(&self, publisher: &str, collection: &str) -> Result<bool>;
 
     fn tree_file(&self, publisher: &str, collection: &str, hex: &str) -> Result<Option<Vec<u8>>>;
 
@@ -186,11 +190,16 @@ impl Site for ServedSite {
             let octets = served
                 .filter(|_| !unchanged)
                 .map_or(0, |octets| octets.len() as u64);
+            let no_object_left = self.meter.objects_remaining == Some(0);
             match self.meter.read(request.bound, octets).0 {
-                Metered::Suspended => return Ok(Answer::Suspended),
+                Metered::Suspended if no_object_left => return Ok(Answer::Suspended),
+                Metered::Suspended => {
+                    self.requested.push(path);
+                    return Ok(Answer::Interrupted);
+                }
                 Metered::Failed => {
                     self.requested.push(path);
-                    return Ok(Answer::Failed);
+                    return Ok(Answer::Oversized);
                 }
                 Metered::Read => {}
             }
@@ -199,7 +208,7 @@ impl Site for ServedSite {
         Ok(match served {
             None => Answer::Failed,
             Some(_) if unchanged => Answer::NotModified,
-            Some(octets) if octets.len() as u64 > request.bound => Answer::Failed,
+            Some(octets) if octets.len() as u64 > request.bound => Answer::Oversized,
             Some(octets) => Answer::Octets {
                 octets: octets.clone(),
                 validator: Some(validator(octets)),
@@ -265,6 +274,13 @@ impl Held for MemoryHeld {
             (size, root, items.to_vec()),
         );
         Ok(())
+    }
+
+    fn holds_list(&self, publisher: &str, collection: &str) -> Result<bool> {
+        Ok(self
+            .lists
+            .keys()
+            .any(|(p, c, _)| p == publisher && c == collection))
     }
 
     fn tree_file(&self, publisher: &str, collection: &str, hex: &str) -> Result<Option<Vec<u8>>> {
