@@ -1,9 +1,8 @@
-use super::prepare::{OwnedRecordChange, PreparedEpoch};
+use super::prepare::PreparedEpoch;
 use super::SealReport;
 use crate::db::Mutation;
 use crate::db::{
-    Db, ParamChangeRow, RecordChange, RecordUpsert, SealedDeclarationRow, SealedDisputeRow,
-    SealedLabelRow, WithdrawalRow,
+    Db, ParamChangeRow, SealedDeclarationRow, SealedDisputeRow, SealedLabelRow, WithdrawalRow,
 };
 use crate::error::{Error, Result};
 use std::path::Path;
@@ -34,40 +33,7 @@ pub(super) fn epoch(
         entry_count,
         projection,
         windows,
-        record_updates,
     } = prepared;
-    let records: Vec<RecordChange> = record_updates
-        .iter()
-        .map(|change| match change {
-            OwnedRecordChange::Upsert {
-                url,
-                publisher,
-                delta_id,
-                observed_at,
-                title,
-                abstract_text,
-                lang,
-            } => RecordChange::Upsert(RecordUpsert {
-                url,
-                publisher,
-                delta_id,
-                observed_at,
-                title,
-                abstract_text: abstract_text.as_deref(),
-                lang,
-            }),
-            OwnedRecordChange::Attest {
-                url,
-                publisher,
-                observed_at,
-            } => RecordChange::Attest {
-                url,
-                publisher,
-                observed_at,
-            },
-            OwnedRecordChange::Delete { url, publisher } => RecordChange::Delete { url, publisher },
-        })
-        .collect();
     let param_changes: Vec<ParamChangeRow> = accepted_changes
         .iter()
         .map(|c| ParamChangeRow {
@@ -84,7 +50,7 @@ pub(super) fn epoch(
         .iter()
         .map(|w| WithdrawalRow {
             update_id: &w.update_id,
-            delta_id: &w.delta_id,
+            item_id: &w.item_id,
             domain: &w.domain,
         })
         .collect();
@@ -160,7 +126,6 @@ pub(super) fn epoch(
         &sealed_at,
         &entries,
         octets,
-        &records,
         &param_changes,
         &withdrawal_rows,
         &suffix_lists,

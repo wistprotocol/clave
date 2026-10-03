@@ -1,8 +1,8 @@
 mod common;
 
 use common::{
-    add_delta, head_checkpoint, make_publisher_with_scope, reserve_addr, serve_static,
-    served_entries, write_feed,
+    add_label, head_checkpoint, make_publisher_with_scope, reserve_addr, serve_static,
+    served_entries, write_label_feed,
 };
 use std::path::Path;
 
@@ -32,8 +32,8 @@ fn leftovers(dir: &Path) -> Vec<String> {
 fn a_seal_records_its_checkpoint_before_publishing_the_tree_it_states() {
     let (listener, host, client) = reserve_addr();
     let p = make_publisher_with_scope(&host, &["example.com"]);
-    let id = add_delta(&p, "https://example.com/a", "alpha body", None);
-    write_feed(&p, &host, std::slice::from_ref(&id), "2026-08-09T12:00:00Z");
+    let id = add_label(&p, "https://other.example/a", "2026-08-09T11:00:00Z");
+    write_label_feed(&p, &host, std::slice::from_ref(&id), "2026-08-09T12:00:00Z");
     serve_static(listener, p.dir.path().to_path_buf());
     let data = tempfile::tempdir().unwrap();
     let db = sealed_store(&host, &client, data.path());
@@ -71,8 +71,8 @@ fn a_publication_interrupted_after_its_commit_is_finished_from_the_stored_checkp
     use std::os::unix::fs::PermissionsExt;
     let (listener, host, client) = reserve_addr();
     let p = make_publisher_with_scope(&host, &["example.com"]);
-    let id = add_delta(&p, "https://example.com/a", "alpha body", None);
-    write_feed(&p, &host, std::slice::from_ref(&id), "2026-08-09T12:00:00Z");
+    let id = add_label(&p, "https://other.example/a", "2026-08-09T11:00:00Z");
+    write_label_feed(&p, &host, std::slice::from_ref(&id), "2026-08-09T12:00:00Z");
     serve_static(listener, p.dir.path().to_path_buf());
     let data = tempfile::tempdir().unwrap();
     let db = sealed_store(&host, &client, data.path());
@@ -114,8 +114,8 @@ fn a_publication_interrupted_after_its_commit_is_finished_from_the_stored_checkp
 fn a_head_whose_files_went_missing_is_republished_from_the_store() {
     let (listener, host, client) = reserve_addr();
     let p = make_publisher_with_scope(&host, &["example.com"]);
-    let id = add_delta(&p, "https://example.com/a", "alpha body", None);
-    write_feed(&p, &host, std::slice::from_ref(&id), "2026-08-09T12:00:00Z");
+    let id = add_label(&p, "https://other.example/a", "2026-08-09T11:00:00Z");
+    write_label_feed(&p, &host, std::slice::from_ref(&id), "2026-08-09T12:00:00Z");
     serve_static(listener, p.dir.path().to_path_buf());
     let data = tempfile::tempdir().unwrap();
     let db = sealed_store(&host, &client, data.path());
@@ -146,8 +146,8 @@ fn a_head_whose_files_went_missing_is_republished_from_the_store() {
 fn a_torn_head_tile_is_repaired_from_the_stored_tree() {
     let (listener, host, client) = reserve_addr();
     let p = make_publisher_with_scope(&host, &["example.com"]);
-    let id = add_delta(&p, "https://example.com/a", "alpha body", None);
-    write_feed(&p, &host, std::slice::from_ref(&id), "2026-08-09T12:00:00Z");
+    let id = add_label(&p, "https://other.example/a", "2026-08-09T11:00:00Z");
+    write_label_feed(&p, &host, std::slice::from_ref(&id), "2026-08-09T12:00:00Z");
     serve_static(listener, p.dir.path().to_path_buf());
     let data = tempfile::tempdir().unwrap();
     let db = sealed_store(&host, &client, data.path());
@@ -175,9 +175,15 @@ fn the_head_checkpoint_never_names_entries_the_log_does_not_serve() {
     let (listener, host, client) = reserve_addr();
     let p = make_publisher_with_scope(&host, &["example.com"]);
     let ids: Vec<String> = (0..3)
-        .map(|i| add_delta(&p, &format!("https://example.com/p{i}"), "body", None))
+        .map(|i| {
+            add_label(
+                &p,
+                &format!("https://other.example/p{i}"),
+                "2026-08-09T11:00:00Z",
+            )
+        })
         .collect();
-    write_feed(&p, &host, &ids, "2026-08-09T12:00:00Z");
+    write_label_feed(&p, &host, &ids, "2026-08-09T12:00:00Z");
     serve_static(listener, p.dir.path().to_path_buf());
     let data = tempfile::tempdir().unwrap();
     let db = sealed_store(&host, &client, data.path());

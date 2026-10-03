@@ -3,10 +3,9 @@ use crate::error::{Error, Result};
 use rusqlite::{Connection, OptionalExtension};
 
 const SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS pull_runs(run_id INTEGER PRIMARY KEY AUTOINCREMENT, domain TEXT NOT NULL UNIQUE, token INTEGER, now TEXT NOT NULL, day TEXT NOT NULL, unit TEXT NOT NULL, phase TEXT NOT NULL CHECK(phase IN ('walk','deltas','labels','label_items','closing','aborted')), work_bytes INTEGER NOT NULL, work_objects INTEGER NOT NULL, feed_retry_used INTEGER NOT NULL DEFAULT 0, unseen_any INTEGER NOT NULL DEFAULT 0, suspended INTEGER NOT NULL DEFAULT 0, chain_pos INTEGER NOT NULL DEFAULT 0, pages_epoch INTEGER, queue_json BLOB NOT NULL DEFAULT '[]', position INTEGER NOT NULL DEFAULT 0, ended TEXT);
+CREATE TABLE IF NOT EXISTS pull_runs(run_id INTEGER PRIMARY KEY AUTOINCREMENT, domain TEXT NOT NULL UNIQUE, token INTEGER, now TEXT NOT NULL, day TEXT NOT NULL, unit TEXT NOT NULL, phase TEXT NOT NULL CHECK(phase IN ('walk','labels','label_items','closing','aborted')), work_bytes INTEGER NOT NULL, work_objects INTEGER NOT NULL, discovered INTEGER NOT NULL DEFAULT 0, suspended INTEGER NOT NULL DEFAULT 0, pages_epoch INTEGER, queue_json BLOB NOT NULL DEFAULT '[]', position INTEGER NOT NULL DEFAULT 0, ended TEXT);
 CREATE TABLE IF NOT EXISTS pull_objects(run_id INTEGER NOT NULL, kind TEXT NOT NULL, object_id TEXT NOT NULL, url TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('issued','fetched','verified','admitted','rejected','failed')), raw BLOB, byte_len INTEGER, debited INTEGER NOT NULL DEFAULT 0, unit TEXT, day TEXT, checks_json TEXT, refs_json TEXT, report TEXT, report_seq INTEGER, PRIMARY KEY(run_id, kind, object_id));
-CREATE TABLE IF NOT EXISTS pull_walk(domain TEXT NOT NULL, feed TEXT NOT NULL CHECK(feed IN ('feed','label')), idx INTEGER NOT NULL, url TEXT NOT NULL, generated_at TEXT NOT NULL, ids_json BLOB NOT NULL, next_url TEXT, raw BLOB, PRIMARY KEY(domain, feed, idx));
-CREATE TABLE IF NOT EXISTS pull_attempts(run_id INTEGER NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('delta_refresh','resolved_prev')), id TEXT NOT NULL, PRIMARY KEY(run_id, kind, id));
+CREATE TABLE IF NOT EXISTS pull_walk(domain TEXT NOT NULL, feed TEXT NOT NULL CHECK(feed IN ('label')), idx INTEGER NOT NULL, url TEXT NOT NULL, generated_at TEXT NOT NULL, ids_json BLOB NOT NULL, next_url TEXT, raw BLOB, PRIMARY KEY(domain, feed, idx));
 ";
 
 pub(super) fn create(conn: &Connection) -> Result<()> {
@@ -17,7 +16,6 @@ pub(super) fn create(conn: &Connection) -> Result<()> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Phase {
     Walk,
-    Deltas,
     Labels,
     LabelItems,
     Closing,
@@ -28,7 +26,6 @@ impl Phase {
     fn as_str(self) -> &'static str {
         match self {
             Phase::Walk => "walk",
-            Phase::Deltas => "deltas",
             Phase::Labels => "labels",
             Phase::LabelItems => "label_items",
             Phase::Closing => "closing",
@@ -39,7 +36,6 @@ impl Phase {
     fn parse(value: &str) -> Result<Phase> {
         Ok(match value {
             "walk" => Phase::Walk,
-            "deltas" => Phase::Deltas,
             "labels" => Phase::Labels,
             "label_items" => Phase::LabelItems,
             "closing" => Phase::Closing,
@@ -102,10 +98,8 @@ pub(crate) struct PullRun {
     pub phase: Phase,
     pub work_bytes: u64,
     pub work_objects: u32,
-    pub feed_retry_used: bool,
-    pub unseen_any: bool,
+    pub discovered: bool,
     pub suspended: bool,
-    pub chain_pos: i64,
     pub pages_epoch: Option<u64>,
     pub queue: Vec<String>,
     pub position: usize,
@@ -160,7 +154,7 @@ pub(crate) enum Settled<'a> {
     Failed(&'a str),
 }
 
-const RUN_COLUMNS: &str = "run_id, domain, now, day, unit, phase, work_bytes, work_objects, feed_retry_used, unseen_any, suspended, chain_pos, pages_epoch, queue_json, position, ended";
+const RUN_COLUMNS: &str = "run_id, domain, now, day, unit, phase, work_bytes, work_objects, discovered, suspended, pages_epoch, queue_json, position, ended";
 
 fn run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(PullRun, String, String)> {
     Ok((
@@ -173,17 +167,15 @@ fn run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(PullRun, String, String
             phase: Phase::Walk,
             work_bytes: row.get::<_, i64>(6)?.max(0) as u64,
             work_objects: row.get::<_, i64>(7)?.clamp(0, u32::MAX as i64) as u32,
-            feed_retry_used: row.get(8)?,
-            unseen_any: row.get(9)?,
-            suspended: row.get(10)?,
-            chain_pos: row.get(11)?,
-            pages_epoch: row.get::<_, Option<i64>>(12)?.map(|h| h.max(0) as u64),
+            discovered: row.get(8)?,
+            suspended: row.get(9)?,
+            pages_epoch: row.get::<_, Option<i64>>(10)?.map(|h| h.max(0) as u64),
             queue: Vec::new(),
-            position: row.get::<_, i64>(14)?.max(0) as usize,
-            ended: row.get(15)?,
+            position: row.get::<_, i64>(12)?.max(0) as usize,
+            ended: row.get(13)?,
         },
         row.get(5)?,
-        row.get(13)?,
+        row.get(11)?,
     ))
 }
 
@@ -240,7 +232,6 @@ fn reservation_meter(
 fn delete_run(conn: &Connection, run_id: i64) -> Result<Vec<Credit>> {
     let credited = release_reservations(conn, run_id)?;
     conn.execute("DELETE FROM pull_objects WHERE run_id = ?1", [run_id])?;
-    conn.execute("DELETE FROM pull_attempts WHERE run_id = ?1", [run_id])?;
     conn.execute("DELETE FROM pull_runs WHERE run_id = ?1", [run_id])?;
     Ok(credited)
 }
@@ -304,16 +295,14 @@ impl Db {
 
     pub(crate) fn update_pull_run(&self, run: &PullRun) -> Result<()> {
         self.execute(
-            "UPDATE pull_runs SET phase = ?2, work_bytes = ?3, work_objects = ?4, feed_retry_used = ?5, unseen_any = ?6, suspended = ?7, chain_pos = ?8, position = ?9, ended = ?10 WHERE run_id = ?1",
+            "UPDATE pull_runs SET phase = ?2, work_bytes = ?3, work_objects = ?4, discovered = ?5, suspended = ?6, position = ?7, ended = ?8 WHERE run_id = ?1",
             rusqlite::params![
                 run.run_id,
                 run.phase.as_str(),
                 run.work_bytes.min(i64::MAX as u64) as i64,
                 run.work_objects,
-                run.feed_retry_used,
-                run.unseen_any,
+                run.discovered,
                 run.suspended,
-                run.chain_pos,
                 run.position as i64,
                 run.ended,
             ],
@@ -574,7 +563,7 @@ impl Db {
         let moved = match self.pull_object(run_id, kind, object_id)? {
             Some(object) if from.contains(&object.status) => {
                 tx.execute(
-                    "UPDATE pull_objects SET status = ?4, checks_json = COALESCE(?5, checks_json), raw = CASE WHEN ?4 IN ('admitted', 'rejected') AND kind IN ('delta', 'payload', 'label') THEN NULL ELSE raw END WHERE run_id = ?1 AND kind = ?2 AND object_id = ?3",
+                    "UPDATE pull_objects SET status = ?4, checks_json = COALESCE(?5, checks_json), raw = CASE WHEN ?4 IN ('admitted', 'rejected') AND kind = 'label' THEN NULL ELSE raw END WHERE run_id = ?1 AND kind = ?2 AND object_id = ?3",
                     (run_id, kind, object_id, to.as_str(), checks),
                 )?;
                 true
@@ -613,7 +602,7 @@ impl Db {
             (run_id, kind, object_id, status.as_str()),
         )?;
         tx.execute(
-            "UPDATE pull_objects SET status = ?4, report = ?5, report_seq = (SELECT COALESCE(MAX(report_seq), 0) + 1 FROM pull_objects WHERE run_id = ?1), raw = CASE WHEN ?4 IN ('admitted', 'rejected') AND kind IN ('delta', 'payload', 'label') THEN NULL ELSE raw END WHERE run_id = ?1 AND kind = ?2 AND object_id = ?3",
+            "UPDATE pull_objects SET status = ?4, report = ?5, report_seq = (SELECT COALESCE(MAX(report_seq), 0) + 1 FROM pull_objects WHERE run_id = ?1), raw = CASE WHEN ?4 IN ('admitted', 'rejected') AND kind = 'label' THEN NULL ELSE raw END WHERE run_id = ?1 AND kind = ?2 AND object_id = ?3",
             (run_id, kind, object_id, status.as_str(), report),
         )?;
         tx.commit()
@@ -625,34 +614,6 @@ impl Db {
             .prepare("SELECT object_id, report FROM pull_objects WHERE run_id = ?1 AND report_seq IS NOT NULL ORDER BY report_seq")?
             .query_map([run_id], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?)
-    }
-
-    pub(crate) fn pull_attempted(&self, run_id: i64, kind: &str, id: &str) -> Result<bool> {
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT 1 FROM pull_attempts WHERE run_id = ?1 AND kind = ?2 AND id = ?3",
-                (run_id, kind, id),
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some())
-    }
-
-    pub(crate) fn record_pull_attempt(&self, run_id: i64, kind: &str, id: &str) -> Result<()> {
-        self.execute(
-            "INSERT OR IGNORE INTO pull_attempts(run_id, kind, id) VALUES (?1, ?2, ?3)",
-            (run_id, kind, id),
-        )?;
-        Ok(())
-    }
-
-    pub(crate) fn forget_pull_attempt(&self, run_id: i64, kind: &str, id: &str) -> Result<()> {
-        self.execute(
-            "DELETE FROM pull_attempts WHERE run_id = ?1 AND kind = ?2 AND id = ?3",
-            (run_id, kind, id),
-        )?;
-        Ok(())
     }
 
     pub(crate) fn walk_page(&self, domain: &str, feed: &str, idx: u32) -> Result<Option<WalkPage>> {

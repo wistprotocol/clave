@@ -29,7 +29,6 @@ pub fn seal_fixture_epoch(
             &[],
             &[],
             &[],
-            &[],
         )
         .unwrap();
     clave::publication::recover(db, data_dir).unwrap();
@@ -64,7 +63,6 @@ pub fn seal_vector_epochs(
                 checkpoint.sealed_at(),
                 &entries,
                 wist_core::epoch::epoch_octets(&entries).unwrap(),
-                &[],
                 &[],
                 &[],
                 &[],
@@ -203,8 +201,7 @@ fn build_publisher(domain: &str, subdomain_scope: Option<&[&str]>) -> TestPub {
     let sk = wist_core::crypto::SigningKey::from_seed(&K1_SEED);
     let dir = tempfile::tempdir().unwrap();
     let wk = dir.path().join(".well-known/wist");
-    fs::create_dir_all(wk.join("deltas")).unwrap();
-    fs::create_dir_all(wk.join("payloads")).unwrap();
+    fs::create_dir_all(&wk).unwrap();
     let mut publisher = serde_json::json!({
         "wist_version": "1.0.0", "domain": domain,
         "keys": [key_entry(&K1_SEED, "2026-08-09T00:00:00Z")],
@@ -232,103 +229,29 @@ pub fn make_publisher_with_scope(domain: &str, subdomain_scope: &[&str]) -> Test
     build_publisher(domain, Some(subdomain_scope))
 }
 
-pub fn add_delta(p: &TestPub, url: &str, extract: &str, prev: Option<&str>) -> String {
-    add_delta_with_links(p, url, extract, prev, &[])
+pub fn label(labeler: &str, subject: &str, asserted_at: &str) -> serde_json::Value {
+    serde_json::json!({"wist_version": "1.0.0", "labeler": labeler, "subject": subject, "name": "wist:spam", "asserted_at": asserted_at})
 }
 
-pub fn add_delta_with_links(
-    p: &TestPub,
-    url: &str,
-    extract: &str,
-    prev: Option<&str>,
-    links: &[&str],
-) -> String {
-    let salt = wist_core::crypto::b64u_encode(&[5u8; 16]);
-    let content = serde_json::json!({"extract": extract, "links": {"total": links.len(), "urls": links}, "summary": {"title": url.chars().take(256).collect::<String>()}});
-    let payload = serde_json::json!({"wist_version": "1.0.0", "salt": salt, "content": content});
-    let mut delta = serde_json::json!({
-        "wist_version": "1.0.0", "publisher": p.domain, "url": url,
-        "change_type": if prev.is_some() { "update" } else { "new" },
-        "observed_at": "2026-08-09T12:00:00Z",
-        "payload": {"commitment": wist_core::delta::make_commitment(&salt, &content).unwrap(), "alg": "HMAC-SHA256", "bytes": wist_core::delta::content_bytes(&content).unwrap()},
-        "meta": {"lang": "en"}
-    });
-    if let Some(pv) = prev {
-        delta["prev"] = pv.into();
-        if let Some(at) = successor_observed_at(p, pv) {
-            delta["observed_at"] = at.into();
-        }
-    }
-    let id = store_delta(p, &delta);
+pub fn add_label(p: &TestPub, subject: &str, asserted_at: &str) -> String {
+    let inner = label(&p.domain, subject, asserted_at);
+    let id = wist_core::label::label_id(&inner).unwrap();
+    let envelope = wist_core::envelope::sign_envelope(&inner, "label", &p.kid, &p.sk).unwrap();
+    let dir = p.dir.path().join(".well-known/wist/labels");
+    fs::create_dir_all(&dir).unwrap();
     fs::write(
-        p.dir
-            .path()
-            .join(format!(".well-known/wist/payloads/{}.json", &id[7..])),
-        serde_json::to_vec(&payload).unwrap(),
+        dir.join(format!("{}.json", &id[7..])),
+        serde_json::to_vec(&envelope).unwrap(),
     )
     .unwrap();
     id
 }
 
-/// An `attest` Delta continuing `prev`, observed one second after it.
-pub fn add_attest(p: &TestPub, url: &str, prev: &str) -> String {
-    add_content_free_delta(p, url, "attest", prev)
+pub fn write_label_feed(p: &TestPub, domain: &str, ids: &[String], generated_at: &str) {
+    write_label_feed_with_next(p, domain, ids, generated_at, None);
 }
 
-/// A `delete` Delta continuing `prev`, observed one second after it.
-pub fn add_delete(p: &TestPub, url: &str, prev: &str) -> String {
-    add_content_free_delta(p, url, "delete", prev)
-}
-
-fn add_content_free_delta(p: &TestPub, url: &str, change_type: &str, prev: &str) -> String {
-    let delta = serde_json::json!({
-        "wist_version": "1.0.0", "publisher": p.domain, "url": url,
-        "change_type": change_type,
-        "observed_at": successor_observed_at(p, prev).expect("the predecessor Delta is on the site"),
-        "prev": prev,
-        "meta": {"lang": "en"}
-    });
-    store_delta(p, &delta)
-}
-
-fn successor_observed_at(p: &TestPub, prev: &str) -> Option<String> {
-    let raw = fs::read(
-        p.dir
-            .path()
-            .join(format!(".well-known/wist/deltas/{}.json", &prev[7..])),
-    )
-    .ok()?;
-    let predecessor: serde_json::Value = serde_json::from_slice(&raw).unwrap();
-    let at = predecessor["delta"]["observed_at"]
-        .as_str()
-        .unwrap()
-        .parse::<jiff::Timestamp>()
-        .unwrap();
-    Some(
-        at.checked_add(jiff::SignedDuration::from_secs(1))
-            .unwrap()
-            .to_string(),
-    )
-}
-
-fn store_delta(p: &TestPub, delta: &serde_json::Value) -> String {
-    let id = wist_core::delta::delta_id(delta).unwrap();
-    let env = wist_core::envelope::sign_envelope(delta, "delta", &p.kid, &p.sk).unwrap();
-    fs::write(
-        p.dir
-            .path()
-            .join(format!(".well-known/wist/deltas/{}.json", &id[7..])),
-        serde_json::to_vec(&env).unwrap(),
-    )
-    .unwrap();
-    id
-}
-
-pub fn write_feed(p: &TestPub, domain: &str, ids: &[String], generated_at: &str) {
-    write_feed_with_next(p, domain, ids, generated_at, None);
-}
-
-pub fn write_feed_with_next(
+pub fn write_label_feed_with_next(
     p: &TestPub,
     domain: &str,
     ids: &[String],
@@ -338,13 +261,13 @@ pub fn write_feed_with_next(
     let feed = serde_json::json!({"wist_version": "1.0.0", "domain": domain, "generated_at": generated_at, "deltas": ids, "next": next});
     let env = wist_core::envelope::sign_envelope(&feed, "feed", &p.kid, &p.sk).unwrap();
     fs::write(
-        p.dir.path().join(".well-known/wist/feed.json"),
+        p.dir.path().join(".well-known/wist/label-feed.json"),
         serde_json::to_vec(&env).unwrap(),
     )
     .unwrap();
 }
 
-pub fn write_feed_page(
+pub fn write_label_feed_page(
     p: &TestPub,
     domain: &str,
     number: u64,
@@ -352,19 +275,11 @@ pub fn write_feed_page(
     generated_at: &str,
     next: Option<&str>,
 ) {
-    let feed = serde_json::json!({"wist_version": "1.0.0", "domain": domain, "generated_at": generated_at, "deltas": ids, "next": next});
-    let env = wist_core::envelope::sign_envelope(&feed, "feed", &p.kid, &p.sk).unwrap();
-    let dir = p.dir.path().join(".well-known/wist/feed");
-    fs::create_dir_all(&dir).unwrap();
-    fs::write(
-        dir.join(format!("{number}.json")),
-        serde_json::to_vec(&env).unwrap(),
-    )
-    .unwrap();
+    write_label_feed_page_signed(p, domain, number, ids, generated_at, next, &K1_SEED);
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn write_feed_page_signed(
+pub fn write_label_feed_page_signed(
     p: &TestPub,
     domain: &str,
     number: u64,
@@ -376,7 +291,7 @@ pub fn write_feed_page_signed(
     let feed = serde_json::json!({"wist_version": "1.0.0", "domain": domain, "generated_at": generated_at, "deltas": ids, "next": next});
     let sk = wist_core::crypto::SigningKey::from_seed(signer_seed);
     let env = wist_core::envelope::sign_envelope(&feed, "feed", &kid(signer_seed), &sk).unwrap();
-    let dir = p.dir.path().join(".well-known/wist/feed");
+    let dir = p.dir.path().join(".well-known/wist/label-feed");
     fs::create_dir_all(&dir).unwrap();
     fs::write(
         dir.join(format!("{number}.json")),
@@ -385,8 +300,25 @@ pub fn write_feed_page_signed(
     .unwrap();
 }
 
-pub fn page_url(domain: &str, number: u64) -> String {
-    format!("https://{domain}/.well-known/wist/feed/{number}.json")
+pub fn write_label_feed_signed(
+    p: &TestPub,
+    domain: &str,
+    ids: &[String],
+    generated_at: &str,
+    signer_seed: &[u8; 32],
+) {
+    let feed = serde_json::json!({"wist_version": "1.0.0", "domain": domain, "generated_at": generated_at, "deltas": ids, "next": null});
+    let sk = wist_core::crypto::SigningKey::from_seed(signer_seed);
+    let env = wist_core::envelope::sign_envelope(&feed, "feed", &kid(signer_seed), &sk).unwrap();
+    fs::write(
+        p.dir.path().join(".well-known/wist/label-feed.json"),
+        serde_json::to_vec(&env).unwrap(),
+    )
+    .unwrap();
+}
+
+pub fn label_page_url(domain: &str, number: u64) -> String {
+    format!("https://{domain}/.well-known/wist/label-feed/{number}.json")
 }
 
 pub fn reserve_addr() -> (std::net::TcpListener, String, clave::fetch::Client) {
@@ -460,8 +392,7 @@ pub fn make_publisher_with_recovery(domain: &str) -> TestPub {
     let sk = wist_core::crypto::SigningKey::from_seed(&K1_SEED);
     let dir = tempfile::tempdir().unwrap();
     let wk = dir.path().join(".well-known/wist");
-    fs::create_dir_all(wk.join("deltas")).unwrap();
-    fs::create_dir_all(wk.join("payloads")).unwrap();
+    fs::create_dir_all(&wk).unwrap();
     let publisher = serde_json::json!({
         "wist_version": "1.0.0", "domain": domain,
         "subdomain_scope": ["example.com"],
@@ -500,78 +431,6 @@ pub fn write_declaration(p: &TestPub, publisher: &serde_json::Value, signer_seed
         wist_core::envelope::sign_envelope(publisher, "publisher", &kid(signer_seed), &sk).unwrap();
     fs::write(
         p.dir.path().join(".well-known/wist/publisher.json"),
-        serde_json::to_vec(&env).unwrap(),
-    )
-    .unwrap();
-}
-
-pub fn add_delta_signed(
-    p: &TestPub,
-    url: &str,
-    extract: &str,
-    prev: Option<&str>,
-    observed_at: &str,
-    signer_seed: &[u8; 32],
-) -> String {
-    add_delta_signed_as(p, url, extract, prev, observed_at, signer_seed, signer_seed)
-}
-
-/// A Delta whose signature names `named_seed`'s entry but was produced by
-/// `signer_seed`: the shape WIST-1 §5.1 rejects with `WIST1-E01` when the
-/// named entry is authorized and `WIST1-E02` when it is not.
-#[allow(clippy::too_many_arguments)]
-pub fn add_delta_signed_as(
-    p: &TestPub,
-    url: &str,
-    extract: &str,
-    prev: Option<&str>,
-    observed_at: &str,
-    signer_seed: &[u8; 32],
-    named_seed: &[u8; 32],
-) -> String {
-    let salt = wist_core::crypto::b64u_encode(&[5u8; 16]);
-    let content = serde_json::json!({"extract": extract, "links": {"total": 0, "urls": []}, "summary": {"title": url.chars().take(256).collect::<String>()}});
-    let payload = serde_json::json!({"wist_version": "1.0.0", "salt": salt, "content": content});
-    let mut delta = serde_json::json!({
-        "wist_version": "1.0.0", "publisher": p.domain, "url": url,
-        "change_type": if prev.is_some() { "update" } else { "new" },
-        "observed_at": observed_at,
-        "payload": {"commitment": wist_core::delta::make_commitment(&salt, &content).unwrap(), "alg": "HMAC-SHA256", "bytes": wist_core::delta::content_bytes(&content).unwrap()},
-        "meta": {"lang": "en"}
-    });
-    if let Some(pv) = prev {
-        delta["prev"] = pv.into();
-    }
-    let id = wist_core::delta::delta_id(&delta).unwrap();
-    let sk = wist_core::crypto::SigningKey::from_seed(signer_seed);
-    let env = wist_core::envelope::sign_envelope(&delta, "delta", &kid(named_seed), &sk).unwrap();
-    let hex = id.strip_prefix("sha256:").unwrap();
-    let wk = p.dir.path().join(".well-known/wist");
-    fs::write(
-        wk.join(format!("deltas/{hex}.json")),
-        serde_json::to_vec(&env).unwrap(),
-    )
-    .unwrap();
-    fs::write(
-        wk.join(format!("payloads/{hex}.json")),
-        serde_json::to_vec(&payload).unwrap(),
-    )
-    .unwrap();
-    id
-}
-
-pub fn write_feed_signed(
-    p: &TestPub,
-    domain: &str,
-    ids: &[String],
-    generated_at: &str,
-    signer_seed: &[u8; 32],
-) {
-    let feed = serde_json::json!({"wist_version": "1.0.0", "domain": domain, "generated_at": generated_at, "deltas": ids, "next": null});
-    let sk = wist_core::crypto::SigningKey::from_seed(signer_seed);
-    let env = wist_core::envelope::sign_envelope(&feed, "feed", &kid(signer_seed), &sk).unwrap();
-    fs::write(
-        p.dir.path().join(".well-known/wist/feed.json"),
         serde_json::to_vec(&env).unwrap(),
     )
     .unwrap();

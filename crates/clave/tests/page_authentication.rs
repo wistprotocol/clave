@@ -44,7 +44,7 @@ impl Fixture {
 
     fn install_document(&self, publisher: Value, seed: &[u8; 32], now: &str, seal: bool) {
         write_declaration(&self.publisher, &publisher, seed);
-        write_feed(&self.publisher, &self.host, &[], now);
+        write_label_feed(&self.publisher, &self.host, &[], now);
         let report = self.ingest(now);
         assert!(report.rejected.is_empty());
         assert_ne!(report.noise, Some("WIST2-E04"));
@@ -97,38 +97,52 @@ impl Fixture {
                 self.db = clave::db::Db::open(&self.directory.path().join("clave.sqlite")).unwrap();
             }
             self.attempts += 1;
-            let live = add_delta(
+            let live = add_label(
                 &self.publisher,
-                &format!("https://{}/{}", self.host, self.attempts),
-                "page authentication probe",
-                None,
+                &format!("https://other.example/live/{}", self.attempts),
+                "2026-08-09T11:00:00Z",
             );
-            write_feed_with_next(
+            let paged = add_label(
+                &self.publisher,
+                &format!("https://other.example/paged/{}", self.attempts),
+                "2026-08-09T11:00:00Z",
+            );
+            write_label_feed_with_next(
                 &self.publisher,
                 &self.host,
                 std::slice::from_ref(&live),
                 now,
-                Some(&page_url(&self.host, 0)),
+                Some(&label_page_url(&self.host, 0)),
             );
-            write_feed_page_signed(&self.publisher, &self.host, 0, &[], cut, None, seed);
+            write_label_feed_page_signed(
+                &self.publisher,
+                &self.host,
+                0,
+                std::slice::from_ref(&paged),
+                cut,
+                None,
+                seed,
+            );
+            let rejections = self.db.list_rejections(&self.host).unwrap().len();
             let report = self.ingest(now);
+            let context = format!("cut {cut}, seed {seed:?}, reopened {reopen}");
+            let expected = if accepted {
+                vec![paged.clone(), live.clone()]
+            } else {
+                vec![live.clone()]
+            };
+            assert_eq!(report.labels, expected, "{context}");
             assert_eq!(
-                report.noise,
-                if accepted { None } else { Some("WIST2-E04") },
-                "cut {cut}, seed {seed:?}, reopened {reopen}"
+                self.db.is_label_seen_for(&paged, &self.host).unwrap(),
+                accepted,
+                "{context}"
             );
-            assert_eq!(
-                report
-                    .accepted
-                    .into_iter()
-                    .chain(report.queued)
-                    .collect::<Vec<_>>(),
-                if accepted { vec![live.clone()] } else { vec![] }
-            );
-            assert_eq!(self.db.is_delta_seen(&live).unwrap(), accepted);
-            if !accepted {
-                let failures = self.db.list_rejections(&self.host).unwrap();
-                assert_eq!(failures.last().unwrap().code, "WIST2-E04");
+            let failures = self.db.list_rejections(&self.host).unwrap();
+            if accepted {
+                assert_eq!(failures.len(), rejections, "{context}");
+            } else {
+                assert_eq!(failures.len(), rejections + 1, "{context}");
+                assert_eq!(failures[0].code, "WIST2-E04", "{context}");
             }
         }
     }
@@ -347,36 +361,40 @@ fn cursor_pages(fixture: &Fixture) -> i64 {
     rusqlite::Connection::open(fixture.directory.path().join("clave.sqlite"))
         .unwrap()
         .query_row(
-            "SELECT COUNT(*) FROM pull_walk WHERE domain = ?1 AND feed = 'feed'",
+            "SELECT COUNT(*) FROM pull_walk WHERE domain = ?1 AND feed = 'label'",
             [&fixture.host],
             |row| row.get(0),
         )
         .unwrap()
 }
 
-fn excluded_page_disposition(held: bool) -> (Option<&'static str>, bool, Option<String>, bool) {
+fn excluded_page_disposition(held: bool) -> (Option<String>, bool, bool) {
     const CUT: &str = "2026-08-09T13:30:00Z";
     const WINDOW_END: &str = "2026-08-16T13:00:00Z";
     const NOW: &str = "2026-08-16T18:00:00Z";
     let fixture = contested_recovery();
-    let page = page_url(&fixture.host, 0);
-    write_feed_page_signed(
+    let page = label_page_url(&fixture.host, 0);
+    let paged = add_label(
+        &fixture.publisher,
+        "https://other.example/paged",
+        "2026-08-09T11:00:00Z",
+    );
+    write_label_feed_page_signed(
         &fixture.publisher,
         &fixture.host,
         0,
-        &[],
+        std::slice::from_ref(&paged),
         CUT,
         None,
         &[13; 32],
     );
     if held {
-        let walked = add_delta(
+        let walked = add_label(
             &fixture.publisher,
-            &format!("https://{}/walked", fixture.host),
-            "walked while the window was open",
-            None,
+            "https://other.example/walked",
+            "2026-08-09T11:00:00Z",
         );
-        write_feed_with_next(
+        write_label_feed_with_next(
             &fixture.publisher,
             &fixture.host,
             std::slice::from_ref(&walked),
@@ -402,41 +420,43 @@ fn excluded_page_disposition(held: bool) -> (Option<&'static str>, bool, Option<
             report.suspended && report.rejected.is_empty(),
             "the Page is authenticated under the open window and left in the cursor"
         );
-        assert_eq!(cursor_pages(&fixture), 2, "the Feed and the Page are held");
+        assert_eq!(
+            cursor_pages(&fixture),
+            2,
+            "the Label Feed and the Page are held"
+        );
         std::fs::remove_file(
             fixture
                 .publisher
                 .dir
                 .path()
-                .join(".well-known/wist/feed/0.json"),
+                .join(".well-known/wist/label-feed/0.json"),
         )
         .unwrap();
     }
     settle_and_seal(&fixture, WINDOW_END);
-    let live = add_delta(
+    let live = add_label(
         &fixture.publisher,
-        &format!("https://{}/live", fixture.host),
-        "listed beside the Page",
-        None,
+        "https://other.example/live",
+        "2026-08-09T11:00:00Z",
     );
-    write_feed_with_next(
+    write_label_feed_with_next(
         &fixture.publisher,
         &fixture.host,
         std::slice::from_ref(&live),
         NOW,
         Some(&page),
     );
-    let report = fixture.ingest(NOW);
+    fixture.ingest(NOW);
     (
-        report.noise,
-        report.accepted.is_empty() && report.queued.is_empty(),
         fixture
             .db
             .list_rejections(&fixture.host)
             .unwrap()
-            .last()
+            .first()
             .map(|rejection| rejection.code.clone()),
-        fixture.db.is_delta_seen(&live).unwrap(),
+        fixture.db.is_label_seen_for(&live, &fixture.host).unwrap(),
+        fixture.db.is_label_seen_for(&paged, &fixture.host).unwrap(),
     )
 }
 
@@ -445,7 +465,7 @@ fn a_held_page_whose_signing_declaration_the_settlement_excluded_is_refused_as_a
     let fetched = excluded_page_disposition(false);
     assert_eq!(
         fetched,
-        (Some("WIST2-E04"), true, Some("WIST2-E04".into()), false),
+        (Some("WIST2-E04".into()), true, false),
         "a fetched Page the settled sources no longer authenticate is WIST2-E04"
     );
     assert_eq!(

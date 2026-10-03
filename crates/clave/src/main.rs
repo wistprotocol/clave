@@ -98,8 +98,8 @@ enum Command {
         data: PathBuf,
         #[arg(long)]
         domain: String,
-        #[arg(long = "delta-id")]
-        delta_id: String,
+        #[arg(long = "item-id")]
+        item_id: String,
         #[arg(long = "legal-basis")]
         legal_basis: String,
         #[arg(long)]
@@ -367,7 +367,7 @@ fn main() -> Result<(), clave::Error> {
         Command::Withdraw {
             data,
             domain,
-            delta_id,
+            item_id,
             legal_basis,
             jurisdiction,
         } => {
@@ -377,7 +377,7 @@ fn main() -> Result<(), clave::Error> {
                 &db,
                 &sk,
                 &domain,
-                &delta_id,
+                &item_id,
                 &legal_basis,
                 &jurisdiction,
                 jiff::Timestamp::now().as_second(),

@@ -1,6 +1,6 @@
 mod common;
 
-use common::{add_delta, make_publisher_with_scope, reserve_addr, serve_static, write_feed};
+use common::{add_label, make_publisher_with_scope, reserve_addr, serve_static, write_label_feed};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use wist_core::checkpoint::{self, Checkpoint, SignatureLine, WitnessKey};
@@ -115,8 +115,8 @@ struct Log {
 fn sealed_log() -> Log {
     let (listener, host, client) = reserve_addr();
     let p = make_publisher_with_scope(&host, &["example.com"]);
-    let id = add_delta(&p, "https://example.com/a", "alpha body", None);
-    write_feed(&p, &host, std::slice::from_ref(&id), "2026-08-09T12:00:00Z");
+    let id = add_label(&p, "https://other.example/a", "2026-08-09T11:00:00Z");
+    write_label_feed(&p, &host, std::slice::from_ref(&id), "2026-08-09T12:00:00Z");
     serve_static(listener, p.dir.path().to_path_buf());
     let data = tempfile::tempdir().unwrap();
     clave::init::run(&host, data.path()).unwrap();

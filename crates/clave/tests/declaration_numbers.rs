@@ -40,7 +40,6 @@ impl Rig {
     fn admit(&self, body: &Value, seed: &[u8; 32], at: &str) -> Value {
         write_declaration(&self.publisher, body, seed);
         let declaration = current_declaration(&self.publisher);
-        write_feed_signed(&self.publisher, &self.host, &[], at, seed);
         clave::ingest::run(&self.db, &self.client, self.data.path(), &self.host, at).unwrap();
         assert_eq!(
             self.db
@@ -160,7 +159,7 @@ fn integral_declaration_sequences_preserve_admission_metadata_and_snapshot_heigh
             .unwrap()
             .unwrap();
         write_declaration(&rig.publisher, &equivalent, &K1_SEED);
-        write_feed(&rig.publisher, &rig.host, &[], at);
+        write_label_feed(&rig.publisher, &rig.host, &[], at);
         clave::ingest::run(&rig.db, &rig.client, rig.data.path(), &rig.host, at).unwrap();
         assert_eq!(
             rig.db
@@ -262,9 +261,16 @@ fn integral_pending_recovery_sequences_settle_in_order_and_preserve_the_floor() 
         )
         .unwrap();
         assert_eq!(
-            clave::declaration::evaluate_with_heads(&last, None, None, 6, &rejected)
-                .unwrap_err()
-                .0,
+            clave::declaration::evaluate_with_heads(
+                &last,
+                None,
+                None,
+                6,
+                &rejected,
+                &Default::default()
+            )
+            .unwrap_err()
+            .0,
             "WIST1-E08"
         );
         follower["seq"] = json!(7.0);

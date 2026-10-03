@@ -54,7 +54,7 @@ fn authenticated_settlement_declarations_and_rejection_twins() {
             for entry in &entries {
                 let incoming = &entry["body"];
                 if current.is_none() {
-                    evaluate_initial(incoming).unwrap();
+                    evaluate_initial(incoming, &Default::default()).unwrap();
                 } else {
                     assert!(incoming["publisher"]["seq"].as_u64().unwrap() > floor);
                     let previous = current
@@ -64,7 +64,7 @@ fn authenticated_settlement_declarations_and_rejection_twins() {
                             inner_hash(env).unwrap() == incoming["publisher"]["prev_declaration"]
                         })
                         .expect("eligible named predecessor");
-                    let decision = evaluate(previous, incoming).unwrap();
+                    let decision = evaluate(previous, incoming, &Default::default()).unwrap();
                     if chain.is_some() {
                         if Some(previous) == chain.as_ref()
                             && matches!(decision, Decision::Ordinary | Decision::Recovery)
@@ -104,7 +104,9 @@ fn authenticated_settlement_declarations_and_rejection_twins() {
             let result = if candidate["publisher"]["seq"].as_u64().unwrap() <= *floor {
                 "WIST1-E08"
             } else if let Some(previous) = previous {
-                evaluate(previous, candidate).unwrap_err().0
+                evaluate(previous, candidate, &Default::default())
+                    .unwrap_err()
+                    .0
             } else {
                 "WIST1-E08"
             };

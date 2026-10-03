@@ -22,7 +22,6 @@ pub const MAX_PENDING_INGESTS: usize = 64;
 pub const OVERLOAD_RETRY_AFTER_SECS: u64 = 30;
 pub const BACKLOG_EPOCHS: u32 = 2;
 pub const BACKLOG_ENTRIES: u64 = 1 << 20;
-pub const PREFETCH_OBJECTS: u32 = 4;
 pub const DEFAULT_INSTANCE: &str = "primary";
 
 #[derive(Debug, Clone)]
@@ -47,10 +46,7 @@ impl Default for ServeOptions {
             seal: true,
             backlog_epochs: BACKLOG_EPOCHS,
             backlog_entries: BACKLOG_ENTRIES,
-            pull_limits: ingest::PullLimits {
-                prefetch_objects: PREFETCH_OBJECTS,
-                ..ingest::PullLimits::default()
-            },
+            pull_limits: ingest::PullLimits::default(),
         }
     }
 }
@@ -207,6 +203,7 @@ fn load_status(db: &Db, domain: &str) -> Result<Option<Status>> {
         last_pull_at: row.last_pull_at,
         quota_remaining,
         state: row.state,
+        collections: Vec::new(),
         rejections,
     }))
 }

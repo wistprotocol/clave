@@ -1,12 +1,10 @@
 use crate::error::{Error, Result};
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet};
+
 use std::path::Path;
 use wist_core::objects::{AggregatorKeyEntry, PublisherState, StatusRejection};
 
-mod delta_history;
-mod delta_indexes;
 mod leases;
 mod pull_runs;
 mod pull_schedule;
@@ -155,17 +153,6 @@ pub struct EpochRow {
     pub sealed_at: String,
 }
 
-pub struct RecordRow {
-    pub url: String,
-    pub publisher: String,
-    pub delta_id: String,
-    pub observed_at: String,
-    pub title: String,
-    pub abstract_text: Option<String>,
-    pub lang: String,
-    pub sealed_at: String,
-}
-
 pub struct PublisherListRow {
     pub domain: String,
     pub declaration_json: Vec<u8>,
@@ -176,7 +163,7 @@ pub struct PendingEntryRow {
     pub entry_type: String,
     pub domain: String,
     pub entry_json: Value,
-    /// WIST-4 §5: the first Epoch with room for this Delta under WIST-3 §3.2's
+    /// WIST-4 §5: the first Epoch with room for this Entry under WIST-3 §3.2's
     /// per-domain capacity; the inclusion ceiling runs from it.
     pub turn_epoch: Option<u64>,
 }
@@ -190,11 +177,11 @@ pub struct ParamChangeRow<'a> {
 
 pub struct WithdrawalRow<'a> {
     pub update_id: &'a str,
-    pub delta_id: &'a str,
+    pub item_id: &'a str,
     pub domain: &'a str,
 }
 
-/// WIST-3 §7 `withdrawal` tuple: `(delta_id, publisher domain, sealing
+/// WIST-3 §7 `withdrawal` tuple: `(item_id, publisher domain, sealing
 /// height)`.
 pub type WithdrawalState = (String, String, u64);
 
@@ -231,39 +218,6 @@ pub struct RecoveryWindowRow {
     pub window_end: Option<String>,
 }
 
-pub struct QueuedDeltaRow {
-    pub delta_id: String,
-    pub entry_json: Value,
-    pub url: String,
-    pub chain_pos: i64,
-    pub(crate) acceptance_order: i64,
-}
-
-pub struct RecordUpsert<'a> {
-    pub url: &'a str,
-    pub publisher: &'a str,
-    pub delta_id: &'a str,
-    pub observed_at: &'a str,
-    pub title: &'a str,
-    pub abstract_text: Option<&'a str>,
-    pub lang: &'a str,
-}
-
-/// WIST-3 §7 materialization in the Epoch's chain order; a `Delete` leaves
-/// the chain tip in `sealed_url_tips`.
-pub enum RecordChange<'a> {
-    Upsert(RecordUpsert<'a>),
-    Attest {
-        url: &'a str,
-        publisher: &'a str,
-        observed_at: &'a str,
-    },
-    Delete {
-        url: &'a str,
-        publisher: &'a str,
-    },
-}
-
 fn exec_insert_publisher(
     conn: &Connection,
     domain: &str,
@@ -293,14 +247,6 @@ fn exec_insert_pending_entry(
     Ok(())
 }
 
-fn exec_insert_seen_delta(conn: &Connection, delta_id: &str, domain: &str) -> Result<()> {
-    conn.execute(
-        "INSERT INTO seen_deltas(delta_id, domain) VALUES (?1, ?2)",
-        (delta_id, domain),
-    )?;
-    Ok(())
-}
-
 pub(super) fn exec_retain_declaration_seq(conn: &Connection, domain: &str, seq: u64) -> Result<()> {
     conn.execute(
         "INSERT INTO declaration_floors(domain, seq) VALUES (?1, ?2) ON CONFLICT(domain) DO UPDATE SET seq = MAX(seq, excluded.seq)",
@@ -310,107 +256,13 @@ pub(super) fn exec_retain_declaration_seq(conn: &Connection, domain: &str, seq: 
 }
 
 pub(super) fn accepted_declaration_seq(domain: &str, doc: &Value) -> Result<u64> {
-    let publisher = crate::declaration::validate_fields(doc)
+    let publisher = crate::declaration::validate_fields(doc, None)
         .map_err(|(code, detail)| Error::History(format!("{code} {detail}")))?
         .publisher;
     if publisher.domain != domain {
         return Err(Error::History("stored Declaration domain mismatch".into()));
     }
     Ok(publisher.seq)
-}
-
-fn exec_set_url_tip(conn: &Connection, url: &str, domain: &str, tip: &str) -> Result<()> {
-    conn.execute(
-        "INSERT INTO url_tips(url, domain, tip) VALUES (?1, ?2, ?3) ON CONFLICT(domain, url) DO UPDATE SET tip = excluded.tip",
-        (url, domain, tip),
-    )?;
-    Ok(())
-}
-
-fn exec_set_sealed_url_tip(conn: &Connection, url: &str, domain: &str, tip: &str) -> Result<()> {
-    conn.execute(
-        "INSERT INTO sealed_url_tips(url, domain, tip) VALUES (?1, ?2, ?3) ON CONFLICT(domain, url) DO UPDATE SET tip = excluded.tip",
-        (url, domain, tip),
-    )?;
-    Ok(())
-}
-
-fn epoch_chain_tips(entries: &[Value]) -> Result<Vec<(String, String, String)>> {
-    let mut chains: BTreeMap<(String, String), BTreeMap<String, Option<String>>> = BTreeMap::new();
-    for entry in entries
-        .iter()
-        .filter(|entry| entry["type"] == "publisher_delta")
-    {
-        let body = &entry["body"]["delta"];
-        let unreadable = || Error::Seal("a sealed Delta lacks its publisher or URL".into());
-        let domain = wist_core::delta::publisher(body).map_err(|_| unreadable())?;
-        let url = body["url"]
-            .as_str()
-            .filter(|url| !url.is_empty())
-            .ok_or_else(unreadable)?;
-        let id = wist_core::delta::delta_id(body)?;
-        let prev = body["prev"].as_str().map(str::to_string);
-        let chain = chains.entry((domain.into(), url.into())).or_default();
-        if chain.insert(id, prev).is_some() {
-            return Err(Error::Seal(format!(
-                "the Epoch repeats a Delta of {domain} {url}"
-            )));
-        }
-    }
-    let mut tips = Vec::with_capacity(chains.len());
-    for ((domain, url), chain) in chains {
-        let prevs: BTreeSet<&String> = chain.values().flatten().collect();
-        let mut candidates = chain.keys().filter(|id| !prevs.contains(id));
-        let (Some(tip), None) = (candidates.next(), candidates.next()) else {
-            return Err(Error::Seal(format!(
-                "the Epoch's Deltas for {domain} {url} do not form a single chain"
-            )));
-        };
-        tips.push((domain, url, tip.clone()));
-    }
-    Ok(tips)
-}
-
-fn exec_upsert_record(conn: &Connection, r: &RecordUpsert, sealed_at: &str) -> Result<()> {
-    conn.execute(
-        "INSERT INTO records(url, publisher, delta_id, observed_at, title, abstract, lang, sealed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-         ON CONFLICT(url, publisher) DO UPDATE SET delta_id = excluded.delta_id, observed_at = excluded.observed_at, title = excluded.title, abstract = excluded.abstract, lang = excluded.lang, sealed_at = excluded.sealed_at",
-        (
-            r.url,
-            r.publisher,
-            r.delta_id,
-            r.observed_at,
-            r.title,
-            r.abstract_text,
-            r.lang,
-            sealed_at,
-        ),
-    )?;
-    Ok(())
-}
-
-fn exec_record_change(conn: &Connection, change: &RecordChange, sealed_at: &str) -> Result<()> {
-    match change {
-        RecordChange::Upsert(r) => exec_upsert_record(conn, r, sealed_at),
-        RecordChange::Attest {
-            url,
-            publisher,
-            observed_at,
-        } => {
-            conn.execute(
-                "UPDATE records SET observed_at = ?3, sealed_at = ?4 WHERE url = ?1 AND publisher = ?2",
-                (url, publisher, observed_at, sealed_at),
-            )?;
-            Ok(())
-        }
-        RecordChange::Delete { url, publisher } => {
-            conn.execute(
-                "DELETE FROM records WHERE url = ?1 AND publisher = ?2",
-                (url, publisher),
-            )?;
-            Ok(())
-        }
-    }
 }
 
 pub type Publication = (u64, String);
@@ -429,23 +281,6 @@ pub struct Db {
 }
 
 impl Db {
-    pub(crate) fn observe_feed_generated_at(&self, domain: &str, at: &str) -> Result<bool> {
-        let at = crate::registry::unix(at)?;
-        self.write(|conn| {
-            Ok(conn
-                .query_row(
-                    "INSERT INTO feed_observations(domain, generated_at_s) VALUES (?1, ?2)
-                     ON CONFLICT(domain) DO UPDATE SET generated_at_s = excluded.generated_at_s
-                     WHERE excluded.generated_at_s >= feed_observations.generated_at_s
-                     RETURNING generated_at_s",
-                    rusqlite::params![domain, at],
-                    |row| row.get::<_, i64>(0),
-                )
-                .optional()?
-                .is_some())
-        })
-    }
-
     pub(crate) fn mutation(&self) -> Result<Mutation<'_>> {
         Mutation::fenced(&self.conn, self.fence)
     }
@@ -679,27 +514,6 @@ impl Db {
         Ok(())
     }
 
-    /// WIST-1 §5.1: `keyset_cache_ttl_seconds` is measured from this instant.
-    pub fn declaration_fetched_at(&self, domain: &str) -> Result<Option<String>> {
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT declaration_fetched_at FROM publishers WHERE domain = ?1",
-                [domain],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .optional()?
-            .flatten())
-    }
-
-    pub fn mark_declaration_fetched(&self, domain: &str, at: &str) -> Result<()> {
-        self.execute(
-            "UPDATE publishers SET declaration_fetched_at = ?2 WHERE domain = ?1",
-            (domain, at),
-        )?;
-        Ok(())
-    }
-
     pub fn sealed_declarations(&self, domain: &str) -> Result<Vec<SealedDeclarationEntry>> {
         let mut stmt = self.conn.prepare(
             "SELECT seq, epoch_number, sealed_at, declaration_json FROM sealed_declarations WHERE domain = ?1 ORDER BY seq ASC",
@@ -847,190 +661,6 @@ impl Db {
         Ok(())
     }
 
-    pub fn queue_delta(
-        &self,
-        domain: &str,
-        delta_id: &str,
-        entry_json: &Value,
-        url: &str,
-        tip: &str,
-        chain_pos: i64,
-    ) -> Result<()> {
-        let bytes = serde_json::to_vec(entry_json)?;
-        let tx = self.mutation()?;
-        exec_insert_seen_delta(&tx, delta_id, domain)?;
-        tx.execute(
-            "INSERT INTO queued_deltas(domain, delta_id, entry_json, url, chain_pos) VALUES (?1, ?2, ?3, ?4, ?5)",
-            (domain, delta_id, bytes, url, chain_pos),
-        )?;
-        exec_set_url_tip(&tx, url, domain, tip)?;
-        tx.commit()?;
-        Ok(())
-    }
-
-    pub(crate) fn requeue_pending_delta(&self, entry: &PendingEntryRow) -> Result<()> {
-        let delta = &entry.entry_json["delta"];
-        let delta_id = wist_core::delta::delta_id(delta)?;
-        let url = delta["url"].as_str().unwrap_or_default();
-        let tx = self.mutation()?;
-        let moved = tx.execute(
-            "INSERT INTO queued_deltas(domain, delta_id, entry_json, url, chain_pos, acceptance_order) SELECT domain, ?2, entry_json, ?3, chain_pos, acceptance_order FROM pending_entries WHERE rowid = ?1 AND entry_type = 'publisher_delta' AND domain = ?4",
-            (entry.rowid, delta_id, url, &entry.domain),
-        )?;
-        if moved != 1 {
-            return Err(Error::History(
-                "pending Delta copy unavailable for recovery diversion".into(),
-            ));
-        }
-        tx.execute(
-            "DELETE FROM pending_entries WHERE rowid = ?1",
-            [entry.rowid],
-        )?;
-        tx.commit()?;
-        Ok(())
-    }
-
-    pub fn drain_queued_deltas(&self, domain: &str) -> Result<Vec<QueuedDeltaRow>> {
-        let tx = self.mutation()?;
-        let rows = {
-            let mut stmt = tx.prepare(
-                "SELECT delta_id, entry_json, url, chain_pos, acceptance_order FROM queued_deltas WHERE domain = ?1 ORDER BY acceptance_order",
-            )?;
-            let mapped = stmt.query_map([domain], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, i64>(4)?,
-                ))
-            })?;
-            mapped.collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        let entries = rows
-            .into_iter()
-            .map(|(delta_id, blob, url, chain_pos, acceptance_order)| {
-                Ok(QueuedDeltaRow {
-                    delta_id,
-                    entry_json: crate::json::parse(&blob)?,
-                    url,
-                    chain_pos,
-                    acceptance_order,
-                })
-            })
-            .collect::<Result<_>>()?;
-        tx.execute("DELETE FROM queued_deltas WHERE domain = ?1", [domain])?;
-        tx.commit()?;
-        Ok(entries)
-    }
-
-    pub(crate) fn reject_delta_copies(
-        &self,
-        domain: &str,
-        rejected: &[(Value, &str)],
-        at: &str,
-    ) -> Result<Vec<String>> {
-        if rejected.is_empty() {
-            return Ok(Vec::new());
-        }
-        let tx = self.mutation()?;
-        let mut dropped = std::collections::BTreeMap::new();
-        for (envelope, code) in rejected {
-            let delta = &envelope["delta"];
-            dropped.insert(
-                wist_core::delta::delta_id(delta)?,
-                (delta["prev"].as_str().map(str::to_owned), *code),
-            );
-        }
-        let mut statement = tx.prepare(
-            "SELECT entry_json FROM pending_entries WHERE entry_type = 'publisher_delta' AND domain = ?1 UNION ALL SELECT entry_json FROM queued_deltas WHERE domain = ?1",
-        )?;
-        let copies = statement
-            .query_map([domain], |row| row.get::<_, Vec<u8>>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-            .into_iter()
-            .map(|raw| crate::json::parse(&raw))
-            .collect::<serde_json::Result<Vec<_>>>()?;
-        drop(statement);
-        loop {
-            let count = dropped.len();
-            for envelope in &copies {
-                let delta = &envelope["delta"];
-                let id = wist_core::delta::delta_id(delta)?;
-                if !dropped.contains_key(&id)
-                    && delta["prev"]
-                        .as_str()
-                        .is_some_and(|prev| dropped.contains_key(prev))
-                {
-                    dropped.insert(id, (delta["prev"].as_str().map(str::to_owned), "WIST1-E07"));
-                }
-            }
-            if dropped.len() == count {
-                break;
-            }
-        }
-        let mut tip_statement = tx.prepare("SELECT url, tip FROM url_tips WHERE domain = ?1")?;
-        let tips = tip_statement
-            .query_map([domain], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(tip_statement);
-        for (url, tip) in tips {
-            if !dropped.contains_key(&tip) {
-                continue;
-            }
-            let mut restored = Some(tip);
-            let mut visited = std::collections::HashSet::new();
-            while let Some(id) = &restored {
-                if !visited.insert(id.clone()) {
-                    return Err(Error::History("accepted Delta predecessor cycle".into()));
-                }
-                let Some((prev, _)) = dropped.get(id) else {
-                    break;
-                };
-                restored = prev.clone();
-            }
-            match restored {
-                Some(id) if self.is_delta_seen_for(&id, domain)? => {
-                    exec_set_url_tip(&tx, &url, domain, &id)?
-                }
-                _ => {
-                    tx.execute(
-                        "DELETE FROM url_tips WHERE domain = ?1 AND url = ?2",
-                        (domain, &url),
-                    )?;
-                }
-            }
-        }
-        let mut report = Vec::new();
-        for (id, (_, code)) in &dropped {
-            self.insert_rejection(domain, code, at, Some(id), Some("accepted Delta copy rejected; dependent copies cannot resolve their predecessor"))?;
-            tx.execute(
-                "DELETE FROM seen_deltas WHERE domain = ?1 AND delta_id = ?2",
-                (domain, &id),
-            )?;
-            tx.execute(
-                "DELETE FROM queued_deltas WHERE domain = ?1 AND delta_id = ?2",
-                (domain, &id),
-            )?;
-            report.push(format!("{id}: {code}"));
-        }
-        for entry in self.peek_pending_entries()?.0 {
-            if entry.entry_type == "publisher_delta"
-                && entry.domain == domain
-                && dropped.contains_key(&wist_core::delta::delta_id(&entry.entry_json["delta"])?)
-            {
-                tx.execute(
-                    "DELETE FROM pending_entries WHERE rowid = ?1",
-                    [entry.rowid],
-                )?;
-            }
-        }
-        tx.commit()?;
-        Ok(report)
-    }
-
     pub(crate) fn reject_label_entries(
         &self,
         rejected: &[(i64, String, String, String)],
@@ -1043,7 +673,7 @@ impl Db {
         let mut report = Vec::with_capacity(rejected.len());
         for (rowid, domain, entry_type, id) in rejected {
             tx.execute(
-                "INSERT INTO rejections(domain, code, at, delta_id, detail) VALUES (?1, 'WIST2-E06', ?2, ?3, ?4)",
+                "INSERT INTO rejections(domain, code, at, id, detail) VALUES (?1, 'WIST2-E06', ?2, ?3, ?4)",
                 (
                     domain,
                     at,
@@ -1062,48 +692,12 @@ impl Db {
         Ok(report)
     }
 
-    pub(crate) fn release_queued_delta(&self, domain: &str, delta: &QueuedDeltaRow) -> Result<()> {
-        self.execute(
-            "INSERT INTO pending_entries(entry_type, domain, entry_json, chain_pos, acceptance_order) VALUES ('publisher_delta', ?1, ?2, ?3, ?4)",
-            (domain, serde_json::to_vec(&delta.entry_json)?, delta.chain_pos, delta.acceptance_order),
-        )?;
-        Ok(())
-    }
-
     pub fn set_publisher_pulled(&self, domain: &str, now: &str) -> Result<()> {
         self.execute(
             "UPDATE publishers SET last_pull_at = ?2, state = 'active' WHERE domain = ?1",
             (domain, now),
         )?;
         Ok(())
-    }
-
-    pub fn is_delta_seen(&self, delta_id: &str) -> Result<bool> {
-        self.conn
-            .query_row(
-                "SELECT 1 FROM seen_deltas WHERE delta_id = ?1",
-                [delta_id],
-                |_| Ok(()),
-            )
-            .optional()
-            .map(|row| row.is_some())
-            .map_err(Error::Db)
-    }
-
-    pub fn is_delta_seen_for(&self, delta_id: &str, domain: &str) -> Result<bool> {
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT 1 FROM seen_deltas WHERE delta_id = ?1 AND domain = ?2",
-                (delta_id, domain),
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some())
-    }
-
-    pub fn insert_seen_delta(&self, delta_id: &str, domain: &str) -> Result<()> {
-        self.write(|conn| exec_insert_seen_delta(conn, delta_id, domain))
     }
 
     pub fn insert_pending_entry(
@@ -1427,7 +1021,6 @@ impl Db {
         sealed_at: &str,
         entries: &[Value],
         epoch_bytes: u64,
-        records: &[RecordChange],
         param_changes: &[ParamChangeRow],
         withdrawals: &[WithdrawalRow],
         suffix_lists: &[String],
@@ -1444,7 +1037,6 @@ impl Db {
             sealed_at,
             entries,
             epoch_bytes,
-            records,
             param_changes,
             withdrawals,
             suffix_lists,
@@ -1468,7 +1060,6 @@ impl Db {
         sealed_at: &str,
         entries: &[Value],
         epoch_bytes: u64,
-        records: &[RecordChange],
         param_changes: &[ParamChangeRow],
         withdrawals: &[WithdrawalRow],
         suffix_lists: &[String],
@@ -1488,7 +1079,6 @@ impl Db {
                 signers.len()
             )));
         }
-        let chain_tips = epoch_chain_tips(entries)?;
         let tx = self.mutation()?;
         for rowid in sealed_rowids {
             tx.execute("DELETE FROM pending_entries WHERE rowid = ?1", [rowid])?;
@@ -1563,12 +1153,6 @@ impl Db {
                 epoch_bytes as i64,
             ),
         )?;
-        for change in records {
-            exec_record_change(&tx, change, sealed_at)?;
-        }
-        for (domain, url, tip) in &chain_tips {
-            exec_set_sealed_url_tip(&tx, url, domain, tip)?;
-        }
         for d in declarations {
             exec_retain_declaration_seq(&tx, d.domain, d.seq)?;
             tx.execute(
@@ -1591,14 +1175,13 @@ impl Db {
         }
         for w in withdrawals {
             let first = tx.execute(
-                "INSERT OR IGNORE INTO withdrawals(delta_id, domain, update_id, epoch_number, sealed_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-                (w.delta_id, w.domain, w.update_id, epoch_number as i64, sealed_at),
+                "INSERT OR IGNORE INTO withdrawals(item_id, domain, update_id, epoch_number, sealed_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                (w.item_id, w.domain, w.update_id, epoch_number as i64, sealed_at),
             )? == 1;
-            tx.execute("DELETE FROM records WHERE delta_id = ?1", [w.delta_id])?;
             if first {
                 tx.execute(
-                    "INSERT OR IGNORE INTO pending_removals(delta_id, domain) VALUES (?1, ?2)",
-                    (w.delta_id, w.domain),
+                    "INSERT OR IGNORE INTO pending_removals(item_id, domain) VALUES (?1, ?2)",
+                    (w.item_id, w.domain),
                 )?;
             }
         }
@@ -1655,7 +1238,7 @@ impl Db {
     }
 
     /// WIST-2 §3.3: a Label ID or Dispute ID the Log sealed or holds
-    /// accepted for sealing is seen, exactly as a Delta ID is.
+    /// accepted for sealing is seen.
     pub fn is_label_seen_for(&self, id: &str, domain: &str) -> Result<bool> {
         Ok(self
             .conn
@@ -1840,49 +1423,24 @@ impl Db {
         )
     }
 
-    /// WIST-3 §7: each withdrawn Delta at the earliest Epoch that sealed a
+    /// WIST-3 §7: each withdrawn Item at the earliest Epoch that sealed a
     /// withdrawal of it.
     pub fn withdrawal_state(&self) -> Result<Vec<WithdrawalState>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT delta_id, domain, epoch_number FROM withdrawals ORDER BY delta_id")?;
+            .prepare("SELECT item_id, domain, epoch_number FROM withdrawals ORDER BY item_id")?;
         let rows = stmt
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
-    pub fn is_withdrawn(&self, delta_id: &str) -> Result<bool> {
+    pub fn is_withdrawn(&self, item_id: &str) -> Result<bool> {
         Ok(self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM withdrawals WHERE delta_id = ?1)",
-            [delta_id],
+            "SELECT EXISTS(SELECT 1 FROM withdrawals WHERE item_id = ?1)",
+            [item_id],
             |row| row.get(0),
         )?)
-    }
-
-    pub fn is_delta_sealed_for(&self, delta_id: &str, domain: &str) -> Result<bool> {
-        if !self.is_delta_seen_for(delta_id, domain)? {
-            return Ok(false);
-        }
-        let queued: bool = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM queued_deltas WHERE delta_id = ?1 AND domain = ?2)",
-            (delta_id, domain),
-            |row| row.get(0),
-        )?;
-        if queued {
-            return Ok(false);
-        }
-        let mut statement = self.conn.prepare(
-            "SELECT entry_json FROM pending_entries WHERE entry_type = 'publisher_delta' AND domain = ?1",
-        )?;
-        let mut rows = statement.query([domain])?;
-        while let Some(row) = rows.next()? {
-            let doc: Value = crate::json::parse(&row.get::<_, Vec<u8>>(0)?)?;
-            if wist_core::delta::delta_id(&doc["delta"])? == delta_id {
-                return Ok(false);
-            }
-        }
-        Ok(true)
     }
 
     pub fn bump_noise_ping(&self, domain: &str, day: &str) -> Result<()> {
@@ -1948,20 +1506,17 @@ impl Db {
     pub fn pending_removals(&self) -> Result<Vec<(String, String)>> {
         let mut statement = self
             .conn
-            .prepare("SELECT delta_id, domain FROM pending_removals ORDER BY delta_id")?;
+            .prepare("SELECT item_id, domain FROM pending_removals ORDER BY item_id")?;
         let rows = statement
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
-    pub fn clear_pending_removals(&self, delta_ids: &[String]) -> Result<()> {
+    pub fn clear_pending_removals(&self, item_ids: &[String]) -> Result<()> {
         self.write(|conn| {
-            for delta_id in delta_ids {
-                conn.execute(
-                    "DELETE FROM pending_removals WHERE delta_id = ?1",
-                    [delta_id],
-                )?;
+            for item_id in item_ids {
+                conn.execute("DELETE FROM pending_removals WHERE item_id = ?1", [item_id])?;
             }
             Ok(())
         })
@@ -2087,49 +1642,6 @@ impl Db {
             .collect()
     }
 
-    pub fn get_record(&self, url: &str, publisher: &str) -> Result<Option<RecordRow>> {
-        self.conn
-            .query_row(
-                "SELECT url, publisher, delta_id, observed_at, title, abstract, lang, sealed_at FROM records WHERE url = ?1 AND publisher = ?2",
-                (url, publisher),
-                |row| {
-                    Ok(RecordRow {
-                        url: row.get(0)?,
-                        publisher: row.get(1)?,
-                        delta_id: row.get(2)?,
-                        observed_at: row.get(3)?,
-                        title: row.get(4)?,
-                        abstract_text: row.get(5)?,
-                        lang: row.get(6)?,
-                        sealed_at: row.get(7)?,
-                    })
-                },
-            )
-            .optional()
-            .map_err(Error::Db)
-    }
-
-    pub fn list_records(&self) -> Result<Vec<RecordRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT url, publisher, delta_id, observed_at, title, abstract, lang, sealed_at FROM records ORDER BY publisher, url",
-        )?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok(RecordRow {
-                    url: row.get(0)?,
-                    publisher: row.get(1)?,
-                    delta_id: row.get(2)?,
-                    observed_at: row.get(3)?,
-                    title: row.get(4)?,
-                    abstract_text: row.get(5)?,
-                    lang: row.get(6)?,
-                    sealed_at: row.get(7)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
-    }
-
     pub fn list_publishers(&self) -> Result<Vec<PublisherListRow>> {
         let mut stmt = self
             .conn
@@ -2143,58 +1655,6 @@ impl Db {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
-    }
-
-    pub fn list_url_tips(&self) -> Result<Vec<(String, String, String)>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT domain, url, tip FROM url_tips ORDER BY domain, url")?;
-        let rows = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
-    }
-
-    pub fn list_sealed_url_tips(&self) -> Result<Vec<(String, String, String)>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT domain, url, tip FROM sealed_url_tips ORDER BY domain, url")?;
-        let rows = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
-    }
-
-    pub fn url_tip(&self, domain: &str, url: &str) -> Result<Option<String>> {
-        self.conn
-            .query_row(
-                "SELECT tip FROM url_tips WHERE domain = ?1 AND url = ?2",
-                (domain, url),
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(Error::Db)
-    }
-
-    pub fn set_url_tip(&self, url: &str, domain: &str, tip: &str) -> Result<()> {
-        self.write(|conn| exec_set_url_tip(conn, url, domain, tip))
-    }
-
-    pub fn record_accepted_delta(
-        &self,
-        domain: &str,
-        delta_id: &str,
-        entry_json: &Value,
-        chain_pos: i64,
-        url: &str,
-        tip: &str,
-    ) -> Result<()> {
-        let tx = self.mutation()?;
-        exec_insert_seen_delta(&tx, delta_id, domain)?;
-        exec_insert_pending_entry(&tx, "publisher_delta", domain, entry_json, chain_pos)?;
-        exec_set_url_tip(&tx, url, domain, tip)?;
-        tx.commit()?;
-        Ok(())
     }
 
     pub fn get_publisher_status(&self, domain: &str) -> Result<Option<PublisherStatusRow>> {
@@ -2218,14 +1678,18 @@ impl Db {
 
     pub fn list_rejections(&self, domain: &str) -> Result<Vec<StatusRejection>> {
         let mut stmt = self.conn.prepare(
-            "SELECT code, at, delta_id, detail FROM rejections WHERE domain = ?1 ORDER BY rowid DESC",
+            "SELECT code, at, id, detail FROM rejections WHERE domain = ?1 ORDER BY rowid DESC",
         )?;
         let rows = stmt
             .query_map([domain], |row| {
                 Ok(StatusRejection {
                     code: row.get(0)?,
                     at: row.get(1)?,
-                    delta_id: row.get(2)?,
+                    id: row.get(2)?,
+                    collection: None,
+                    urls: None,
+                    condition: None,
+                    change_list: None,
                     detail: row.get(3)?,
                 })
             })?
@@ -2238,12 +1702,12 @@ impl Db {
         domain: &str,
         code: &str,
         at: &str,
-        delta_id: Option<&str>,
+        id: Option<&str>,
         detail: Option<&str>,
     ) -> Result<()> {
         self.execute(
-            "INSERT INTO rejections(domain, code, at, delta_id, detail) VALUES (?1, ?2, ?3, ?4, ?5)",
-            (domain, code, at, delta_id, detail),
+            "INSERT INTO rejections(domain, code, at, id, detail) VALUES (?1, ?2, ?3, ?4, ?5)",
+            (domain, code, at, id, detail),
         )?;
         Ok(())
     }
@@ -2273,7 +1737,6 @@ pub(crate) mod tests {
             sealed_at,
             &[],
             0,
-            &[],
             param_changes,
             &[],
             &[],
@@ -2350,46 +1813,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn queue_delta_marks_seen_sets_tip_and_drains_in_order() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
-        db.queue_delta(
-            "example.com",
-            "sha256:d1",
-            &serde_json::json!({"n": 1}),
-            "https://example.com/a",
-            "sha256:d1",
-            0,
-        )
-        .unwrap();
-        db.queue_delta(
-            "example.com",
-            "sha256:d2",
-            &serde_json::json!({"n": 2}),
-            "https://example.com/a",
-            "sha256:d2",
-            1,
-        )
-        .unwrap();
-        assert!(db.is_delta_seen("sha256:d1").unwrap());
-        assert_eq!(
-            db.url_tip("example.com", "https://example.com/a")
-                .unwrap()
-                .as_deref(),
-            Some("sha256:d2")
-        );
-        assert_eq!(db.count_pending_entries("publisher_delta").unwrap(), 0);
-
-        let drained = db.drain_queued_deltas("example.com").unwrap();
-        assert_eq!(drained.len(), 2);
-        assert_eq!(drained[0].delta_id, "sha256:d1");
-        assert_eq!(drained[0].entry_json, serde_json::json!({"n": 1}));
-        assert_eq!(drained[0].chain_pos, 0);
-        assert_eq!(drained[1].delta_id, "sha256:d2");
-        assert!(db.drain_queued_deltas("example.com").unwrap().is_empty());
-    }
-
-    #[test]
     fn update_publisher_declaration_updates_row_and_enqueues_entry() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
@@ -2418,6 +1841,32 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_store_without_the_current_layout_stamp_is_refused_with_its_rows_untouched() {
+        for version in [0, 1] {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("clave.sqlite");
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE seen_deltas(delta_id TEXT PRIMARY KEY, domain TEXT NOT NULL);
+                 INSERT INTO seen_deltas VALUES ('sha256:a', 'example.com');",
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+            drop(conn);
+            let error = match Db::open(&path) {
+                Ok(_) => panic!("a store of layout {version} must be refused"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains("superseded layout"), "{error}");
+            let rows: i64 = Connection::open(&path)
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM seen_deltas", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(rows, 1);
+        }
+    }
+
+    #[test]
     fn open_applies_schema_idempotently() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("clave.sqlite");
@@ -2426,40 +1875,12 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_run_table_naming_its_disposition_noise_is_reopened_with_the_column_renamed() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("clave.sqlite");
-        let db = Db::open(&path).unwrap();
-        let mut run = db
-            .start_pull_run(&NewRun {
-                domain: "a.example",
-                now: "2026-08-09T12:00:00Z",
-                day: "2026-08-09",
-                unit: "a.example",
-                work_bytes: 1,
-                work_objects: 1,
-                pages_epoch: None,
-            })
-            .unwrap();
-        run.ended = Some("WIST2-E01".to_string());
-        db.update_pull_run(&run).unwrap();
-        db.conn
-            .execute_batch("ALTER TABLE pull_runs RENAME COLUMN ended TO noise")
-            .unwrap();
-        drop(db);
-
-        let db = Db::open(&path).unwrap();
-        assert_eq!(db.pull_run(run.run_id).unwrap(), Some(run));
-        Db::open(&path).unwrap();
-    }
-
-    #[test]
-    fn feed_observations_are_atomic_and_host_scoped_across_connections() {
+    fn label_feed_observations_are_atomic_and_host_scoped_across_connections() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("clave.sqlite");
         let db = Db::open(&path).unwrap();
         assert!(db
-            .observe_feed_generated_at("example.com", "0000-01-01T00:00:00Z")
+            .observe_label_feed_generated_at("example.com", "0000-01-01T00:00:00Z")
             .unwrap());
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
         let handles = ["2026-08-09T14:00:00Z", "2026-08-09T14:00:01Z"].map(|at| {
@@ -2468,7 +1889,8 @@ pub(crate) mod tests {
             std::thread::spawn(move || {
                 let db = Db::open(&path).unwrap();
                 barrier.wait();
-                db.observe_feed_generated_at("example.com", at).unwrap()
+                db.observe_label_feed_generated_at("example.com", at)
+                    .unwrap()
             })
         });
         let [earlier, later] = handles;
@@ -2477,13 +1899,13 @@ pub(crate) mod tests {
         drop(db);
         let db = Db::open(&path).unwrap();
         assert!(!db
-            .observe_feed_generated_at("example.com", "2026-08-09T14:00:00Z")
+            .observe_label_feed_generated_at("example.com", "2026-08-09T14:00:00Z")
             .unwrap());
         assert!(db
-            .observe_feed_generated_at("other.example", "0000-01-01T00:00:00Z")
+            .observe_label_feed_generated_at("other.example", "0000-01-01T00:00:00Z")
             .unwrap());
         assert!(db
-            .observe_feed_generated_at("example.com", "2026-08-09T14:00:01Z")
+            .observe_label_feed_generated_at("example.com", "2026-08-09T14:00:01Z")
             .unwrap());
     }
 
@@ -2611,51 +2033,16 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn seen_delta_roundtrips() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
-        assert!(!db.is_delta_seen("sha256:abc").unwrap());
-        db.insert_seen_delta("sha256:abc", "example.com").unwrap();
-        assert!(db.is_delta_seen("sha256:abc").unwrap());
-    }
-
-    #[test]
     fn pending_entries_count_by_type() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
-        assert_eq!(db.count_pending_entries("publisher_delta").unwrap(), 0);
-        db.insert_pending_entry("publisher_delta", "example.com", &Value::Null, 0)
+        assert_eq!(db.count_pending_entries("label").unwrap(), 0);
+        db.insert_pending_entry("label", "example.com", &Value::Null, 0)
             .unwrap();
-        assert_eq!(db.count_pending_entries("publisher_delta").unwrap(), 1);
+        assert_eq!(db.count_pending_entries("label").unwrap(), 1);
         assert_eq!(
             db.count_pending_entries("publisher_declaration").unwrap(),
             0
-        );
-    }
-
-    #[test]
-    fn url_tip_roundtrips_and_updates() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
-        assert!(db
-            .url_tip("example.com", "https://example.com/a")
-            .unwrap()
-            .is_none());
-        db.set_url_tip("https://example.com/a", "example.com", "sha256:1")
-            .unwrap();
-        assert_eq!(
-            db.url_tip("example.com", "https://example.com/a")
-                .unwrap()
-                .unwrap(),
-            "sha256:1"
-        );
-        db.set_url_tip("https://example.com/a", "example.com", "sha256:2")
-            .unwrap();
-        assert_eq!(
-            db.url_tip("example.com", "https://example.com/a")
-                .unwrap()
-                .unwrap(),
-            "sha256:2"
         );
     }
 
@@ -2676,66 +2063,21 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn record_accepted_delta_is_atomic_on_conflict() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
-        db.record_accepted_delta(
-            "example.com",
-            "sha256:a",
-            &Value::Null,
-            0,
-            "https://example.com/x",
-            "sha256:a",
-        )
-        .unwrap();
-        assert_eq!(db.count_pending_entries("publisher_delta").unwrap(), 1);
-        assert!(db
-            .record_accepted_delta(
-                "example.com",
-                "sha256:a",
-                &Value::Null,
-                1,
-                "https://example.com/y",
-                "sha256:a",
-            )
-            .is_err());
-        assert_eq!(db.count_pending_entries("publisher_delta").unwrap(), 1);
-        assert!(db
-            .url_tip("example.com", "https://example.com/y")
-            .unwrap()
-            .is_none());
-    }
-
-    #[test]
     fn drain_pending_entries_orders_by_rowid_and_empties_table() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
         record_test_declaration(&db).unwrap();
-        db.record_accepted_delta(
-            "example.com",
-            "sha256:a",
-            &serde_json::json!({"n": 1}),
-            0,
-            "https://example.com/x",
-            "sha256:a",
-        )
-        .unwrap();
-        db.record_accepted_delta(
-            "example.com",
-            "sha256:b",
-            &serde_json::json!({"n": 2}),
-            0,
-            "https://example.com/y",
-            "sha256:b",
-        )
-        .unwrap();
+        db.insert_pending_entry("label", "example.com", &serde_json::json!({"n": 1}), 0)
+            .unwrap();
+        db.insert_pending_entry("label", "example.com", &serde_json::json!({"n": 2}), 0)
+            .unwrap();
 
         let entries = db.drain_pending_entries().unwrap();
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].entry_type, "publisher_declaration");
-        assert_eq!(entries[1].entry_type, "publisher_delta");
+        assert_eq!(entries[1].entry_type, "label");
         assert_eq!(entries[1].entry_json, serde_json::json!({"n": 1}));
-        assert_eq!(entries[2].entry_type, "publisher_delta");
+        assert_eq!(entries[2].entry_type, "label");
         assert_eq!(entries[2].entry_json, serde_json::json!({"n": 2}));
 
         assert!(db.drain_pending_entries().unwrap().is_empty());
@@ -2746,20 +2088,13 @@ pub(crate) mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
         record_test_declaration(&db).unwrap();
-        db.record_accepted_delta(
-            "example.com",
-            "sha256:a",
-            &serde_json::json!({"n": 1}),
-            0,
-            "https://example.com/x",
-            "sha256:a",
-        )
-        .unwrap();
+        db.insert_pending_entry("label", "example.com", &serde_json::json!({"n": 1}), 0)
+            .unwrap();
 
         let (peeked, up_to) = db.peek_pending_entries().unwrap();
         assert_eq!(peeked.len(), 2);
         assert_eq!(peeked[0].entry_type, "publisher_declaration");
-        assert_eq!(peeked[1].entry_type, "publisher_delta");
+        assert_eq!(peeked[1].entry_type, "label");
         assert_eq!(up_to, peeked[1].rowid);
         let (peeked_again, _) = db.peek_pending_entries().unwrap();
         assert_eq!(peeked_again.len(), 2);
@@ -2773,15 +2108,6 @@ pub(crate) mod tests {
             "2026-08-09T00:00:00Z",
             &[],
             0,
-            &[RecordChange::Upsert(RecordUpsert {
-                url: "https://example.com/x",
-                publisher: "example.com",
-                delta_id: "sha256:a",
-                observed_at: "2026-08-09T00:00:00Z",
-                title: "t",
-                abstract_text: None,
-                lang: "en",
-            })],
             &[],
             &[],
             &[],
@@ -2797,28 +2123,14 @@ pub(crate) mod tests {
             db.last_epoch().unwrap().unwrap().sealed_at,
             "2026-08-09T00:00:00Z"
         );
-        assert_eq!(
-            db.get_record("https://example.com/x", "example.com")
-                .unwrap()
-                .unwrap()
-                .delta_id,
-            "sha256:a"
-        );
     }
 
     #[test]
     fn commit_seal_rolls_back_pending_delete_on_conflicting_epoch_number() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
-        db.record_accepted_delta(
-            "example.com",
-            "sha256:a",
-            &serde_json::json!({"n": 1}),
-            0,
-            "https://example.com/x",
-            "sha256:a",
-        )
-        .unwrap();
+        db.insert_pending_entry("label", "example.com", &serde_json::json!({"n": 1}), 0)
+            .unwrap();
         let (peeked, _up_to) = db.peek_pending_entries().unwrap();
         let sealed: Vec<i64> = peeked.iter().map(|e| e.rowid).collect();
         db.commit_seal(
@@ -2835,19 +2147,11 @@ pub(crate) mod tests {
             &[],
             &[],
             &[],
-            &[],
         )
         .unwrap();
 
-        db.record_accepted_delta(
-            "example.com",
-            "sha256:b",
-            &serde_json::json!({"n": 2}),
-            0,
-            "https://example.com/y",
-            "sha256:b",
-        )
-        .unwrap();
+        db.insert_pending_entry("label", "example.com", &serde_json::json!({"n": 2}), 0)
+            .unwrap();
         let (peeked2, _up_to2) = db.peek_pending_entries().unwrap();
         assert_eq!(peeked2.len(), 1);
 
@@ -2860,7 +2164,6 @@ pub(crate) mod tests {
             "2026-08-09T00:01:00Z",
             &[],
             0,
-            &[],
             &[],
             &[],
             &[],
@@ -2920,7 +2223,7 @@ pub(crate) mod tests {
         let rejections = db.list_rejections("example.com").unwrap();
         assert_eq!(rejections.len(), 2);
         assert_eq!(rejections[0].code, "WIST2-E03");
-        assert_eq!(rejections[0].delta_id.as_deref(), Some("sha256:abc"));
+        assert_eq!(rejections[0].id.as_deref(), Some("sha256:abc"));
         assert_eq!(rejections[1].code, "WIST2-E01");
     }
 

@@ -1,7 +1,7 @@
 mod common;
 
 use clave::snapshot::{Outcome, Phase};
-use common::{add_delta, make_publisher_with_scope, reserve_addr, serve_static, write_feed};
+use common::{add_label, make_publisher_with_scope, reserve_addr, serve_static, write_label_feed};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -26,9 +26,15 @@ impl Log {
         let publisher = make_publisher_with_scope(&host, &["example.com"]);
         let ids: Vec<String> = urls
             .iter()
-            .map(|url| add_delta(&publisher, url, &format!("body of {url}"), None))
+            .map(|url| {
+                add_label(
+                    &publisher,
+                    &url.replace("example.com", "other.example"),
+                    "2026-08-09T11:00:00Z",
+                )
+            })
             .collect();
-        write_feed(&publisher, &host, &ids, "2026-08-09T12:00:00Z");
+        write_label_feed(&publisher, &host, &ids, "2026-08-09T12:00:00Z");
         serve_static(listener, publisher.dir.path().to_path_buf());
         let data = tempfile::tempdir().unwrap();
         clave::init::run(&host, data.path()).unwrap();
@@ -82,9 +88,13 @@ impl Log {
     }
 
     fn publish(&mut self, url: &str, generated_at: &str) -> String {
-        let id = add_delta(&self.publisher, url, &format!("body of {url}"), None);
+        let id = add_label(
+            &self.publisher,
+            &url.replace("example.com", "other.example"),
+            "2026-08-09T11:00:00Z",
+        );
         self.ids.push(id.clone());
-        write_feed(&self.publisher, &self.host, &self.ids, generated_at);
+        write_label_feed(&self.publisher, &self.host, &self.ids, generated_at);
         id
     }
 
@@ -92,37 +102,11 @@ impl Log {
         clave::ingest::run(db, &self.client, self.path(), &self.host, at).unwrap()
     }
 
-    fn connection(&self) -> clave::db::Db {
-        clave::db::Db::connect(&self.db_path()).unwrap()
-    }
-
-    fn manifest(&self, date: &str) -> Value {
-        read(&common::served_snapshot(self.path(), date).join("manifest.json"))
-    }
-
     fn listed(&self) -> Vec<Value> {
         read(&self.path().join("snapshots/index.json"))["index"]["snapshots"]
             .as_array()
             .unwrap()
             .clone()
-    }
-
-    fn records_digest(&self) -> String {
-        let projection: Vec<Value> = self
-            .db
-            .list_records()
-            .unwrap()
-            .iter()
-            .map(|r| {
-                serde_json::json!({
-                    "url": r.url,
-                    "publisher": r.publisher,
-                    "delta_id": r.delta_id,
-                    "observed_at": r.observed_at,
-                })
-            })
-            .collect();
-        wist_core::snapshot::content_digest(&projection).unwrap()
     }
 
     fn staged(&self) -> Vec<String> {
@@ -177,20 +161,6 @@ fn crash_at(at: Phase) -> impl FnMut(Phase) -> clave::error::Result<()> {
     }
 }
 
-fn tier0_urls(path: &Path) -> Vec<String> {
-    let conn =
-        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .unwrap();
-    let mut statement = conn
-        .prepare("SELECT url FROM records ORDER BY url")
-        .unwrap();
-    statement
-        .query_map([], |row| row.get(0))
-        .unwrap()
-        .collect::<rusqlite::Result<Vec<String>>>()
-        .unwrap()
-}
-
 #[test]
 fn production_reports_an_unsealed_log_and_a_current_snapshot() {
     let log = Log::new(&["https://example.com/a"]);
@@ -205,140 +175,6 @@ fn production_reports_an_unsealed_log_and_a_current_snapshot() {
         }
     ));
     assert_eq!(log.produce().unwrap(), Outcome::Current { epoch_number: 0 });
-}
-
-#[test]
-fn a_seal_committed_while_files_are_written_leaves_the_manifest_at_the_read_height() {
-    let log = Log::new(&["https://example.com/a"]);
-    log.seal(SEAL_START);
-    let read_digest = log.records_digest();
-    let read_head = log.db.epoch_at(0).unwrap().unwrap();
-
-    let outcome = log
-        .produce_with(&mut |phase| {
-            if phase == Phase::FilesWritten {
-                let db = log.connection();
-                let id = add_delta(&log.publisher, "https://example.com/b", "b body", None);
-                write_feed(
-                    &log.publisher,
-                    &log.host,
-                    &[log.ids[0].clone(), id],
-                    "2026-08-09T12:00:10Z",
-                );
-                assert_eq!(log.pull(&db, "2026-08-09T12:00:10Z").accepted.len(), 1);
-                assert_eq!(log.seal_on(&db, SEAL_START + 3600), 1);
-            }
-            Ok(())
-        })
-        .unwrap();
-    let Outcome::Built {
-        epoch_number,
-        tree_size,
-        snapshot_date,
-        shards_rebuilt,
-        shard_count,
-        ..
-    } = outcome
-    else {
-        panic!("no Snapshot built");
-    };
-    assert_eq!(
-        (
-            epoch_number,
-            tree_size,
-            snapshot_date,
-            shards_rebuilt,
-            shard_count
-        ),
-        (0, read_head.tree_size, DATE.to_string(), 1, 1)
-    );
-    let manifest = log.manifest(DATE);
-    assert_eq!(manifest["manifest"]["epoch_number"], 0);
-    assert_eq!(manifest["manifest"]["tree_size"], read_head.tree_size);
-    assert_eq!(manifest["manifest"]["root_hash"], read_head.root);
-    assert_eq!(manifest["manifest"]["content_digest"], read_digest);
-    assert_ne!(log.records_digest(), read_digest);
-    let listed = log.listed();
-    assert_eq!(listed.len(), 1);
-    assert_eq!(listed[0]["tree_size"], read_head.tree_size);
-
-    let head = log.db.last_epoch().unwrap().unwrap();
-    let Outcome::Built {
-        epoch_number,
-        tree_size,
-        snapshot_date,
-        shards_rebuilt,
-        shard_count,
-        ..
-    } = log.produce().unwrap()
-    else {
-        panic!("no Snapshot built");
-    };
-    assert_eq!(
-        (
-            epoch_number,
-            tree_size,
-            snapshot_date,
-            shards_rebuilt,
-            shard_count
-        ),
-        (1, head.tree_size, DATE.to_string(), 1, 1)
-    );
-    assert_eq!(
-        log.manifest(DATE)["manifest"]["content_digest"],
-        log.records_digest()
-    );
-}
-
-#[test]
-fn a_withdrawal_sealed_while_files_are_written_supersedes_the_build() {
-    let log = Log::new(&["https://example.com/a", "https://example.com/b"]);
-    log.seal(SEAL_START);
-    let doomed = log.ids[1].clone();
-
-    let outcome = log
-        .produce_with(&mut |phase| {
-            if phase == Phase::FilesWritten {
-                let db = log.connection();
-                clave::governance::withdraw(
-                    &db,
-                    &log.sk,
-                    &log.host,
-                    &doomed,
-                    "court order",
-                    "DE",
-                    SEAL_START + 1,
-                )
-                .unwrap();
-                assert_eq!(log.seal_on(&db, SEAL_START + 3600), 1);
-            }
-            Ok(())
-        })
-        .unwrap();
-    assert_eq!(
-        outcome,
-        Outcome::Superseded {
-            built: 0,
-            withdrawal_height: 1,
-        }
-    );
-    assert!(log.staged().is_empty(), "{:?}", log.staged());
-    assert!(log.served_directories().is_empty());
-    assert!(log.listed().is_empty());
-
-    assert!(matches!(
-        log.produce().unwrap(),
-        Outcome::Built {
-            epoch_number: 1,
-            ..
-        }
-    ));
-    let manifest = log.manifest(DATE);
-    assert_eq!(manifest["manifest"]["content_digest"], log.records_digest());
-    assert_eq!(
-        tier0_urls(&common::served_snapshot(log.path(), DATE).join("tier0/index.sqlite")),
-        vec!["https://example.com/a".to_string()]
-    );
 }
 
 #[test]
@@ -418,97 +254,6 @@ fn the_staging_area_lies_outside_the_served_snapshot_tree() {
     assert!(staged.join("manifest.json").exists());
     assert!(!staged.starts_with(log.path().join("snapshots")));
     assert!(log.served_directories().is_empty());
-}
-
-#[test]
-fn a_pull_committing_during_the_read_succeeds_and_the_build_keeps_the_read_head() {
-    let log = Log::new(&["https://example.com/a"]);
-    log.seal(SEAL_START);
-    let read_digest = log.records_digest();
-    let mut accepted = Vec::new();
-
-    let outcome = log
-        .produce_with(&mut |phase| {
-            if phase == Phase::Reading {
-                let db = log.connection();
-                let id = add_delta(&log.publisher, "https://example.com/b", "b body", None);
-                write_feed(
-                    &log.publisher,
-                    &log.host,
-                    &[log.ids[0].clone(), id],
-                    "2026-08-09T12:00:10Z",
-                );
-                accepted = log.pull(&db, "2026-08-09T12:00:10Z").accepted;
-                log.seal_on(&db, SEAL_START + 3600);
-            }
-            Ok(())
-        })
-        .unwrap();
-    assert_eq!(accepted.len(), 1);
-    assert!(matches!(
-        outcome,
-        Outcome::Built {
-            epoch_number: 0,
-            ..
-        }
-    ));
-    assert_eq!(log.manifest(DATE)["manifest"]["epoch_number"], 0);
-    assert_eq!(
-        log.manifest(DATE)["manifest"]["content_digest"],
-        read_digest
-    );
-}
-
-#[test]
-fn a_withdrawal_seal_removes_every_wiped_date_from_the_index() {
-    let log = Log::new(&["https://example.com/a", "https://example.com/b"]);
-    log.seal(SEAL_START);
-    log.produce().unwrap();
-    log.seal(SEAL_START + DAY);
-    log.produce().unwrap();
-    let dates: Vec<Value> = log
-        .listed()
-        .iter()
-        .map(|entry| entry["snapshot_date"].clone())
-        .collect();
-    assert_eq!(dates, vec!["2026-08-10", DATE]);
-
-    clave::governance::withdraw(
-        &log.db,
-        &log.sk,
-        &log.host,
-        &log.ids[1],
-        "court order",
-        "DE",
-        SEAL_START + DAY + 1,
-    )
-    .unwrap();
-    log.seal(SEAL_START + DAY + 3600);
-    assert!(log.listed().is_empty());
-    assert!(log.served_directories().is_empty());
-    wist_core::envelope::verify_envelope(
-        &read(&log.path().join("snapshots/index.json")),
-        "index",
-        &log.sk.public(),
-    )
-    .unwrap();
-}
-
-#[test]
-fn a_live_record_without_its_payload_fails_the_build_naming_the_delta() {
-    let log = Log::new(&["https://example.com/a"]);
-    log.seal(SEAL_START);
-    let id = &log.ids[0];
-    std::fs::remove_file(
-        log.path()
-            .join("payloads")
-            .join(format!("{}.json", id.strip_prefix("sha256:").unwrap())),
-    )
-    .unwrap();
-    let error = log.produce().unwrap_err().to_string();
-    assert!(error.contains(id), "{error}");
-    assert!(log.served_directories().is_empty());
-    assert!(!log.path().join("snapshots/index.json").exists());
 }
 
 #[test]

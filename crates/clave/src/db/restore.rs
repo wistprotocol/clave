@@ -10,7 +10,6 @@ pub(super) fn run(db: &Db, path: &Path) -> Result<()> {
     db.parameter_schedule(0)?;
     db.restore_recovery_owners(path)?;
     db.restore_declaration_floors(path)?;
-    db.restore_delta_indexes(path)?;
     db.restore_pull_schedule()
 }
 
@@ -82,6 +81,11 @@ impl Db {
             None
         };
         let pending = self.peek_pending_entries()?.0;
+        let at = match self.last_epoch()? {
+            Some(head) => crate::registry::unix(&head.sealed_at)?,
+            None => 0,
+        };
+        let limits = crate::declaration::limits(&self.parameter_schedule(at)?, at)?;
         let tx = self.mutation()?;
         for (domain, prior, opened) in rows {
             let prior: Value = crate::json::parse(&prior)?;
@@ -107,7 +111,7 @@ impl Db {
                 for entry in &pending {
                     if entry.entry_type == "publisher_declaration"
                         && entry.domain == domain
-                        && crate::declaration::evaluate(&prior, &entry.entry_json)
+                        && crate::declaration::evaluate(&prior, &entry.entry_json, &limits)
                             == Ok(crate::declaration::Decision::Recovery)
                         && !candidates.contains(&entry.entry_json)
                     {

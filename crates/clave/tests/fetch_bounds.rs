@@ -292,11 +292,20 @@ fn fetch_bounds_vector() {
             });
         }
         let caps = clave::ingest::ObjectCaps::from_schedule(&schedule, 0);
+        let size_caps = wist_core::item::SizeCaps::new(
+            params["url_cap_bytes"].as_i64().unwrap(),
+            params["extract_cap_bytes"].as_i64().unwrap(),
+            params["links_cap_bytes"].as_i64().unwrap(),
+            2048,
+            params["summary_cap_bytes"].as_i64().unwrap(),
+        )
+        .unwrap();
         let bound = match case["object"].as_str().unwrap() {
-            "declaration" | "feed" | "page" | "mirrors" => clave::fetch::OBJECT_CAP_BYTES,
-            "delta" => caps.of(clave::ingest::Object::Delta),
-            "label" => caps.of(clave::ingest::Object::Label),
-            "payload" => caps.of(clave::ingest::Object::Payload),
+            "declaration" | "label_feed" | "page" | "mirrors" => clave::fetch::OBJECT_CAP_BYTES,
+            "catalog" => wist_core::constants::CATALOG_FILE_READ_MAX_BYTES,
+            "change_list" => wist_core::constants::CHANGE_LIST_CAP_BYTES,
+            "label" | "dispute" => caps.of(clave::ingest::Object::Label),
+            "payload" => clave::payload::cap_bytes(&size_caps),
             other => panic!("{label}: unknown object {other}"),
         };
         assert_eq!(bound, case["bound"].as_u64().unwrap(), "{label}");

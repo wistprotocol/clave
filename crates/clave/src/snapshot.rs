@@ -1,20 +1,21 @@
-use crate::db::{Db, EpochRow, RecordRow, WithdrawalState};
+use crate::db::{Db, EpochRow, WithdrawalState};
 use crate::error::{Error, Result};
 use crate::history::declarations::{Declarations, DeclarationsReplay};
 use crate::WIST_VERSION;
 use rusqlite::Connection;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use wist_core::crypto::{hex_encode, SigningKey};
 use wist_core::envelope::sign_envelope;
 use wist_core::label::{self, LabelerRow, SealedLabelCount};
+use wist_core::materialization::ContentTuple;
 use wist_core::objects::{
     AggregatorKeyEntry, DeclarationEntry, DisputeEntry, LabelEntry, ParameterEntry,
-    PendingDeclarationEntry, RecordEntry, RecoveryWindowEntry, SnapshotFile, SnapshotIndex,
-    SnapshotIndexEntry, SnapshotManifest, SnapshotState, SnapshotStateFile, StateEntry,
-    SuffixListEntry, WithdrawalEntry,
+    PendingDeclarationEntry, RecoveryWindowEntry, SnapshotFile, SnapshotIndex, SnapshotIndexEntry,
+    SnapshotManifest, SnapshotState, SnapshotStateFile, StateEntry, SuffixListEntry,
+    WithdrawalEntry,
 };
 use wist_core::snapshot::{content_digest, state_digest};
 
@@ -64,10 +65,21 @@ pub fn shard_index(domain: &str, count: u64) -> u64 {
     u64::from_be_bytes(prefix) % count
 }
 
+pub(crate) struct SnapshotRecord {
+    pub url: String,
+    pub publisher: String,
+    pub item_id: String,
+    pub observed_at: String,
+    pub attested_at: String,
+    pub title: String,
+    pub abstract_text: Option<String>,
+    pub lang: String,
+}
+
 struct Tier1Row {
     url: String,
     publisher: String,
-    delta_id: String,
+    item_id: String,
     extract: String,
     links: Vec<String>,
 }
@@ -76,17 +88,17 @@ struct Tier1Row {
 /// that rather than emit a Snapshot silently missing a record.
 fn load_tier1_rows(
     data_dir: &Path,
-    records: &[&RecordRow],
+    records: &[&SnapshotRecord],
     cost: &mut Cost,
 ) -> Result<Vec<Tier1Row>> {
     let mut rows = Vec::with_capacity(records.len());
     for r in records {
-        let hex = r.delta_id.strip_prefix("sha256:").unwrap_or(&r.delta_id);
+        let hex = r.item_id.strip_prefix("sha256:").unwrap_or(&r.item_id);
         let bytes = std::fs::read(data_dir.join("payloads").join(format!("{hex}.json"))).map_err(
             |error| {
                 Error::Snapshot(format!(
                     "the Payload of live record {} cannot be read: {error}",
-                    r.delta_id
+                    r.item_id
                 ))
             },
         )?;
@@ -95,7 +107,7 @@ fn load_tier1_rows(
         let payload: Value = crate::json::parse(&bytes).map_err(|error| {
             Error::Snapshot(format!(
                 "the Payload of live record {} does not parse: {error}",
-                r.delta_id
+                r.item_id
             ))
         })?;
         let extract = payload["content"]["extract"]
@@ -113,7 +125,7 @@ fn load_tier1_rows(
         rows.push(Tier1Row {
             url: r.url.clone(),
             publisher: r.publisher.clone(),
-            delta_id: r.delta_id.clone(),
+            item_id: r.item_id.clone(),
             extract,
             links,
         });
@@ -363,7 +375,7 @@ fn build_tier1(dir: &Path, rows: &[Tier1Row]) -> Result<(Vec<u8>, Vec<u8>)> {
                 .map(|r| r.publisher.clone().into_bytes())
                 .collect(),
             rows.iter()
-                .map(|r| r.delta_id.clone().into_bytes())
+                .map(|r| r.item_id.clone().into_bytes())
                 .collect(),
             rows.iter()
                 .map(|r| r.extract.clone().into_bytes())
@@ -391,16 +403,17 @@ fn build_tier1(dir: &Path, rows: &[Tier1Row]) -> Result<(Vec<u8>, Vec<u8>)> {
     Ok((extracts_bytes, links_bytes))
 }
 
-fn record_projection(r: &RecordRow) -> Value {
-    serde_json::json!({
-        "url": r.url,
-        "publisher": r.publisher,
-        "delta_id": r.delta_id,
-        "observed_at": r.observed_at,
-    })
+fn content_tuple(r: &SnapshotRecord) -> ContentTuple {
+    ContentTuple {
+        url: r.url.clone(),
+        publisher: r.publisher.clone(),
+        item_id: r.item_id.clone(),
+        observed_at: r.observed_at.clone(),
+        attested_at: r.attested_at.clone(),
+    }
 }
 
-fn build_tier0(dir: &Path, records: &[&RecordRow]) -> Result<Vec<u8>> {
+fn build_tier0(dir: &Path, records: &[&SnapshotRecord]) -> Result<Vec<u8>> {
     std::fs::create_dir_all(dir)?;
     let sqlite_path = dir.join("index.sqlite");
     if sqlite_path.exists() {
@@ -414,7 +427,7 @@ fn build_tier0(dir: &Path, records: &[&RecordRow]) -> Result<Vec<u8>> {
     for r in records {
         conn.execute(
             "INSERT INTO records(url, publisher, delta_id, observed_at, title, abstract, lang) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            (&r.url, &r.publisher, &r.delta_id, &r.observed_at, &r.title, &r.abstract_text, &r.lang),
+            (&r.url, &r.publisher, &r.item_id, &r.observed_at, &r.title, &r.abstract_text, &r.lang),
         )?;
     }
     conn.execute("INSERT INTO records_fts(records_fts) VALUES('rebuild')", [])?;
@@ -425,8 +438,7 @@ fn build_tier0(dir: &Path, records: &[&RecordRow]) -> Result<Vec<u8>> {
 struct ReadState {
     head: EpochRow,
     signer: (String, SigningKey),
-    records: Vec<RecordRow>,
-    sealed_tips: Vec<(String, String, String)>,
+    records: Vec<SnapshotRecord>,
     withdrawals: Vec<WithdrawalState>,
     parameters: Vec<(String, i64, String)>,
     suffix_list: Option<(String, u64)>,
@@ -440,16 +452,7 @@ struct ReadState {
 
 fn read_state(db: &Db, data_dir: &Path, head: EpochRow) -> Result<ReadState> {
     let withdrawals = db.withdrawal_state()?;
-    let withdrawn: HashSet<&str> = withdrawals
-        .iter()
-        .map(|(delta_id, _, _)| delta_id.as_str())
-        .collect();
-    let live: Vec<RecordRow> = db
-        .list_records()?
-        .into_iter()
-        .filter(|record| !withdrawn.contains(record.delta_id.as_str()))
-        .collect();
-    let records = prefer_one_publisher(db, live)?;
+    let records = prefer_one_publisher(db, Vec::new())?;
     let (labels, disputes, labelers) = label_state(db, &head.sealed_at)?;
     let mut key_entries = db.aggregator_key_entries()?;
     if key_entries.is_empty() {
@@ -466,7 +469,6 @@ fn read_state(db: &Db, data_dir: &Path, head: EpochRow) -> Result<ReadState> {
     Ok(ReadState {
         signer: crate::keys::head_signer(data_dir, db)?,
         records,
-        sealed_tips: db.list_sealed_url_tips()?,
         parameters: db.parameter_state(&head.sealed_at)?,
         suffix_list: db.suffix_list_at_epoch(head.epoch_number)?,
         labels,
@@ -543,21 +545,11 @@ fn build_state(read: &ReadState) -> Result<(SnapshotState, String)> {
             head_height: window.head().position().epoch_number,
         }));
     }
-    for (delta_id, publisher, sealing_height) in &read.withdrawals {
+    for (item_id, publisher, sealing_height) in &read.withdrawals {
         entries.push(StateEntry::Withdrawal(WithdrawalEntry {
-            delta_id: delta_id.clone(),
+            item_id: item_id.clone(),
             publisher: publisher.clone(),
             sealing_height: *sealing_height,
-        }));
-    }
-    // WIST-3 §7: a `record` tuple carries the newest sealed Delta of each
-    // chain at `tree_size`, a deleted URL included; admitted but unsealed
-    // Deltas are not part of the state.
-    for (publisher, url, tip) in &read.sealed_tips {
-        entries.push(StateEntry::Record(RecordEntry {
-            publisher: publisher.clone(),
-            url: url.clone(),
-            delta_id: tip.clone(),
         }));
     }
 
@@ -925,7 +917,7 @@ pub fn resign_unsealed(db: &Db, data_dir: &Path) -> Result<Vec<String>> {
 /// WIST-3 §7, one URL, one Publisher: a self-declared host's own record,
 /// else the nearest ancestor Publisher's, else the least non-ancestor
 /// domain in ascending octet order; the other records are excluded.
-fn prefer_one_publisher(db: &Db, records: Vec<RecordRow>) -> Result<Vec<RecordRow>> {
+fn prefer_one_publisher(db: &Db, records: Vec<SnapshotRecord>) -> Result<Vec<SnapshotRecord>> {
     let mut by_url: std::collections::HashMap<&str, Vec<usize>> = std::collections::HashMap::new();
     for (index, record) in records.iter().enumerate() {
         by_url.entry(record.url.as_str()).or_default().push(index);
@@ -955,7 +947,7 @@ fn prefer_one_publisher(db: &Db, records: Vec<RecordRow>) -> Result<Vec<RecordRo
             self_declared,
             indices
                 .iter()
-                .map(|index| records[*index].publisher.as_str()),
+                .map(|index| (records[*index].publisher.as_str(), false)),
         );
         for index in indices {
             keep[index] = preferred == Some(records[index].publisher.as_str());
@@ -1083,10 +1075,10 @@ fn build_staged(
     let (key_id, sk) = (&read.signer.0, &read.signer.1);
     let shard_count = read.shard_count;
     let sharded = shard_count > 1;
-    let mut partitions: Vec<Vec<&RecordRow>> = (0..shard_count).map(|_| Vec::new()).collect();
+    let mut partitions: Vec<Vec<&SnapshotRecord>> = (0..shard_count).map(|_| Vec::new()).collect();
     let mut whole_projection = Vec::with_capacity(read.records.len());
     for r in &read.records {
-        whole_projection.push(record_projection(r));
+        whole_projection.push(content_tuple(r));
         partitions[shard_index(&r.publisher, shard_count) as usize].push(r);
     }
     let content_digest_value = content_digest(&whole_projection)?;
@@ -1121,7 +1113,8 @@ fn build_staged(
             .filter(|r| in_shard(&r.labeler))
             .cloned()
             .collect();
-        let projection: Vec<Value> = shard_records.iter().map(|r| record_projection(r)).collect();
+        let projection: Vec<ContentTuple> =
+            shard_records.iter().map(|r| content_tuple(r)).collect();
         let mut fingerprint = Fingerprint {
             shard_count,
             shard,
@@ -1403,14 +1396,14 @@ pub(crate) fn apply_pending_removals(db: &Db, data_dir: &Path) -> Result<bool> {
         return Ok(false);
     }
     db.check_fence()?;
-    for (delta_id, _) in &pending {
-        let hex = delta_id.strip_prefix("sha256:").unwrap_or(delta_id);
+    for (item_id, _) in &pending {
+        let hex = item_id.strip_prefix("sha256:").unwrap_or(item_id);
         remove_path(&data_dir.join("payloads").join(format!("{hex}.json")))?;
     }
     let publishers: Vec<&str> = pending.iter().map(|(_, domain)| domain.as_str()).collect();
     withdraw_served(db, data_dir, &publishers)?;
-    let delta_ids: Vec<String> = pending.into_iter().map(|(delta_id, _)| delta_id).collect();
-    db.clear_pending_removals(&delta_ids)?;
+    let item_ids: Vec<String> = pending.into_iter().map(|(item_id, _)| item_id).collect();
+    db.clear_pending_removals(&item_ids)?;
     if !db.truncate_wal()? {
         tracing::warn!("a reader kept the write-ahead log from being truncated after a withdrawal");
     }
@@ -1611,7 +1604,6 @@ pub fn produce_with(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{RecordChange, RecordUpsert};
 
     const T0: i64 = 1_800_000_000;
 
@@ -1619,14 +1611,7 @@ mod tests {
         jiff::Timestamp::from_second(unix).unwrap().to_string()
     }
 
-    fn seal_record_as(
-        db: &Db,
-        epoch: u64,
-        sealed_unix: i64,
-        url: &str,
-        publisher: &str,
-        declared: &[&str],
-    ) {
+    fn seal_declarations(db: &Db, epoch: u64, sealed_unix: i64, declared: &[&str]) {
         let declarations: Vec<crate::db::SealedDeclarationRow<'_>> = declared
             .iter()
             .map(|domain| crate::db::SealedDeclarationRow {
@@ -1643,15 +1628,6 @@ mod tests {
             &ts(sealed_unix),
             &[],
             0,
-            &[RecordChange::Upsert(RecordUpsert {
-                url,
-                publisher,
-                delta_id: &format!("sha256:{:064x}", epoch),
-                observed_at: &ts(sealed_unix),
-                title: "t",
-                abstract_text: None,
-                lang: "en",
-            })],
             &[],
             &[],
             &[],
@@ -1699,17 +1675,21 @@ mod tests {
             ("https://a.notexample.com/x", "example.com", &[]),
             ("https://a.notexample.com/x", "beta.example", &[]),
         ];
+        let mut records = Vec::new();
         for (epoch, (url, publisher, declared)) in rows.iter().enumerate() {
-            seal_record_as(
-                &db,
-                epoch as u64,
-                T0 + epoch as i64,
-                url,
-                publisher,
-                declared,
-            );
+            seal_declarations(&db, epoch as u64, T0 + epoch as i64, declared);
+            records.push(SnapshotRecord {
+                url: url.to_string(),
+                publisher: publisher.to_string(),
+                item_id: format!("sha256:{epoch:064x}"),
+                observed_at: ts(T0),
+                attested_at: ts(T0),
+                title: String::new(),
+                abstract_text: None,
+                lang: "en".into(),
+            });
         }
-        let kept = prefer_one_publisher(&db, db.list_records().unwrap()).unwrap();
+        let kept = prefer_one_publisher(&db, records).unwrap();
         let mut pairs: Vec<(&str, &str)> = kept
             .iter()
             .map(|r| (r.url.as_str(), r.publisher.as_str()))

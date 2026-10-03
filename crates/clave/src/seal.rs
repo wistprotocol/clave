@@ -8,24 +8,14 @@ use wist_core::crypto::SigningKey;
 
 mod prepare;
 mod publish;
-#[cfg(test)]
-mod withdrawal_tests;
 
 pub(crate) use prepare::validate_pending_parameter;
-
-pub(super) const ENTRY_TYPE_ORDER: [&str; 5] = [
-    "publisher_declaration",
-    "registry_update",
-    "publisher_delta",
-    "label",
-    "dispute",
-];
 
 pub struct SealReport {
     pub epoch_number: u64,
     pub entry_count: u64,
     pub dropped: Vec<String>,
-    /// Deltas sealed past WIST-4 §5's inclusion ceiling, counted from
+    /// Entries sealed past WIST-4 §5's inclusion ceiling, counted from
     /// the Epoch each one's turn arrived in.
     pub late: Vec<String>,
 }

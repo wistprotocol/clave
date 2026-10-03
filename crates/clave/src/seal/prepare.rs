@@ -1,4 +1,3 @@
-use super::ENTRY_TYPE_ORDER;
 use crate::db::{Db, PendingEntryRow};
 use crate::error::{Error, Result};
 use crate::history::declarations::DeclarationsReplay;
@@ -11,7 +10,8 @@ use std::path::Path;
 use wist_core::aggregator_keys::{self, KeyAction, Outcome, Registry};
 use wist_core::crypto::SigningKey;
 use wist_core::envelope::sign_envelope;
-use wist_core::objects::{AggregatorKeyEntry, ChangeType};
+use wist_core::epoch::ENTRY_TYPES as ENTRY_TYPE_ORDER;
+use wist_core::objects::AggregatorKeyEntry;
 use wist_core::{jcs, merkle, tiles};
 
 pub(super) struct PreparedEpoch {
@@ -35,7 +35,6 @@ pub(super) struct PreparedEpoch {
     pub(super) entry_count: u64,
     pub(super) projection: Projection,
     pub(super) windows: Vec<SealedWindow>,
-    pub(super) record_updates: Vec<OwnedRecordChange>,
 }
 
 pub(super) struct SealedWindow {
@@ -116,20 +115,14 @@ pub(super) fn epoch(
                 .unwrap()
         });
     crate::recovery::settle_due(db, &declarations, &sealed_at)?;
-    divert_recovery_deltas(
-        db,
-        &declarations
-            .domains()
-            .iter()
-            .filter(|(_, state)| {
-                state
-                    .window()
-                    .is_some_and(|window| window.end_s() > i128::from(sealed_unix))
-            })
-            .map(|(domain, _)| domain.as_str())
-            .collect(),
-    )?;
-    let settlement = declarations.project(&sealed_at, recovery_days, activation_epochs, &[])?;
+    let default_schedule = wist_core::parameters::Schedule::new(sealed_unix);
+    let sealing_schedule = history.schedule().unwrap_or(&default_schedule);
+    let limits = crate::declaration::limits(sealing_schedule, sealed_unix)?;
+    let clock_skew_seconds = sealing_schedule
+        .value_at("clock_skew_seconds", sealed_unix)
+        .ok_or_else(|| Error::Param("clock_skew_seconds".into()))?;
+    let settlement =
+        declarations.project(&sealed_at, recovery_days, activation_epochs, &limits, &[])?;
 
     let (peeked, _up_to_rowid) = db.peek_pending_entries()?;
     let domain_cap = registry::effective(db, "domain_epoch_entries_max", &sealed_at)?;
@@ -173,44 +166,8 @@ pub(super) fn epoch(
         })
         .collect();
     let (seal_entries, _deferred) = fit_to_cap(seal_entries, cap, &installed)?;
-    let projection = declarations.project(
-        &sealed_at,
-        recovery_days,
-        activation_epochs,
-        &seal_entries
-            .iter()
-            .map(|entry| entry.wrapped.clone())
-            .collect::<Vec<_>>(),
-    )?;
-    let recovering: HashSet<_> = projection
-        .domains()
-        .iter()
-        .filter(|(_, state)| state.window().is_some())
-        .map(|(domain, _)| domain.as_str())
-        .collect();
-    divert_recovery_deltas(db, &recovering)?;
-    let seal_entries = seal_entries
-        .into_iter()
-        .filter(|entry| {
-            entry.entry_type != "publisher_delta" || !recovering.contains(entry.domain.as_str())
-        })
-        .collect();
-    let default_schedule = wist_core::parameters::Schedule::new(sealed_unix);
-    let sealing_schedule = history.schedule().unwrap_or(&default_schedule);
-    let size_caps =
-        crate::declaration::delta::SizeCaps::from_schedule(sealing_schedule, sealed_unix);
-    let clock_skew_seconds = sealing_schedule
-        .value_at("clock_skew_seconds", sealed_unix)
-        .unwrap();
-    let (seal_entries, retired_rowids, retired) = revalidate_queued_deltas(
-        db,
-        data_dir,
-        &size_caps,
-        clock_skew_seconds,
-        seal_entries,
-        &sealed_at,
-        &projection,
-    )?;
+    let (seal_entries, retired_rowids, retired) =
+        revalidate_labels(db, clock_skew_seconds, seal_entries, &sealed_at)?;
     let ceiling = registry::effective(db, "max_inclusion_epochs", &sealed_at)?;
     let late = late_inclusions(&seal_entries, epoch_number, ceiling);
     let candidate_octets = seal_entries.iter().map(SealEntry::octets).sum();
@@ -256,8 +213,13 @@ pub(super) fn epoch(
             "the Epoch's entry-bundle octets exceed epoch_cap_bytes".into(),
         ));
     }
-    let projection =
-        declarations.project(&sealed_at, recovery_days, activation_epochs, &entries)?;
+    let projection = declarations.project(
+        &sealed_at,
+        recovery_days,
+        activation_epochs,
+        &limits,
+        &entries,
+    )?;
     let windows = projection
         .domains()
         .iter()
@@ -280,7 +242,6 @@ pub(super) fn epoch(
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    let record_updates = resolve_record_updates(data_dir, &size_caps, &seal_entries)?;
 
     Ok(PreparedEpoch {
         log_id: history.log_id().to_owned(),
@@ -300,7 +261,6 @@ pub(super) fn epoch(
         entry_count,
         projection,
         windows,
-        record_updates,
     })
 }
 
@@ -313,7 +273,7 @@ pub(super) struct AcceptedParamChange {
 
 pub(super) struct OwnedWithdrawal {
     pub(super) update_id: String,
-    pub(super) delta_id: String,
+    pub(super) item_id: String,
     pub(super) domain: String,
 }
 
@@ -404,10 +364,6 @@ pub(crate) fn validate_pending_parameter(
     ))
 }
 
-/// WIST-2 §5 step 4: a queued Delta is sealed only where it verifies
-/// under the Key Set WIST-1 §5.2 resolves at the sealing Epoch — the
-/// highest-`seq` Declaration sealed at a height at or below it, this
-/// Epoch's own Declarations included (WIST-3 §3.2 applies them first).
 /// WIST-3 §3.2: the per-Registrable-Domain caps apply under the snapshot
 /// in force (WIST-4 §3.1); the surplus waits its turn in acceptance order,
 /// and WIST-4 §6.4's inclusion ceiling runs from the Epoch its turn arrives
@@ -426,10 +382,7 @@ pub(super) fn fit_to_domain_cap(
     let mut labeled: HashMap<String, usize> = HashMap::new();
     let mut kept = Vec::with_capacity(peeked.len());
     for p in peeked {
-        if !matches!(
-            p.entry_type.as_str(),
-            "publisher_delta" | "label" | "dispute"
-        ) {
+        if !matches!(p.entry_type.as_str(), "label" | "dispute") {
             kept.push(p);
             continue;
         }
@@ -438,13 +391,11 @@ pub(super) fn fit_to_domain_cap(
         if *count >= cap {
             continue;
         }
-        if p.entry_type != "publisher_delta" {
-            let opinions = labeled.entry(unit).or_insert(0);
-            if *opinions >= labeler_cap {
-                continue;
-            }
-            *opinions += 1;
+        let opinions = labeled.entry(unit).or_insert(0);
+        if *opinions >= labeler_cap {
+            continue;
         }
+        *opinions += 1;
         *count += 1;
         db.set_turn_epoch(p.rowid, epoch_number)?;
         kept.push(p);
@@ -452,7 +403,7 @@ pub(super) fn fit_to_domain_cap(
     Ok(kept)
 }
 
-/// WIST-4 §6.4: an accepted Delta MUST be sealed no later than
+/// WIST-4 §6.4: an accepted Entry MUST be sealed no later than
 /// `max_inclusion_epochs` Epochs after the Epoch its turn arrived in.
 pub(super) fn late_inclusions(
     entries: &[SealEntry],
@@ -462,12 +413,7 @@ pub(super) fn late_inclusions(
     let ceiling = ceiling.max(0) as u64;
     entries
         .iter()
-        .filter(|e| {
-            matches!(
-                e.entry_type.as_str(),
-                "publisher_delta" | "label" | "dispute"
-            )
-        })
+        .filter(|e| matches!(e.entry_type.as_str(), "label" | "dispute"))
         .filter_map(|e| {
             let turn = e.turn_epoch?;
             (epoch_number > turn + ceiling).then(|| {
@@ -481,188 +427,75 @@ pub(super) fn late_inclusions(
         .collect()
 }
 
-pub(super) fn divert_recovery_deltas(db: &Db, domains: &HashSet<&str>) -> Result<()> {
-    for entry in db.peek_pending_entries()?.0 {
-        if entry.entry_type != "publisher_delta" || !domains.contains(entry.domain.as_str()) {
-            continue;
-        }
-        db.requeue_pending_delta(&entry)?;
-    }
-    Ok(())
-}
-
-pub(super) fn revalidate_queued_deltas(
+/// WIST-2 §3.3: a Label or dispute whose `asserted_at` the sealing clock
+/// no longer allows is rejected rather than sealed.
+pub(super) fn revalidate_labels(
     db: &Db,
-    data_dir: &Path,
-    size_caps: &crate::declaration::delta::SizeCaps,
     clock_skew_seconds: i64,
     entries: Vec<SealEntry>,
     sealed_at: &str,
-    projection: &Projection,
 ) -> Result<(Vec<SealEntry>, Vec<i64>, Vec<String>)> {
     let clock = sealed_at
         .parse::<jiff::Timestamp>()
         .map_err(|e| Error::Clock(e.to_string()))?;
-    let sources = projection
-        .domains()
-        .iter()
-        .filter_map(|(domain, state)| {
-            state.delta_sealing_source().map(|source| {
-                crate::declaration::publisher_of(source.envelope())
-                    .map(|publisher| (domain.clone(), publisher))
-                    .map_err(Error::History)
-            })
-        })
-        .collect::<Result<HashMap<_, _>>>()?;
-
     let mut kept = Vec::with_capacity(entries.len());
     let mut dropped_rowids = Vec::new();
-    let mut dropped = Vec::new();
-    let mut rejections = std::collections::BTreeMap::<String, Vec<(Value, &str)>>::new();
     let mut late_labels = Vec::new();
     for e in entries {
-        if matches!(e.entry_type.as_str(), "label" | "dispute") {
-            let asserted_at = e.body[e.entry_type.as_str()]["asserted_at"]
-                .as_str()
-                .unwrap_or_default();
-            if wist_core::publisher_time::within_clock_bound(
-                asserted_at,
-                clock.as_second(),
-                clock_skew_seconds,
-            ) == Some(true)
-            {
-                kept.push(e);
-            } else {
-                let id = if e.entry_type == "label" {
-                    wist_core::label::label_id(&e.body["label"])
-                } else {
-                    wist_core::label::dispute_id(&e.body["dispute"])
-                }
-                .map_err(|err| Error::Seal(format!("queued Label Entry has no ID: {err:?}")))?;
-                dropped_rowids.push(e.rowid);
-                late_labels.push((e.rowid, e.domain, e.entry_type, id));
-            }
-            continue;
-        }
-        if e.entry_type != "publisher_delta" {
+        if !matches!(e.entry_type.as_str(), "label" | "dispute") {
             kept.push(e);
             continue;
         }
-        let source: Vec<_> = sources.get(&e.domain).into_iter().collect();
-        let verified = crate::declaration::delta_publisher(&e.body)
-            .and_then(|domain| {
-                if domain == e.domain {
-                    Ok(())
-                } else {
-                    Err("WIST1-E02")
-                }
-            })
-            .and_then(|()| crate::declaration::verify_delta_authority(&source, &e.body));
-        let code = match verified {
-            Ok(()) => {
-                let sizes = size_caps.validate_delta(&e.body).and_then(|()| {
-                    crate::declaration::verify_delta_clock(&e.body, clock, clock_skew_seconds)
-                });
-                let sizes = match sizes {
-                    Ok(()) if e.body["delta"].get("payload").is_some() => {
-                        let id = wist_core::delta::delta_id(&e.body["delta"])?;
-                        let bytes =
-                            std::fs::read(data_dir.join(format!("payloads/{}.json", &id[7..])))?;
-                        let payload: Value = crate::json::parse(&bytes)?;
-                        let delta: wist_core::objects::Delta =
-                            serde_json::from_slice(&jcs::canonicalize(&e.body["delta"])?)?;
-                        match crate::payload::validate(
-                            &payload,
-                            delta.payload.as_ref().unwrap(),
-                            &delta.publisher,
-                            size_caps,
-                        ) {
-                            Ok(_) => Ok(()),
-                            Err("WIST1-E04") => Err("WIST1-E04"),
-                            Err(code) => {
-                                return Err(Error::Seal(format!(
-                                    "retained Payload {id} failed validation: {code}"
-                                )));
-                            }
-                        }
-                    }
-                    result => result,
-                };
-                match sizes {
-                    Ok(()) => {
-                        kept.push(e);
-                        continue;
-                    }
-                    Err(code) => code,
-                }
-            }
-            Err(code @ ("WIST1-E14" | "WIST1-E03" | "WIST1-E15")) => code,
-            Err(_) => "WIST1-E02",
-        };
-        rejections
-            .entry(e.domain.clone())
-            .or_default()
-            .push((e.body, code));
+        let asserted_at = e.body[e.entry_type.as_str()]["asserted_at"]
+            .as_str()
+            .unwrap_or_default();
+        if wist_core::publisher_time::within_clock_bound(
+            asserted_at,
+            clock.as_second(),
+            clock_skew_seconds,
+        ) == Some(true)
+        {
+            kept.push(e);
+            continue;
+        }
+        let id = if e.entry_type == "label" {
+            wist_core::label::label_id(&e.body["label"])
+        } else {
+            wist_core::label::dispute_id(&e.body["dispute"])
+        }
+        .map_err(|err| Error::Seal(format!("queued Label Entry has no ID: {err:?}")))?;
         dropped_rowids.push(e.rowid);
+        late_labels.push((e.rowid, e.domain, e.entry_type, id));
     }
-    for (domain, rejected) in rejections {
-        dropped.extend(db.reject_delta_copies(&domain, &rejected, sealed_at)?);
-    }
-    dropped.extend(db.reject_label_entries(&late_labels, sealed_at)?);
-    let retained: HashSet<_> = db
-        .peek_pending_entries()?
-        .0
-        .into_iter()
-        .map(|entry| entry.rowid)
-        .collect();
-    kept.retain(|entry| retained.contains(&entry.rowid));
+    let dropped = db.reject_label_entries(&late_labels, sealed_at)?;
     Ok((kept, dropped_rowids, dropped))
 }
 
-/// WIST-4 §5.1: the act must verify under the Log key and name a Delta
-/// sealed at or below this Epoch whose signed publisher is the subject; a
-/// repeated withdrawal seals and changes nothing.
+/// WIST-4 §5.1: the act must verify under the Log key and name an Item
+/// sealed for the subject at or below this Epoch; a repeated withdrawal
+/// seals and changes nothing.
 fn check_withdrawal(
-    db: &Db,
     replay: &mut wist_core::withdrawal::WithdrawalReplay,
     public_key_of: impl Fn(&str) -> Option<wist_core::crypto::PublicKey>,
     body: &Value,
     epoch_number: u64,
-    epoch_deltas: &HashMap<String, String>,
+    sealed: &wist_core::withdrawal::SealedItems,
 ) -> std::result::Result<Option<OwnedWithdrawal>, String> {
-    use wist_core::withdrawal::{Disposition, SealedDelta};
-    let subject = body["update"]["subject"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
-    let lookup = |delta_id: &str| match epoch_deltas.get(delta_id) {
-        Some(publisher) => SealedDelta::Known {
-            publisher: publisher.clone(),
-            height: epoch_number,
-        },
-        None => match db.is_delta_sealed_for(delta_id, &subject) {
-            Ok(true) => SealedDelta::Known {
-                publisher: subject.clone(),
-                height: epoch_number,
-            },
-            _ => SealedDelta::Absent,
-        },
-    };
-    match replay.apply(epoch_number, body, public_key_of, lookup) {
+    use wist_core::withdrawal::Disposition;
+    match replay.apply(epoch_number, body, public_key_of, sealed) {
         Disposition::Accepted {
-            delta_id,
-            publisher,
-            ..
+            item_id, publisher, ..
         } => Ok(Some(OwnedWithdrawal {
             update_id: crate::governance::update_id(&body["update"]).map_err(|e| e.to_string())?,
-            delta_id,
+            item_id,
             domain: publisher,
         })),
+        Disposition::Repeated { .. } => Ok(None),
         Disposition::Rejected(code) => Err(format!(
             "{code} payload_withdrawal {} is not sealed",
             body["update"]["details"]["delta_id"]
                 .as_str()
-                .unwrap_or("without a Delta ID")
+                .unwrap_or("without an Item ID")
         )),
         Disposition::NotWithdrawal => Ok(None),
     }
@@ -799,19 +632,10 @@ pub(super) fn enforce_governance(
         dropped_rowids: Vec::new(),
         key_registry,
     };
-    let epoch_deltas: HashMap<String, String> = entries
-        .iter()
-        .filter(|e| e.entry_type == "publisher_delta")
-        .map(|e| {
-            Ok((
-                wist_core::delta::delta_id(&e.body["delta"])?,
-                e.domain.clone(),
-            ))
-        })
-        .collect::<Result<_>>()?;
+    let sealed_items = crate::governance::sealed_items(db)?;
     let mut replay = wist_core::withdrawal::WithdrawalReplay::new();
-    for (delta_id, domain, height) in db.withdrawal_state()? {
-        replay.adopt(&delta_id, &domain, height);
+    for (item_id, domain, height) in db.withdrawal_state()? {
+        replay.adopt(&item_id, &domain, height);
     }
     let mut suffix_replay = wist_core::suffix_list::SuffixListReplay::new();
     for (height, identifier) in db.suffix_list_acts()? {
@@ -873,12 +697,11 @@ pub(super) fn enforce_governance(
             }
             Some("payload_withdrawal") => {
                 match check_withdrawal(
-                    db,
                     &mut replay,
                     public_key_of,
                     &e.body,
                     epoch_number,
-                    &epoch_deltas,
+                    &sealed_items,
                 ) {
                     Ok(Some(withdrawal)) => {
                         out.withdrawals.push(withdrawal);
@@ -1030,33 +853,6 @@ pub(super) fn hold_out_oversize_entries(
         .partition(|entry| entry.canonical.len() as u64 <= tiles::ENTRY_MAX_BYTES)
 }
 
-pub(super) struct DeltaApply {
-    body: Value,
-    id: String,
-    prev: Option<String>,
-}
-
-pub(super) enum OwnedRecordChange {
-    Upsert {
-        url: String,
-        publisher: String,
-        delta_id: String,
-        observed_at: String,
-        title: String,
-        abstract_text: Option<String>,
-        lang: String,
-    },
-    Attest {
-        url: String,
-        publisher: String,
-        observed_at: String,
-    },
-    Delete {
-        url: String,
-        publisher: String,
-    },
-}
-
 pub(super) fn entry_type_rank(entry_type: &str) -> usize {
     ENTRY_TYPE_ORDER
         .iter()
@@ -1091,102 +887,6 @@ pub(super) fn storage_order(peeked: Vec<PendingEntryRow>) -> Result<Vec<SealEntr
     Ok(entries)
 }
 
-pub(super) fn chain_order(mut remaining: Vec<DeltaApply>) -> Vec<DeltaApply> {
-    let mut ordered = Vec::with_capacity(remaining.len());
-    while !remaining.is_empty() {
-        let ids: HashSet<String> = remaining.iter().map(|d| d.id.clone()).collect();
-        let mut blocked = Vec::with_capacity(remaining.len());
-        let mut progressed = false;
-        for d in remaining {
-            if d.prev.as_deref().is_some_and(|p| ids.contains(p)) {
-                blocked.push(d);
-            } else {
-                progressed = true;
-                ordered.push(d);
-            }
-        }
-        if !progressed {
-            ordered.extend(blocked);
-            break;
-        }
-        remaining = blocked;
-    }
-    ordered
-}
-
-pub(super) fn resolve_record_updates(
-    data_dir: &Path,
-    size_caps: &crate::declaration::delta::SizeCaps,
-    seal_entries: &[SealEntry],
-) -> Result<Vec<OwnedRecordChange>> {
-    let mut deltas = Vec::new();
-    for e in seal_entries {
-        if e.entry_type != "publisher_delta" {
-            continue;
-        }
-        let id = wist_core::delta::delta_id(&e.body["delta"])?;
-        let prev = e.body["delta"]["prev"].as_str().map(str::to_string);
-        deltas.push(DeltaApply {
-            body: e.body.clone(),
-            id,
-            prev,
-        });
-    }
-
-    let mut updates = Vec::new();
-    for d in chain_order(deltas) {
-        let delta: wist_core::objects::Delta =
-            serde_json::from_slice(&jcs::canonicalize(&d.body["delta"])?)?;
-        match delta.change_type {
-            ChangeType::Attest => {
-                updates.push(OwnedRecordChange::Attest {
-                    url: delta.url,
-                    publisher: delta.publisher,
-                    observed_at: delta.observed_at,
-                });
-                continue;
-            }
-            ChangeType::Delete => {
-                updates.push(OwnedRecordChange::Delete {
-                    url: delta.url,
-                    publisher: delta.publisher,
-                });
-                continue;
-            }
-            ChangeType::New | ChangeType::Update => {}
-        }
-        if delta.payload.is_none() {
-            continue;
-        }
-        let hex = d.id.strip_prefix("sha256:").unwrap_or(&d.id);
-        let payload_path = data_dir.join("payloads").join(format!("{hex}.json"));
-        let payload_bytes = std::fs::read(&payload_path)?;
-        let payload_value = crate::json::parse(&payload_bytes)?;
-        let payload = crate::payload::validate(
-            &payload_value,
-            delta.payload.as_ref().unwrap(),
-            &delta.publisher,
-            size_caps,
-        )
-        .map_err(|code| {
-            Error::Seal(format!(
-                "retained Payload {} failed validation: {code}",
-                d.id
-            ))
-        })?;
-        updates.push(OwnedRecordChange::Upsert {
-            url: delta.url,
-            publisher: delta.publisher,
-            delta_id: d.id,
-            observed_at: delta.observed_at,
-            title: payload.content.summary.title,
-            abstract_text: payload.content.summary.r#abstract,
-            lang: delta.meta.lang,
-        });
-    }
-    Ok(updates)
-}
-
 #[cfg(test)]
 mod tests {
     use crate::WIST_VERSION;
@@ -1208,7 +908,6 @@ mod tests {
             0,
             &[],
             &[],
-            &[],
             std::slice::from_ref(&identifier),
             &[],
             &[],
@@ -1216,7 +915,7 @@ mod tests {
         )
         .unwrap();
         for domain in ["a.example.com", "b.example.com", "alice.github.io"] {
-            db.insert_pending_entry("publisher_delta", domain, &serde_json::json!({}), 0)
+            db.insert_pending_entry("label", domain, &serde_json::json!({}), 0)
                 .unwrap();
         }
         let peeked = db.peek_pending_entries().unwrap().0;

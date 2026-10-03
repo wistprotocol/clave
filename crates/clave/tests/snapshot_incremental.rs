@@ -1,11 +1,7 @@
 mod common;
 
 use clave::snapshot::{shard_index, Mode, Outcome, Phase, SHARD_CACHE_DIRECTORY};
-use common::{
-    add_attest, add_delete, add_delta, add_delta_signed, current_declaration, declaration_hash,
-    key_entry, make_publisher_with_scope, serve_static, write_declaration, write_feed,
-    write_feed_signed, TestPub, K1_SEED, K2_SEED,
-};
+use common::{add_label, make_publisher_with_scope, serve_static, write_label_feed, TestPub};
 use serde_json::{json, Value};
 use sha2::Digest;
 use std::collections::BTreeMap;
@@ -72,9 +68,9 @@ impl Log {
         let mut sites = Vec::new();
         for (domain, scope) in [(PRIMARY, "example.com"), (other.as_str(), "example.org")] {
             let publisher = make_publisher_with_scope(domain, &[scope]);
-            let url = format!("https://{scope}/a");
-            let ids = vec![add_delta(&publisher, &url, &format!("body of {url}"), None)];
-            write_feed(&publisher, domain, &ids, "2026-08-09T12:00:00Z");
+            let url = format!("https://subject.example/{scope}/a");
+            let ids = vec![add_label(&publisher, &url, "2026-08-09T11:00:00Z")];
+            write_label_feed(&publisher, domain, &ids, "2026-08-09T12:00:00Z");
             sites.push(Site {
                 publisher,
                 scope,
@@ -155,29 +151,12 @@ impl Log {
     fn publish(&mut self, primary: bool, path: &str) -> String {
         let now = self.now();
         let site = self.site(primary);
-        let url = format!("https://{}/{path}", site.scope);
-        let id = add_delta(&site.publisher, &url, &format!("body of {url}"), None);
+        let url = format!("https://subject.example/{}/{path}", site.scope);
+        let id = add_label(&site.publisher, &url, "2026-08-09T11:00:00Z");
         site.ids.push(id.clone());
-        write_feed(&site.publisher, &site.publisher.domain, &site.ids, &now);
+        write_label_feed(&site.publisher, &site.publisher.domain, &site.ids, &now);
         let domain = site.publisher.domain.clone();
-        assert_eq!(self.ingest(&domain).accepted, vec![id.clone()]);
-        id
-    }
-
-    fn continue_chain(
-        &mut self,
-        primary: bool,
-        prev: &str,
-        delta: fn(&TestPub, &str, &str) -> String,
-    ) -> String {
-        let now = self.now();
-        let site = self.site(primary);
-        let url = format!("https://{}/a", site.scope);
-        let id = delta(&site.publisher, &url, prev);
-        site.ids.push(id.clone());
-        write_feed(&site.publisher, &site.publisher.domain, &site.ids, &now);
-        let domain = site.publisher.domain.clone();
-        assert_eq!(self.ingest(&domain).accepted, vec![id.clone()]);
+        assert_eq!(self.ingest(&domain).labels, vec![id.clone()]);
         id
     }
 
@@ -236,23 +215,6 @@ impl Log {
         ["state.json", "manifest.json"]
             .iter()
             .map(|file| file_size(&self.served_dir().join(file)))
-            .sum()
-    }
-
-    fn tier1_records(&self, shard: u64) -> u64 {
-        table_rows(&self.served_file(shard, "tier1/extracts.parquet")).len() as u64
-    }
-
-    fn payload_bytes(&self, ids: &[String]) -> u64 {
-        ids.iter()
-            .map(|id| {
-                file_size(
-                    &self
-                        .path()
-                        .join("payloads")
-                        .join(format!("{}.json", &id[7..])),
-                )
-            })
             .sum()
     }
 
@@ -416,23 +378,6 @@ fn walk(directory: &Path, found: &mut Vec<PathBuf>) {
     }
 }
 
-fn files_containing(directory: &Path, needle: &str) -> Vec<PathBuf> {
-    let mut found = Vec::new();
-    if directory.exists() {
-        walk(directory, &mut found);
-    }
-    found
-        .into_iter()
-        .filter(|path| {
-            std::fs::read(path).is_ok_and(|bytes| {
-                bytes
-                    .windows(needle.len())
-                    .any(|window| window == needle.as_bytes())
-            })
-        })
-        .collect()
-}
-
 fn cache_bytes(log: &Log) -> BTreeMap<PathBuf, Vec<u8>> {
     let mut found = Vec::new();
     walk(&log.path().join(SHARD_CACHE_DIRECTORY), &mut found);
@@ -462,81 +407,6 @@ fn an_empty_epoch_reuses_every_shard_and_matches_a_full_rebuild() {
     }
     let incremental = log.capture();
     assert_eq!(incremental.manifest["manifest"]["epoch_number"], 1);
-    assert_same_snapshot(&incremental, &log.full_rebuild());
-}
-
-#[test]
-fn a_new_delta_rebuilds_only_its_publishers_shard() {
-    let mut log = built_log(2);
-    let changed = log.shard_of(&log.other_domain());
-    let kept = log.shard_of(PRIMARY);
-    let (kept_before, changed_before) = (log.entry_inodes(kept), log.entry_inodes(changed));
-    log.publish(false, "b");
-    log.seal();
-    assert_eq!(log.produce_built(Mode::Incremental), 1);
-    assert_eq!(log.served_inodes(kept), kept_before);
-    assert_ne!(log.entry_inodes(changed), changed_before);
-    assert_eq!(log.served_inodes(changed), log.entry_inodes(changed));
-    let incremental = log.capture();
-    assert_eq!(
-        incremental.rows[&format!("shard-{changed}/tier0/index.sqlite")].len(),
-        2
-    );
-    assert_same_snapshot(&incremental, &log.full_rebuild());
-}
-
-fn tier0_rows(captured: &Captured, shard: u64) -> &Vec<Vec<String>> {
-    &captured.rows[&format!("shard-{shard}/tier0/index.sqlite")]
-}
-
-#[test]
-fn an_attest_rebuilds_only_its_publishers_shard_and_moves_the_records_freshness() {
-    let mut log = built_log(2);
-    let changed = log.shard_of(&log.other_domain());
-    let kept = log.shard_of(PRIMARY);
-    let (kept_before, changed_before) = (log.entry_inodes(kept), log.entry_inodes(changed));
-    let anchor = log.other.ids[0].clone();
-    let before = log.capture();
-    log.continue_chain(false, &anchor, add_attest);
-    log.seal();
-    assert_eq!(log.produce_built(Mode::Incremental), 1);
-    assert_eq!(log.served_inodes(kept), kept_before);
-    assert_ne!(log.entry_inodes(changed), changed_before);
-    let incremental = log.capture();
-    let (row_before, row_after) = (
-        &tier0_rows(&before, changed)[0],
-        &tier0_rows(&incremental, changed)[0],
-    );
-    assert_eq!(tier0_rows(&incremental, changed).len(), 1);
-    assert_eq!(row_after[0], row_before[0], "the URL");
-    assert_eq!(row_after[2], anchor, "the anchor Delta stays");
-    assert_ne!(
-        row_after[3], row_before[3],
-        "observed_at moves to the attest's"
-    );
-    assert_ne!(
-        incremental.manifest["manifest"]["content_digest"],
-        before.manifest["manifest"]["content_digest"]
-    );
-    assert_same_snapshot(&incremental, &log.full_rebuild());
-}
-
-#[test]
-fn a_delete_rebuilds_only_its_publishers_shard_and_excludes_the_record() {
-    let mut log = built_log(2);
-    let changed = log.shard_of(&log.other_domain());
-    let kept = log.shard_of(PRIMARY);
-    let (kept_before, changed_before) = (log.entry_inodes(kept), log.entry_inodes(changed));
-    let anchor = log.other.ids[0].clone();
-    log.continue_chain(false, &anchor, add_delete);
-    log.seal();
-    assert_eq!(log.produce_built(Mode::Incremental), 1);
-    assert_eq!(log.served_inodes(kept), kept_before);
-    assert_ne!(log.entry_inodes(changed), changed_before);
-    let incremental = log.capture();
-    assert!(tier0_rows(&incremental, changed).is_empty());
-    assert_eq!(log.tier1_records(changed), 0);
-    assert_eq!(tier0_rows(&incremental, kept).len(), 1);
     assert_same_snapshot(&incremental, &log.full_rebuild());
 }
 
@@ -589,55 +459,11 @@ fn a_sealed_label_rebuilds_only_its_labelers_shard() {
     let incremental = log.capture();
     assert_eq!(
         incremental.rows[&format!("shard-{changed}/tier1/labels.parquet")].len(),
-        1
+        2
     );
     assert_eq!(
         incremental.rows[&format!("shard-{changed}/tier1/labelers.parquet")].len(),
         1
-    );
-    assert_same_snapshot(&incremental, &log.full_rebuild());
-}
-
-#[test]
-fn a_declaration_key_rotation_rebuilds_its_shard_and_matches_a_full_rebuild() {
-    let mut log = built_log(2);
-    let changed = log.shard_of(PRIMARY);
-    let kept = log.shard_of(&log.other_domain());
-    let kept_before = log.entry_inodes(kept);
-    let previous = current_declaration(&log.primary.publisher);
-    let mut rotated = previous["publisher"].clone();
-    rotated["seq"] = 1.into();
-    rotated["prev_declaration"] = declaration_hash(&previous).into();
-    rotated["keys"] = json!([
-        key_entry(&K1_SEED, "2026-08-09T00:00:00Z"),
-        key_entry(&K2_SEED, "2026-08-09T00:00:00Z")
-    ]);
-    write_declaration(&log.primary.publisher, &rotated, &K1_SEED);
-    let now = log.now();
-    let id = add_delta_signed(
-        &log.primary.publisher,
-        "https://example.com/rotated",
-        "body under the rotated key",
-        None,
-        &now,
-        &K2_SEED,
-    );
-    log.primary.ids.push(id.clone());
-    write_feed_signed(
-        &log.primary.publisher,
-        PRIMARY,
-        &log.primary.ids,
-        &now,
-        &K2_SEED,
-    );
-    assert_eq!(log.ingest(PRIMARY).accepted, vec![id]);
-    log.seal();
-    assert_eq!(log.produce_built(Mode::Incremental), 1);
-    assert_eq!(log.served_inodes(kept), kept_before);
-    let incremental = log.capture();
-    assert_eq!(
-        incremental.rows[&format!("shard-{changed}/tier0/index.sqlite")].len(),
-        2
     );
     assert_same_snapshot(&incremental, &log.full_rebuild());
 }
@@ -659,59 +485,6 @@ fn an_aggregator_key_addition_reuses_every_shard_and_changes_only_the_state() {
         before.manifest["manifest"]["state"]["state_digest"]
     );
     assert_eq!(incremental.files, before.files);
-    assert_same_snapshot(&incremental, &log.full_rebuild());
-}
-
-#[test]
-fn a_withdrawal_removes_its_shards_cache_entry_and_the_next_build_rebuilds_only_it() {
-    let mut log = built_log(2);
-    let changed = log.shard_of(PRIMARY);
-    let kept = log.shard_of(&log.other_domain());
-    let kept_before = log.entry_inodes(kept);
-    let doomed = log.primary.ids[0].clone();
-    let content = "body of https://example.com/a";
-    assert!(!files_containing(&log.cache_entry(changed), content).is_empty());
-
-    let (_, signer) = clave::keys::head_signer(log.path(), &log.db).unwrap();
-    clave::governance::withdraw(
-        &log.db,
-        &signer,
-        PRIMARY,
-        &doomed,
-        "court order",
-        "DE",
-        SEAL_START + 60,
-    )
-    .unwrap();
-    log.seal();
-
-    assert!(!log.path().join("snapshots").join(DATE).exists());
-    assert!(!log.cache_entry(changed).exists());
-    assert_eq!(log.entry_inodes(kept), kept_before);
-    let outside_the_store: Vec<PathBuf> = files_containing(log.path(), content)
-        .into_iter()
-        .filter(|path| {
-            !path
-                .file_name()
-                .is_some_and(|name| name.to_string_lossy().starts_with("clave.sqlite"))
-        })
-        .collect();
-    assert_eq!(outside_the_store, Vec::<PathBuf>::new());
-    for tree in [
-        "snapshots",
-        clave::snapshot::STAGING_DIRECTORY,
-        SHARD_CACHE_DIRECTORY,
-    ] {
-        assert_eq!(
-            files_containing(&log.path().join(tree), &doomed),
-            Vec::<PathBuf>::new()
-        );
-    }
-
-    assert_eq!(log.produce_built(Mode::Incremental), 1);
-    assert_eq!(log.served_inodes(kept), kept_before);
-    let incremental = log.capture();
-    assert!(incremental.rows[&format!("shard-{changed}/tier0/index.sqlite")].is_empty());
     assert_same_snapshot(&incremental, &log.full_rebuild());
 }
 
@@ -866,52 +639,4 @@ fn an_empty_epoch_build_reads_no_payloads_and_writes_only_state_and_manifest() {
             payload_bytes_read: 0,
         }
     );
-}
-
-#[test]
-fn a_new_delta_build_reads_the_payloads_of_its_rebuilt_shard_only() {
-    let mut log = built_log(2);
-    let changed = log.shard_of(&log.other_domain());
-    let kept = log.shard_of(PRIMARY);
-    log.publish(false, "b");
-    log.seal();
-    let cost = log.produce_cost(Mode::Incremental);
-    assert_eq!(log.tier1_records(changed), 2);
-    assert_eq!(
-        cost,
-        Cost {
-            bytes_written: log.served_shard_bytes(changed) + log.served_top_level_bytes(),
-            bytes_reused: log.served_shard_bytes(kept),
-            cache_bytes_written: 0,
-            payloads_read: log.tier1_records(changed),
-            payload_bytes_read: log.payload_bytes(&log.other.ids),
-        }
-    );
-}
-
-#[test]
-fn a_full_build_reuses_nothing_and_reads_every_payload() {
-    let mut log = built_log(2);
-    log.seal();
-    let cost = log.produce_cost(Mode::Full);
-    let ids: Vec<String> = log
-        .primary
-        .ids
-        .iter()
-        .chain(&log.other.ids)
-        .cloned()
-        .collect();
-    assert_eq!(
-        cost,
-        Cost {
-            bytes_written: log.served_shard_bytes(0)
-                + log.served_shard_bytes(1)
-                + log.served_top_level_bytes(),
-            bytes_reused: 0,
-            cache_bytes_written: 0,
-            payloads_read: log.tier1_records(0) + log.tier1_records(1),
-            payload_bytes_read: log.payload_bytes(&ids),
-        }
-    );
-    assert_eq!(cost.payloads_read, 2);
 }

@@ -46,7 +46,6 @@ fn seal_sizes(db: &Db, height: u64, sealed_at: &str, changes: &[ParamChangeRow],
         sealed_at,
         &[],
         octets,
-        &[],
         changes,
         &[],
         &[],
@@ -224,8 +223,8 @@ fn prospective_vectors_filter_rejected_history_and_preserve_every_future_map() {
 fn queued_conflicts_use_canonical_entry_order_for_admission_and_sealing() {
     let (data, db, sk) = setup();
     let mut candidates = [
-        envelope(&sk, "link_url_cap_bytes", 4000, NOW + 10 * DAY),
-        envelope(&sk, "links_cap_bytes", 4000, NOW + 10 * DAY),
+        envelope(&sk, "payload_window_days", 540, NOW + 10 * DAY),
+        envelope(&sk, "mirror_retention_days", 30, NOW + 10 * DAY),
     ];
     candidates.sort_by_key(|body| {
         wist_core::merkle::leaf_hash(

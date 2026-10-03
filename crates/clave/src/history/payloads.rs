@@ -1,15 +1,16 @@
-use super::deltas::DeltaSource;
-use crate::db::EpochRow;
-use crate::declaration::delta::SizeCaps;
 use crate::error::{Error, Result};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
-use wist_core::objects::{DeltaPayloadCommitment, Payload};
+use wist_core::item::SizeCaps;
+use wist_core::objects::{PageItem, Payload};
 
 #[derive(Clone)]
 pub struct PayloadSource {
-    delta: DeltaSource,
-    commitment: DeltaPayloadCommitment,
+    item: Value,
+    page: PageItem,
+    name: String,
+    epoch_number: u64,
+    size_caps: SizeCaps,
 }
 
 pub struct RetrievedPayload<'a> {
@@ -69,48 +70,33 @@ impl PayloadLocations {
 }
 
 impl PayloadSource {
-    pub fn reconstruct(
-        db: &crate::db::Db,
-        directory: &Path,
-        head: Option<EpochRow>,
-        delta_id: &str,
-    ) -> Result<Self> {
-        let delta = DeltaSource::reconstruct(db, directory, head, delta_id)?;
-        Self::from_delta(delta)
+    pub fn from_item(item: Value, epoch_number: u64, size_caps: SizeCaps) -> Result<Self> {
+        let page: PageItem = serde_json::from_slice(&wist_core::jcs::canonicalize(&item)?)
+            .map_err(|_| failure("the sealed Item is not of kind page"))?;
+        let name = wist_core::item::payload_name(&item)?;
+        Ok(Self {
+            item,
+            page,
+            name,
+            epoch_number,
+            size_caps,
+        })
     }
 
-    pub(crate) fn from_delta(delta: DeltaSource) -> Result<Self> {
-        let commitment = delta.envelope()["delta"]
-            .get("payload")
-            .ok_or_else(|| failure("requested Delta has no Payload commitment"))?;
-        let commitment = serde_json::from_slice(&wist_core::jcs::canonicalize(commitment)?)?;
-        Ok(Self { delta, commitment })
-    }
-
-    pub fn delta_source(&self) -> &DeltaSource {
-        &self.delta
-    }
-
-    pub fn envelope(&self) -> &Value {
-        self.delta.envelope()
+    pub fn item(&self) -> &Value {
+        &self.item
     }
 
     pub fn epoch_number(&self) -> u64 {
-        self.delta.position().epoch_number
+        self.epoch_number
     }
 
     pub fn size_caps(&self) -> &SizeCaps {
-        self.delta.size_caps()
+        &self.size_caps
     }
 
     pub fn validate(&self, raw: &[u8]) -> std::result::Result<Payload, &'static str> {
-        let payload = crate::json::parse(raw).map_err(|_| "WIST1-E05")?;
-        crate::payload::validate(
-            &payload,
-            &self.commitment,
-            self.envelope()["delta"]["publisher"].as_str().unwrap(),
-            self.size_caps(),
-        )
+        crate::payload::judge(&self.page, raw, &self.size_caps)
     }
 
     pub fn read(&self, directory: &Path) -> Result<RetrievedPayload<'_>> {
@@ -151,7 +137,7 @@ impl PayloadSource {
     }
 
     pub fn publisher_location(&self, client: &crate::fetch::Client) -> PayloadLocation {
-        let publisher = self.envelope()["delta"]["publisher"].as_str().unwrap();
+        let publisher = self.page.publisher.as_str();
         let scheme = crate::fetch::scheme_for_host(publisher, client.allow_http());
         PayloadLocation::Url(format!(
             "{scheme}://{publisher}/.well-known/wist/{}",
@@ -254,7 +240,7 @@ impl PayloadSource {
     }
 
     fn relative_path(&self) -> String {
-        format!("payloads/{}.json", &self.delta.id()[7..])
+        format!("payloads/{}.json", self.name)
     }
 
     fn checked(&self, raw: Vec<u8>, location: PayloadLocation) -> Result<RetrievedPayload<'_>> {

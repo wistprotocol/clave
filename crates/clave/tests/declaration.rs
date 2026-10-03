@@ -82,7 +82,7 @@ fn base() -> Value {
 fn unchanged_when_same_seq_and_content() {
     let stored = base();
     assert_eq!(
-        evaluate(&stored, &stored.clone()).unwrap(),
+        evaluate(&stored, &stored.clone(), &Default::default()).unwrap(),
         Decision::Unchanged
     );
 }
@@ -97,7 +97,7 @@ fn same_seq_different_content_is_rejected() {
         Some(vec![key_json(&R1, "2026-08-01T00:00:00Z")]),
         &K1,
     );
-    assert!(evaluate(&stored, &mutated).is_err());
+    assert!(evaluate(&stored, &mutated, &Default::default()).is_err());
 }
 
 #[test]
@@ -116,7 +116,7 @@ fn lower_seq_is_rejected() {
         None,
         &K1,
     );
-    assert!(evaluate(&stored, &stale).is_err());
+    assert!(evaluate(&stored, &stale, &Default::default()).is_err());
 }
 
 #[test]
@@ -132,7 +132,7 @@ fn prev_declaration_mismatch_is_rejected() {
         Some(vec![key_json(&R1, "2026-08-01T00:00:00Z")]),
         &K1,
     );
-    assert!(evaluate(&stored, &next).is_err());
+    assert!(evaluate(&stored, &next, &Default::default()).is_err());
 }
 
 #[test]
@@ -148,7 +148,10 @@ fn ordinary_rotation_signed_by_stored_key() {
         Some(vec![key_json(&R1, "2026-08-01T00:00:00Z")]),
         &K1,
     );
-    assert_eq!(evaluate(&stored, &next).unwrap(), Decision::Ordinary);
+    assert_eq!(
+        evaluate(&stored, &next, &Default::default()).unwrap(),
+        Decision::Ordinary
+    );
 }
 
 #[test]
@@ -162,7 +165,7 @@ fn signature_not_verifying_under_the_named_entry_is_rejected() {
         &K2,
     );
     next["sig"]["key_id"] = kid(&K1).into();
-    assert!(evaluate(&stored, &next).is_err());
+    assert!(evaluate(&stored, &next, &Default::default()).is_err());
 }
 
 #[test]
@@ -175,7 +178,10 @@ fn recovery_rotation_signed_by_stored_recovery_key() {
         Some(vec![key_json(&R1, "2026-08-01T00:00:00Z")]),
         &R1,
     );
-    assert_eq!(evaluate(&stored, &next).unwrap(), Decision::Recovery);
+    assert_eq!(
+        evaluate(&stored, &next, &Default::default()).unwrap(),
+        Decision::Recovery
+    );
 }
 
 #[test]
@@ -188,7 +194,10 @@ fn recovery_signed_declaration_may_replace_recovery_keys() {
         Some(vec![key_json(&X1, "2026-08-10T00:00:00Z")]),
         &R1,
     );
-    assert_eq!(evaluate(&stored, &next).unwrap(), Decision::Recovery);
+    assert_eq!(
+        evaluate(&stored, &next, &Default::default()).unwrap(),
+        Decision::Recovery
+    );
 }
 
 #[test]
@@ -207,7 +216,10 @@ fn fresh_identity_signed_by_own_new_key() {
         None,
         &X1,
     );
-    assert_eq!(evaluate(&stored, &next).unwrap(), Decision::FreshIdentity);
+    assert_eq!(
+        evaluate(&stored, &next, &Default::default()).unwrap(),
+        Decision::FreshIdentity
+    );
 }
 
 #[test]
@@ -220,7 +232,7 @@ fn unknown_signer_is_rejected() {
         Some(vec![key_json(&R1, "2026-08-01T00:00:00Z")]),
         &X1,
     );
-    assert!(evaluate(&stored, &next).is_err());
+    assert!(evaluate(&stored, &next, &Default::default()).is_err());
 }
 
 #[test]
@@ -233,7 +245,7 @@ fn altering_recovery_keys_without_recovery_signature_is_rejected() {
         Some(vec![key_json(&X1, "2026-08-10T00:00:00Z")]),
         &K1,
     );
-    assert!(evaluate(&stored, &next).is_err());
+    assert!(evaluate(&stored, &next, &Default::default()).is_err());
 }
 
 #[test]
@@ -246,7 +258,7 @@ fn dropping_recovery_keys_without_recovery_signature_is_rejected() {
         None,
         &K1,
     );
-    assert!(evaluate(&stored, &next).is_err());
+    assert!(evaluate(&stored, &next, &Default::default()).is_err());
 }
 
 #[test]
@@ -265,7 +277,10 @@ fn establishing_recovery_keys_with_ordinary_signature_is_allowed() {
         Some(vec![key_json(&R1, "2026-08-10T00:00:00Z")]),
         &K1,
     );
-    assert_eq!(evaluate(&stored, &next).unwrap(), Decision::Ordinary);
+    assert_eq!(
+        evaluate(&stored, &next, &Default::default()).unwrap(),
+        Decision::Ordinary
+    );
 }
 
 #[test]
@@ -278,7 +293,7 @@ fn fresh_identity_must_carry_recovery_keys_byte_identical() {
         None,
         &X1,
     );
-    assert!(evaluate(&stored, &next).is_err());
+    assert!(evaluate(&stored, &next, &Default::default()).is_err());
 }
 
 #[test]
@@ -298,7 +313,7 @@ fn fresh_identity_is_accepted_and_left_to_the_windows_settlement() {
         &X1,
     );
     assert_eq!(
-        evaluate(&stored, &thief).unwrap(),
+        evaluate(&stored, &thief, &Default::default()).unwrap(),
         Decision::FreshIdentity,
         "an open window does not change acceptance; supersession happens at its end"
     );
@@ -316,7 +331,7 @@ fn domain_change_is_rejected() {
         wist_core::envelope::sign_envelope(&publisher, "publisher", &kid(&K1), &sk).unwrap(),
     )
     .unwrap();
-    assert!(evaluate(&stored, &next).is_err());
+    assert!(evaluate(&stored, &next, &Default::default()).is_err());
 }
 
 #[test]
@@ -327,7 +342,7 @@ fn spec_declaration_sequence_vector() {
     assert!(!cases.is_empty());
     for case in cases {
         let name = case["name"].as_str().unwrap();
-        let got = evaluate(&case["stored"], &case["fetched"]);
+        let got = evaluate(&case["stored"], &case["fetched"], &Default::default());
         match case["expected"].as_str().unwrap() {
             "idempotent" => assert_eq!(got.as_ref().ok(), Some(&Decision::Unchanged), "{name}"),
             "ordinary_rotation" => {
@@ -353,13 +368,16 @@ fn spec_declaration_binding_vectors() {
     .unwrap();
     for case in vector["cases"].as_array().unwrap() {
         let result = if case["stored"].is_null() {
-            clave::declaration::evaluate_initial(&case["fetched"]).map(|_| "initial")
+            clave::declaration::evaluate_initial(&case["fetched"], &Default::default())
+                .map(|_| "initial")
         } else {
-            evaluate(&case["stored"], &case["fetched"]).map(|decision| match decision {
-                Decision::Ordinary => "ordinary_rotation",
-                Decision::Recovery => "recovery_rotation",
-                Decision::FreshIdentity => "fresh_identity",
-                Decision::Unchanged => "idempotent",
+            evaluate(&case["stored"], &case["fetched"], &Default::default()).map(|decision| {
+                match decision {
+                    Decision::Ordinary => "ordinary_rotation",
+                    Decision::Recovery => "recovery_rotation",
+                    Decision::FreshIdentity => "fresh_identity",
+                    Decision::Unchanged => "idempotent",
+                }
             })
         };
         let outcome = result.unwrap_or_else(|(code, _)| code);
@@ -383,13 +401,16 @@ fn spec_canonical_encoding_and_usable_key_vectors() {
             let fetched = case.get("fetched").unwrap_or(&case["envelope"]);
             let before = fetched.clone();
             let result = if case["stored"].is_null() {
-                clave::declaration::evaluate_initial(fetched).map(|_| "initial")
+                clave::declaration::evaluate_initial(fetched, &Default::default())
+                    .map(|_| "initial")
             } else {
-                evaluate(&case["stored"], fetched).map(|decision| match decision {
-                    Decision::Ordinary => "ordinary_rotation",
-                    Decision::Recovery => "recovery_rotation",
-                    Decision::FreshIdentity => "fresh_identity",
-                    Decision::Unchanged => "idempotent",
+                evaluate(&case["stored"], fetched, &Default::default()).map(|decision| {
+                    match decision {
+                        Decision::Ordinary => "ordinary_rotation",
+                        Decision::Recovery => "recovery_rotation",
+                        Decision::FreshIdentity => "fresh_identity",
+                        Decision::Unchanged => "idempotent",
+                    }
                 })
             };
             assert_eq!(
@@ -399,7 +420,11 @@ fn spec_canonical_encoding_and_usable_key_vectors() {
                 case["name"]
             );
             if let Some(expected) = case.get("expected_usable") {
-                let publisher = clave::declaration::publisher_of(fetched).unwrap();
+                let publisher = serde_json::from_value::<wist_core::objects::PublisherEnvelope>(
+                    fetched.clone(),
+                )
+                .unwrap()
+                .publisher;
                 for (field, keys) in [
                     ("keys", publisher.keys.as_slice()),
                     (
@@ -429,23 +454,22 @@ fn signed_objects_exclude_unusable_keys_before_signature_verification() {
     )
     .unwrap();
     for case in vector["cases"].as_array().unwrap() {
-        let publisher = clave::declaration::publisher_of(&case["fetched"]).unwrap();
+        let publisher = serde_json::from_value::<wist_core::objects::PublisherEnvelope>(
+            case["fetched"].clone(),
+        )
+        .unwrap()
+        .publisher;
         for key in &publisher.keys {
             if !clave::declaration::usable_keys(std::slice::from_ref(key)).any(|_| true) {
                 let doc = wist_core::envelope::sign_envelope(
-                    &json!({"wist_version":"1.0.0", "publisher":publisher.domain, "url":"https://example.com/a", "change_type":"delete", "prev":format!("sha256:{}", "0".repeat(64)), "meta":{"lang":"en"}, "observed_at":"2026-08-04T12:00:00Z"}),
-                    "delta",
+                    &json!({"wist_version":"1.0.0", "domain":publisher.domain, "generated_at":"2026-08-04T12:00:00Z", "deltas":[], "next":null}),
+                    "feed",
                     &key.kid,
                     &SigningKey::from_seed(&K1),
                 )
                 .unwrap();
                 assert_eq!(
-                    clave::declaration::verify_signed(
-                        &[key],
-                        &doc,
-                        "delta",
-                        Some("2026-08-04T12:00:00Z")
-                    ),
+                    clave::declaration::verify_signed(&[key], &doc, "feed"),
                     Err("WIST1-E02"),
                     "{}",
                     case["name"]
@@ -480,7 +504,7 @@ fn every_key_and_signature_encoding_boundary_is_checked_before_authentication() 
                     entry["kid"] = wist_core::objects::publisher::thumbprint(&x).into();
                 }
             }
-            let result = clave::declaration::validate_fields(&candidate)
+            let result = clave::declaration::validate_fields(&candidate, None)
                 .map(|_| "well_formed")
                 .unwrap_or_else(|(code, _)| code);
             assert_eq!(
@@ -524,111 +548,6 @@ fn recovery_chain_membership_uses_authenticated_public_key() {
 }
 
 #[test]
-fn signed_delta_key_bound_orders_publisher_instants_exactly() {
-    let sk = SigningKey::from_seed(&K1);
-    let cases = [
-        ("2026-08-04T10:00:00Z", None, "2026-08-04T10:00:00.5Z", true),
-        (
-            "2026-08-04T10:00:00Z",
-            None,
-            "2026-08-04T09:59:59.999999999999999999999Z",
-            false,
-        ),
-        (
-            "2026-08-04T10:00:00Z",
-            None,
-            "2026-08-04T10:00:00.0000Z",
-            true,
-        ),
-        (
-            "2026-08-04T10:00:00Z",
-            None,
-            "2026-08-04T11:00:00+01:00",
-            true,
-        ),
-        (
-            "2026-08-04T10:00:00Z",
-            None,
-            "2026-08-04T10:30:00+01:00",
-            false,
-        ),
-        (
-            "2026-08-04T10:00:00Z",
-            None,
-            "2026-08-04T09:30:00-01:00",
-            true,
-        ),
-        ("2026-08-04T10:00:00Z", None, "2026-08-04t10:00:00z", true),
-        (
-            "2026-08-04T10:00:00Z",
-            None,
-            "2026-08-04T10:00:00-00:00",
-            true,
-        ),
-        (
-            "2026-08-04T00:00:00Z",
-            None,
-            "2026-08-03T23:59:59-00:01",
-            true,
-        ),
-        ("2000-02-29T23:59:59Z", None, "2000-03-01T00:00:00Z", true),
-        (
-            "1970-01-01T00:00:00Z",
-            None,
-            "0000-01-01T00:00:00+23:59",
-            false,
-        ),
-        ("1970-01-01T00:00:00Z", None, "1970-01-01T00:00:00Z", true),
-        (
-            "9999-12-31T23:59:59Z",
-            None,
-            "9999-12-31T23:59:59-23:59",
-            true,
-        ),
-        (
-            "2026-08-04T10:00:00Z",
-            Some("2026-08-04T11:00:00Z"),
-            "2026-08-04T10:59:59.999999999999999999999Z",
-            true,
-        ),
-        (
-            "2026-08-04T10:00:00Z",
-            Some("2026-08-04T11:00:00Z"),
-            "2026-08-04T11:00:00Z",
-            false,
-        ),
-        (
-            "2026-08-04T10:00:00Z",
-            Some("2026-08-04T11:00:00Z"),
-            "2026-08-04T12:00:00+01:00",
-            false,
-        ),
-    ];
-    for (not_before, expires, observed_at, eligible) in cases {
-        let key = wist_core::objects::PublisherKey::new(
-            &public_of(&K1),
-            nbf(not_before),
-            expires.map(nbf),
-        );
-        let delta = json!({"wist_version":"1.0.0", "publisher":"example.com", "url":"https://example.com/a", "change_type":"delete", "observed_at":observed_at, "prev":format!("sha256:{}", "0".repeat(64)), "meta":{"lang":"en"}});
-        let signed = wist_core::envelope::sign_envelope(&delta, "delta", &kid(&K1), &sk).unwrap();
-        assert_eq!(
-            clave::declaration::verify_signed(&[&key], &signed, "delta", Some(observed_at)),
-            if eligible { Ok(()) } else { Err("WIST1-E02") },
-            "nbf={not_before}, exp={expires:?}, observed_at={observed_at}"
-        );
-        if eligible {
-            let mut tampered = signed;
-            tampered["delta"]["url"] = "https://example.com/b".into();
-            assert_eq!(
-                clave::declaration::verify_signed(&[&key], &tampered, "delta", Some(observed_at)),
-                Err("WIST1-E01")
-            );
-        }
-    }
-}
-
-#[test]
 fn complete_signed_declaration_fields_match_the_specification_vectors() {
     for name in ["declaration-fields", "declaration-hosts"] {
         let vector: Value = serde_json::from_slice(
@@ -639,13 +558,16 @@ fn complete_signed_declaration_fields_match_the_specification_vectors() {
             let incoming = &case["envelope"];
             let original = incoming.clone();
             let result = if name == "declaration-hosts" {
-                clave::declaration::evaluate_initial(incoming).map(|_| "initial")
+                clave::declaration::evaluate_initial(incoming, &Default::default())
+                    .map(|_| "initial")
             } else {
-                evaluate(&vector["stored"], incoming).map(|decision| match decision {
-                    Decision::Ordinary => "ordinary_rotation",
-                    Decision::Recovery => "recovery_rotation",
-                    Decision::FreshIdentity => "fresh_identity",
-                    Decision::Unchanged => "idempotent",
+                evaluate(&vector["stored"], incoming, &Default::default()).map(|decision| {
+                    match decision {
+                        Decision::Ordinary => "ordinary_rotation",
+                        Decision::Recovery => "recovery_rotation",
+                        Decision::FreshIdentity => "fresh_identity",
+                        Decision::Unchanged => "idempotent",
+                    }
                 })
             };
             assert_eq!(
@@ -656,53 +578,6 @@ fn complete_signed_declaration_fields_match_the_specification_vectors() {
             );
             assert_eq!(*incoming, original);
         }
-    }
-}
-
-#[test]
-fn signed_timestamp_eligibility_and_key_bounds_match_the_specification_vectors() {
-    let vector: Value = serde_json::from_slice(
-        &std::fs::read(common::spec_dir().join("vectors/wist1/declaration-fields.json")).unwrap(),
-    )
-    .unwrap();
-    let publisher = clave::declaration::publisher_of(&vector["stored"]).unwrap();
-    let keys: Vec<_> = publisher.keys.iter().collect();
-    for case in vector["delta_cases"].as_array().unwrap() {
-        let doc = &case["envelope"];
-        let result = clave::declaration::verify_signed(
-            &keys,
-            doc,
-            "delta",
-            doc["delta"]["observed_at"].as_str(),
-        );
-        assert_eq!(
-            result == Err("WIST1-E14"),
-            case["expected"] == "WIST1-E14",
-            "{}: {result:?}",
-            case["name"]
-        );
-    }
-    for case in vector["key_time_cases"].as_array().unwrap() {
-        let result = clave::declaration::evaluate_initial(&case["declaration"])
-            .map_err(|(code, _)| code)
-            .and_then(|publisher| {
-                let keys: Vec<_> = publisher.keys.iter().collect();
-                let doc = &case["envelope"];
-                clave::declaration::verify_signed(
-                    &keys,
-                    doc,
-                    "delta",
-                    doc["delta"]["observed_at"].as_str(),
-                )
-            });
-        assert_eq!(
-            result
-                .map(|_| "key_bound_satisfied")
-                .unwrap_or_else(|code| code),
-            case["expected"].as_str().unwrap(),
-            "{}",
-            case["name"]
-        );
     }
 }
 
@@ -723,7 +598,9 @@ fn declaration_numeric_spellings_and_unicode_string_bounds_preserve_signed_bytes
         let doc = wist_core::envelope::sign_envelope(&inner, "publisher", &kid(&K1), &sk).unwrap();
         let before = doc.clone();
         assert_eq!(
-            clave::declaration::evaluate_initial(&doc).unwrap().seq,
+            clave::declaration::evaluate_initial(&doc, &Default::default())
+                .unwrap()
+                .seq,
             0,
             "{literal}"
         );
@@ -741,7 +618,9 @@ fn declaration_numeric_spellings_and_unicode_string_bounds_preserve_signed_bytes
         inner["wist_version"] = version.into();
         let doc = wist_core::envelope::sign_envelope(&inner, "publisher", &kid(&K1), &sk).unwrap();
         assert_eq!(
-            clave::declaration::evaluate_initial(&doc).unwrap_err().0,
+            clave::declaration::evaluate_initial(&doc, &Default::default())
+                .unwrap_err()
+                .0,
             "WIST1-E14",
             "{version:?}"
         );

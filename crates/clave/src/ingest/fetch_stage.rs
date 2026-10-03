@@ -2,23 +2,14 @@ use crate::error::Error;
 use crate::fetch::Client;
 use serde_json::Value;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum Attempt {
-    Periodic,
-    Feed,
-    Delta(String),
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Walk {
-    Feed,
     Label,
 }
 
 impl Walk {
     pub fn as_str(self) -> &'static str {
         match self {
-            Walk::Feed => "feed",
             Walk::Label => "label",
         }
     }
@@ -26,46 +17,30 @@ impl Walk {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum ObjectKey {
-    Declaration { attempt: Attempt },
+    Declaration,
     Page { feed: Walk, index: u32 },
-    Delta { id: String },
-    Payload { delta_id: String },
     Label { id: String },
 }
 
 impl ObjectKey {
     pub fn kind(&self) -> &'static str {
         match self {
-            ObjectKey::Declaration { .. } => "declaration",
+            ObjectKey::Declaration => "declaration",
             ObjectKey::Page { .. } => "page",
-            ObjectKey::Delta { .. } => "delta",
-            ObjectKey::Payload { .. } => "payload",
             ObjectKey::Label { .. } => "label",
         }
     }
 
     pub fn name(&self) -> String {
         match self {
-            ObjectKey::Declaration {
-                attempt: Attempt::Periodic,
-            } => "periodic".into(),
-            ObjectKey::Declaration {
-                attempt: Attempt::Feed,
-            } => "feed".into(),
-            ObjectKey::Declaration {
-                attempt: Attempt::Delta(id),
-            } => format!("delta:{id}"),
+            ObjectKey::Declaration => "periodic".into(),
             ObjectKey::Page { feed, index } => format!("{}:{index}", feed.as_str()),
-            ObjectKey::Delta { id } | ObjectKey::Label { id } => id.clone(),
-            ObjectKey::Payload { delta_id } => delta_id.clone(),
+            ObjectKey::Label { id } => id.clone(),
         }
     }
 
     pub fn per_attempt(&self) -> bool {
-        matches!(
-            self,
-            ObjectKey::Delta { .. } | ObjectKey::Payload { .. } | ObjectKey::Label { .. }
-        )
+        matches!(self, ObjectKey::Label { .. })
     }
 }
 

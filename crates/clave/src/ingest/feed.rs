@@ -33,7 +33,7 @@ pub(super) fn validate_fields(doc: &Value) -> Result<FeedEnvelope, &'static str>
             }) || !ids.insert(id)
         })
     {
-        return Err("Feed Delta IDs are invalid, repeated or exceed 1000 entries");
+        return Err("Feed IDs are invalid, repeated or exceed 1000 entries");
     }
     if feed
         .next

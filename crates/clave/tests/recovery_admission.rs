@@ -58,7 +58,6 @@ fn append(db: &Db, path: &std::path::Path, sk: &wist_core::crypto::SigningKey, d
         &[],
         &[],
         &[],
-        &[],
     )
     .unwrap();
     clave::publication::recover(db, path).unwrap();
@@ -170,6 +169,7 @@ fn signed_pending_declaration_settlement_vectors_survive_reopen_and_repeat() {
                     .unwrap()
                     .unwrap(),
                 doc,
+                &Default::default(),
             );
             let outcome = match result {
                 Ok(Decision::FreshIdentity) => {
@@ -216,6 +216,7 @@ fn signed_pending_declaration_settlement_vectors_survive_reopen_and_repeat() {
                 vector["declaration_activation_epochs"]
                     .as_i64()
                     .unwrap_or(24),
+                &Default::default(),
                 &entries,
             )
             .unwrap();

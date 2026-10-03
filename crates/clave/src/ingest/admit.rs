@@ -3,9 +3,9 @@ use crate::declaration::{self, Decision};
 use crate::error::Result;
 use serde_json::Value;
 use std::path::Path;
-use wist_core::objects::{DeltaEnvelope, FeedEnvelope, Publisher, PublisherEnvelope};
+use wist_core::objects::{FeedEnvelope, Publisher, PublisherEnvelope};
 
-use super::fetch_stage::{Attempt, ObjectKey, Walk};
+use super::fetch_stage::{ObjectKey, Walk};
 use super::verify::{DeclarationRef, IssuedRefs, LabelKind};
 use super::IngestReport;
 
@@ -23,7 +23,6 @@ pub(super) fn reject(
 pub(super) fn unseen(db: &Db, host: &str, walk: Walk, ids: &[String]) -> Result<bool> {
     for id in ids {
         let seen = match walk {
-            Walk::Feed => db.is_delta_seen_for(id, host)?,
             Walk::Label => db.is_label_seen_for(id, host)?,
         };
         if !seen {
@@ -55,6 +54,7 @@ fn accepted_recovery_head(
     data_dir: &Path,
     host: &str,
     window: &crate::db::RecoveryWindowRow,
+    limits: &wist_core::collection::Limits,
 ) -> Result<Value> {
     use crate::history::declarations::DeclarationsReplay;
     let mut head = if window.opened_epoch.is_some() {
@@ -78,7 +78,7 @@ fn accepted_recovery_head(
     } else {
         let owner: Value = crate::json::parse(&window.owner_declaration_json)?;
         let prior: Value = crate::json::parse(&window.prior_declaration_json)?;
-        if declaration::evaluate(&prior, &owner) != Ok(Decision::Recovery) {
+        if declaration::evaluate(&prior, &owner, limits) != Ok(Decision::Recovery) {
             return Err(crate::error::Error::History(
                 "invalid pending recovery owner".into(),
             ));
@@ -106,18 +106,6 @@ fn accepted_recovery_head(
 }
 
 fn consume(db: &Db, run: &mut PullRun, key: &ObjectKey) -> Result<()> {
-    match key {
-        ObjectKey::Declaration {
-            attempt: Attempt::Feed,
-        } => {
-            run.feed_retry_used = true;
-            db.update_pull_run(run)?;
-        }
-        ObjectKey::Declaration {
-            attempt: Attempt::Delta(id),
-        } => db.record_pull_attempt(run.run_id, "delta_refresh", id)?,
-        _ => {}
-    }
     db.advance_pull_object(
         run.run_id,
         key.kind(),
@@ -127,12 +115,6 @@ fn consume(db: &Db, run: &mut PullRun, key: &ObjectKey) -> Result<()> {
         None,
     )?;
     Ok(())
-}
-
-pub(super) fn consume_attempt(db: &Db, run: &mut PullRun, key: &ObjectKey) -> Result<()> {
-    let mutation = db.mutation()?;
-    consume(db, run, key)?;
-    mutation.commit()
 }
 
 pub(super) fn onboard(
@@ -147,12 +129,20 @@ pub(super) fn onboard(
     let mutation = db.mutation()?;
     let entry = &publisher.keys[0];
     db.record_publisher_declaration(host, raw, &entry.kid, &entry.x, value)?;
-    db.mark_declaration_fetched(host, &run.now)?;
+    run.discovered = true;
+    db.update_pull_run(run)?;
     consume(db, run, key)?;
     mutation.commit()
 }
 
-/// WIST-1 §§5.1–5.2, after any recovery settlement due first.
+pub(super) enum Admitted {
+    Proceeds,
+    Refused(String),
+}
+
+/// WIST-1 §§5.1–5.2, after any recovery settlement due first. WIST-2 §5.1
+/// step 0: a refused Declaration stops the pull, except an open window's
+/// recovery-chain head served again.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn admit_declaration(
     db: &Db,
@@ -163,18 +153,19 @@ pub(super) fn admit_declaration(
     key: &ObjectKey,
     raw: &[u8],
     value: Value,
-) -> Result<Value> {
+    limits: &wist_core::collection::Limits,
+) -> Result<Admitted> {
     settle_if_due(db, data_dir, host, clock)?;
     let mutation = db.mutation()?;
     let now = run.now.clone();
     let stored_raw = db.get_publisher_declaration(host)?.ok_or_else(|| {
         crate::error::Error::History("publisher row lost before Declaration admission".into())
     })?;
-    let mut current_doc: Value = crate::json::parse(&stored_raw)?;
+    let current_doc: Value = crate::json::parse(&stored_raw)?;
     let open_window = db.get_recovery_window(host)?;
     let recovery_head = open_window
         .as_ref()
-        .map(|window| accepted_recovery_head(db, data_dir, host, window))
+        .map(|window| accepted_recovery_head(db, data_dir, host, window, limits))
         .transpose()?;
     if let Some(head) = &recovery_head {
         db.update_recovery_chain_head(host, &serde_json::to_vec(head)?)?;
@@ -186,16 +177,15 @@ pub(super) fn admit_declaration(
         .get_pending_identity(host)?
         .map(|raw| crate::json::parse(&raw))
         .transpose()?;
-    match declaration::evaluate_with_heads(
+    let admitted = match declaration::evaluate_with_heads(
         &current_doc,
         recovery_head.as_ref(),
         pending_head.as_ref(),
         floor,
         &value,
+        limits,
     ) {
-        Ok(Decision::Unchanged) => {
-            db.mark_declaration_fetched(host, &now)?;
-        }
+        Ok(Decision::Unchanged) => Admitted::Proceeds,
         Ok(decision) => {
             let names_pending = pending_head.as_ref().is_some_and(|head| {
                 declaration::inner_hash(head).ok().as_deref()
@@ -203,20 +193,18 @@ pub(super) fn admit_declaration(
             });
             if names_pending {
                 db.record_pending_identity(host, raw, &value)?;
-                db.mark_declaration_fetched(host, &now)?;
+                run.discovered = true;
+                Admitted::Proceeds
             } else if decision == Decision::FreshIdentity && open_window.is_none() {
                 if pending_head.is_some() {
-                    reject(
-                        db,
-                        host,
-                        "WIST1-E08",
-                        &now,
-                        None,
-                        "fresh identity names the current Declaration beside a pending head",
-                    )?;
+                    let detail =
+                        "fresh identity names the current Declaration beside a pending head";
+                    reject(db, host, "WIST1-E08", &now, None, detail)?;
+                    Admitted::Refused(format!("WIST1-E08: {detail}"))
                 } else {
                     db.record_pending_identity(host, raw, &value)?;
-                    db.mark_declaration_fetched(host, &now)?;
+                    run.discovered = true;
+                    Admitted::Proceeds
                 }
             } else {
                 let (kid, x) = value
@@ -243,17 +231,26 @@ pub(super) fn admit_declaration(
                         }
                     }
                 }
-                current_doc = value;
-                db.mark_declaration_fetched(host, &now)?;
+                run.discovered = true;
+                Admitted::Proceeds
             }
         }
         Err((code, detail)) => {
             reject(db, host, code, &now, None, &detail)?;
+            let head_served_again = recovery_head.as_ref().is_some_and(|head| {
+                declaration::inner_hash(head).ok() == declaration::inner_hash(&value).ok()
+            });
+            if head_served_again {
+                Admitted::Proceeds
+            } else {
+                Admitted::Refused(format!("{code}: {detail}"))
+            }
         }
-    }
+    };
+    db.update_pull_run(run)?;
     consume(db, run, key)?;
     mutation.commit()?;
-    Ok(current_doc)
+    Ok(admitted)
 }
 
 pub(super) fn abort(
@@ -315,23 +312,6 @@ pub(super) fn reject_page(
     mutation.commit()
 }
 
-/// Refuses a sealed Page of the Feed walk: WIST-2 §3.2 stops the walk
-/// there with the Pages before it, whose Deltas proceed under §5.
-pub(super) fn stop_walk(
-    db: &Db,
-    run: &mut PullRun,
-    host: &str,
-    key: &ObjectKey,
-    code: &str,
-    detail: &str,
-) -> Result<()> {
-    let mutation = db.mutation()?;
-    refuse_page(db, run, host, key, code, detail)?;
-    run.ended = Some(code.to_string());
-    db.update_pull_run(run)?;
-    mutation.commit()
-}
-
 /// WIST-2 §3.2 (`WIST2-E05`): a live page's `generated_at` is compared and
 /// retained.
 #[allow(clippy::too_many_arguments)]
@@ -350,18 +330,12 @@ pub(super) fn admit_page(
 ) -> Result<Option<(WalkPage, bool)>> {
     let mutation = db.mutation()?;
     let observed = match walk {
-        Walk::Feed => !live || db.observe_feed_generated_at(host, &page.feed.generated_at)?,
         Walk::Label => {
             !live || db.observe_label_feed_generated_at(host, &page.feed.generated_at)?
         }
     };
     if !observed {
-        let detail = match walk {
-            Walk::Feed => "live Feed generated_at precedes the retained authenticated observation",
-            Walk::Label => {
-                "live Label Feed generated_at precedes the retained authenticated observation"
-            }
-        };
+        let detail = "live Label Feed generated_at precedes the retained authenticated observation";
         reject(db, host, "WIST2-E05", &run.now, None, detail)?;
         db.advance_pull_object(
             run.run_id,
@@ -371,21 +345,13 @@ pub(super) fn admit_page(
             Status::Rejected,
             None,
         )?;
-        if walk == Walk::Feed {
-            run.phase = Phase::Aborted;
-            run.ended = Some("WIST2-E05".to_string());
-            db.update_pull_run(run)?;
-        }
         mutation.commit()?;
         return Ok(None);
     }
     let unseen = unseen(db, host, walk, &page.feed.deltas)?;
     let stopped_at_next = unseen && next == Some(None);
     if stopped_at_next {
-        let detail = match walk {
-            Walk::Feed => "feed next fails the target rule: not its Normalized URL under the requested host's well-known prefix",
-            Walk::Label => "label feed next fails the target rule: not its Normalized URL under the requested host's well-known prefix",
-        };
+        let detail = "label feed next fails the target rule: not its Normalized URL under the requested host's well-known prefix";
         reject(db, host, "WIST2-E01", &run.now, None, detail)?;
     }
     let walked = WalkPage {
@@ -396,13 +362,6 @@ pub(super) fn admit_page(
         raw: Some(raw.to_vec()),
     };
     db.record_walk_page(host, walk.as_str(), index, &walked)?;
-    if walk == Walk::Feed && unseen {
-        run.unseen_any = true;
-        if stopped_at_next {
-            run.ended = Some("WIST2-E01".to_string());
-        }
-        db.update_pull_run(run)?;
-    }
     db.advance_pull_object(
         run.run_id,
         key.kind(),
@@ -426,8 +385,6 @@ pub(super) struct Refusal<'a> {
     pub id: &'a str,
     pub kind: &'static str,
     pub slot: &'a str,
-    pub consumed: Option<(&'static str, String)>,
-    pub resolved_prev: bool,
 }
 
 pub(super) fn reject_item(
@@ -453,145 +410,8 @@ pub(super) fn reject_item(
         Status::Rejected,
         code,
     )?;
-    if let Some((kind, slot)) = &refusal.consumed {
-        db.advance_pull_object(
-            run.run_id,
-            kind,
-            slot,
-            &[
-                Status::Issued,
-                Status::Fetched,
-                Status::Verified,
-                Status::Failed,
-            ],
-            Status::Rejected,
-            None,
-        )?;
-    }
-    if refusal.resolved_prev {
-        db.record_pull_attempt(run.run_id, "resolved_prev", refusal.id)?;
-    }
     run.position = refusal.index + 1;
     db.update_pull_run(run)?;
-    mutation.commit()
-}
-
-/// WIST-2 §5 step 3: a retrieved predecessor is admitted before the Delta
-/// that named it.
-pub(super) fn splice_predecessor(
-    db: &Db,
-    run: &mut PullRun,
-    id: &str,
-    prev: &str,
-    index: usize,
-) -> Result<()> {
-    let mutation = db.mutation()?;
-    db.record_pull_attempt(run.run_id, "resolved_prev", id)?;
-    run.queue.insert(index, prev.to_string());
-    run.position = index;
-    db.set_pull_queue(run)?;
-    db.update_pull_run(run)?;
-    mutation.commit()
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Staleness {
-    Declaration,
-    ChainTip,
-    Schedule,
-}
-
-pub(super) enum Admission {
-    Accepted,
-    Queued,
-    Stale(Staleness),
-    Duplicate,
-}
-
-pub(super) struct DeltaItem<'a> {
-    pub index: usize,
-    pub id: &'a str,
-    pub slot: &'a str,
-    pub payload_slot: Option<&'a str>,
-}
-
-/// The references the Delta was verified under are revalidated in the
-/// admitting transaction, the size caps and clock allowance only when an
-/// Epoch was sealed since.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn admit_delta(
-    db: &Db,
-    data_dir: &Path,
-    run: &mut PullRun,
-    host: &str,
-    item: &DeltaItem<'_>,
-    doc: &Value,
-    envelope: &DeltaEnvelope,
-    payload_raw: Option<&[u8]>,
-    refs: &IssuedRefs,
-) -> Result<Admission> {
-    let admission = db.mutation()?;
-    if db
-        .pull_object(run.run_id, "delta", item.slot)?
-        .is_none_or(|object| object.status != Status::Verified)
-    {
-        past(db, run, item.index, admission)?;
-        return Ok(Admission::Duplicate);
-    }
-    let current = super::declaration_ref(db, host)?;
-    if !current.same_version(&refs.decl) {
-        return Ok(Admission::Stale(Staleness::Declaration));
-    }
-    if envelope.delta.prev != db.url_tip(host, &envelope.delta.url)? {
-        return Ok(Admission::Stale(Staleness::ChainTip));
-    }
-    if db.last_epoch()?.map(|epoch| epoch.epoch_number) != refs.schedule_at {
-        let profile = crate::declaration::delta::AdmissionProfile::start(db, data_dir, refs.clock)?;
-        if profile.sizes != refs.sizes || profile.clock_skew_seconds != refs.clock_skew_seconds {
-            return Ok(Admission::Stale(Staleness::Schedule));
-        }
-    }
-    if let Some(raw) = payload_raw {
-        let payloads_dir = data_dir.join("payloads");
-        std::fs::create_dir_all(&payloads_dir)?;
-        std::fs::write(payloads_dir.join(format!("{}.json", &item.id[7..])), raw)?;
-    }
-    let url = &envelope.delta.url;
-    let (outcome, report) = if current.window.is_some() {
-        db.queue_delta(host, item.id, doc, url, item.id, run.chain_pos)?;
-        (Admission::Queued, "queued")
-    } else {
-        db.record_accepted_delta(host, item.id, doc, run.chain_pos, url, item.id)?;
-        (Admission::Accepted, "accepted")
-    };
-    db.report_pull_object(run.run_id, "delta", item.slot, Status::Admitted, report)?;
-    if let Some(slot) = item.payload_slot {
-        db.advance_pull_object(
-            run.run_id,
-            "payload",
-            slot,
-            &[Status::Verified],
-            Status::Admitted,
-            None,
-        )?;
-    }
-    run.chain_pos += 1;
-    run.position = item.index + 1;
-    db.update_pull_run(run)?;
-    admission.commit()?;
-    Ok(outcome)
-}
-
-pub(super) fn reissue(
-    db: &Db,
-    run: &PullRun,
-    id: &str,
-    slot: &str,
-    refs: &IssuedRefs,
-) -> Result<()> {
-    let mutation = db.mutation()?;
-    db.forget_pull_attempt(run.run_id, "resolved_prev", id)?;
-    db.set_pull_object_refs(run.run_id, "delta", slot, &refs.to_json()?)?;
     mutation.commit()
 }
 
@@ -729,7 +549,7 @@ pub(super) fn close_run(db: &Db, run_id: i64) -> Result<IngestReport> {
             db.set_walk_suspended(&run.domain, run.suspended)?;
             if !run.suspended {
                 report.ended = run.ended.clone();
-                if !run.unseen_any
+                if !run.discovered
                     && report.accepted.is_empty()
                     && report.queued.is_empty()
                     && report.rejected.is_empty()

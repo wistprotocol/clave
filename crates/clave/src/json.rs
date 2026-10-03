@@ -1,1 +1,1 @@
-pub use wist_core::json::{parse, validate};
+pub use wist_core::json::parse;

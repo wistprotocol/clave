@@ -1,5 +1,4 @@
 pub mod declarations;
-pub mod deltas;
 pub mod payloads;
 
 use crate::db::{Db, EpochRow};
@@ -61,7 +60,8 @@ pub struct VerifiedEpoch {
     rejected_parameters: Vec<usize>,
     recovery_window_days: i64,
     declaration_activation_epochs: i64,
-    delta_size_caps: crate::declaration::delta::SizeCaps,
+    size_caps: wist_core::item::SizeCaps,
+    pub(crate) limits: wist_core::collection::Limits,
     clock_skew_seconds: i64,
 }
 
@@ -95,8 +95,12 @@ impl VerifiedEpoch {
         self.octets
     }
 
-    pub fn delta_size_caps(&self) -> &crate::declaration::delta::SizeCaps {
-        &self.delta_size_caps
+    pub fn size_caps(&self) -> &wist_core::item::SizeCaps {
+        &self.size_caps
+    }
+
+    pub fn limits(&self) -> &wist_core::collection::Limits {
+        &self.limits
     }
 
     pub fn clock_skew_seconds(&self) -> i64 {
@@ -264,7 +268,8 @@ impl<'a> History<'a> {
         let declaration_activation_epochs = schedule
             .value_at("declaration_activation_epochs", at)
             .unwrap();
-        let delta_size_caps = crate::declaration::delta::SizeCaps::from_schedule(&schedule, at);
+        let size_caps = crate::declaration::size_caps(&schedule, at)?;
+        let limits = crate::declaration::limits(&schedule, at)?;
         let clock_skew_seconds = schedule.value_at("clock_skew_seconds", at).unwrap();
         self.schedule = Some(schedule);
         self.previous = Some(checkpoint);
@@ -280,7 +285,8 @@ impl<'a> History<'a> {
             rejected_parameters,
             recovery_window_days,
             declaration_activation_epochs,
-            delta_size_caps,
+            size_caps,
+            limits,
             clock_skew_seconds,
         }))
     }

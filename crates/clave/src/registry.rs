@@ -138,16 +138,20 @@ mod tests {
 
     #[test]
     fn validate_checks_every_combination_participant_at_its_boundary() {
+        let wide_links = |name: &str| match name {
+            "link_url_cap_bytes" => 4096,
+            other => defaults(other),
+        };
         for (name, accepted, rejected) in [
-            ("links_cap_bytes", 2069, 2068),
+            ("links_cap_bytes", 4117, 4116),
             ("link_url_cap_bytes", 4075, 4076),
             ("payload_window_days", 540, 541),
             ("mirror_retention_days", 30, 29),
         ] {
-            validate(name, accepted, defaults).unwrap();
+            validate(name, accepted, wide_links).unwrap();
             assert!(
                 matches!(
-                    validate(name, rejected, defaults),
+                    validate(name, rejected, wide_links),
                     Err(Error::ParamChange(_))
                 ),
                 "{name}"

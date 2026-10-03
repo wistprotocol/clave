@@ -97,8 +97,8 @@ fn check_capped_chain(oversized_predecessor: bool, spellings: [&str; 2]) {
             (leaf(&candidate) < leaf(&predecessor)).then_some(candidate)
         })
         .expect("a deterministic successor hashes before its predecessor");
-    clave::declaration::evaluate(&initial, &predecessor).unwrap();
-    clave::declaration::evaluate(&predecessor, &successor).unwrap();
+    clave::declaration::evaluate(&initial, &predecessor, &Default::default()).unwrap();
+    clave::declaration::evaluate(&predecessor, &successor, &Default::default()).unwrap();
 
     let predecessor_bytes = octets(&predecessor);
     let successor_bytes = octets(&successor);

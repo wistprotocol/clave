@@ -30,6 +30,7 @@ impl DeclarationsReplay for Declarations {
             verified.sealed_at(),
             verified.recovery_window_days,
             verified.declaration_activation_epochs,
+            &verified.limits,
             verified.entries(),
         )?)
     }

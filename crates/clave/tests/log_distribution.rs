@@ -1,8 +1,8 @@
 mod common;
 
 use common::{
-    add_delta, head_checkpoint, make_publisher_with_scope, reserve_addr, seal_fixture_epoch,
-    serve_static, served_entries, spec_dir, write_feed,
+    add_label, head_checkpoint, make_publisher_with_scope, reserve_addr, seal_fixture_epoch,
+    serve_static, served_entries, spec_dir, write_label_feed,
 };
 use serde_json::Value;
 use std::path::Path;
@@ -83,8 +83,8 @@ fn sealed_log(host: &str, client: &clave::fetch::Client, data: &Path) -> clave::
 fn a_sealed_log_verifies_end_to_end_from_its_static_files_alone() {
     let (listener, host, client) = reserve_addr();
     let p = make_publisher_with_scope(&host, &["example.com"]);
-    let first = add_delta(&p, "https://example.com/a", "alpha body", None);
-    write_feed(
+    let first = add_label(&p, "https://other.example/a", "2026-08-09T11:00:00Z");
+    write_label_feed(
         &p,
         &host,
         std::slice::from_ref(&first),
@@ -97,8 +97,8 @@ fn a_sealed_log_verifies_end_to_end_from_its_static_files_alone() {
 
     clave::seal::run(&db, data.path(), &sk, SEAL_START).unwrap();
     clave::seal::run(&db, data.path(), &sk, SEAL_START + 3600).unwrap();
-    let second = add_delta(&p, "https://example.com/b", "beta body", None);
-    write_feed(
+    let second = add_label(&p, "https://other.example/b", "2026-08-09T11:00:00Z");
+    write_label_feed(
         &p,
         &host,
         std::slice::from_ref(&second),

@@ -56,6 +56,7 @@ fn field_rejection_preserves_the_complete_declaration_prefix() {
                     .unwrap()
                     .value_at("declaration_activation_epochs", epoch.sealed_at_s())
                     .unwrap(),
+                &Default::default(),
                 epoch.entries(),
             );
             assert_eq!(format!("{state:?}"), before);
@@ -98,163 +99,6 @@ fn field_rejection_preserves_the_complete_declaration_prefix() {
                     .contains(case["expected"].as_str().unwrap()));
             }
         }
-    }
-}
-
-#[test]
-fn delta_bindings_use_frozen_authenticated_recovery_sources() {
-    let vector = vector("wist1/recovery-bindings");
-    let mut prefixes = std::collections::BTreeMap::new();
-    for (name, history) in vector["histories"].as_object().unwrap() {
-        let epochs = history["epochs"].as_array().unwrap();
-        let fixture = Fixture::new(epochs);
-        assert_eq!(
-            fixture.head().unwrap().root,
-            history["pinned_head"].as_str().unwrap()
-        );
-        let mut reader = fixture.reader();
-        let mut state = Declarations::default();
-        while let Some(epoch) = reader.next_epoch().unwrap() {
-            state.apply(&epoch).unwrap();
-            if state.domains()["example.com"].window().is_some() {
-                prefixes.insert((name.clone(), epoch.epoch_number()), state.clone());
-            }
-        }
-        assert_eq!(
-            format!("{:?}", fixture.restore().unwrap()),
-            format!("{state:?}")
-        );
-    }
-    for case in vector["cases"].as_array().unwrap() {
-        let name = case["name"].as_str().unwrap();
-        let state = &prefixes[&(
-            case["history"].as_str().unwrap().to_owned(),
-            case["prefix_height"].as_u64().unwrap(),
-        )];
-        let before = format!("{state:?}");
-        let window = state.domains()["example.com"].window().unwrap();
-        assert_eq!(window.owner().position().epoch_number, 1);
-        assert_eq!(window.before().position().epoch_number, 0);
-        let prior = clave::declaration::publisher_of(window.before().envelope()).unwrap();
-        let owner = clave::declaration::publisher_of(window.owner().envelope()).unwrap();
-        let mut keys: Vec<_> = prior.keys.iter().chain(&owner.keys).collect();
-        let envelope = &case["envelope"];
-        let check = |keys: &[&wist_core::objects::PublisherKey], doc: &Value| {
-            clave::declaration::verify_signed(
-                keys,
-                doc,
-                "delta",
-                doc["delta"]["observed_at"].as_str(),
-            )
-            .err()
-            .unwrap_or("accepted")
-        };
-        assert_eq!(check(&keys, envelope), case["expected"], "{name}");
-        keys.reverse();
-        assert_eq!(check(&keys, envelope), case["expected"], "{name}");
-        if case["expected"] == "accepted" {
-            let mut altered = envelope.clone();
-            altered["delta"]["url"] = json!("https://example.com/changed");
-            assert_eq!(check(&keys, &altered), "WIST1-E01", "{name}");
-        }
-        assert_eq!(format!("{state:?}"), before, "{name}");
-    }
-}
-
-#[test]
-fn delta_scope_stays_with_its_authenticated_declaration_source() {
-    let vector = vector("wist1/recovery-scope");
-    let key_id = vector["log_key"]["key_id"].as_str().unwrap();
-    let mut sources = std::collections::BTreeMap::new();
-    for (name, history) in vector["histories"].as_object().unwrap() {
-        let epochs = history["epochs"].as_array().unwrap();
-        let fixture = Fixture::with_key_id(epochs, key_id);
-        assert_eq!(
-            fixture.head().unwrap().root,
-            history["pinned_head"].as_str().unwrap()
-        );
-        let mut reader = fixture.reader();
-        let mut state = Declarations::default();
-        while let Some(epoch) = reader.next_epoch().unwrap() {
-            let effects = state.apply(&epoch).unwrap();
-            let height = epoch.epoch_number();
-            let domain = &state.domains()["example.com"];
-            fn parse(doc: &Value) -> wist_core::objects::Publisher {
-                clave::declaration::publisher_of(doc).unwrap()
-            }
-            let admission = domain
-                .delta_admission_sources()
-                .into_iter()
-                .map(|source| parse(source.envelope()))
-                .collect();
-            sources.insert((name.clone(), height, "admission"), admission);
-            sources.insert(
-                (name.clone(), height, "sealing"),
-                domain
-                    .delta_sealing_source()
-                    .map(|source| parse(source.envelope()))
-                    .into_iter()
-                    .collect(),
-            );
-            for settlement in effects.settlements {
-                assert_eq!(settlement.domain, "example.com");
-                sources.insert(
-                    (name.clone(), height, "settlement"),
-                    vec![parse(settlement.restored.envelope())],
-                );
-            }
-            if vector["probes"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|probe| probe["history"] == *name && probe["height"] == height)
-            {
-                let restored = Fixture::with_key_id(&epochs[..=height as usize], key_id)
-                    .restore()
-                    .unwrap();
-                assert_eq!(format!("{restored:?}"), format!("{state:?}"));
-            }
-        }
-        assert_eq!(
-            format!("{:?}", fixture.restore().unwrap()),
-            format!("{state:?}")
-        );
-    }
-    for probe in vector["probes"].as_array().unwrap() {
-        let stage = probe["stage"].as_str().unwrap();
-        let source = &sources[&(
-            probe["history"].as_str().unwrap().to_owned(),
-            probe["height"].as_u64().unwrap(),
-            stage,
-        )];
-        let envelope = &probe["envelope"];
-        let original = envelope.clone();
-        for reverse in [false, true] {
-            let mut source: Vec<_> = source.iter().collect();
-            if reverse {
-                source.reverse();
-            }
-            let check = |doc| match clave::declaration::verify_delta_authority(&source, doc) {
-                Ok(()) => "accepted",
-                Err("WIST1-E14") => "WIST1-E14",
-                Err(_) if stage == "settlement" => "WIST1-E13",
-                Err("WIST1-E01") if stage == "sealing" => "WIST1-E02",
-                Err(code) => code,
-            };
-            assert_eq!(check(envelope), probe["expected"], "{}", probe["name"]);
-            if probe["expected"] == "accepted" {
-                let mut altered = envelope.clone();
-                let signature = altered["sig"]["value"].as_str().unwrap();
-                altered["sig"]["value"] = format!(
-                    "{}{}",
-                    if signature.starts_with('A') { "B" } else { "A" },
-                    &signature[1..]
-                )
-                .into();
-                assert_ne!(check(&altered), "accepted", "{}", probe["name"]);
-            }
-        }
-        assert_eq!(*envelope, original);
     }
 }
 
@@ -328,7 +172,6 @@ impl Fixture {
                     &sealed_at(epoch),
                     &entries,
                     epoch::epoch_octets(&entries).unwrap(),
-                    &[],
                     &[],
                     &[],
                     &[],
@@ -420,6 +263,7 @@ fn probe(epochs: &[Value], probe: &Value) -> (Declarations, Result<Effects, Stri
             .unwrap()
             .value_at("declaration_activation_epochs", candidate.sealed_at_s())
             .unwrap(),
+        &Default::default(),
         candidate.entries(),
     );
     assert_eq!(format!("{state:?}"), before);
@@ -567,6 +411,7 @@ fn apply_under(
         epoch.sealed_at(),
         days,
         activation_epochs,
+        &Default::default(),
         epoch.entries(),
     )?)
 }
@@ -844,241 +689,6 @@ fn authenticated_parameter_schedules_freeze_window_length_at_each_owner() {
 }
 
 #[test]
-fn legacy_recovery_owners_require_authenticated_matching_history() {
-    let vector = vector("wist1/recovery-bindings");
-    for (name, history) in vector["histories"].as_object().unwrap() {
-        for mutation in ["none", "opening", "prior", "missing_epoch", "corrupt_epoch"] {
-            let epochs = history["epochs"].as_array().unwrap();
-            let fixture = Fixture::new(epochs);
-            let state = fixture.restore().unwrap();
-            let window = state.domains()["example.com"].window().unwrap();
-            let path = fixture.data.path().join("clave.sqlite");
-            let db = clave::db::Db::connect(&path).unwrap();
-            db.open_recovery_window(
-                "example.com",
-                &serde_json::to_vec(window.head().envelope()).unwrap(),
-                &serde_json::to_vec(if mutation == "prior" {
-                    window.owner().envelope()
-                } else {
-                    window.before().envelope()
-                })
-                .unwrap(),
-            )
-            .unwrap();
-            db.activate_recovery_window(
-                "example.com",
-                if mutation == "opening" { 0 } else { 1 },
-                &timestamp(window.end_s().try_into().unwrap()),
-            )
-            .unwrap();
-            drop(db);
-            let connection = rusqlite::Connection::open(&path).unwrap();
-            connection
-                .execute(
-                    "ALTER TABLE recovery_windows DROP COLUMN owner_declaration_json",
-                    [],
-                )
-                .unwrap();
-            drop(connection);
-            let connection = rusqlite::Connection::open(&path).unwrap();
-            if mutation == "missing_epoch" {
-                connection
-                    .execute("DELETE FROM epochs WHERE epoch_number = 1", [])
-                    .unwrap();
-            } else if mutation == "corrupt_epoch" {
-                connection
-                    .execute(
-                        "UPDATE log_entries SET entry_json = ?1 WHERE leaf_index = 0",
-                        [br#"{"type":"label","body":{}}"#.as_slice()],
-                    )
-                    .unwrap();
-            }
-            drop(connection);
-            let restored = clave::db::Db::open(&path);
-            if mutation == "none" {
-                let db = restored.unwrap();
-                let row = db.get_recovery_window("example.com").unwrap().unwrap();
-                assert_eq!(
-                    serde_json::from_slice::<Value>(&row.owner_declaration_json).unwrap(),
-                    *window.owner().envelope(),
-                    "{name}"
-                );
-                assert_eq!(
-                    serde_json::from_slice::<Value>(&row.declaration_json).unwrap(),
-                    *window.head().envelope(),
-                    "{name}"
-                );
-                drop(db);
-                assert!(clave::db::Db::open(&path).is_ok());
-            } else {
-                assert!(restored.is_err(), "{name}: {mutation}");
-                let connection = rusqlite::Connection::open(&path).unwrap();
-                assert!(connection
-                    .query_row(
-                        "SELECT owner_declaration_json IS NULL FROM recovery_windows",
-                        [],
-                        |row| row.get::<_, bool>(0)
-                    )
-                    .unwrap());
-            }
-        }
-    }
-}
-
-#[test]
-fn candidate_sources_keep_settlement_separate_from_deadline_replacements() {
-    let vector = vector("wist1/recovery-scope");
-    let key_id = vector["log_key"]["key_id"].as_str().unwrap();
-    for history in vector["histories"].as_object().unwrap().values() {
-        let epochs = history["epochs"].as_array().unwrap();
-        let fixture = Fixture::with_key_id(&epochs[..169], key_id);
-        let state = fixture.restore().unwrap();
-        let before = format!("{state:?}");
-        let domain = &state.domains()["example.com"];
-        assert_eq!(domain.current().envelope()["publisher"]["seq"], 5);
-        assert_eq!(
-            domain.window().unwrap().head().envelope()["publisher"]["seq"],
-            4
-        );
-        let deadline = i64::try_from(domain.window().unwrap().end_s()).unwrap();
-        let prior = state.project(&timestamp(deadline - 1), 7, 0, &[]).unwrap();
-        assert!(prior.effects().settlements.is_empty());
-        let domain = &prior.domains()["example.com"];
-        assert!(domain.delta_sealing_source().is_none());
-        assert_eq!(
-            domain
-                .delta_admission_sources()
-                .iter()
-                .map(|source| source.envelope()["publisher"]["seq"].as_u64().unwrap())
-                .collect::<Vec<_>>(),
-            [1, 2]
-        );
-
-        let empty = state.project(&timestamp(deadline), 7, 0, &[]).unwrap();
-        let restored = &empty.domains()["example.com"];
-        assert_eq!(
-            restored.delta_sealing_source().unwrap().envelope()["publisher"]["seq"],
-            4
-        );
-        assert_eq!(restored.highest_accepted_seq(), 5);
-        assert_eq!(restored.reset(), domain.reset());
-        assert_eq!(empty.effects().settlements.len(), 1);
-        assert!(empty.effects().installations.is_empty());
-        assert_eq!(
-            empty.effects().settlements[0]
-                .superseded
-                .iter()
-                .map(|source| source.envelope()["publisher"]["seq"].as_u64().unwrap())
-                .collect::<Vec<_>>(),
-            [3, 5]
-        );
-
-        let replacement = state
-            .project(
-                sealed_at(&epochs[169]).as_str(),
-                7,
-                0,
-                epochs[169]["entries"].as_array().unwrap(),
-            )
-            .unwrap();
-        let settlement = &replacement.effects().settlements[0];
-        assert_eq!(settlement.restored.envelope()["publisher"]["seq"], 4);
-        assert_eq!(
-            settlement.restored.envelope()["publisher"]["subdomain_scope"],
-            json!(["old.example", "retained.example", "follower.example"])
-        );
-        let current = &replacement.domains()["example.com"];
-        assert_eq!(current.highest_accepted_seq(), 6);
-        assert_eq!(
-            current.delta_sealing_source().unwrap().envelope()["publisher"]["seq"],
-            6
-        );
-        assert!(
-            current.delta_sealing_source().unwrap().envelope()["publisher"]
-                .get("subdomain_scope")
-                .is_none()
-        );
-        assert_eq!(current.delta_admission_sources().len(), 1);
-        assert_eq!(replacement.epoch_number(), 169);
-        assert_eq!(replacement.sealed_at_s(), deadline);
-        assert_eq!(format!("{state:?}"), before);
-
-        let mut corrupted = epochs[169]["entries"].as_array().unwrap().clone();
-        let signature = corrupted[0]["body"]["sig"]["value"].as_str().unwrap();
-        corrupted[0]["body"]["sig"]["value"] = format!(
-            "{}{}",
-            if signature.starts_with('A') { "B" } else { "A" },
-            &signature[1..]
-        )
-        .into();
-        assert!(state
-            .project(&timestamp(deadline), 7, 0, &corrupted)
-            .unwrap_err()
-            .to_string()
-            .contains("WIST1-E01"));
-        assert_eq!(format!("{state:?}"), before);
-        assert_eq!(
-            format!(
-                "{:?}",
-                state.project(&timestamp(deadline), 7, 0, &[]).unwrap()
-            ),
-            format!("{empty:?}")
-        );
-        assert_eq!(format!("{:?}", fixture.restore().unwrap()), before);
-    }
-}
-
-#[test]
-fn unsealed_candidate_followers_do_not_advance_recovery_authority() {
-    let vector = vector("wist1/recovery-scope");
-    let key_id = vector["log_key"]["key_id"].as_str().unwrap();
-    for history in vector["histories"].as_object().unwrap().values() {
-        let epochs = history["epochs"].as_array().unwrap();
-        let fixture = Fixture::with_key_id(&epochs[..3], key_id);
-        let state = fixture.restore().unwrap();
-        let before = format!("{state:?}");
-        let candidate = state
-            .project(
-                sealed_at(&epochs[3]).as_str(),
-                7,
-                0,
-                epochs[3]["entries"].as_array().unwrap(),
-            )
-            .unwrap();
-        let projected = &candidate.domains()["example.com"];
-        assert_eq!(
-            projected.window().unwrap().head().envelope()["publisher"]["seq"],
-            4
-        );
-        assert_eq!(projected.highest_accepted_seq(), 4);
-        assert!(projected.delta_sealing_source().is_none());
-        assert_eq!(
-            projected
-                .delta_admission_sources()
-                .iter()
-                .map(|source| source.envelope()["publisher"]["seq"].as_u64().unwrap())
-                .collect::<Vec<_>>(),
-            [1, 2]
-        );
-        let domain = &state.domains()["example.com"];
-        assert_eq!(
-            domain.window().unwrap().head().envelope()["publisher"]["seq"],
-            2
-        );
-        assert_eq!(domain.highest_accepted_seq(), 3);
-        let deadline = i64::try_from(domain.window().unwrap().end_s()).unwrap();
-        let settled = state.project(&timestamp(deadline), 7, 0, &[]).unwrap();
-        assert_eq!(
-            settled.effects().settlements[0].restored.envelope()["publisher"]["seq"],
-            2
-        );
-        assert_eq!(settled.domains()["example.com"].highest_accepted_seq(), 3);
-        assert_eq!(format!("{state:?}"), before);
-        assert_eq!(format!("{:?}", fixture.restore().unwrap()), before);
-    }
-}
-
-#[test]
 fn candidate_projection_requires_valid_time_profile_and_entry_order() {
     let vector = vector("wist1/recovery-heads");
     let epochs = vector["epochs"].as_array().unwrap();
@@ -1093,18 +703,28 @@ fn candidate_projection_requires_valid_time_profile_and_entry_order() {
         "2026-08-04T02:00:00.0Z",
         "2026-08-04T02:00:00+00:00",
     ] {
-        assert!(state.project(invalid, 7, 0, &[]).is_err());
+        assert!(state
+            .project(invalid, 7, 0, &Default::default(), &[])
+            .is_err());
     }
-    assert!(state.project(at, 0, 0, &[]).is_err());
-    assert!(state.project(at, i64::MAX, 0, &[]).is_err());
+    assert!(state.project(at, 0, 0, &Default::default(), &[]).is_err());
+    assert!(state
+        .project(at, i64::MAX, 0, &Default::default(), &[])
+        .is_err());
     let malformed = json!({"type":"publisher_declaration","body":null});
-    assert!(state.project(at, 7, 0, &[malformed]).is_err());
+    assert!(state
+        .project(at, 7, 0, &Default::default(), &[malformed])
+        .is_err());
     let mut entries = vec![
         json!({"type":"label","body":{}}),
         epochs[2]["entries"][0].clone(),
     ];
-    assert!(state.project(at, 7, 0, &entries).is_err());
+    assert!(state
+        .project(at, 7, 0, &Default::default(), &entries)
+        .is_err());
     entries.reverse();
-    assert!(state.project(at, 7, 0, &entries).is_ok());
+    assert!(state
+        .project(at, 7, 0, &Default::default(), &entries)
+        .is_ok());
     assert_eq!(format!("{state:?}"), before);
 }

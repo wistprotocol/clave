@@ -1879,13 +1879,13 @@ mod tests {
         for json in ["{}", "{\"a\":1}"] {
             db.conn
                 .execute(
-                    "INSERT INTO pending_entries(entry_type, domain, entry_json, chain_pos) VALUES ('publisher_delta', 'a.example', CAST(?1 AS BLOB), 0)",
+                    "INSERT INTO pending_entries(entry_type, domain, entry_json, chain_pos) VALUES ('label', 'a.example', CAST(?1 AS BLOB), 0)",
                     [json],
                 )
                 .unwrap();
         }
         let wrapped = |body: &str| {
-            let entry = serde_json::json!({"type": "publisher_delta", "body": serde_json::from_str::<serde_json::Value>(body).unwrap()});
+            let entry = serde_json::json!({"type": "label", "body": serde_json::from_str::<serde_json::Value>(body).unwrap()});
             wist_core::jcs::canonicalize(&entry).unwrap().len() as u64 + 2
         };
         assert_eq!(

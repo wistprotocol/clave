@@ -18,30 +18,12 @@ fn sign(body: &Value, kind: &str) -> Value {
 #[derive(Default)]
 struct Origin {
     delay_ms: std::sync::atomic::AtomicU64,
-    slow_ms: std::sync::Mutex<std::collections::HashMap<String, u64>>,
-    in_flight: std::sync::atomic::AtomicUsize,
-    peak: std::sync::atomic::AtomicUsize,
     served: std::sync::Mutex<Vec<String>>,
 }
 
 impl Origin {
     fn delay(&self, ms: u64) {
         self.delay_ms.store(ms, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    fn slow(&self, path: &str, ms: u64) {
-        self.slow_ms
-            .lock()
-            .unwrap()
-            .insert(format!("/.well-known/wist/{path}"), ms);
-    }
-
-    fn in_flight(&self) -> usize {
-        self.in_flight.load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    fn take_peak(&self) -> usize {
-        self.peak.swap(0, std::sync::atomic::Ordering::SeqCst)
     }
 
     fn take_served(&self) -> Vec<String> {
@@ -51,14 +33,9 @@ impl Origin {
     async fn serve(&self, root: &std::path::Path, path: &str) -> Option<Vec<u8>> {
         use std::sync::atomic::Ordering::SeqCst;
         self.served.lock().unwrap().push(path.to_string());
-        let running = self.in_flight.fetch_add(1, SeqCst) + 1;
-        self.peak.fetch_max(running, SeqCst);
-        let delay = self.slow_ms.lock().unwrap().get(path).copied();
-        let delay = delay.unwrap_or_else(|| self.delay_ms.load(SeqCst));
+        let delay = self.delay_ms.load(SeqCst);
         tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-        let body = std::fs::read(root.join(path.trim_start_matches('/'))).ok();
-        self.in_flight.fetch_sub(1, SeqCst);
-        body
+        std::fs::read(root.join(path.trim_start_matches('/'))).ok()
     }
 }
 
@@ -142,44 +119,28 @@ impl Site {
         .unwrap()
     }
 
-    pub(crate) fn delta(
-        &self,
-        url: &str,
-        extract: &str,
-        prev: Option<&str>,
-        observed_at: &str,
-    ) -> String {
-        let salt = wist_core::crypto::b64u_encode(&[5u8; 16]);
-        let content = serde_json::json!({
-            "extract": extract, "links": {"total": 0, "urls": []},
-            "summary": {"title": url}
+    pub(crate) fn label(&self, subject: &str, asserted_at: &str) -> String {
+        let label = serde_json::json!({
+            "wist_version": "1.0.0", "labeler": self.host, "subject": subject,
+            "name": "wist:spam", "asserted_at": asserted_at
         });
-        let mut delta = serde_json::json!({
-            "wist_version": "1.0.0", "publisher": self.host, "url": url,
-            "change_type": if prev.is_some() { "update" } else { "new" },
-            "observed_at": observed_at,
-            "payload": {
-                "commitment": wist_core::delta::make_commitment(&salt, &content).unwrap(),
-                "alg": "HMAC-SHA256",
-                "bytes": wist_core::delta::content_bytes(&content).unwrap()
-            },
-            "meta": {"lang": "en"}
-        });
-        if let Some(prev) = prev {
-            delta["prev"] = prev.into();
-        }
-        let id = wist_core::delta::delta_id(&delta).unwrap();
-        let hex = &id[7..];
-        self.write(&format!("deltas/{hex}.json"), &sign(&delta, "delta"));
+        let id = wist_core::label::label_id(&label).unwrap();
+        self.write(&format!("labels/{}.json", &id[7..]), &sign(&label, "label"));
+        id
+    }
+
+    fn unreadable_label(&self, seed: u8) -> String {
+        let id = format!("sha256:{}", wist_core::crypto::hex_encode(&[seed; 32]));
         self.write(
-            &format!("payloads/{hex}.json"),
-            &serde_json::json!({"wist_version": "1.0.0", "salt": salt, "content": content}),
+            &format!("labels/{}.json", &id[7..]),
+            &serde_json::json!({"wist_version": "1.0.0"}),
         );
         id
     }
 
     fn feed_doc(&self, ids: &[String], generated_at: &str, next: Option<u64>) -> Value {
-        let next = next.map(|n| format!("https://{}/.well-known/wist/feed/{n}.json", self.host));
+        let next =
+            next.map(|n| format!("https://{}/.well-known/wist/label-feed/{n}.json", self.host));
         sign(
             &serde_json::json!({
                 "wist_version": "1.0.0", "domain": self.host,
@@ -189,31 +150,13 @@ impl Site {
         )
     }
 
-    pub(crate) fn feed(&self, ids: &[String], generated_at: &str, next: Option<u64>) {
-        self.write("feed.json", &self.feed_doc(ids, generated_at, next));
+    pub(crate) fn label_feed(&self, ids: &[String], generated_at: &str, next: Option<u64>) {
+        self.write("label-feed.json", &self.feed_doc(ids, generated_at, next));
     }
 
     fn page(&self, number: u64, ids: &[String], generated_at: &str) {
         let doc = self.feed_doc(ids, generated_at, number.checked_sub(1));
-        self.write(&format!("feed/{number}.json"), &doc);
-    }
-
-    fn label_feed(&self, ids: &[String], generated_at: &str) {
-        let doc = self.feed_doc(ids, generated_at, None);
-        self.write("label-feed.json", &doc);
-        for id in ids {
-            self.write(
-                &format!("labels/{}.json", &id[7..]),
-                &serde_json::json!({"wist_version": "1.0.0"}),
-            );
-        }
-    }
-
-    fn tamper_payload(&self, id: &str) {
-        let path = format!("payloads/{}.json", &id[7..]);
-        let mut payload = self.read(&path);
-        payload["content"]["extract"] = "tampered".into();
-        self.write(&path, &payload);
+        self.write(&format!("label-feed/{number}.json"), &doc);
     }
 }
 
@@ -251,8 +194,9 @@ impl Log {
 
     fn onboarded(self, site: &Site) -> Log {
         let Log { data, db } = self;
-        let feed = site.read("feed.json");
-        site.feed(&[], "2026-08-09T09:00:00Z", None);
+        let live = site.dir.path().join(".well-known/wist/label-feed.json");
+        let feed = std::fs::read(&live).ok();
+        let _ = std::fs::remove_file(&live);
         run(
             &db,
             &site.client,
@@ -269,7 +213,9 @@ impl Log {
             instant("2026-08-09T09:00:00Z").as_second(),
         )
         .unwrap();
-        site.write("feed.json", &feed);
+        if let Some(feed) = feed {
+            std::fs::write(&live, feed).unwrap();
+        }
         Log { data, db }
     }
 
@@ -336,10 +282,7 @@ fn admitted_state(log: &Log) -> Vec<String> {
     let conn = rusqlite::Connection::open(log.path()).unwrap();
     let mut dump = Vec::new();
     for query in [
-        "SELECT delta_id, domain FROM seen_deltas ORDER BY delta_id",
-        "SELECT entry_type, domain, json_extract(CAST(entry_json AS TEXT), '$.delta.url'), json_extract(CAST(entry_json AS TEXT), '$.delta.observed_at') FROM pending_entries ORDER BY rowid",
-        "SELECT domain, delta_id FROM queued_deltas ORDER BY rowid",
-        "SELECT url, domain, tip FROM url_tips ORDER BY domain, url",
+        "SELECT entry_type, domain, CAST(entry_json AS TEXT) FROM pending_entries ORDER BY rowid",
         "SELECT id, domain FROM seen_labels ORDER BY id",
     ] {
         let mut statement = conn.prepare(query).unwrap();
@@ -348,7 +291,10 @@ fn admitted_state(log: &Log) -> Vec<String> {
             .query_map([], |row| {
                 let mut fields = Vec::new();
                 for column in 0..columns {
-                    fields.push(format!("{:?}", row.get::<_, rusqlite::types::Value>(column)?));
+                    fields.push(format!(
+                        "{:?}",
+                        row.get::<_, rusqlite::types::Value>(column)?
+                    ));
                 }
                 Ok(fields.join("|"))
             })
@@ -357,14 +303,6 @@ fn admitted_state(log: &Log) -> Vec<String> {
             .unwrap();
         dump.push(format!("{query}: {}", rows.join(" / ")));
     }
-    let mut payloads: Vec<String> = std::fs::read_dir(log.data.path().join("payloads"))
-        .map(|dir| {
-            dir.map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-                .collect()
-        })
-        .unwrap_or_default();
-    payloads.sort();
-    dump.push(format!("payloads: {}", payloads.join(" / ")));
     dump
 }
 
@@ -397,213 +335,45 @@ fn queue_writes(log: &Log) -> i64 {
         .unwrap()
 }
 
-fn walked_site() -> (Site, [String; 4]) {
+fn walked_site() -> (Site, [String; 3]) {
     let site = Site::new();
-    let paged = site.delta("https://localhost/a", "paged", None, "2026-08-09T10:00:00Z");
-    let broken = site.delta(
-        "https://localhost/b",
-        "broken",
-        None,
-        "2026-08-09T11:00:00Z",
-    );
-    site.tamper_payload(&broken);
-    let root = site.delta("https://localhost/c", "root", None, "2026-08-09T11:30:00Z");
-    let update = site.delta(
-        "https://localhost/c",
-        "update",
-        Some(&root),
-        "2026-08-09T11:40:00Z",
-    );
+    let paged = site.label("https://other.example/paged", "2026-08-09T10:00:00Z");
+    let broken = site.unreadable_label(9);
+    let live = site.label("https://other.example/live", "2026-08-09T11:30:00Z");
     site.page(0, std::slice::from_ref(&paged), "2026-08-09T10:30:00Z");
-    site.feed(&[broken.clone(), update.clone()], NOW, Some(0));
-    site.label_feed(std::slice::from_ref(&paged), NOW);
-    (site, [paged, broken, root, update])
-}
-
-#[test]
-fn a_delta_admits_only_under_the_references_it_was_verified_under() {
-    let site = Site::new();
-    let first = site.delta("https://localhost/a", "one", None, "2026-08-09T12:00:00Z");
-    site.feed(&[], NOW, None);
-    let log = Log::onboard(&site);
-    let (db, data) = (&log.db, log.data.path());
-    let doc = site.read(&format!("deltas/{}.json", &first[7..]));
-    let payload = std::fs::read(
-        site.dir
-            .path()
-            .join(format!(".well-known/wist/payloads/{}.json", &first[7..])),
-    )
-    .unwrap();
-    let mut run = start_run(db, &site.host, NOW);
-    let slot = format!("{first}#0");
-    db.record_pull_object(
-        run.run_id,
-        "delta",
-        &slot,
-        "https://localhost/",
-        Status::Verified,
-        None,
-        None,
-    )
-    .unwrap();
-    let refs = issue_refs(db, data, &site.host, instant(NOW)).unwrap();
-    let Ok(verified) =
-        verify::delta(&doc, &site.host, &first, &refs.sizes, refs.clock, 600).decoded
-    else {
-        panic!("the Delta decodes");
-    };
-    let envelope = verified.envelope;
-    let item = admit::DeltaItem {
-        index: 0,
-        id: &first,
-        slot: &slot,
-        payload_slot: None,
-    };
-    let unwritten = || {
-        assert!(!db.is_delta_seen_for(&first, &site.host).unwrap());
-        assert_eq!(db.url_tip(&site.host, "https://localhost/a").unwrap(), None);
-        assert!(!data.join(format!("payloads/{}.json", &first[7..])).exists());
-    };
-
-    let mut stale = issue_refs(db, data, &site.host, instant(NOW)).unwrap();
-    stale.decl.hash = Some("another Declaration".into());
-    assert!(matches!(
-        admit::admit_delta(
-            db,
-            data,
-            &mut run,
-            &site.host,
-            &item,
-            &doc,
-            &envelope,
-            Some(&payload),
-            &stale
-        )
-        .unwrap(),
-        admit::Admission::Stale(admit::Staleness::Declaration)
-    ));
-    unwritten();
-
-    let mut stale = issue_refs(db, data, &site.host, instant(NOW)).unwrap();
-    stale.schedule_at = Some(u64::MAX);
-    stale.sizes.url_cap_bytes += 1;
-    assert!(matches!(
-        admit::admit_delta(
-            db,
-            data,
-            &mut run,
-            &site.host,
-            &item,
-            &doc,
-            &envelope,
-            Some(&payload),
-            &stale
-        )
-        .unwrap(),
-        admit::Admission::Stale(admit::Staleness::Schedule)
-    ));
-    unwritten();
-
-    let mut extended = issue_refs(db, data, &site.host, instant(NOW)).unwrap();
-    extended.schedule_at = Some(u64::MAX);
-    assert!(matches!(
-        admit::admit_delta(
-            db,
-            data,
-            &mut run,
-            &site.host,
-            &item,
-            &doc,
-            &envelope,
-            Some(&payload),
-            &extended
-        )
-        .unwrap(),
-        admit::Admission::Accepted
-    ));
-    assert!(db.is_delta_seen_for(&first, &site.host).unwrap());
-    assert!(data.join(format!("payloads/{}.json", &first[7..])).exists());
-
-    let second = site.delta(
-        "https://localhost/a",
-        "two",
-        Some(&first),
-        "2026-08-09T12:00:01Z",
-    );
-    let doc = site.read(&format!("deltas/{}.json", &second[7..]));
-    let Ok(verified) =
-        verify::delta(&doc, &site.host, &second, &refs.sizes, refs.clock, 600).decoded
-    else {
-        panic!("the Delta decodes");
-    };
-    let slot = format!("{second}#0");
-    db.record_pull_object(
-        run.run_id,
-        "delta",
-        &slot,
-        "https://localhost/",
-        Status::Verified,
-        None,
-        None,
-    )
-    .unwrap();
-    db.set_url_tip("https://localhost/a", &site.host, "sha256:elsewhere")
-        .unwrap();
-    let item = admit::DeltaItem {
-        index: 1,
-        id: &second,
-        slot: &slot,
-        payload_slot: None,
-    };
-    assert!(matches!(
-        admit::admit_delta(
-            db,
-            data,
-            &mut run,
-            &site.host,
-            &item,
-            &doc,
-            &verified.envelope,
-            None,
-            &refs
-        )
-        .unwrap(),
-        admit::Admission::Stale(admit::Staleness::ChainTip)
-    ));
-    assert!(!db.is_delta_seen_for(&second, &site.host).unwrap());
+    site.label_feed(&[broken.clone(), live.clone()], NOW, Some(0));
+    (site, [paged, broken, live])
 }
 
 #[test]
 fn delivering_the_same_fetched_or_verified_result_twice_changes_nothing() {
     let site = Site::new();
-    let id = site.delta("https://localhost/a", "one", None, "2026-08-09T12:00:00Z");
-    site.feed(&[], NOW, None);
+    let id = site.label("https://other.example/a", "2026-08-09T11:00:00Z");
     let log = Log::onboard(&site);
-    let (db, data) = (&log.db, log.data.path());
+    let db = &log.db;
     let host = site.host.clone();
     let mut run = start_run(db, &host, NOW);
     let slot = format!("{id}#0");
-    let doc = site.read(&format!("deltas/{}.json", &id[7..]));
-    let raw = serde_json::to_vec(&doc).unwrap();
+    let raw = serde_json::to_vec(&site.read(&format!("labels/{}.json", &id[7..]))).unwrap();
 
     let spent = db.ingest_bytes(&host, &NOW[..10]).unwrap();
     db.reserve_pull_object(
         run.run_id,
-        "delta",
+        "label",
         &slot,
-        "https://localhost/d",
+        "https://localhost/l",
         &host,
         &NOW[..10],
         100,
     )
     .unwrap();
     assert!(db
-        .settle_pull_object(&run, "delta", &slot, Settled::Body(&raw))
+        .settle_pull_object(&run, "label", &slot, Settled::Body(&raw))
         .unwrap());
     let debited = db.ingest_bytes(&host, &NOW[..10]).unwrap();
     assert_eq!(debited, spent + raw.len() as i64);
     assert!(
-        !db.settle_pull_object(&run, "delta", &slot, Settled::Body(&raw))
+        !db.settle_pull_object(&run, "label", &slot, Settled::Body(&raw))
             .unwrap(),
         "a second delivery of the same response is not persisted again"
     );
@@ -612,7 +382,7 @@ fn delivering_the_same_fetched_or_verified_result_twice_changes_nothing() {
     assert!(db
         .advance_pull_object(
             run.run_id,
-            "delta",
+            "label",
             &slot,
             &[Status::Fetched],
             Status::Verified,
@@ -622,7 +392,7 @@ fn delivering_the_same_fetched_or_verified_result_twice_changes_nothing() {
     assert!(!db
         .advance_pull_object(
             run.run_id,
-            "delta",
+            "label",
             &slot,
             &[Status::Fetched],
             Status::Verified,
@@ -630,65 +400,31 @@ fn delivering_the_same_fetched_or_verified_result_twice_changes_nothing() {
         )
         .unwrap());
 
-    let refs = issue_refs(db, data, &host, instant(NOW)).unwrap();
-    let Ok(verified) = verify::delta(&doc, &host, &id, &refs.sizes, refs.clock, 600).decoded else {
-        panic!("the Delta decodes");
-    };
-    let item = admit::DeltaItem {
-        index: 0,
-        id: &id,
-        slot: &slot,
-        payload_slot: None,
-    };
-    for expected_duplicate in [false, true] {
-        let admission = admit::admit_delta(
-            db,
-            data,
-            &mut run,
-            &host,
-            &item,
-            &doc,
-            &verified.envelope,
-            None,
-            &refs,
-        )
-        .unwrap();
-        assert_eq!(
-            matches!(admission, admit::Admission::Duplicate),
-            expected_duplicate
-        );
-    }
-    assert_eq!(db.count_pending_entries("publisher_delta").unwrap(), 1);
-    assert_eq!(run.chain_pos, 1);
-
-    let refused = site.delta("https://localhost/b", "two", None, "2026-08-09T12:00:00Z");
+    let refused = site.unreadable_label(3);
     let slot = format!("{refused}#0");
     let refusal = admit::Refusal {
         index: 1,
         id: &refused,
-        kind: "delta",
+        kind: "label",
         slot: &slot,
-        consumed: None,
-        resolved_prev: false,
     };
     for _ in 0..2 {
-        admit::reject_item(db, &mut run, &host, &refusal, "WIST2-E03", "unavailable").unwrap();
+        admit::reject_item(db, &mut run, &host, &refusal, "WIST2-E06", "unavailable").unwrap();
     }
     assert_eq!(
         db.list_rejections(&host)
             .unwrap()
             .iter()
-            .filter(|rejection| rejection.delta_id.as_deref() == Some(refused.as_str()))
+            .filter(|rejection| rejection.id.as_deref() == Some(refused.as_str()))
             .count(),
         1
     );
-    assert_eq!(db.pull_report(run.run_id).unwrap().len(), 2);
+    assert_eq!(db.pull_report(run.run_id).unwrap().len(), 1);
 }
 
 #[test]
 fn the_reservation_a_crashed_pull_left_is_released_with_its_run_and_settles_once() {
     let site = Site::new();
-    site.feed(&[], NOW, None);
     let log = Log::onboard(&site);
     let (db, host, day) = (&log.db, site.host.clone(), &NOW[..10]);
     let spent = db.ingest_bytes(&host, day).unwrap();
@@ -696,9 +432,9 @@ fn the_reservation_a_crashed_pull_left_is_released_with_its_run_and_settles_once
     let slot = "sha256:abc#0";
     db.reserve_pull_object(
         run.run_id,
-        "delta",
+        "label",
         slot,
-        "https://localhost/d",
+        "https://localhost/l",
         &host,
         day,
         4096,
@@ -719,16 +455,16 @@ fn the_reservation_a_crashed_pull_left_is_released_with_its_run_and_settles_once
     );
     db.reserve_pull_object(
         next.run_id,
-        "delta",
+        "label",
         slot,
-        "https://localhost/d",
+        "https://localhost/l",
         &host,
         day,
         4096,
     )
     .unwrap();
     assert_eq!(db.ingest_bytes(&host, day).unwrap(), spent + 4096);
-    db.settle_pull_object(&next, "delta", slot, Settled::Body(b"12345"))
+    db.settle_pull_object(&next, "label", slot, Settled::Body(b"12345"))
         .unwrap();
     assert_eq!(db.ingest_bytes(&host, day).unwrap(), spent + 5);
 }
@@ -736,7 +472,6 @@ fn the_reservation_a_crashed_pull_left_is_released_with_its_run_and_settles_once
 #[test]
 fn a_reservation_settles_and_releases_on_the_row_its_request_was_issued_against() {
     let site = Site::new();
-    site.feed(&[], NOW, None);
     let log = Log::onboard(&site);
     let (db, host, day) = (&log.db, site.host.clone(), &NOW[..10]);
     let (crossed_unit, crossed_day) = ("sub.localhost", "2026-08-10");
@@ -745,9 +480,9 @@ fn a_reservation_settles_and_releases_on_the_row_its_request_was_issued_against(
     let slot = "sha256:abc#0";
     db.reserve_pull_object(
         run.run_id,
-        "delta",
+        "label",
         slot,
-        "https://localhost/d",
+        "https://localhost/l",
         crossed_unit,
         crossed_day,
         4096,
@@ -761,7 +496,7 @@ fn a_reservation_settles_and_releases_on_the_row_its_request_was_issued_against(
     );
 
     assert!(db
-        .settle_pull_object(&run, "delta", slot, Settled::Body(b"12345"))
+        .settle_pull_object(&run, "label", slot, Settled::Body(b"12345"))
         .unwrap());
     assert_eq!(
         db.ingest_bytes(crossed_unit, crossed_day).unwrap(),
@@ -773,7 +508,7 @@ fn a_reservation_settles_and_releases_on_the_row_its_request_was_issued_against(
     db.reserve_pull_object(
         run.run_id,
         "page",
-        "feed:0",
+        "label:0",
         "https://localhost/f",
         crossed_unit,
         crossed_day,
@@ -795,42 +530,20 @@ fn a_reservation_settles_and_releases_on_the_row_its_request_was_issued_against(
 
 #[test]
 fn a_fresh_pull_after_an_interruption_at_any_commit_admits_what_one_pull_admits() {
-    interrupted_pulls_admit_what_one_pull_admits(PullLimits::default());
-}
-
-#[test]
-fn a_fresh_pull_after_an_interruption_at_any_commit_with_prefetches_admits_what_one_pull_admits() {
-    interrupted_pulls_admit_what_one_pull_admits(PullLimits {
-        prefetch_objects: 4,
-        ..PullLimits::default()
-    });
-}
-
-fn interrupted_pulls_admit_what_one_pull_admits(limits: PullLimits) {
     let (site, ids) = walked_site();
     let expected = {
         let log = Log::onboard(&site);
-        let report = log.pull_with(&site, limits).unwrap();
-        assert_eq!(
-            report.accepted,
-            [ids[0].clone(), ids[2].clone(), ids[3].clone()]
-        );
-        assert_eq!(
-            report.rejected,
-            [
-                (ids[1].clone(), "WIST2-E03".to_string()),
-                (ids[0].clone(), "WIST2-E06".to_string())
-            ]
-        );
+        let report = log.pull(&site).unwrap();
+        assert_eq!(report.labels, [ids[0].clone(), ids[2].clone()]);
+        assert_eq!(report.rejected, [(ids[1].clone(), "WIST2-E06".to_string())]);
         assert!(!report.suspended && report.noise.is_none());
         admitted_state(&log)
     };
     for commits in 0.. {
         let log = Log::onboard(&site);
         crate::db::interrupt::after(commits);
-        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            log.pull_with(&site, limits)
-        }));
+        let interrupted =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| log.pull(&site)));
         if crate::db::interrupt::disarm() {
             assert!(interrupted.is_ok(), "the pull ran to its end");
             assert!(commits > 0, "the pull commits at least once");
@@ -840,7 +553,7 @@ fn interrupted_pulls_admit_what_one_pull_admits(limits: PullLimits) {
             interrupted.is_err(),
             "the {commits}th commit interrupts the pull"
         );
-        let fresh = log.pull_with(&site, limits).unwrap();
+        let fresh = log.pull(&site).unwrap();
         assert!(
             !fresh.suspended,
             "the pull after the {commits}th commit runs to its end"
@@ -857,15 +570,14 @@ fn interrupted_pulls_admit_what_one_pull_admits(limits: PullLimits) {
 #[test]
 fn a_pull_never_continues_the_run_an_interrupted_pull_left_open() {
     let site = Site::new();
-    site.feed(&[], NOW, None);
     let log = Log::onboard(&site);
     let db = &log.db;
     let run = start_run(db, &site.host, NOW);
     db.record_pull_object(
         run.run_id,
-        "delta",
+        "label",
         "sha256:abc#0",
-        "https://localhost/d",
+        "https://localhost/l",
         Status::Fetched,
         Some(b"{}"),
         None,
@@ -876,7 +588,7 @@ fn a_pull_never_continues_the_run_an_interrupted_pull_left_open() {
     assert_ne!(next.run_id, run.run_id, "the pull begins a fresh run");
     assert_eq!(open_runs(&log), 1, "one run per domain");
     assert!(
-        db.pull_object(run.run_id, "delta", "sha256:abc#0")
+        db.pull_object(run.run_id, "label", "sha256:abc#0")
             .unwrap()
             .is_none(),
         "the objects of the run left open are dropped with it"
@@ -884,7 +596,7 @@ fn a_pull_never_continues_the_run_an_interrupted_pull_left_open() {
     assert_eq!(
         next.phase,
         Phase::Walk,
-        "a fresh run starts at Declaration discovery and the Feed walk"
+        "a fresh run starts at Declaration discovery"
     );
     assert_eq!(next.now, NOW, "a fresh run takes the new pull's clock");
 }
@@ -896,81 +608,38 @@ fn settling_a_fetch_or_admitting_an_item_does_not_write_the_run_s_queue() {
         let site = Site::new();
         let ids: Vec<String> = (0..items)
             .map(|n| {
-                site.delta(
-                    &format!("https://localhost/{n}"),
-                    "listed",
-                    None,
+                site.label(
+                    &format!("https://other.example/{n}"),
                     "2026-08-09T11:00:00Z",
                 )
             })
             .collect();
-        site.feed(&ids, NOW, None);
+        site.label_feed(&ids, NOW, None);
         let log = Log::onboard(&site);
         count_queue_writes(&log);
         let report = log.pull(&site).unwrap();
-        assert_eq!(report.accepted, ids, "every listed Delta is admitted");
+        assert_eq!(report.labels, ids, "every listed Label is admitted");
         writes.push(queue_writes(&log));
     }
     assert_eq!(
         writes[0], writes[1],
         "the queue is written where it changes, not once per item decided"
     );
-    assert_eq!(
-        writes[0], 3,
-        "the Feed walk, the Delta queue and the Label Feed walk each end once"
-    );
+    assert_eq!(writes[0], 1, "the Label Feed walk ends once");
 }
 
 #[test]
-fn a_page_that_cannot_be_fetched_leaves_the_cursor_holding_the_feed_it_read() {
-    let site = Site::new();
-    let first = site.delta("https://localhost/a", "first", None, "2026-08-09T11:00:00Z");
-    let second = site.delta(
-        "https://localhost/b",
-        "second",
-        None,
-        "2026-08-09T11:10:00Z",
-    );
-    let listed = [first.clone(), second.clone()];
-    site.feed(&listed, NOW, Some(0));
-    let log = Log::onboard(&site);
-
-    let report = run_bounded(
-        &log.db,
-        &site.client,
-        log.data.path(),
-        &site.host,
-        NOW,
-        || instant(NOW),
-        PullLimits {
-            work_bytes: u64::MAX,
-            work_objects: 3,
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    assert_eq!(report.accepted, [first]);
-    assert!(report.suspended);
-    assert_eq!(report.ended, None);
-    let held = log.db.walk_pages(&site.host, "feed").unwrap();
-    assert_eq!(
-        held.iter().map(|page| page.ids.clone()).collect::<Vec<_>>(),
-        [listed],
-        "the Feed the walk read stays held and the Page it could not fetch does not"
-    );
-}
-
-#[test]
-fn a_decided_delta_payload_or_label_holds_no_fetched_bytes_while_its_run_is_open() {
+fn a_decided_label_holds_no_fetched_bytes_while_its_run_is_open() {
     let (site, _) = walked_site();
     let log = Log::onboard(&site);
     let run_id = log.open_pull(&site, PullLimits::default());
-    let decided = "FROM pull_objects WHERE run_id = ?1 AND kind IN ('delta', 'payload', 'label') AND status IN ('admitted', 'rejected')";
-    assert!(
+    let decided = "FROM pull_objects WHERE run_id = ?1 AND kind = 'label' AND status IN ('admitted', 'rejected')";
+    assert_eq!(
         log.count(
             &format!("SELECT COUNT(*) {decided} AND byte_len > 0 AND debited > 0"),
             run_id
-        ) >= 5,
+        ),
+        3,
         "the decided objects keep their size and debit"
     );
     assert_eq!(
@@ -1017,10 +686,8 @@ fn paged_site() -> (Site, Vec<String>) {
     let site = Site::new();
     let ids: Vec<String> = (0..5)
         .map(|n| {
-            site.delta(
-                &format!("https://localhost/{n}"),
-                "paged",
-                None,
+            site.label(
+                &format!("https://other.example/{n}"),
                 &format!("2026-08-09T10:0{n}:00Z"),
             )
         })
@@ -1032,7 +699,7 @@ fn paged_site() -> (Site, Vec<String>) {
             &format!("2026-08-09T10:3{page}:00Z"),
         );
     }
-    site.feed(std::slice::from_ref(&ids[4]), NOW, Some(3));
+    site.label_feed(std::slice::from_ref(&ids[4]), NOW, Some(3));
     (site, ids.into_iter().rev().collect())
 }
 
@@ -1040,7 +707,7 @@ fn served_pages(site: &Site) -> Vec<String> {
     site.origin
         .take_served()
         .into_iter()
-        .filter(|path| path.contains("/feed"))
+        .filter(|path| path.contains("/label-feed"))
         .collect()
 }
 
@@ -1057,7 +724,7 @@ fn the_walk_cursor_page_bound_ends_the_walk_as_an_absent_next_does() {
     };
     let report = log.pull_with(&site, limits).unwrap();
     assert_eq!(
-        report.accepted,
+        report.labels,
         [ids[2].clone(), ids[1].clone(), ids[0].clone()]
     );
     assert!(!report.suspended && report.ended.is_none() && report.rejected.is_empty());
@@ -1068,9 +735,9 @@ fn the_walk_cursor_page_bound_ends_the_walk_as_an_absent_next_does() {
     assert_eq!(
         served_pages(&site),
         [
-            "/.well-known/wist/feed.json",
-            "/.well-known/wist/feed/3.json",
-            "/.well-known/wist/feed/2.json"
+            "/.well-known/wist/label-feed.json",
+            "/.well-known/wist/label-feed/3.json",
+            "/.well-known/wist/label-feed/2.json"
         ]
     );
     let (pages, bytes) = cursor_peak(&log);
@@ -1078,10 +745,10 @@ fn the_walk_cursor_page_bound_ends_the_walk_as_an_absent_next_does() {
     assert!(bytes <= limits.walk_bytes);
 
     let report = log.pull_with(&site, limits).unwrap();
-    assert!(report.accepted.is_empty() && !report.suspended);
+    assert!(report.labels.is_empty() && !report.suspended);
     assert_eq!(
         served_pages(&site),
-        ["/.well-known/wist/feed.json"],
+        ["/.well-known/wist/label-feed.json"],
         "a later walk stops at the first page listing no unseen ID"
     );
 }
@@ -1097,15 +764,18 @@ fn the_walk_cursor_byte_bound_counts_a_page_it_does_not_hold_at_the_page_cap() {
     let log = Log::onboard(&site);
     track_cursor_peak(&log);
     let limits = PullLimits {
-        walk_bytes: crate::fetch::OBJECT_CAP_BYTES + size("feed.json") + size("feed/3.json") - 1,
+        walk_bytes: crate::fetch::OBJECT_CAP_BYTES
+            + size("label-feed.json")
+            + size("label-feed/3.json")
+            - 1,
         ..PullLimits::default()
     };
     let report = log.pull_with(&site, limits).unwrap();
-    assert_eq!(report.accepted, [ids[1].clone(), ids[0].clone()]);
+    assert_eq!(report.labels, [ids[1].clone(), ids[0].clone()]);
     assert!(!report.suspended && report.ended.is_none());
     assert_eq!(
         cursor_peak(&log),
-        (2, size("feed.json") + size("feed/3.json"))
+        (2, size("label-feed.json") + size("label-feed/3.json"))
     );
 }
 
@@ -1114,15 +784,13 @@ fn a_pull_past_its_work_seconds_suspends_and_a_later_pull_resumes_it() {
     let site = Site::new();
     let ids: Vec<String> = (0..6)
         .map(|n| {
-            site.delta(
-                &format!("https://localhost/{n}"),
-                "timed",
-                None,
+            site.label(
+                &format!("https://other.example/{n}"),
                 "2026-08-09T11:00:00Z",
             )
         })
         .collect();
-    site.feed(&ids, NOW, None);
+    site.label_feed(&ids, NOW, None);
     let log = Log::onboard(&site);
     site.origin.delay(400);
     let first = log
@@ -1135,11 +803,11 @@ fn a_pull_past_its_work_seconds_suspends_and_a_later_pull_resumes_it() {
         )
         .unwrap();
     assert!(first.suspended);
-    assert!(first.accepted.len() < ids.len());
+    assert!(first.labels.len() < ids.len());
     site.origin.delay(0);
     let later = log.pull(&site).unwrap();
     assert!(!later.suspended);
-    assert_eq!([first.accepted, later.accepted].concat(), ids);
+    assert_eq!([first.labels, later.labels].concat(), ids);
 }
 
 const WAKE_NOW: i64 = 1_786_276_805;
@@ -1215,9 +883,9 @@ fn a_credit_to_a_meter_row_wakes_the_resumptions_of_its_registrable_domain_that_
     let remainder = budget - db.ingest_bytes(&unit, day).unwrap();
     db.reserve_pull_object(
         run.run_id,
-        "delta",
+        "label",
         "sha256:a#0",
-        "https://a.example.com/d",
+        "https://a.example.com/l",
         &unit,
         day,
         remainder as u64,
@@ -1280,7 +948,7 @@ fn a_credit_to_a_meter_row_wakes_the_resumptions_of_its_registrable_domain_that_
     );
 
     let credit = db
-        .settle_pull_object_crediting(&run, "delta", "sha256:a#0", Settled::Body(b"12345"))
+        .settle_pull_object_crediting(&run, "label", "sha256:a#0", Settled::Body(b"12345"))
         .unwrap();
     assert_eq!(
         credit,
@@ -1305,13 +973,8 @@ fn a_credit_to_a_meter_row_wakes_the_resumptions_of_its_registrable_domain_that_
 #[test]
 fn a_pull_s_settlement_wakes_a_sibling_resumption_deferred_to_the_next_day() {
     let site = Site::at("a.wake.localhost");
-    let id = site.delta(
-        "https://a.wake.localhost/a",
-        "one",
-        None,
-        "2026-08-09T11:00:00Z",
-    );
-    site.feed(std::slice::from_ref(&id), NOW, None);
+    let id = site.label("https://other.example/a", "2026-08-09T11:00:00Z");
+    site.label_feed(std::slice::from_ref(&id), NOW, None);
     let log = Log::with_suffix_list().onboarded(&site);
     let db = &log.db;
     let sibling = "b.wake.localhost";
@@ -1326,7 +989,7 @@ fn a_pull_s_settlement_wakes_a_sibling_resumption_deferred_to_the_next_day() {
     );
 
     let report = log.pull(&site).unwrap();
-    assert_eq!(report.accepted, [id]);
+    assert_eq!(report.labels, [id]);
     assert_eq!(due_at(db, sibling), WAKE_NOW);
 }
 
@@ -1343,9 +1006,9 @@ fn opening_a_pull_releases_a_crashed_run_s_reservation_and_wakes_a_sibling_resum
     let crashed = start_run(db, &site.host, NOW);
     db.reserve_pull_object(
         crashed.run_id,
-        "delta",
+        "label",
         "sha256:a#0",
-        "https://a.wake.localhost/d",
+        "https://a.wake.localhost/l",
         &unit,
         &NOW[..10],
         4096,
@@ -1367,249 +1030,4 @@ fn opening_a_pull_releases_a_crashed_run_s_reservation_and_wakes_a_sibling_resum
         "the pull makes no metered request whose settlement could credit the row"
     );
     assert_eq!(due_at(db, sibling), WAKE_NOW);
-}
-
-fn listed_site() -> (Site, Vec<String>) {
-    let site = Site::new();
-    let ids: Vec<String> = (0..12)
-        .map(|n| {
-            site.delta(
-                &format!("https://localhost/{n}"),
-                "listed",
-                None,
-                "2026-08-09T11:00:00Z",
-            )
-        })
-        .collect();
-    site.feed(&ids, NOW, None);
-    (site, ids)
-}
-
-const PREFETCHING: PullLimits = PullLimits {
-    work_bytes: 64 << 20,
-    work_objects: 4096,
-    work_seconds: 300,
-    walk_pages: 1024,
-    walk_bytes: 64 << 20,
-    prefetch_objects: 4,
-    prefetch_bytes: 8 << 20,
-};
-
-#[test]
-fn prefetched_delta_files_are_fetched_concurrently_and_admit_what_a_sequential_pull_admits() {
-    let (site, ids) = listed_site();
-    let mut states = Vec::new();
-    let mut peaks = Vec::new();
-    for limits in [PullLimits::default(), PREFETCHING] {
-        let log = Log::onboard(&site);
-        site.origin.delay(50);
-        site.origin.take_peak();
-        let report = log.pull_with(&site, limits).unwrap();
-        site.origin.delay(0);
-        assert_eq!(report.accepted, ids);
-        peaks.push(site.origin.take_peak());
-        states.push(admitted_state(&log));
-    }
-    assert_eq!(peaks[0], 1, "the default pull is sequential");
-    assert!(peaks[1] >= 2, "prefetches overlap: {}", peaks[1]);
-    assert_eq!(states[0], states[1]);
-}
-
-#[test]
-fn prefetching_under_a_budget_below_its_margin_stays_sequential_and_crosses_where_a_sequential_pull_does(
-) {
-    let (site, _) = listed_site();
-    let mut pulls = Vec::new();
-    for limits in [PullLimits::default(), PREFETCHING] {
-        let log = Log::onboard(&site);
-        let unit = crate::suffix_list::unit_at(&log.db, &site.host, NOW).unwrap();
-        let spent = log.db.ingest_bytes(&unit, &NOW[..10]).unwrap();
-        log.db
-            .set_param("ingest_budget_bytes_day", spent + 6_000)
-            .unwrap();
-        site.origin.take_peak();
-        site.origin.take_served();
-        let report = log.pull_with(&site, limits).unwrap();
-        assert!(report.suspended, "the budget is crossed");
-        pulls.push((
-            report.accepted,
-            log.db.ingest_bytes(&unit, &NOW[..10]).unwrap(),
-            site.origin.take_served(),
-            site.origin.take_peak(),
-        ));
-    }
-    assert_eq!(pulls[1].3, 1, "no request overlaps another");
-    assert_eq!(pulls[0], pulls[1]);
-}
-
-#[test]
-fn a_pull_suspended_with_prefetches_in_flight_joins_and_settles_them_before_it_returns() {
-    let site = Site::new();
-    let mut chain = None;
-    for n in 0..11 {
-        chain = Some(site.delta(
-            "https://localhost/chain",
-            "chained",
-            chain.as_deref(),
-            &format!("2026-08-09T10:{n:02}:00Z"),
-        ));
-    }
-    let mut ids = vec![chain.unwrap()];
-    for n in 0..8 {
-        let id = site.delta(
-            &format!("https://localhost/{n}"),
-            "listed",
-            None,
-            "2026-08-09T11:00:00Z",
-        );
-        site.origin
-            .slow(&format!("deltas/{}.json", &id[7..]), 1_500);
-        ids.push(id);
-    }
-    site.feed(&ids, NOW, None);
-    let log = Log::onboard(&site);
-
-    let run_id = log.open_pull(
-        &site,
-        PullLimits {
-            work_objects: 16,
-            ..PREFETCHING
-        },
-    );
-    assert_eq!(site.origin.in_flight(), 0, "no prefetch outlives the pull");
-    assert_eq!(
-        log.count(
-            "SELECT COUNT(*) FROM pull_objects WHERE run_id = ?1 AND status = 'issued'",
-            run_id
-        ),
-        0
-    );
-    let prefetched = ids[1..5]
-        .iter()
-        .map(|id| {
-            log.db
-                .pull_object(run_id, "delta", &format!("{id}#0"))
-                .unwrap()
-                .map(|object| object.status)
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(prefetched, [Some(Status::Fetched); 4]);
-    assert!(log.db.pull_run(run_id).unwrap().unwrap().suspended);
-    admit::close_run(&log.db, run_id).unwrap();
-
-    let later = log.pull(&site).unwrap();
-    assert!(!later.suspended);
-    for id in &ids {
-        assert!(log.db.is_delta_seen_for(id, &site.host).unwrap());
-    }
-}
-
-#[test]
-fn a_pull_after_a_suspension_requests_and_debits_again_the_prefetched_delta_files_it_never_reached()
-{
-    let site = Site::new();
-    let mut chain = None;
-    for n in 0..11 {
-        chain = Some(site.delta(
-            "https://localhost/chain",
-            "chained",
-            chain.as_deref(),
-            &format!("2026-08-09T10:{n:02}:00Z"),
-        ));
-    }
-    let mut ids = vec![chain.unwrap()];
-    for n in 0..8 {
-        ids.push(site.delta(
-            &format!("https://localhost/{n}"),
-            "listed",
-            None,
-            "2026-08-09T11:00:00Z",
-        ));
-    }
-    site.feed(&ids, NOW, None);
-    let metered = |served: Vec<String>| {
-        served
-            .into_iter()
-            .filter(|path| !path.ends_with("/publisher.json"))
-            .collect::<Vec<_>>()
-    };
-    let octets = |paths: &[String]| -> i64 {
-        paths
-            .iter()
-            .map(|path| {
-                std::fs::metadata(site.dir.path().join(path.trim_start_matches('/')))
-                    .unwrap()
-                    .len() as i64
-            })
-            .sum()
-    };
-
-    let control = Log::onboard(&site);
-    let unit = crate::suffix_list::unit_at(&control.db, &site.host, NOW).unwrap();
-    let spent = |log: &Log| log.db.ingest_bytes(&unit, &NOW[..10]).unwrap();
-    let before = spent(&control);
-    let report = control.pull_with(&site, PREFETCHING).unwrap();
-    assert!(!report.suspended);
-    let uninterrupted = spent(&control) - before;
-
-    let log = Log::onboard(&site);
-    let before = spent(&log);
-    site.origin.take_served();
-    let run_id = log.open_pull(
-        &site,
-        PullLimits {
-            work_objects: 16,
-            ..PREFETCHING
-        },
-    );
-    assert!(log.db.pull_run(run_id).unwrap().unwrap().suspended);
-    let prefetched = ids[1..5]
-        .iter()
-        .map(|id| {
-            log.db
-                .pull_object(run_id, "delta", &format!("{id}#0"))
-                .unwrap()
-                .map(|object| object.status)
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        prefetched,
-        [Some(Status::Fetched); 4],
-        "the prefetched Delta files landed and the walk never reached them"
-    );
-    admit::close_run(&log.db, run_id).unwrap();
-    let suspended = metered(site.origin.take_served());
-    let resumed = log.pull_with(&site, PREFETCHING).unwrap();
-    assert!(!resumed.suspended);
-    let later = metered(site.origin.take_served());
-    let interrupted = spent(&log) - before;
-
-    let prefetched: Vec<String> = ids[1..5]
-        .iter()
-        .map(|id| format!("/.well-known/wist/deltas/{}.json", &id[7..]))
-        .collect();
-    for path in &prefetched {
-        assert_eq!(
-            suspended
-                .iter()
-                .chain(&later)
-                .filter(|p| *p == path)
-                .count(),
-            2,
-            "{path} is requested by both pulls"
-        );
-    }
-    let refetched: Vec<String> = suspended
-        .iter()
-        .filter(|path| later.contains(path))
-        .cloned()
-        .collect();
-    assert_eq!(
-        interrupted - uninterrupted,
-        octets(&refetched),
-        "the two pulls are debited the octets of every file the second one requested again beyond one uninterrupted pull"
-    );
-    assert!(prefetched.iter().all(|path| refetched.contains(path)));
-    assert!(octets(&prefetched) <= PREFETCHING.prefetch_bytes as i64);
-    assert_eq!(admitted_state(&log), admitted_state(&control));
 }

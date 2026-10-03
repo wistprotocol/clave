@@ -2,7 +2,7 @@ mod common;
 
 use common::{
     make_publisher, make_publisher_with_scope, reserve_addr, serve_recording, serve_static,
-    write_feed,
+    write_label_feed,
 };
 use serde_json::{json, Value};
 use std::fs;
@@ -90,7 +90,7 @@ fn label(labeler: &str, subject: &str, name: &str, asserted_at: &str) -> Value {
 fn a_label_feed_next_failing_the_target_rule_records_e01_and_keeps_the_labels() {
     let (listener, host, client) = reserve_addr();
     let p = make_publisher(&host);
-    write_feed(&p, &host, &[], "2026-08-09T12:00:00Z");
+    write_label_feed(&p, &host, &[], "2026-08-09T12:00:00Z");
     let (id, envelope) = sign(
         &p,
         "label",
@@ -126,7 +126,7 @@ fn a_label_feed_next_failing_the_target_rule_records_e01_and_keeps_the_labels() 
         .list_rejections(&host)
         .unwrap()
         .into_iter()
-        .filter(|r| r.code == "WIST2-E01" && r.delta_id.is_none())
+        .filter(|r| r.code == "WIST2-E01" && r.id.is_none())
         .collect();
     assert_eq!(e01.len(), 1);
     assert!(e01[0]
@@ -145,7 +145,7 @@ fn a_label_feed_next_failing_the_target_rule_records_e01_and_keeps_the_labels() 
 fn labels_and_disputes_are_pulled_sealed_and_carried() {
     let (listener, host, client) = reserve_addr();
     let p = make_publisher(&host);
-    write_feed(&p, &host, &[], "2026-08-09T12:00:00Z");
+    write_label_feed(&p, &host, &[], "2026-08-09T12:00:00Z");
     let subject = "https://reduced.example.org/notice";
     let mut valid = label(&host, subject, "wist:spam", "2026-08-09T12:00:00Z");
     valid["value"] = 500_000.into();
@@ -195,7 +195,7 @@ fn labels_and_disputes_are_pulled_sealed_and_carried() {
     let rejections = db.list_rejections(&host).unwrap();
     assert!(rejections
         .iter()
-        .any(|r| r.code == "WIST2-E06" && r.delta_id.as_deref() == Some(self_id.as_str())));
+        .any(|r| r.code == "WIST2-E06" && r.id.as_deref() == Some(self_id.as_str())));
 
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
     let r0 = clave::seal::run(&db, data.path(), &sk, SEAL_START).unwrap();
@@ -238,7 +238,7 @@ fn labels_and_disputes_are_pulled_sealed_and_carried() {
             .resolve(&disputant, disputant_listener.local_addr().unwrap()),
     );
     let d = make_publisher_with_scope(&disputant, &["reduced.example.org"]);
-    write_feed(&d, &disputant, &[], "2026-08-09T13:00:00Z");
+    write_label_feed(&d, &disputant, &[], "2026-08-09T13:00:00Z");
     let (dispute_id, dispute_envelope) = sign(
         &d,
         "dispute",
@@ -322,14 +322,14 @@ fn is_e06_for(db: &clave::db::Db, host: &str, id: &str) -> bool {
     db.list_rejections(host)
         .unwrap()
         .iter()
-        .any(|r| r.code == "WIST2-E06" && r.delta_id.as_deref() == Some(id))
+        .any(|r| r.code == "WIST2-E06" && r.id.as_deref() == Some(id))
 }
 
 #[test]
 fn a_label_asserted_beyond_the_attempt_clock_allowance_is_rejected_and_pulled_again() {
     let (listener, host, client) = reserve_addr();
     let p = make_publisher(&host);
-    write_feed(&p, &host, &[], "2026-08-09T12:00:00Z");
+    write_label_feed(&p, &host, &[], "2026-08-09T12:00:00Z");
     let subject = "https://reduced.example.org/notice";
     let at_bound = sign(
         &p,
@@ -375,7 +375,7 @@ fn a_label_asserted_beyond_the_attempt_clock_allowance_is_rejected_and_pulled_ag
 fn a_dispute_asserted_beyond_the_attempt_clock_allowance_is_rejected_and_pulled_again() {
     let (listener, host, client) = reserve_addr();
     let p = make_publisher(&host);
-    write_feed(&p, &host, &[], "2026-08-09T12:00:00Z");
+    write_label_feed(&p, &host, &[], "2026-08-09T12:00:00Z");
     let subject = "https://reduced.example.org/notice";
     let (id, envelope) = sign(
         &p,
@@ -403,7 +403,7 @@ fn a_dispute_asserted_beyond_the_attempt_clock_allowance_is_rejected_and_pulled_
             .resolve(&disputant, disputant_listener.local_addr().unwrap()),
     );
     let d = make_publisher_with_scope(&disputant, &["reduced.example.org"]);
-    write_feed(&d, &disputant, &[], "2026-08-09T13:00:00Z");
+    write_label_feed(&d, &disputant, &[], "2026-08-09T13:00:00Z");
     let dispute = |asserted_at: &str| {
         sign(
             &d,
@@ -455,7 +455,7 @@ fn a_dispute_asserted_beyond_the_attempt_clock_allowance_is_rejected_and_pulled_
 fn a_queued_label_beyond_the_allowance_at_sealed_at_is_dropped_reported_and_pulled_again() {
     let (listener, host, client) = reserve_addr();
     let p = make_publisher(&host);
-    write_feed(&p, &host, &[], "2026-08-16T11:55:00Z");
+    write_label_feed(&p, &host, &[], "2026-08-16T11:55:00Z");
     let (id, envelope) = sign(
         &p,
         "label",

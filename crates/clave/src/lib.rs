@@ -36,10 +36,10 @@ mod tests {
     #[test]
     fn wist_version_matches_spec_example() {
         let dir = std::env::var("WIST_SPEC_DIR").unwrap_or_else(|_| "../../../spec".into());
-        let delta: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(std::path::Path::new(&dir).join("examples/delta.json")).unwrap(),
+        let catalog: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(std::path::Path::new(&dir).join("examples/catalog.json")).unwrap(),
         )
         .unwrap();
-        assert_eq!(delta["delta"]["wist_version"], WIST_VERSION);
+        assert_eq!(catalog["catalog"]["wist_version"], WIST_VERSION);
     }
 }

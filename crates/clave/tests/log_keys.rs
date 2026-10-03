@@ -912,7 +912,6 @@ fn replay_vector_history(history: &Value) -> (tempfile::TempDir, clave::db::Db, 
                 &[],
                 &[],
                 &[],
-                &[],
             )
             .unwrap();
         assert_eq!(
@@ -1042,7 +1041,6 @@ fn a_checkpoint_is_never_signed_by_more_than_sixteen_aggregator_keys() {
             "2026-08-09T12:00:00Z",
             &[],
             0,
-            &[],
             &[],
             &[],
             &[],
