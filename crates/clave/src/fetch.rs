@@ -229,6 +229,16 @@ fn read_bounded(
     Ok(body)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Octets {
+    NotModified,
+    Read {
+        octets: Vec<u8>,
+        exceeded: bool,
+        validator: Option<String>,
+    },
+}
+
 pub struct PostResponse {
     pub status: u16,
     pub content_type: Option<String>,
@@ -339,6 +349,38 @@ impl Client {
         read_bounded(resp, limit, url)
     }
 
+    pub fn get_octets(
+        &self,
+        url: &str,
+        subdomain_scope: &[String],
+        limit: u64,
+        validator: Option<&str>,
+    ) -> Result<Octets> {
+        let resp = self.final_response_with(url, subdomain_scope, validator)?;
+        if validator.is_some() && resp.status() == reqwest::StatusCode::NOT_MODIFIED {
+            return Ok(Octets::NotModified);
+        }
+        if !resp.status().is_success() {
+            return Err(Error::Fetch(format!("HTTP {} for {url}", resp.status())));
+        }
+        let etag = resp
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let mut octets = Vec::new();
+        resp.take(limit.saturating_add(1))
+            .read_to_end(&mut octets)
+            .map_err(|e| Error::Fetch(e.to_string()))?;
+        let exceeded = octets.len() as u64 > limit;
+        octets.truncate(limit.min(usize::MAX as u64) as usize);
+        Ok(Octets::Read {
+            octets,
+            exceeded,
+            validator: etag,
+        })
+    }
+
     pub fn get_bytes_unless_absent(&self, url: &str, limit: u64) -> Result<Option<Vec<u8>>> {
         let resp = self.final_response(url, &[])?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
@@ -355,6 +397,15 @@ impl Client {
         url: &str,
         subdomain_scope: &[String],
     ) -> Result<reqwest::blocking::Response> {
+        self.final_response_with(url, subdomain_scope, None)
+    }
+
+    fn final_response_with(
+        &self,
+        url: &str,
+        subdomain_scope: &[String],
+        validator: Option<&str>,
+    ) -> Result<reqwest::blocking::Response> {
         let mut parsed =
             url::Url::parse(url).map_err(|e| Error::Fetch(format!("invalid URL {url}: {e}")))?;
         guard_target(&parsed, self.allow_http)?;
@@ -363,12 +414,14 @@ impl Client {
         let mut fetched = std::collections::HashSet::new();
         fetched.insert(parsed.clone());
         let resp = loop {
-            let resp = self
-                .inner
-                .get(parsed.clone())
-                .send()
-                .map_err(|e| Error::Fetch(describe(e)))?;
-            if !resp.status().is_redirection() {
+            let mut request = self.inner.get(parsed.clone());
+            if let Some(validator) = validator {
+                request = request.header(reqwest::header::IF_NONE_MATCH, validator);
+            }
+            let resp = request.send().map_err(|e| Error::Fetch(describe(e)))?;
+            if !resp.status().is_redirection()
+                || (validator.is_some() && resp.status() == reqwest::StatusCode::NOT_MODIFIED)
+            {
                 break resp;
             }
             if hops == MAX_REDIRECTS {

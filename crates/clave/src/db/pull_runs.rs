@@ -3,7 +3,7 @@ use crate::error::{Error, Result};
 use rusqlite::{Connection, OptionalExtension};
 
 const SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS pull_runs(run_id INTEGER PRIMARY KEY AUTOINCREMENT, domain TEXT NOT NULL UNIQUE, token INTEGER, now TEXT NOT NULL, day TEXT NOT NULL, unit TEXT NOT NULL, phase TEXT NOT NULL CHECK(phase IN ('walk','labels','label_items','closing','aborted')), work_bytes INTEGER NOT NULL, work_objects INTEGER NOT NULL, discovered INTEGER NOT NULL DEFAULT 0, suspended INTEGER NOT NULL DEFAULT 0, pages_epoch INTEGER, queue_json BLOB NOT NULL DEFAULT '[]', position INTEGER NOT NULL DEFAULT 0, ended TEXT);
+CREATE TABLE IF NOT EXISTS pull_runs(run_id INTEGER PRIMARY KEY AUTOINCREMENT, domain TEXT NOT NULL UNIQUE, token INTEGER, now TEXT NOT NULL, day TEXT NOT NULL, unit TEXT NOT NULL, phase TEXT NOT NULL CHECK(phase IN ('walk','collections','labels','label_items','closing','aborted')), work_bytes INTEGER NOT NULL, work_objects INTEGER NOT NULL, discovered INTEGER NOT NULL DEFAULT 0, suspended INTEGER NOT NULL DEFAULT 0, pages_epoch INTEGER, queue_json BLOB NOT NULL DEFAULT '[]', position INTEGER NOT NULL DEFAULT 0, ended TEXT, event INTEGER, positions INTEGER);
 CREATE TABLE IF NOT EXISTS pull_objects(run_id INTEGER NOT NULL, kind TEXT NOT NULL, object_id TEXT NOT NULL, url TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('issued','fetched','verified','admitted','rejected','failed')), raw BLOB, byte_len INTEGER, debited INTEGER NOT NULL DEFAULT 0, unit TEXT, day TEXT, checks_json TEXT, refs_json TEXT, report TEXT, report_seq INTEGER, PRIMARY KEY(run_id, kind, object_id));
 CREATE TABLE IF NOT EXISTS pull_walk(domain TEXT NOT NULL, feed TEXT NOT NULL CHECK(feed IN ('label')), idx INTEGER NOT NULL, url TEXT NOT NULL, generated_at TEXT NOT NULL, ids_json BLOB NOT NULL, next_url TEXT, raw BLOB, PRIMARY KEY(domain, feed, idx));
 ";
@@ -16,6 +16,7 @@ pub(super) fn create(conn: &Connection) -> Result<()> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Phase {
     Walk,
+    Collections,
     Labels,
     LabelItems,
     Closing,
@@ -26,6 +27,7 @@ impl Phase {
     fn as_str(self) -> &'static str {
         match self {
             Phase::Walk => "walk",
+            Phase::Collections => "collections",
             Phase::Labels => "labels",
             Phase::LabelItems => "label_items",
             Phase::Closing => "closing",
@@ -36,6 +38,7 @@ impl Phase {
     fn parse(value: &str) -> Result<Phase> {
         Ok(match value {
             "walk" => Phase::Walk,
+            "collections" => Phase::Collections,
             "labels" => Phase::Labels,
             "label_items" => Phase::LabelItems,
             "closing" => Phase::Closing,
@@ -104,6 +107,8 @@ pub(crate) struct PullRun {
     pub queue: Vec<String>,
     pub position: usize,
     pub ended: Option<String>,
+    pub event: Option<u64>,
+    pub positions: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,11 +155,12 @@ fn page_of((url, generated_at, ids, next_url, raw): WalkRow) -> Result<WalkPage>
 
 pub(crate) enum Settled<'a> {
     Body(&'a [u8]),
+    Read(u64),
     Bounded(u64),
     Failed(&'a str),
 }
 
-const RUN_COLUMNS: &str = "run_id, domain, now, day, unit, phase, work_bytes, work_objects, discovered, suspended, pages_epoch, queue_json, position, ended";
+const RUN_COLUMNS: &str = "run_id, domain, now, day, unit, phase, work_bytes, work_objects, discovered, suspended, pages_epoch, queue_json, position, ended, event, positions";
 
 fn run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(PullRun, String, String)> {
     Ok((
@@ -173,6 +179,8 @@ fn run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(PullRun, String, String
             queue: Vec::new(),
             position: row.get::<_, i64>(12)?.max(0) as usize,
             ended: row.get(13)?,
+            event: row.get::<_, Option<i64>>(14)?.map(|e| e.max(0) as u64),
+            positions: row.get::<_, Option<i64>>(15)?.unwrap_or_default().max(0) as u64,
         },
         row.get(5)?,
         row.get(11)?,
@@ -295,7 +303,7 @@ impl Db {
 
     pub(crate) fn update_pull_run(&self, run: &PullRun) -> Result<()> {
         self.execute(
-            "UPDATE pull_runs SET phase = ?2, work_bytes = ?3, work_objects = ?4, discovered = ?5, suspended = ?6, position = ?7, ended = ?8 WHERE run_id = ?1",
+            "UPDATE pull_runs SET phase = ?2, work_bytes = ?3, work_objects = ?4, discovered = ?5, suspended = ?6, position = ?7, ended = ?8, event = ?9, positions = ?10 WHERE run_id = ?1",
             rusqlite::params![
                 run.run_id,
                 run.phase.as_str(),
@@ -305,6 +313,8 @@ impl Db {
                 run.suspended,
                 run.position as i64,
                 run.ended,
+                run.event.map(|e| e.min(i64::MAX as u64) as i64),
+                run.positions.min(i64::MAX as u64) as i64,
             ],
         )?;
         Ok(())
@@ -481,6 +491,7 @@ impl Db {
             .ok_or_else(|| Error::History(format!("{kind} {object_id} lost its reservation")))?;
         let (status, raw, debited, checks) = match settled {
             Settled::Body(raw) => (Status::Fetched, Some(raw), raw.len() as u64, None),
+            Settled::Read(octets) => (Status::Fetched, None, octets, None),
             Settled::Bounded(debited) => (Status::Failed, None, debited, None),
             Settled::Failed(detail) => (
                 Status::Failed,

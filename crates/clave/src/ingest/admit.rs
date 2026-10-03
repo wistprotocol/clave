@@ -468,7 +468,25 @@ pub(super) fn admit_label(
     };
     let admission = match outcome {
         Ok(()) => {
-            db.insert_pending_entry(kind.as_str(), host, doc, 0)?;
+            let place = crate::collection::state::Place::url(
+                run.event.unwrap_or_default(),
+                run.positions,
+                index as u64,
+            );
+            let eligibility = db.last_epoch()?.map_or(0, |epoch| epoch.epoch_number + 1);
+            db.insert_waiting_label(
+                id,
+                &crate::collection::state::WaitingLabel {
+                    kind: match kind {
+                        LabelKind::Label => crate::collection::state::LabelKind::Label,
+                        LabelKind::Dispute => crate::collection::state::LabelKind::Dispute,
+                    },
+                    publisher: host.to_owned(),
+                    envelope: doc.clone(),
+                    place,
+                    eligibility,
+                },
+            )?;
             db.insert_seen_label(id, host)?;
             db.report_pull_object(run.run_id, "label", slot, Status::Admitted, "label")?;
             LabelAdmission::Admitted
@@ -533,6 +551,7 @@ pub(super) fn close_run(db: &Db, run_id: i64) -> Result<IngestReport> {
             .to_string();
         match entry.as_str() {
             "accepted" => report.accepted.push(id),
+            "item" => report.items.push(id),
             "queued" => report.queued.push(id),
             "label" => report.labels.push(id),
             code => report.rejected.push((id, code.to_string())),
@@ -552,7 +571,7 @@ pub(super) fn close_run(db: &Db, run_id: i64) -> Result<IngestReport> {
                 if !run.discovered
                     && report.accepted.is_empty()
                     && report.queued.is_empty()
-                    && report.rejected.is_empty()
+                    && report.items.is_empty()
                     && report.labels.is_empty()
                 {
                     report.noise = Some("WIST2-E02");

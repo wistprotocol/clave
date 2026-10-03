@@ -464,12 +464,14 @@ fn assert_catalog(history: &History<'_>, at: &str, got: &CatalogReport, wanted: 
         match member.as_str() {
             "codes" | "reason" => {}
             "tree_files_fetched" => {
-                for hex in value.as_array().unwrap() {
-                    assert!(
-                        got.tree_files_fetched.iter().any(|got| got == hex),
-                        "{at}: tree file {hex} not fetched"
-                    );
-                }
+                let mut wanted: Vec<&str> = value
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|hex| hex.as_str().unwrap())
+                    .collect();
+                wanted.sort_unstable();
+                assert_eq!(got.tree_files_fetched, wanted, "{at}: tree files fetched");
             }
             "items" => {
                 let items = value.as_array().unwrap();
@@ -1124,4 +1126,365 @@ fn a_pull_after_the_one_that_settled_the_queue_settles_nothing_again() {
     assert_eq!(report.catalogs[0].outcome, CatalogOutcome::Idempotent);
     assert_eq!(run.state.urls, urls);
     run.epoch(8, &events[8], &expected[8]);
+}
+
+type Served = std::sync::Arc<std::sync::Mutex<BTreeMap<String, Vec<u8>>>>;
+
+fn serve_validated(files: Served) -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let base = format!(
+        "http://{}/.well-known/wist/",
+        listener.local_addr().unwrap()
+    );
+    std::thread::spawn(move || {
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async move {
+                let app = axum::Router::new().fallback(
+                    move |headers: axum::http::HeaderMap, uri: axum::http::Uri| {
+                        let path = uri
+                            .path()
+                            .trim_start_matches("/.well-known/wist/")
+                            .to_owned();
+                        let served = files.lock().unwrap().get(&path).cloned();
+                        async move {
+                            use axum::http::{header, HeaderValue, StatusCode};
+                            let Some(octets) = served else {
+                                return (
+                                    StatusCode::NOT_FOUND,
+                                    axum::http::HeaderMap::new(),
+                                    Vec::new(),
+                                );
+                            };
+                            let validator = clave::collection::site::validator(&octets);
+                            let mut answer = axum::http::HeaderMap::new();
+                            answer.insert(header::ETAG, HeaderValue::from_str(&validator).unwrap());
+                            if headers
+                                .get(header::IF_NONE_MATCH)
+                                .and_then(|v| v.to_str().ok())
+                                == Some(validator.as_str())
+                            {
+                                return (StatusCode::NOT_MODIFIED, answer, Vec::new());
+                            }
+                            (StatusCode::OK, answer, octets)
+                        }
+                    },
+                );
+                axum::serve(tokio::net::TcpListener::from_std(listener).unwrap(), app)
+                    .await
+                    .unwrap();
+            });
+    });
+    base
+}
+
+struct HttpSite<'a> {
+    client: &'a clave::fetch::Client,
+    base: &'a str,
+    meter: Meter,
+}
+
+impl clave::collection::Site for HttpSite<'_> {
+    fn fetch(
+        &mut self,
+        request: &clave::collection::Request<'_>,
+    ) -> clave::error::Result<clave::collection::Answer> {
+        use clave::collection::site::Metered;
+        use clave::collection::Answer;
+        let metered = request.object.metered();
+        let no_object_left = self.meter.objects_remaining == Some(0);
+        if metered && no_object_left {
+            self.meter.read(request.bound, 0);
+            return Ok(Answer::Suspended);
+        }
+        let url = format!("{}{}", self.base, request.object.path());
+        let fetched = self
+            .client
+            .get_octets(&url, &[], 1 << 30, request.validator)
+            .ok();
+        if metered {
+            let octets = match &fetched {
+                Some(clave::fetch::Octets::Read { octets, .. }) => octets.len() as u64,
+                _ => 0,
+            };
+            match self.meter.read(request.bound, octets).0 {
+                Metered::Suspended => return Ok(Answer::Interrupted),
+                Metered::Failed => return Ok(Answer::Oversized),
+                Metered::Read => {}
+            }
+        }
+        Ok(match fetched {
+            None => Answer::Failed,
+            Some(clave::fetch::Octets::NotModified) => Answer::NotModified,
+            Some(clave::fetch::Octets::Read { octets, .. })
+                if octets.len() as u64 > request.bound =>
+            {
+                Answer::Oversized
+            }
+            Some(clave::fetch::Octets::Read {
+                octets, validator, ..
+            }) => Answer::Octets { octets, validator },
+        })
+    }
+}
+
+fn publishers_of(state: &State) -> BTreeSet<String> {
+    state
+        .collections
+        .keys()
+        .map(|(publisher, _)| publisher.clone())
+        .chain(state.discovered.keys().cloned())
+        .chain(state.queues.keys().cloned())
+        .chain(state.urls.keys().map(|(publisher, _)| publisher.clone()))
+        .chain(state.records.keys().map(|(publisher, _)| publisher.clone()))
+        .chain(state.labels.values().map(|label| label.publisher.clone()))
+        .chain(state.floors.keys().cloned())
+        .collect()
+}
+
+struct StoreRun {
+    data: tempfile::TempDir,
+    db: clave::db::Db,
+    sealed: State,
+    client: clave::fetch::Client,
+    files: Served,
+    base: String,
+}
+
+impl StoreRun {
+    fn new() -> Self {
+        let data = tempfile::tempdir().unwrap();
+        clave::init::run("log.example", data.path()).unwrap();
+        let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
+        let files: Served = Default::default();
+        let base = serve_validated(files.clone());
+        StoreRun {
+            data,
+            db,
+            sealed: State::default(),
+            client: clave::fetch::Client::with_builder(
+                true,
+                reqwest::blocking::Client::builder().no_proxy(),
+            ),
+            files,
+            base,
+        }
+    }
+
+    /// The store's clock counts the last event it assigned; the vectors number the first event 0.
+    fn load(&self, publishers: &BTreeSet<String>) -> State {
+        let mut state = self
+            .db
+            .load_state(clave::db::Sealed::of(&self.sealed), publishers)
+            .unwrap();
+        state.events -= 1;
+        state
+    }
+
+    fn store(&self, before: &State, after: &State, publishers: &BTreeSet<String>) {
+        let shift = |state: &State| State {
+            events: state.events + 1,
+            ..state.clone()
+        };
+        self.db
+            .store_state(
+                &shift(before),
+                &shift(after),
+                publishers,
+                "2026-08-09T00:00:00Z",
+            )
+            .unwrap();
+    }
+
+    fn pull(&mut self, history: &History<'_>, event: &Value) -> (u64, u64) {
+        let served = serve_pull(history, event);
+        *self.files.lock().unwrap() = served.files.clone();
+        let publisher = event["publisher"].as_str().unwrap();
+        let scope = self.db.pull_scope(publisher).unwrap();
+        let before = self.load(&scope);
+        let mut state = before.clone();
+        let mut held =
+            clave::db::StoreHeld::new(&self.db, self.data.path(), "2026-08-09T00:00:00Z");
+        let mut site = HttpSite {
+            client: &self.client,
+            base: &self.base,
+            meter: served.meter,
+        };
+        let map = parameters(&event["parameters"]);
+        let report = pull(
+            &mut state,
+            &mut site,
+            &mut held,
+            &PullInput {
+                publisher,
+                at: event["at"].as_str().unwrap(),
+                parameters: &map,
+            },
+        )
+        .unwrap();
+        let envelopes = named_labels(history, &event["labels"]);
+        accept_labels(&mut state, &report, publisher, &envelopes).unwrap();
+        held.store().unwrap();
+        self.store(&before, &state, &scope);
+        (before.events, state.events)
+    }
+
+    fn epoch(&mut self, history: &History<'_>, event: &Value, memory: &State) -> (u64, u64) {
+        let publishers = publishers_of(memory);
+        let before = self.load(&publishers);
+        let (map, declarations, updates, unsealed) = epoch_input_parts(history, event);
+        let log_kid = history.log_kid.clone();
+        let log_key = history.log_key.clone();
+        let key = move |kid: &str| (kid == log_kid).then(|| log_key.clone());
+        let input = EpochInput {
+            height: event["height"].as_u64().unwrap(),
+            sealed_at: event["sealed_at"].as_str().unwrap(),
+            parameters: &map,
+            inclusion: &history.inclusion,
+            suffix_list: history.suffix_list.as_ref(),
+            declarations: &declarations,
+            updates: &updates,
+            unsealed: &unsealed,
+            log_key: &key,
+        };
+        let held = clave::db::StoreHeld::new(&self.db, self.data.path(), "2026-08-09T00:00:00Z");
+        let planned = plan::plan(&before, &held, &input).unwrap();
+        for item_id in &planned.payloads_destroyed {
+            let _ = std::fs::remove_file(
+                self.data
+                    .path()
+                    .join(format!("payloads/{}.json", &item_id["sha256:".len()..])),
+            );
+        }
+        let after = planned.state;
+        let scope: BTreeSet<String> = publishers.union(&publishers_of(&after)).cloned().collect();
+        self.store(&before, &after, &scope);
+        let events = (before.events, after.events);
+        self.sealed = after;
+        events
+    }
+}
+
+/// The store's clock also orders the Labels a pull admits, so its events are the vector's in
+/// order but not in number.
+fn renumber(state: &mut State, events: &BTreeMap<u64, u64>) {
+    let at = |place: &mut Place| place.event = events[&place.event];
+    for collection in state.collections.values_mut() {
+        if let Some(accepted) = collection.accepted.as_mut() {
+            at(&mut accepted.place);
+        }
+    }
+    for waiting in state.urls.values_mut() {
+        at(&mut waiting.place);
+    }
+    for queue in state.queues.values_mut() {
+        queue
+            .queued
+            .values_mut()
+            .for_each(|queued| at(&mut queued.place));
+        queue.first.values_mut().for_each(at);
+    }
+    for label in state.labels.values_mut() {
+        at(&mut label.place);
+    }
+    for found in state.discovered.values_mut().flatten() {
+        found.event = events[&found.event];
+    }
+}
+
+fn replay_through_the_store(keys: &Value, vector: &Value) {
+    let mut run = Run::new(keys, vector);
+    let mut store = StoreRun::new();
+    let mut numbers = BTreeMap::new();
+    let events = vector["events"].as_array().unwrap();
+    let expected = vector["expected"].as_array().unwrap();
+    for (at, (event, expected)) in events.iter().zip(expected).enumerate() {
+        let first = run.state.events;
+        let (from, to) = match event["event"].as_str().unwrap() {
+            "epoch" => {
+                let taken = store.epoch(&run.history, event, &run.state);
+                run.epoch(at, event, expected);
+                taken
+            }
+            _ => {
+                let taken = store.pull(&run.history, event);
+                run.pull(at, event, expected);
+                taken
+            }
+        };
+        assert_eq!(
+            to - from,
+            run.state.events - first,
+            "{} event {at}",
+            run.history.name
+        );
+        numbers.extend((from..to).map(|event| (event, first + event - from)));
+        run.show();
+        let publishers = publishers_of(&run.state);
+        let mut stored = store.load(&publishers);
+        renumber(&mut stored, &numbers);
+        assert_eq!(
+            state_view(&run.history, &stored, &run.shown),
+            state_view(&run.history, &run.state, &run.shown),
+            "{} event {at}: the store",
+            run.history.name
+        );
+        let name = run.history.name;
+        assert_eq!(stored.lists, run.state.lists, "{name} event {at}: lists");
+        assert_eq!(stored.urls, run.state.urls, "{name} event {at}: urls");
+        assert_eq!(stored.queues, run.state.queues, "{name} event {at}: queues");
+        assert_eq!(
+            stored.discovered, run.state.discovered,
+            "{name} event {at}: discovered"
+        );
+        assert_eq!(stored.floors, run.state.floors, "{name} event {at}: floors");
+        assert_eq!(stored.labels, run.state.labels, "{name} event {at}: labels");
+        assert_eq!(
+            stored.records, run.state.records,
+            "{name} event {at}: records"
+        );
+        assert_eq!(
+            stored.removals, run.state.removals,
+            "{name} event {at}: removals"
+        );
+
+        assert_eq!(
+            stored.collections, run.state.collections,
+            "{} event {at}: collections",
+            run.history.name
+        );
+    }
+}
+
+fn replay_file_through_the_store(relative: &str) -> usize {
+    let vector = read_vector(relative);
+    for history in vector["histories"].as_array().unwrap() {
+        replay_through_the_store(&vector["keys"], history);
+    }
+    vector["histories"].as_array().unwrap().len()
+}
+
+#[test]
+fn every_catalog_waiting_history_pulled_over_http_into_the_store_reaches_the_replayed_state() {
+    assert_eq!(
+        replay_file_through_the_store("vectors/wist3/catalog-waiting.json"),
+        42
+    );
+}
+
+#[test]
+fn every_collection_pull_history_pulled_over_http_into_the_store_reaches_the_replayed_state() {
+    assert_eq!(
+        replay_file_through_the_store("vectors/wist2/collection-pull.json"),
+        20
+    );
+}
+
+#[test]
+fn every_catalog_recovery_history_pulled_over_http_into_the_store_reaches_the_replayed_state() {
+    assert_eq!(
+        replay_file_through_the_store("vectors/wist1/catalog-recovery.json"),
+        30
+    );
 }

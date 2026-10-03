@@ -135,7 +135,7 @@ pub enum PullOutcome {
         suspended: bool,
     },
     /// WIST-2 §5 and §7: the one disposition §7's backoff retries.
-    FeedUnusable,
+    StoppedAtDeclaration,
     Failed,
 }
 
@@ -632,10 +632,12 @@ impl Db {
         }
         let interval = baseline_interval(self, now)?;
         let (due_at, reason, attempts) = match outcome {
-            PullOutcome::FeedUnusable | PullOutcome::Failed => match retry_delay(task.attempts) {
-                Some(delay) => (now.saturating_add(delay), Reason::Retry, task.attempts + 1),
-                None => (started_at.saturating_add(interval), Reason::Baseline, 0),
-            },
+            PullOutcome::StoppedAtDeclaration | PullOutcome::Failed => {
+                match retry_delay(task.attempts) {
+                    Some(delay) => (now.saturating_add(delay), Reason::Retry, task.attempts + 1),
+                    None => (started_at.saturating_add(interval), Reason::Baseline, 0),
+                }
+            }
             PullOutcome::Pulled { suspended: true } => {
                 (self.resume_at(&task.domain, now)?, Reason::Resume, 0)
             }
@@ -1194,13 +1196,20 @@ mod tests {
         let (_tmp, db) = open_db();
         db.set_param("baseline_poll_seconds", 86_400).unwrap();
         db.insert_publisher("a.example", b"{}", "k", "p").unwrap();
-        let now = back_off_four_times(&db, PullOutcome::FeedUnusable);
+        let now = back_off_four_times(&db, PullOutcome::StoppedAtDeclaration);
         let task = db
             .claim_pulls(now, 1, "me", ALL, &[], &mut false, true)
             .unwrap()
             .remove(0);
-        db.complete_pull(&task, "me", now, PullOutcome::FeedUnusable, 0.0, now + 5)
-            .unwrap();
+        db.complete_pull(
+            &task,
+            "me",
+            now,
+            PullOutcome::StoppedAtDeclaration,
+            0.0,
+            now + 5,
+        )
+        .unwrap();
         assert_eq!(
             db.scheduled_pull("a.example").unwrap(),
             Some(due("a.example", now + 86_400, Reason::Baseline, 0)),
@@ -1247,9 +1256,9 @@ mod tests {
                 .unwrap();
             db.scheduled_pull("a.example").unwrap().unwrap()
         };
-        let first = complete(NOW, PullOutcome::FeedUnusable);
+        let first = complete(NOW, PullOutcome::StoppedAtDeclaration);
         assert_eq!(first, due("a.example", NOW + 60, Reason::Retry, 1));
-        let second = complete(first.due_at, PullOutcome::FeedUnusable);
+        let second = complete(first.due_at, PullOutcome::StoppedAtDeclaration);
         assert_eq!(
             second,
             due("a.example", first.due_at + 240, Reason::Retry, 2)
@@ -1260,7 +1269,7 @@ mod tests {
             due("a.example", second.due_at + 3600, Reason::Baseline, 0)
         );
         assert_eq!(
-            complete(pulled.due_at, PullOutcome::FeedUnusable),
+            complete(pulled.due_at, PullOutcome::StoppedAtDeclaration),
             due("a.example", pulled.due_at + 60, Reason::Retry, 1),
             "the next pull that ends at WIST2-E01 is the first retry again"
         );
@@ -1275,8 +1284,15 @@ mod tests {
             .claim_pulls(NOW, 1, "me", ALL, &[], &mut false, true)
             .unwrap()
             .remove(0);
-        db.complete_pull(&task, "me", NOW, PullOutcome::FeedUnusable, 0.0, NOW)
-            .unwrap();
+        db.complete_pull(
+            &task,
+            "me",
+            NOW,
+            PullOutcome::StoppedAtDeclaration,
+            0.0,
+            NOW,
+        )
+        .unwrap();
         let retry = db.scheduled_pull("a.example").unwrap().unwrap();
         assert_eq!(retry.attempts, 1);
         let task = db

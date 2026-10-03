@@ -266,7 +266,7 @@ struct Context<'a> {
     publisher: &'a str,
     at: &'a str,
     parameters: &'a Parameters,
-    sources: Vec<Source>,
+    sources: &'a [Source],
     event: u64,
     queues: bool,
     window_opened: bool,
@@ -314,12 +314,105 @@ fn settle_window(
     .map(Some)
 }
 
+pub struct Pulling {
+    report: PullReport,
+    sources: Vec<Source>,
+    order: BTreeMap<String, u64>,
+    next: usize,
+    queues: bool,
+    window_opened: bool,
+}
+
+impl Pulling {
+    pub fn report(&self) -> &PullReport {
+        &self.report
+    }
+
+    pub fn ended(&self) -> bool {
+        !self.report.declaration.proceeds
+            || self.report.suspended
+            || self.next == self.report.collections_pulled.len()
+    }
+
+    fn context<'a>(&'a self, input: &PullInput<'a>) -> Context<'a> {
+        Context {
+            publisher: input.publisher,
+            at: input.at,
+            parameters: input.parameters,
+            sources: &self.sources,
+            event: self.report.event,
+            queues: self.queues,
+            window_opened: self.window_opened,
+        }
+    }
+
+    pub fn pull_next(
+        &mut self,
+        state: &mut State,
+        site: &mut impl Site,
+        held: &mut impl Held,
+        input: &PullInput<'_>,
+    ) -> Result<Option<&CatalogReport>> {
+        if self.ended() {
+            return Ok(None);
+        }
+        let name = self.report.collections_pulled[self.next].clone();
+        let catalog = pull_collection(
+            state,
+            site,
+            held,
+            &self.context(input),
+            &name,
+            self.order[&name],
+        )?;
+        self.next += 1;
+        if catalog.outcome == CatalogOutcome::Suspended || catalog.suspended {
+            self.report.suspended = true;
+        }
+        self.report.catalogs.push(catalog);
+        Ok(self.report.catalogs.last())
+    }
+
+    pub fn finish(
+        self,
+        state: &mut State,
+        held: &impl Held,
+        input: &PullInput<'_>,
+    ) -> Result<PullReport> {
+        if self.report.declaration.proceeds && !self.queues {
+            let in_force = log_declaration(state, input.publisher)?;
+            let eligibility = state.first_epoch_after();
+            refresh_waiting(
+                state,
+                held,
+                input.publisher,
+                self.report.event,
+                &self.order,
+                in_force.as_ref(),
+                eligibility,
+            )?;
+        }
+        Ok(self.report)
+    }
+}
+
 pub fn pull(
     state: &mut State,
     site: &mut impl Site,
     held: &mut impl Held,
     input: &PullInput<'_>,
 ) -> Result<PullReport> {
+    let mut pulling = begin(state, site, held, input)?;
+    while pulling.pull_next(state, site, held, input)?.is_some() {}
+    pulling.finish(state, held, input)
+}
+
+pub fn begin(
+    state: &mut State,
+    site: &mut impl Site,
+    held: &mut impl Held,
+    input: &PullInput<'_>,
+) -> Result<Pulling> {
     let mut event = state.events;
     state.events += 1;
     let mut settlement = Vec::new();
@@ -338,61 +431,42 @@ pub fn pull(
         eligibility,
         event,
     )?);
-    let mut report = PullReport {
-        event,
-        settlement,
-        declaration,
-        collections_pulled: Vec::new(),
-        positions: 0,
-        catalogs: Vec::new(),
-        suspended: false,
+    let mut pulling = Pulling {
+        report: PullReport {
+            event,
+            settlement,
+            declaration,
+            collections_pulled: Vec::new(),
+            positions: 0,
+            catalogs: Vec::new(),
+            suspended: false,
+        },
+        order: BTreeMap::new(),
+        next: 0,
+        queues: state.queues.contains_key(input.publisher),
+        window_opened: state.window_holds(input.publisher),
+        sources,
     };
-    if !report.declaration.proceeds {
-        return Ok(report);
+    if !pulling.report.declaration.proceeds {
+        return Ok(pulling);
     }
     let mut names: Vec<String> = Vec::new();
-    for source in &sources {
+    for source in &pulling.sources {
         for name in collection::names(&source.publisher) {
             if !names.iter().any(|known| known == name) {
                 names.push(name.to_owned());
             }
         }
     }
-    let order = place_order(state, input.publisher, Some(&sources[0].publisher), &names);
-    report.positions = order.len() as u64;
-    let context = Context {
-        publisher: input.publisher,
-        at: input.at,
-        parameters: input.parameters,
-        queues: state.queues.contains_key(input.publisher),
-        window_opened: state.window_holds(input.publisher),
-        sources,
-        event,
-    };
-    for name in &names {
-        let catalog = pull_collection(state, site, held, &context, name, order[name])?;
-        let stops = catalog.outcome == CatalogOutcome::Suspended || catalog.suspended;
-        report.catalogs.push(catalog);
-        if stops {
-            report.suspended = true;
-            break;
-        }
-    }
-    report.collections_pulled = names;
-    if !context.queues {
-        let in_force = log_declaration(state, input.publisher)?;
-        let eligibility = state.first_epoch_after();
-        refresh_waiting(
-            state,
-            held,
-            input.publisher,
-            event,
-            &order,
-            in_force.as_ref(),
-            eligibility,
-        )?;
-    }
-    Ok(report)
+    pulling.order = place_order(
+        state,
+        input.publisher,
+        Some(&pulling.sources[0].publisher),
+        &names,
+    );
+    pulling.report.positions = pulling.order.len() as u64;
+    pulling.report.collections_pulled = names;
+    Ok(pulling)
 }
 
 pub(super) fn log_declaration(state: &State, publisher: &str) -> Result<Option<Publisher>> {
@@ -786,7 +860,7 @@ fn pull_collection(
     let skew = context.parameters.value("clock_skew_seconds")?;
     let items_max = context.parameters.value("catalog_items_max")?;
     let mut judged = Vec::new();
-    for source in &context.sources {
+    for source in context.sources {
         let attempt = Attempt::new(&source.publisher, context.at, skew, items_max)?;
         judged.push(if context.queues {
             catalog::pull_in_window(&fetch, &window, &octets, &attempt)
@@ -798,10 +872,10 @@ fn pull_collection(
         return Ok(unavailable());
     }
     let mut report = CatalogReport::new(name, CatalogOutcome::Refused);
-    let envelope = crate::json::parse(&octets)?;
-    let inner = envelope["catalog"].clone();
-    let catalog_id = catalog::catalog_id(&inner)?;
-    report.catalog = Some(catalog_id.clone());
+    let parsed = crate::json::parse(&octets).ok();
+    report.catalog = parsed
+        .as_ref()
+        .and_then(|envelope| catalog::catalog_id(&envelope["catalog"]).ok());
     let under = |wanted: fn(&Pull) -> bool| -> Vec<&Source> {
         context
             .sources
@@ -832,6 +906,10 @@ fn pull_collection(
         };
         return Ok(report.refused(codes.into_iter().collect()));
     }
+    let envelope =
+        parsed.ok_or_else(|| Error::History("a Catalog the pull accepts does not parse".into()))?;
+    let inner = envelope["catalog"].clone();
+    let catalog_id = catalog::catalog_id(&inner)?;
     let catalog: Catalog = serde_json::from_value(inner.clone())?;
     if accepting.is_empty() {
         report.outcome = CatalogOutcome::Idempotent;

@@ -411,7 +411,7 @@ fn excluded_page_disposition(held: bool) -> (Option<String>, bool, bool) {
             || clock,
             clave::ingest::PullLimits {
                 work_bytes: 1 << 20,
-                work_objects: 2,
+                work_objects: 3,
                 ..Default::default()
             },
         )

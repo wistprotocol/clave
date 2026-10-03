@@ -84,15 +84,9 @@ pub trait Held {
 
     fn holds_list(&self, publisher: &str, collection: &str) -> Result<bool>;
 
-    fn tree_file(&self, publisher: &str, collection: &str, hex: &str) -> Result<Option<Vec<u8>>>;
+    fn tree_file(&self, hex: &str) -> Result<Option<Vec<u8>>>;
 
-    fn hold_tree_file(
-        &mut self,
-        publisher: &str,
-        collection: &str,
-        hex: &str,
-        octets: &[u8],
-    ) -> Result<()>;
+    fn hold_tree_file(&mut self, hex: &str, octets: &[u8]) -> Result<()>;
 
     fn payload(&self, item_id: &str) -> Result<Option<Vec<u8>>>;
 
@@ -222,7 +216,7 @@ type ListKey = (String, String, String);
 #[derive(Debug, Clone, Default)]
 pub struct MemoryHeld {
     pub lists: BTreeMap<ListKey, (u64, String, Vec<Value>)>,
-    pub tree_files: BTreeMap<ListKey, Vec<u8>>,
+    pub tree_files: BTreeMap<String, Vec<u8>>,
     pub payloads: BTreeMap<String, Vec<u8>>,
 }
 
@@ -283,22 +277,12 @@ impl Held for MemoryHeld {
             .any(|(p, c, _)| p == publisher && c == collection))
     }
 
-    fn tree_file(&self, publisher: &str, collection: &str, hex: &str) -> Result<Option<Vec<u8>>> {
-        Ok(self
-            .tree_files
-            .get(&key(publisher, collection, hex))
-            .cloned())
+    fn tree_file(&self, hex: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self.tree_files.get(hex).cloned())
     }
 
-    fn hold_tree_file(
-        &mut self,
-        publisher: &str,
-        collection: &str,
-        hex: &str,
-        octets: &[u8],
-    ) -> Result<()> {
-        self.tree_files
-            .insert(key(publisher, collection, hex), octets.to_vec());
+    fn hold_tree_file(&mut self, hex: &str, octets: &[u8]) -> Result<()> {
+        self.tree_files.insert(hex.into(), octets.to_vec());
         Ok(())
     }
 

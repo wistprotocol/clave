@@ -233,7 +233,7 @@ fn seed_pull(held: &mut MemoryHeld, pull: &Value, vectors: &ChainVectors) {
         }
     }
     for (hex, file) in pull["tree_files_held"].as_object().unwrap() {
-        held.hold_tree_file(DOMAIN, "journal", hex, file.as_str().unwrap().as_bytes())
+        held.hold_tree_file(hex, file.as_str().unwrap().as_bytes())
             .unwrap();
     }
 }

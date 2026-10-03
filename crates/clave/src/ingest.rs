@@ -12,6 +12,7 @@ use crate::registry;
 mod admit;
 mod feed;
 mod fetch_stage;
+mod site;
 #[cfg(test)]
 pub(crate) mod stage_tests;
 mod verify;
@@ -22,6 +23,7 @@ use fetch_stage::{FetchRequest, ObjectKey, Outcome, Walk};
 pub struct IngestReport {
     pub accepted: Vec<String>,
     pub queued: Vec<String>,
+    pub items: Vec<String>,
     pub rejected: Vec<(String, String)>,
     pub labels: Vec<String>,
     pub noise: Option<&'static str>,
@@ -372,7 +374,7 @@ pub fn finish_pull(
         db.bump_noise_ping(&unit, at.get(..10).unwrap_or(&at))?;
     }
     let outcome = match report.ended.as_deref() {
-        Some("WIST2-E01") => crate::db::PullOutcome::FeedUnusable,
+        Some("WIST2-E01") => crate::db::PullOutcome::StoppedAtDeclaration,
         _ => crate::db::PullOutcome::Pulled {
             suspended: report.suspended,
         },
@@ -440,6 +442,12 @@ fn wake_credited(db: &Db, credits: impl IntoIterator<Item = Credit>, now: i64) -
         db.wake_deferred_resumes(&credit.unit, &credit.day, now)?;
     }
     Ok(())
+}
+
+enum Collections {
+    Stopped,
+    Suspended,
+    Ended,
 }
 
 struct Pull<'a, C: Fn() -> jiff::Timestamp> {
@@ -706,9 +714,205 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
         self.db.update_pull_run(&self.run)
     }
 
+    fn parameters(&self) -> Result<crate::collection::Parameters> {
+        let schedule = self.db.parameter_schedule(self.now_unix)?;
+        Ok(crate::collection::Parameters::new(
+            wist_core::parameters::PARAMS
+                .iter()
+                .filter_map(|spec| {
+                    schedule
+                        .value_at(spec.name, self.now_unix)
+                        .map(|value| (spec.name.to_owned(), value))
+                })
+                .collect(),
+        ))
+    }
+
+    /// WIST-2 §5.2: a Label walk that the budget leaves nothing to begin with waits for a
+    /// later pull and suspends nothing.
+    fn budget_spent(&self) -> Result<bool> {
+        let meter = self.meter_at((self.clock)())?;
+        Ok(self.db.ingest_bytes(&meter.unit, &meter.day)? >= meter.budget)
+    }
+
+    fn reject_at(&self, rejection: wist_core::objects::StatusRejection) -> Result<()> {
+        self.db.record_rejection(self.host, &rejection)
+    }
+
+    fn rejection(
+        &self,
+        code: &str,
+        id: Option<&str>,
+        collection: &str,
+    ) -> wist_core::objects::StatusRejection {
+        wist_core::objects::StatusRejection {
+            code: code.to_owned(),
+            at: self.now(),
+            id: id.map(str::to_owned),
+            collection: Some(collection.to_owned()),
+            urls: None,
+            condition: None,
+            change_list: None,
+            detail: None,
+        }
+    }
+
+    fn report_catalog(&self, catalog: &crate::collection::pull::CatalogReport) -> Result<()> {
+        use crate::collection::pull::{CatalogOutcome, ItemOutcome};
+        let (db, run_id) = (self.db, self.run.run_id);
+        let name = &catalog.collection;
+        let object = format!(
+            "{name}/{}",
+            catalog.catalog.as_deref().unwrap_or("catalog.json")
+        );
+        match catalog.outcome {
+            CatalogOutcome::Accepted => db.report_pull_object(
+                run_id,
+                "catalog",
+                &object,
+                Status::Admitted,
+                if catalog.queued { "queued" } else { "accepted" },
+            )?,
+            CatalogOutcome::Refused | CatalogOutcome::Unavailable => {
+                for code in &catalog.codes {
+                    let mut rejection = self.rejection(code, catalog.catalog.as_deref(), name);
+                    if !catalog.dropped.is_empty() {
+                        rejection.urls = Some(catalog.dropped.clone());
+                    }
+                    self.reject_at(rejection)?;
+                }
+                if let Some(code) = catalog.codes.first() {
+                    db.report_pull_object(run_id, "catalog", &object, Status::Rejected, code)?;
+                }
+            }
+            CatalogOutcome::Idempotent | CatalogOutcome::Suspended => {}
+        }
+        if catalog.chain.is_some() {
+            db.report_pull_object(
+                run_id,
+                "chain",
+                &object,
+                Status::Rejected,
+                crate::collection::state::CHAIN_DISCARDED,
+            )?;
+        }
+        for item in &catalog.items {
+            let object = format!("{name}/{}", item.item);
+            match item.outcome {
+                ItemOutcome::Admitted => {
+                    db.report_pull_object(run_id, "item", &object, Status::Admitted, "item")?
+                }
+                ItemOutcome::NotAdmitted | ItemOutcome::Refused => {
+                    for code in &item.codes {
+                        let mut rejection = self.rejection(code, Some(&item.item), name);
+                        rejection.urls = Some(vec![item.url.clone()]);
+                        rejection.detail = item.payload_code.map(str::to_owned);
+                        self.reject_at(rejection)?;
+                    }
+                    if let Some(code) = item.codes.first() {
+                        db.report_pull_object(run_id, "item", &object, Status::Rejected, code)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// WIST-2 §5.1 steps 1 to 4: the machine's state is written in one transaction for the
+    /// Declaration and in one for each Collection, each under the pull's fence.
+    fn collections(&mut self) -> Result<Collections> {
+        use crate::collection::pull;
+        let (db, data_dir, host) = (self.db, self.data_dir, self.host);
+        let now = self.now();
+        let parameters = self.parameters()?;
+        let input = pull::PullInput {
+            publisher: host,
+            at: &now,
+            parameters: &parameters,
+        };
+        let mut held = crate::db::StoreHeld::new(db, data_dir, &now);
+        let mutation = db.mutation()?;
+        let scope = db.pull_scope(host)?;
+        let mut state = db.load_state(db.sealed_state(data_dir)?, &scope)?;
+        let mut stored = state.clone();
+        let mut pulling = pull::begin(&mut state, self, &mut held, &input)?;
+        crate::db::store_changes(db, &stored, &state, &scope, &now)?;
+        held.flush()?;
+        for settled in &pulling.report().settlement {
+            if let Some(code) = match settled.outcome {
+                crate::collection::SettledOutcome::Regressed => {
+                    Some(crate::collection::queue::REGRESSED)
+                }
+                crate::collection::SettledOutcome::Rejected(_) => {
+                    Some(crate::collection::queue::REJECTED)
+                }
+                _ => None,
+            } {
+                let mut rejection =
+                    self.rejection(code, Some(&settled.catalog), &settled.collection);
+                rejection.detail = settled.outcome.condition_code().map(str::to_owned);
+                db.record_rejection(&settled.publisher, &rejection)?;
+            }
+        }
+        let report = pulling.report();
+        self.run.discovered |= report.declaration.discovered;
+        self.run.event = Some(report.event);
+        self.run.positions = report.positions;
+        db.update_pull_run(&self.run)?;
+        let stopped = report.declaration.disposition();
+        let outcome = report.declaration.outcome.clone();
+        mutation.commit()?;
+        if let Some(code) = stopped {
+            self.abort(
+                None,
+                code,
+                &format!("the pull stopped at its Declaration: {outcome}"),
+            )?;
+            return Ok(Collections::Stopped);
+        }
+        stored.clone_from(&state);
+        loop {
+            let Some(catalog) = pulling
+                .pull_next(&mut state, self, &mut held, &input)?
+                .cloned()
+            else {
+                break;
+            };
+            let mutation = db.mutation()?;
+            crate::db::store_changes(db, &stored, &state, &scope, &now)?;
+            held.flush()?;
+            self.report_catalog(&catalog)?;
+            mutation.commit()?;
+            stored.clone_from(&state);
+        }
+        let suspended = pulling.report().suspended;
+        pulling.finish(&mut state, &held, &input)?;
+        let mutation = db.mutation()?;
+        crate::db::store_changes(db, &stored, &state, &scope, &now)?;
+        held.flush()?;
+        mutation.commit()?;
+        Ok(if suspended {
+            Collections::Suspended
+        } else {
+            Collections::Ended
+        })
+    }
+
     fn run(&mut self) -> Result<()> {
         crate::recovery::settle(self.db, self.data_dir, &self.now())?;
         if self.run.phase == Phase::Walk && self.discover()? {
+            self.run.phase = Phase::Collections;
+            self.db.update_pull_run(&self.run)?;
+        }
+        if self.run.phase == Phase::Collections {
+            match self.collections()? {
+                Collections::Stopped => return Ok(()),
+                Collections::Suspended => return self.finish(true),
+                Collections::Ended => {}
+            }
+            if self.budget_spent()? {
+                return self.finish(false);
+            }
             self.run.phase = Phase::Labels;
             self.db.update_pull_run(&self.run)?;
         }

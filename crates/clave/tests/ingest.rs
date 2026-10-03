@@ -205,6 +205,7 @@ fn a_declaration_fetch_that_fails_after_first_contact_stops_the_pull_at_wist2_e0
 fn a_refused_declaration_stops_the_pull_at_wist2_e01_after_recording_its_code() {
     let (listener, host, client) = reserve_addr();
     let p = make_publisher(&host);
+    common::publish_collection(&p, "default", &[], "2026-08-09T11:00:00Z", None);
     let requests = common::serve_recording(listener, p.dir.path().to_path_buf());
     common::write_label_feed(&p, &host, &[], "2026-08-09T12:00:00Z");
     let tmp = tempfile::tempdir().unwrap();
@@ -230,4 +231,449 @@ fn a_refused_declaration_stops_the_pull_at_wist2_e01_after_recording_its_code() 
         requests.lock().unwrap().as_slice(),
         ["/.well-known/wist/publisher.json"]
     );
+}
+
+fn open_store(host: &str) -> (tempfile::TempDir, clave::db::Db) {
+    let data = tempfile::tempdir().unwrap();
+    clave::init::run(host, data.path()).unwrap();
+    let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
+    (data, db)
+}
+
+fn with_payloads(
+    items: &[(serde_json::Value, serde_json::Value)],
+) -> Vec<(serde_json::Value, Option<serde_json::Value>)> {
+    items
+        .iter()
+        .map(|(item, payload)| (item.clone(), Some(payload.clone())))
+        .collect()
+}
+
+fn admitted_ids(report: &clave::ingest::IngestReport) -> Vec<String> {
+    let mut ids: Vec<String> = report
+        .items
+        .iter()
+        .map(|id| id.rsplit_once('/').unwrap().1.to_owned())
+        .collect();
+    ids.sort();
+    ids
+}
+
+fn sorted_ids(items: &[(serde_json::Value, Option<serde_json::Value>)]) -> Vec<String> {
+    let mut ids: Vec<String> = items
+        .iter()
+        .map(|(item, _)| common::item_id(item))
+        .collect();
+    ids.sort();
+    ids
+}
+
+#[test]
+fn a_pull_admits_the_items_whose_payloads_verify_and_not_one_whose_payload_breaks_its_commitment() {
+    let (listener, host, client) = reserve_addr();
+    let p = make_publisher(&host);
+    let good = common::page_item(&p, &format!("https://{host}/good"), "good");
+    let (bad, mut tampered) = common::page_item(&p, &format!("https://{host}/bad"), "bad");
+    tampered["content"]["extract"] = "altered".into();
+    let removed = common::removed_item(&p, &format!("https://{host}/gone"));
+    common::publish_collection(
+        &p,
+        "default",
+        &[
+            (good.0.clone(), Some(good.1)),
+            (bad.clone(), Some(tampered)),
+            (removed.clone(), None),
+        ],
+        "2026-08-09T12:00:00Z",
+        None,
+    );
+    serve_static(listener, p.dir.path().to_path_buf());
+    let (data, db) = open_store(&host);
+    let report = common::pull_at(&db, &client, data.path(), &host, "2026-08-09T12:00:05Z");
+    let mut admitted = vec![common::item_id(&good.0), common::item_id(&removed)];
+    admitted.sort();
+    assert_eq!(admitted_ids(&report), admitted);
+    assert_eq!(report.accepted.len(), 1);
+    assert_eq!(
+        report.rejected,
+        [(
+            format!("default/{}", common::item_id(&bad)),
+            "WIST2-E03".into()
+        )]
+    );
+    let rejection = db.list_rejections(&host).unwrap().remove(0);
+    assert_eq!(rejection.code, "WIST2-E03");
+    assert_eq!(rejection.collection.as_deref(), Some("default"));
+    assert_eq!(rejection.detail.as_deref(), Some("WIST1-E10"));
+    assert_eq!(rejection.urls, Some(vec![format!("https://{host}/bad")]));
+    assert_eq!(
+        common::payload_files(data.path()),
+        1,
+        "only the verified Payload is held"
+    );
+    assert_eq!(report.noise, None);
+}
+
+#[test]
+fn an_item_outside_the_publishers_scope_is_refused_alone_and_one_in_its_subdomain_scope_is_admitted(
+) {
+    let (listener, host, client) = reserve_addr();
+    let p = make_publisher_with_scope(&host, &["example.com"]);
+    let inside = common::page_item(&p, "https://example.com/a", "inside");
+    let outside = common::page_item(&p, "https://other.example/a", "outside");
+    common::publish_collection(
+        &p,
+        "default",
+        &with_payloads(&[inside.clone(), outside.clone()]),
+        "2026-08-09T12:00:00Z",
+        None,
+    );
+    serve_static(listener, p.dir.path().to_path_buf());
+    let (data, db) = open_store(&host);
+    let report = common::pull_at(&db, &client, data.path(), &host, "2026-08-09T12:00:05Z");
+    assert_eq!(admitted_ids(&report), [common::item_id(&inside.0)]);
+    assert_eq!(
+        report.rejected,
+        [(
+            format!("default/{}", common::item_id(&outside.0)),
+            "WIST1-E03".into()
+        )]
+    );
+}
+
+#[test]
+fn a_tree_of_several_files_is_walked_whole_and_an_unchanged_catalog_fetches_nothing_again() {
+    let (listener, host, client) = reserve_addr();
+    let p = make_publisher(&host);
+    let items: Vec<_> = (0..40)
+        .map(|n| common::page_item(&p, &format!("https://{host}/{n}"), "content"))
+        .collect();
+    let items = with_payloads(&items);
+    let published = common::publish_collection(&p, "default", &items, "2026-08-09T12:00:00Z", None);
+    assert!(published.tree.len() > 2);
+    let requests = common::serve_recording(listener, p.dir.path().to_path_buf());
+    let (data, db) = open_store(&host);
+    let report = common::pull_at(&db, &client, data.path(), &host, "2026-08-09T12:00:05Z");
+    assert_eq!(admitted_ids(&report), sorted_ids(&items));
+    let fetched = |part: &str| {
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|path| path.contains(part))
+            .count()
+    };
+    assert_eq!(fetched("/tree/"), published.tree.len());
+    assert_eq!(fetched("/payloads/"), items.len());
+
+    requests.lock().unwrap().clear();
+    let again = common::pull_at(&db, &client, data.path(), &host, "2026-08-09T12:10:05Z");
+    assert!(again.accepted.is_empty() && again.items.is_empty());
+    assert_eq!(
+        (
+            fetched("/tree/"),
+            fetched("/payloads/"),
+            fetched("/changes/")
+        ),
+        (0, 0, 0),
+        "an idempotent re-serve fetches no tree file, no change list and no Payload"
+    );
+    assert_eq!(again.noise, Some("WIST2-E02"));
+}
+
+#[test]
+fn a_changed_catalog_is_obtained_by_its_change_list_without_walking_the_tree() {
+    let (listener, host, client) = reserve_addr();
+    let p = make_publisher(&host);
+    let items = with_payloads(
+        &(0..20)
+            .map(|n| common::page_item(&p, &format!("https://{host}/{n}"), "content"))
+            .collect::<Vec<_>>(),
+    );
+    let first = common::publish_collection(&p, "default", &items, "2026-08-09T12:00:00Z", None);
+    let requests = common::serve_recording(listener, p.dir.path().to_path_buf());
+    let (data, db) = open_store(&host);
+    common::pull_at(&db, &client, data.path(), &host, "2026-08-09T12:00:05Z");
+
+    let mut changed = items.clone();
+    let added = common::page_item(&p, &format!("https://{host}/added"), "added");
+    changed.push((added.0.clone(), Some(added.1)));
+    let second = common::publish_collection(
+        &p,
+        "default",
+        &changed,
+        "2026-08-09T12:05:00Z",
+        Some(&first),
+    );
+    assert!(second.change_list.is_some());
+    requests.lock().unwrap().clear();
+    let report = common::pull_at(&db, &client, data.path(), &host, "2026-08-09T12:10:05Z");
+    assert_eq!(report.accepted, [format!("default/{}", second.catalog_id)]);
+    let requests = requests.lock().unwrap().clone();
+    assert!(
+        !requests.iter().any(|path| path.contains("/tree/")),
+        "{requests:?}"
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|path| path.contains("/changes/"))
+            .count(),
+        1
+    );
+    assert!(admitted_ids(&report).contains(&common::item_id(&added.0)));
+}
+
+#[test]
+fn a_discarded_chain_is_recorded_as_wist2_e08_and_the_walk_accepts_the_catalog() {
+    let (listener, host, client) = reserve_addr();
+    let p = make_publisher(&host);
+    let items = with_payloads(&[common::page_item(&p, &format!("https://{host}/a"), "a")]);
+    common::publish_collection(&p, "default", &items, "2026-08-09T12:00:00Z", None);
+    serve_static(listener, p.dir.path().to_path_buf());
+    let (data, db) = open_store(&host);
+    common::pull_at(&db, &client, data.path(), &host, "2026-08-09T12:00:05Z");
+    let mut changed = items.clone();
+    let added = common::page_item(&p, &format!("https://{host}/b"), "b");
+    changed.push((added.0, Some(added.1)));
+    let second = common::publish_collection(&p, "default", &changed, "2026-08-09T12:05:00Z", None);
+    let report = common::pull_at(&db, &client, data.path(), &host, "2026-08-09T12:10:05Z");
+    assert_eq!(report.accepted, [format!("default/{}", second.catalog_id)]);
+    let discarded = db
+        .list_rejections(&host)
+        .unwrap()
+        .into_iter()
+        .find(|rejection| rejection.code == "WIST2-E08")
+        .unwrap();
+    assert_eq!(discarded.id.as_deref(), Some(second.catalog_id.as_str()));
+    assert_eq!(discarded.collection.as_deref(), Some("default"));
+    assert_eq!(
+        discarded.condition,
+        Some(wist_core::objects::status::RejectionCondition::Fetch)
+    );
+    assert_eq!(
+        discarded.change_list.as_deref(),
+        Some(second.catalog_id.as_str())
+    );
+    assert_eq!(
+        report.noise, None,
+        "the accepted Catalog makes the pull productive"
+    );
+}
+
+#[test]
+fn a_refused_catalog_is_recorded_with_its_collection_and_a_pull_accepting_nothing_is_noise() {
+    let (listener, host, client) = reserve_addr();
+    let p = make_publisher(&host);
+    let items = with_payloads(&[common::page_item(&p, &format!("https://{host}/a"), "a")]);
+    let published = common::publish_collection(&p, "default", &items, "2026-08-10T12:00:00Z", None);
+    serve_static(listener, p.dir.path().to_path_buf());
+    let (data, db) = open_store(&host);
+    common::pull_at(&db, &client, data.path(), &host, "2026-08-09T12:00:05Z");
+    let report = common::pull_at(&db, &client, data.path(), &host, "2026-08-09T12:10:05Z");
+    let rejection = db.list_rejections(&host).unwrap().remove(0);
+    assert_eq!(rejection.id.as_deref(), Some(published.catalog_id.as_str()));
+    assert_eq!(rejection.collection.as_deref(), Some("default"));
+    assert!(report.accepted.is_empty() && report.items.is_empty());
+    assert_eq!(
+        report.noise,
+        Some("WIST2-E02"),
+        "WIST-2 §5.4: a refused Catalog accepts nothing"
+    );
+}
+
+#[test]
+fn the_budget_suspends_a_tree_walk_and_a_later_day_resumes_it_from_the_held_files() {
+    let (listener, host, client) = reserve_addr();
+    let p = make_publisher(&host);
+    let items = with_payloads(
+        &(0..40)
+            .map(|n| common::page_item(&p, &format!("https://{host}/{n}"), "content"))
+            .collect::<Vec<_>>(),
+    );
+    let published = common::publish_collection(&p, "default", &items, "2026-08-09T12:00:00Z", None);
+    let requests = common::serve_recording(listener, p.dir.path().to_path_buf());
+    let (data, db) = open_store(&host);
+    let catalog = std::fs::metadata(common::collection_dir(&p, "default").join("catalog.json"))
+        .unwrap()
+        .len() as i64;
+    let root = &published.tree[&published.envelope["catalog"]["tree"].as_str().unwrap()[7..]];
+    db.set_param("ingest_budget_bytes_day", catalog + root.len() as i64 + 10)
+        .unwrap();
+    let first = common::pull_at(&db, &client, data.path(), &host, "2026-08-09T12:00:05Z");
+    assert!(first.suspended && first.items.is_empty() && first.accepted.is_empty());
+    assert_eq!(first.noise, None, "a suspended pull is not noise");
+    let walked: Vec<String> = requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|path| path.contains("/tree/"))
+        .cloned()
+        .collect();
+    assert_eq!(
+        walked.len(),
+        2,
+        "the root file is read whole and the next one interrupted"
+    );
+
+    db.set_param("ingest_budget_bytes_day", 1 << 30).unwrap();
+    requests.lock().unwrap().clear();
+    let second = common::pull_at(&db, &client, data.path(), &host, "2026-08-10T00:00:05Z");
+    assert!(!second.suspended);
+    assert_eq!(admitted_ids(&second), sorted_ids(&items));
+    let resumed = requests.lock().unwrap().clone();
+    assert!(
+        !resumed.contains(&walked[0]),
+        "the root tree file held whole is not fetched again"
+    );
+    assert!(
+        resumed.contains(&walked[1]),
+        "the interrupted file is fetched again"
+    );
+}
+
+#[test]
+fn held_lists_tree_files_waiting_places_the_queue_and_a_discarded_chain_survive_reopening_the_store(
+) {
+    let (listener, host, client) = reserve_addr();
+    let p = make_publisher(&host);
+    let items = with_payloads(
+        &(0..20)
+            .map(|n| common::page_item(&p, &format!("https://{host}/{n}"), "content"))
+            .collect::<Vec<_>>(),
+    );
+    common::publish_collection(&p, "default", &items[..10], "2026-08-09T12:00:00Z", None);
+    serve_static(listener, p.dir.path().to_path_buf());
+    let (data, db) = open_store(&host);
+    common::pull_at(&db, &client, data.path(), &host, "2026-08-09T12:00:05Z");
+    let second = common::publish_collection(&p, "default", &items, "2026-08-09T12:05:00Z", None);
+    common::pull_at(&db, &client, data.path(), &host, "2026-08-09T12:10:05Z");
+
+    let scope = std::collections::BTreeSet::from([host.clone()]);
+    let sealed = || db.sealed_state(data.path()).unwrap();
+    let before = db.load_state(sealed(), &scope).unwrap();
+    let mut queued = before.clone();
+    let mut queue = clave::collection::state::RecoveryQueue {
+        owner: "sha256:owner".into(),
+        end_s: Some(1_786_881_600),
+        ..Default::default()
+    };
+    queue.queued.insert(
+        ("default".into(), "key".into()),
+        clave::collection::state::QueuedCatalog {
+            envelope: second.envelope.clone(),
+            catalog_id: second.catalog_id.clone(),
+            place: clave::collection::state::Place::catalog(7, 0),
+            sources: vec!["sha256:source".into()],
+        },
+    );
+    queue.first.insert(
+        "default".into(),
+        clave::collection::state::Place::catalog(5, 0),
+    );
+    queued.queues.insert(host.clone(), queue);
+    db.store_state(&before, &queued, &scope, "2026-08-09T12:20:00Z")
+        .unwrap();
+    let stored = db.load_state(sealed(), &scope).unwrap();
+    assert!(
+        !stored.urls.is_empty(),
+        "the admitted URLs wait with their places"
+    );
+    assert!(stored.collections[&(host.clone(), "default".into())]
+        .discarded_chain
+        .is_some());
+    let tree: Vec<String> = second.tree.keys().cloned().collect();
+    let list = |db: &clave::db::Db| {
+        use clave::collection::Held;
+        let held = clave::db::StoreHeld::new(db, data.path(), "2026-08-09T12:30:00Z");
+        (
+            held.list(&host, "default", &second.catalog_id).unwrap(),
+            tree.iter()
+                .map(|hex| held.tree_file(hex).unwrap())
+                .collect::<Vec<_>>(),
+        )
+    };
+    let held = list(&db);
+    assert!(held.0.is_some() && held.1.iter().all(Option::is_some));
+    drop(db);
+
+    let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
+    let reopened = db
+        .load_state(db.sealed_state(data.path()).unwrap(), &scope)
+        .unwrap();
+    assert_eq!(reopened.collections, stored.collections);
+    assert_eq!(reopened.lists, stored.lists);
+    assert_eq!(reopened.urls, stored.urls);
+    assert_eq!(reopened.queues, queued.queues);
+    assert_eq!(reopened.discovered, stored.discovered);
+    assert_eq!(reopened.events, stored.events);
+    assert_eq!(db.waiting_publishers().unwrap(), scope);
+    let waiting = db
+        .load_waiting_state(db.sealed_state(data.path()).unwrap())
+        .unwrap();
+    assert_eq!(waiting.urls, stored.urls);
+    assert_eq!(waiting.queues, queued.queues);
+    assert_eq!(list(&db), held);
+    assert_eq!(
+        db.list_rejections(&host)
+            .unwrap()
+            .iter()
+            .filter(|rejection| rejection.code == "WIST2-E08")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn a_pull_stopped_at_its_declaration_is_scheduled_on_the_backoff() {
+    let (listener, host, client) = reserve_addr();
+    let p = make_publisher(&host);
+    serve_static(listener, p.dir.path().to_path_buf());
+    let (data, db) = open_store(&host);
+    let now = jiff::Timestamp::now().as_second();
+    let at = |unix: i64| jiff::Timestamp::from_second(unix).unwrap().to_string();
+    common::pull_at(&db, &client, data.path(), &host, &at(now - 60));
+    std::fs::remove_file(p.dir.path().join(".well-known/wist/publisher.json")).unwrap();
+    db.schedule_ping(&host, now, 4).unwrap();
+    let task = db
+        .claim_pulls(
+            now,
+            1,
+            "me",
+            clave::db::PARTITIONS as usize,
+            &[],
+            &mut true,
+            true,
+        )
+        .unwrap()
+        .remove(0);
+    let run = clave::ingest::open_pull(
+        &db,
+        &client,
+        data.path(),
+        &host,
+        &at(now),
+        jiff::Timestamp::now,
+        clave::ingest::PullLimits::default(),
+    )
+    .unwrap();
+    let report = clave::ingest::finish_pull(&db, &task, "me", now, run, now).unwrap();
+    assert_eq!(report.ended.as_deref(), Some("WIST2-E01"));
+    let next = db.scheduled_pull(&host).unwrap().unwrap();
+    assert_eq!(next.reason, clave::db::Reason::Retry);
+    assert_eq!(next.attempts, 1);
+}
+
+#[test]
+fn a_store_of_the_layout_before_collections_is_refused_at_open() {
+    let data = tempfile::tempdir().unwrap();
+    let path = data.path().join("clave.sqlite");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE publishers(domain TEXT PRIMARY KEY); PRAGMA user_version = 2;",
+    )
+    .unwrap();
+    drop(conn);
+    let error = clave::db::Db::open(&path).err().unwrap().to_string();
+    assert!(error.contains("superseded layout 2"), "{error}");
 }

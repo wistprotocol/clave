@@ -24,13 +24,22 @@ fn signed_field_dispositions_and_retry_counts_survive_restart() {
             .unwrap()
             .block_on(async move {
                 let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
-                    recorded.lock().unwrap().push(uri.path().into());
+                    let collection = uri.path().contains("/collections/");
+                    if !collection {
+                        recorded.lock().unwrap().push(uri.path().into());
+                    }
                     let body = if uri.path().ends_with("/publisher.json") {
                         declaration.clone()
                     } else {
                         serving.lock().unwrap().clone()
                     };
-                    async move { body }
+                    async move {
+                        if collection {
+                            (axum::http::StatusCode::NOT_FOUND, Vec::new())
+                        } else {
+                            (axum::http::StatusCode::OK, body)
+                        }
+                    }
                 });
                 axum::serve(tokio::net::TcpListener::from_std(listener).unwrap(), app)
                     .await
@@ -56,12 +65,24 @@ fn signed_field_dispositions_and_retry_counts_survive_restart() {
             let db = Db::open(&path).unwrap();
             let report = clave::ingest::run(&db, &client, data.path(), &host, NOW).unwrap();
             assert!(report.labels.is_empty(), "{name}");
-            assert!(report.rejected.is_empty() && !report.suspended, "{name}");
+            assert!(
+                report
+                    .rejected
+                    .iter()
+                    .all(|(id, _)| id.starts_with("default/"))
+                    && !report.suspended,
+                "{name}"
+            );
             assert_eq!(report.ended, None, "{name}");
             if attempt == 2 && accepted {
                 assert_eq!(report.noise, Some("WIST2-E02"), "{name}");
             }
-            let rejections = db.list_rejections(&host).unwrap();
+            let rejections: Vec<_> = db
+                .list_rejections(&host)
+                .unwrap()
+                .into_iter()
+                .filter(|rejection| rejection.collection.is_none())
+                .collect();
             if accepted {
                 assert!(rejections.is_empty(), "{name}: {rejections:?}");
             } else {

@@ -5,6 +5,7 @@ use serde_json::Value;
 use std::path::Path;
 use wist_core::objects::{AggregatorKeyEntry, PublisherState, StatusRejection};
 
+mod collections;
 mod leases;
 mod pull_runs;
 mod pull_schedule;
@@ -12,6 +13,8 @@ mod restore;
 mod schema;
 mod tree;
 
+pub(crate) use collections::store_changes;
+pub use collections::{Sealed, StoreHeld};
 pub use leases::{
     process_owner, Fence, Lease, PARTITIONS, PARTITION_LEASE_SECONDS, SEALER_LEASE_SECONDS,
 };
@@ -1678,23 +1681,35 @@ impl Db {
 
     pub fn list_rejections(&self, domain: &str) -> Result<Vec<StatusRejection>> {
         let mut stmt = self.conn.prepare(
-            "SELECT code, at, id, detail FROM rejections WHERE domain = ?1 ORDER BY rowid DESC",
+            "SELECT code, at, id, detail, collection, urls_json, condition, change_list FROM rejections WHERE domain = ?1 ORDER BY rowid DESC",
         )?;
         let rows = stmt
             .query_map([domain], |row| {
-                Ok(StatusRejection {
-                    code: row.get(0)?,
-                    at: row.get(1)?,
-                    id: row.get(2)?,
-                    collection: None,
-                    urls: None,
-                    condition: None,
-                    change_list: None,
-                    detail: row.get(3)?,
-                })
+                Ok((
+                    StatusRejection {
+                        code: row.get(0)?,
+                        at: row.get(1)?,
+                        id: row.get(2)?,
+                        collection: row.get(4)?,
+                        urls: None,
+                        condition: None,
+                        change_list: row.get(7)?,
+                        detail: row.get(3)?,
+                    },
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
+        rows.into_iter()
+            .map(|(mut rejection, urls, condition)| {
+                rejection.urls = urls.map(|urls| serde_json::from_str(&urls)).transpose()?;
+                rejection.condition = condition
+                    .map(|condition| serde_json::from_value(Value::String(condition)))
+                    .transpose()?;
+                Ok(rejection)
+            })
+            .collect()
     }
 
     pub fn insert_rejection(
@@ -1708,6 +1723,29 @@ impl Db {
         self.execute(
             "INSERT INTO rejections(domain, code, at, id, detail) VALUES (?1, ?2, ?3, ?4, ?5)",
             (domain, code, at, id, detail),
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn record_rejection(&self, domain: &str, rejection: &StatusRejection) -> Result<()> {
+        let condition = rejection
+            .condition
+            .map(serde_json::to_value)
+            .transpose()?
+            .and_then(|condition| condition.as_str().map(str::to_owned));
+        self.execute(
+            "INSERT INTO rejections(domain, code, at, id, detail, collection, urls_json, condition, change_list) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                domain,
+                rejection.code,
+                rejection.at,
+                rejection.id,
+                rejection.detail,
+                rejection.collection,
+                rejection.urls.as_ref().map(serde_json::to_string).transpose()?,
+                condition,
+                rejection.change_list,
+            ],
         )?;
         Ok(())
     }

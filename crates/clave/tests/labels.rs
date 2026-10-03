@@ -226,7 +226,11 @@ fn labels_and_disputes_are_pulled_sealed_and_carried() {
         clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:30:00Z").unwrap();
     assert!(again.labels.is_empty());
     assert_eq!(again.rejected.len(), 2, "rejected Labels are pulled again");
-    assert_eq!(again.noise, None);
+    assert_eq!(
+        again.noise,
+        Some("WIST2-E02"),
+        "WIST-2 §5.4: a pull that admits no Label or dispute is noise"
+    );
 
     let disputant_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     disputant_listener.set_nonblocking(true).unwrap();

@@ -214,8 +214,8 @@ fn fetch_tree_file(
     bounds: &TreeBounds,
     fetched: &mut Vec<String>,
 ) -> Result<TreeFetch> {
-    let (publisher, name) = (target.publisher, target.name);
-    if let Some(octets) = held.tree_file(publisher, name, hex)? {
+    let name = target.name;
+    if let Some(octets) = held.tree_file(hex)? {
         return Ok(TreeFetch::Octets(octets));
     }
     let answer = site.fetch(&Request {
@@ -238,7 +238,7 @@ fn fetch_tree_file(
     if octets.len() as u64 <= bounds.tree_file_cap_bytes()
         && hex_encode(&Sha256::digest(&octets)) == hex
     {
-        held.hold_tree_file(publisher, name, hex, &octets)?;
+        held.hold_tree_file(hex, &octets)?;
     }
     Ok(TreeFetch::Octets(octets))
 }

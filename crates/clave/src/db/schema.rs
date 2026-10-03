@@ -9,6 +9,7 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA)?;
     super::leases::create(conn)?;
     super::pull_runs::create(conn)?;
+    super::collections::create(conn)?;
     add_missing_columns(conn)?;
     restore_acceptance_order(conn)?;
     backfill_key_acts(conn)?;
@@ -16,7 +17,7 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-const LAYOUT_VERSION: i64 = 2;
+const LAYOUT_VERSION: i64 = 3;
 
 fn refuse_unstamped_layout(conn: &Connection) -> Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -60,14 +61,14 @@ fn refuse_superseded_layout(conn: &Connection) -> Result<()> {
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS publishers(domain TEXT PRIMARY KEY, declaration_json BLOB NOT NULL, key_id TEXT NOT NULL, public_key TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'new', last_pull_at TEXT);
 CREATE TABLE IF NOT EXISTS declaration_floors(domain TEXT PRIMARY KEY, seq INTEGER NOT NULL CHECK(typeof(seq) = 'integer' AND seq BETWEEN 0 AND 9007199254740991));
-CREATE TABLE IF NOT EXISTS pending_entries(rowid INTEGER PRIMARY KEY AUTOINCREMENT, entry_type TEXT NOT NULL, domain TEXT NOT NULL, entry_json BLOB NOT NULL, chain_pos INTEGER NOT NULL, turn_epoch INTEGER, acceptance_order INTEGER);
+CREATE TABLE IF NOT EXISTS pending_entries(rowid INTEGER PRIMARY KEY AUTOINCREMENT, entry_type TEXT NOT NULL, domain TEXT NOT NULL, entry_json BLOB NOT NULL, chain_pos INTEGER NOT NULL, turn_epoch INTEGER, acceptance_order INTEGER, label_id TEXT UNIQUE, place_event INTEGER, place_position INTEGER, place_index INTEGER, eligibility INTEGER);
 CREATE TABLE IF NOT EXISTS epochs(epoch_number INTEGER PRIMARY KEY, tree_size INTEGER NOT NULL, root TEXT NOT NULL, sealed_at TEXT NOT NULL, note TEXT NOT NULL, published INTEGER NOT NULL DEFAULT 0, epoch_bytes INTEGER);
 CREATE TABLE IF NOT EXISTS log_entries(leaf_index INTEGER PRIMARY KEY, epoch_number INTEGER NOT NULL, entry_json BLOB NOT NULL);
 CREATE INDEX IF NOT EXISTS log_entries_epoch ON log_entries(epoch_number);
 CREATE TABLE IF NOT EXISTS log_tiles(level INTEGER NOT NULL, tile_index INTEGER NOT NULL, hashes BLOB NOT NULL, PRIMARY KEY(level, tile_index));
 CREATE TABLE IF NOT EXISTS witnesses(name TEXT PRIMARY KEY, public_key TEXT NOT NULL, base_url TEXT NOT NULL, last_size INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS aggregator_keys(note_key_id TEXT PRIMARY KEY, key_id TEXT NOT NULL, public_key TEXT NOT NULL, added_epoch INTEGER NOT NULL, removed_epoch INTEGER, adding_act BLOB, removing_act BLOB);
-CREATE TABLE IF NOT EXISTS rejections(domain TEXT NOT NULL, code TEXT NOT NULL, at TEXT NOT NULL, id TEXT, detail TEXT);
+CREATE TABLE IF NOT EXISTS rejections(domain TEXT NOT NULL, code TEXT NOT NULL, at TEXT NOT NULL, id TEXT, detail TEXT, collection TEXT, urls_json TEXT, condition TEXT, change_list TEXT);
 CREATE TABLE IF NOT EXISTS params(name TEXT PRIMARY KEY, value INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS param_changes(parameter TEXT NOT NULL, value INTEGER NOT NULL, effective_at TEXT NOT NULL, epoch_number INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS noise_pings(domain TEXT NOT NULL, day TEXT NOT NULL, count INTEGER NOT NULL, PRIMARY KEY(domain, day));

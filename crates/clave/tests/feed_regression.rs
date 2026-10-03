@@ -38,13 +38,22 @@ fn signed_observation_sequences_survive_restart() {
             .unwrap()
             .block_on(async move {
                 let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
-                    recorded.lock().unwrap().push(uri.path().into());
+                    let collection = uri.path().contains("/collections/");
+                    if !collection {
+                        recorded.lock().unwrap().push(uri.path().into());
+                    }
                     let body = if uri.path().ends_with("/publisher.json") {
                         declaration.clone()
                     } else {
                         serving.lock().unwrap().clone()
                     };
-                    async move { body }
+                    async move {
+                        if collection {
+                            (axum::http::StatusCode::NOT_FOUND, Vec::new())
+                        } else {
+                            (axum::http::StatusCode::OK, body)
+                        }
+                    }
                 });
                 axum::serve(tokio::net::TcpListener::from_std(listener).unwrap(), app)
                     .await
@@ -63,11 +72,23 @@ fn signed_observation_sequences_survive_restart() {
             let db = Db::open(&path).unwrap();
             let report = clave::ingest::run(&db, &client, data.path(), &host, NOW).unwrap();
             assert!(report.labels.is_empty(), "{name}");
-            assert!(report.rejected.is_empty() && !report.suspended, "{name}");
+            assert!(
+                report
+                    .rejected
+                    .iter()
+                    .all(|(id, _)| id.starts_with("default/"))
+                    && !report.suspended,
+                "{name}"
+            );
             if event["disposition"] != "usable" {
                 refusals += 1;
             }
-            let rejections = db.list_rejections(&host).unwrap();
+            let rejections: Vec<_> = db
+                .list_rejections(&host)
+                .unwrap()
+                .into_iter()
+                .filter(|rejection| rejection.collection.is_none())
+                .collect();
             assert_eq!(rejections.len(), refusals, "{name}");
             if let Some(code) = event["code"].as_str() {
                 assert_eq!(rejections[0].code, code, "{name}");
@@ -172,7 +193,12 @@ fn downstream_failures_and_budget_suspension_preserve_the_observation() {
             )
             .unwrap()
             .len() as i64;
-            db.set_param("ingest_budget_bytes_day", size).unwrap();
+            let collection = common::tree_bytes(&common::collection_dir(&publisher, "default"))
+                .values()
+                .map(|octets| octets.len() as i64)
+                .sum::<i64>();
+            db.set_param("ingest_budget_bytes_day", size + collection)
+                .unwrap();
         }
         let report = clave::ingest::run(&db, &client, data.path(), &host, NOW).unwrap();
         let admitted: &[String] = match failure {
@@ -453,7 +479,10 @@ fn recovery_settlement_preserves_a_superseded_identitys_label_feed_maximum() {
             );
             let report = clave::ingest::run(&db, &client, data.path(), &host, DEADLINE).unwrap();
             assert_eq!(report.labels, std::slice::from_ref(&id));
-            assert!(report.rejected.is_empty());
+            assert!(report
+                .rejected
+                .iter()
+                .all(|(id, _)| id.starts_with("default/")));
             let after_deadline = DEADLINE.parse::<jiff::Timestamp>().unwrap().as_second() + 3600;
             clave::seal::run(&db, data.path(), &key, after_deadline).unwrap();
             db = Db::open(&path).unwrap();

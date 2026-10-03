@@ -1,3 +1,5 @@
+mod common;
+
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -309,5 +311,161 @@ fn fetch_bounds_vector() {
             other => panic!("{label}: unknown object {other}"),
         };
         assert_eq!(bound, case["bound"].as_u64().unwrap(), "{label}");
+    }
+}
+
+const CLOCK: &str = "2026-08-09T14:00:00Z";
+
+fn collection_seed(name: &str) -> [u8; 32] {
+    [40 + name[1..].parse::<u8>().unwrap(); 32]
+}
+
+fn label_feed_site(case: &serde_json::Value) -> (common::TestPub, Vec<String>) {
+    let p = common::make_publisher("localhost");
+    let names: Vec<String> = (0..case["collections"].as_array().unwrap().len())
+        .map(|n| format!("c{n}"))
+        .collect();
+    let mut declaration = common::current_declaration(&p)["publisher"].clone();
+    declaration["collections"] = names
+        .iter()
+        .map(|name| {
+            serde_json::json!({
+                "name": name,
+                "scope": [{"url": format!("https://localhost/{name}/"), "match": "prefix"}],
+                "keys": [common::key_entry(&collection_seed(name), "2026-08-09T00:00:00Z")],
+            })
+        })
+        .collect();
+    common::write_declaration(&p, &declaration, &common::K1_SEED);
+    for name in &names {
+        common::publish_collection_signed(
+            &p,
+            name,
+            &[],
+            "2026-08-09T12:00:00Z",
+            None,
+            &collection_seed(name),
+        );
+    }
+    (p, names)
+}
+
+fn write_label_feed(p: &common::TestPub, case: &serde_json::Value) {
+    let pages = case["label_feed_pages"].as_u64().unwrap();
+    let live = common::add_label(p, "https://other.example/live", "2026-08-09T13:00:00Z");
+    if pages == 2 {
+        let paged = common::add_label(p, "https://other.example/paged", "2026-08-09T12:30:00Z");
+        common::write_label_feed_page(p, "localhost", 0, &[paged], "2026-08-09T12:45:00Z", None);
+        common::write_label_feed_with_next(
+            p,
+            "localhost",
+            &[live],
+            "2026-08-09T13:30:00Z",
+            Some(&common::label_page_url("localhost", 0)),
+        );
+    } else {
+        common::write_label_feed(p, "localhost", &[live], "2026-08-09T13:30:00Z");
+    }
+}
+
+#[test]
+fn every_label_feed_case_decides_over_loopback_whether_the_label_feed_is_pulled() {
+    let vector: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(spec_path("vectors/wist2/fetch-bounds.json")).unwrap(),
+    )
+    .unwrap();
+    let cases = vector["label_feed_cases"].as_array().unwrap();
+    assert_eq!(cases.len(), 7);
+    for case in cases {
+        let label = case["label"].as_str().unwrap();
+        let (listener, host, client) = common::reserve_addr();
+        let (p, names) = label_feed_site(case);
+        let requests = common::serve_recording(listener, p.dir.path().into());
+        let data = tempfile::tempdir().unwrap();
+        clave::init::run(&host, data.path()).unwrap();
+        let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
+        db.set_param("ingest_budget_bytes_day", 1 << 30).unwrap();
+        let onboarded = clave::ingest::run(&db, &client, data.path(), &host, CLOCK).unwrap();
+        assert_eq!(
+            onboarded.accepted.len(),
+            names.len(),
+            "{label}: {onboarded:?}"
+        );
+
+        write_label_feed(&p, case);
+        if case["declaration"] == "stopped" {
+            std::fs::remove_file(p.dir.path().join(".well-known/wist/publisher.json")).unwrap();
+        }
+        let catalog_len = |name: &str| {
+            std::fs::metadata(common::collection_dir(&p, name).join("catalog.json"))
+                .unwrap()
+                .len() as i64
+        };
+        let mut spent_by_collections = 0;
+        let mut stopping = false;
+        for (name, outcome) in names.iter().zip(case["collections"].as_array().unwrap()) {
+            match outcome.as_str().unwrap() {
+                "accepted" | "suspended" => {
+                    common::publish_collection_signed(
+                        &p,
+                        name,
+                        &[],
+                        "2026-08-09T13:00:00Z",
+                        None,
+                        &collection_seed(name),
+                    );
+                }
+                "refused" => {
+                    common::publish_collection_signed(
+                        &p,
+                        name,
+                        &[],
+                        "2026-08-10T13:00:00Z",
+                        None,
+                        &collection_seed(name),
+                    );
+                }
+                "fetch_failed" => {
+                    std::fs::remove_file(common::collection_dir(&p, name).join("catalog.json"))
+                        .unwrap();
+                }
+                _ => {}
+            }
+            if outcome == "suspended" {
+                spent_by_collections += 1;
+                stopping = true;
+            } else if !stopping && outcome != "fetch_failed" {
+                spent_by_collections += catalog_len(name);
+            }
+        }
+        let live_len = std::fs::metadata(p.dir.path().join(".well-known/wist/label-feed.json"))
+            .unwrap()
+            .len() as i64;
+        let day = &CLOCK[..10];
+        let spent = db.ingest_bytes(&host, day).unwrap();
+        let budget = match case["budget_remaining"].as_i64().unwrap() {
+            0 => spent + spent_by_collections,
+            1 => spent + spent_by_collections + live_len,
+            _ => 1 << 30,
+        };
+        db.set_param("ingest_budget_bytes_day", budget).unwrap();
+        requests.lock().unwrap().clear();
+        let report =
+            clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T14:00:30Z").unwrap();
+        let pulled = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|path| path == "/.well-known/wist/label-feed.json");
+        assert_eq!(
+            pulled,
+            case["label_feed_pulled"].as_bool().unwrap(),
+            "{label}: {report:?}"
+        );
+        assert_eq!(
+            report.suspended,
+            case["suspended"].as_bool().unwrap(),
+            "{label}: {report:?}"
+        );
     }
 }

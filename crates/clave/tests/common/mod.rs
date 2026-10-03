@@ -213,12 +213,14 @@ fn build_publisher(domain: &str, subdomain_scope: Option<&[&str]>) -> TestPub {
     let env =
         wist_core::envelope::sign_envelope(&publisher, "publisher", &kid(&K1_SEED), &sk).unwrap();
     fs::write(wk.join("publisher.json"), serde_json::to_vec(&env).unwrap()).unwrap();
-    TestPub {
+    let p = TestPub {
         domain: domain.into(),
         sk,
         kid: kid(&K1_SEED),
         dir,
-    }
+    };
+    publish_collection(&p, "default", &[], "2026-08-09T00:00:01Z", None);
+    p
 }
 
 pub fn make_publisher(domain: &str) -> TestPub {
@@ -403,12 +405,14 @@ pub fn make_publisher_with_recovery(domain: &str) -> TestPub {
     let env =
         wist_core::envelope::sign_envelope(&publisher, "publisher", &kid(&K1_SEED), &sk).unwrap();
     fs::write(wk.join("publisher.json"), serde_json::to_vec(&env).unwrap()).unwrap();
-    TestPub {
+    let p = TestPub {
         domain: domain.into(),
         sk,
         kid: kid(&K1_SEED),
         dir,
-    }
+    };
+    publish_collection(&p, "default", &[], "2026-08-01T00:00:01Z", None);
+    p
 }
 
 pub fn current_declaration(p: &TestPub) -> serde_json::Value {
@@ -507,4 +511,220 @@ pub fn serve_not_found() -> String {
         });
     });
     url
+}
+
+pub fn page_item_with_links(
+    p: &TestPub,
+    url: &str,
+    extract: &str,
+    links: &[&str],
+) -> (serde_json::Value, serde_json::Value) {
+    let salt = wist_core::crypto::b64u_encode(&[5u8; 16]);
+    let content = serde_json::json!({
+        "extract": extract,
+        "links": {"total": links.len(), "urls": links},
+        "summary": {"title": url.chars().take(256).collect::<String>()}
+    });
+    page_item_with_content(p, url, &salt, &content)
+}
+
+pub fn page_item_with_content(
+    p: &TestPub,
+    url: &str,
+    salt: &str,
+    content: &serde_json::Value,
+) -> (serde_json::Value, serde_json::Value) {
+    let bytes = wist_core::jcs::canonicalize(content)
+        .map(|octets| octets.len())
+        .unwrap_or_default();
+    let commitment = wist_core::item::commitment(salt, content)
+        .unwrap_or_else(|_| format!("hmac-sha256:{}", "0".repeat(64)));
+    let item = serde_json::json!({
+        "publisher": p.domain, "url": url, "observed_at": "2026-08-09T07:00:00Z",
+        "payload": {"commitment": commitment, "alg": "HMAC-SHA256", "bytes": bytes},
+        "meta": {"lang": "en"}
+    });
+    let payload = serde_json::json!({"wist_version": "1.0.0", "salt": salt, "content": content});
+    (item, payload)
+}
+
+pub fn page_item(p: &TestPub, url: &str, extract: &str) -> (serde_json::Value, serde_json::Value) {
+    page_item_with_links(p, url, extract, &[])
+}
+
+pub fn removed_item(p: &TestPub, url: &str) -> serde_json::Value {
+    serde_json::json!({
+        "publisher": p.domain, "url": url, "observed_at": "2026-08-09T07:00:00Z", "removed": true
+    })
+}
+
+pub fn item_id(item: &serde_json::Value) -> String {
+    wist_core::item::item_id(item).unwrap()
+}
+
+#[derive(Debug, Clone)]
+pub struct Published {
+    pub envelope: serde_json::Value,
+    pub catalog_id: String,
+    pub list: Vec<serde_json::Value>,
+    pub tree: std::collections::BTreeMap<String, Vec<u8>>,
+    pub change_list: Option<String>,
+}
+
+pub fn collection_dir(p: &TestPub, name: &str) -> std::path::PathBuf {
+    p.dir
+        .path()
+        .join(format!(".well-known/wist/collections/{name}"))
+}
+
+pub fn publish_collection(
+    p: &TestPub,
+    name: &str,
+    items: &[(serde_json::Value, Option<serde_json::Value>)],
+    generated_at: &str,
+    previous: Option<&Published>,
+) -> Published {
+    publish_collection_signed(p, name, items, generated_at, previous, &K1_SEED)
+}
+
+pub fn publish_collection_signed(
+    p: &TestPub,
+    name: &str,
+    items: &[(serde_json::Value, Option<serde_json::Value>)],
+    generated_at: &str,
+    previous: Option<&Published>,
+    signer: &[u8; 32],
+) -> Published {
+    let list: Vec<serde_json::Value> = items.iter().map(|(item, _)| item.clone()).collect();
+    let bounds = wist_core::tree::TreeBounds::new(65_536, 16).unwrap();
+    let built = wist_core::tree::build(&list, &bounds).unwrap();
+    let root = wist_core::item::root(&list).unwrap();
+    let base = collection_dir(p, name);
+    for directory in ["tree", "payloads", "changes"] {
+        fs::create_dir_all(base.join(directory)).unwrap();
+    }
+    for (hex, octets) in &built.files {
+        fs::write(base.join("tree").join(hex), octets).unwrap();
+    }
+    for (item, payload) in items {
+        if let Some(payload) = payload {
+            fs::write(
+                base.join(format!(
+                    "payloads/{}.json",
+                    wist_core::item::payload_name(item).unwrap()
+                )),
+                wist_core::jcs::canonicalize(payload).unwrap(),
+            )
+            .unwrap();
+        }
+    }
+    let inner = serde_json::json!({
+        "wist_version": "1.0.0", "publisher": p.domain, "collection": name,
+        "generated_at": generated_at, "size": list.len(),
+        "root": format!("sha256:{}", wist_core::crypto::hex_encode(&root)),
+        "tree": built.tree,
+    });
+    let envelope = wist_core::envelope::sign_envelope(
+        &inner,
+        "catalog",
+        &kid(signer),
+        &wist_core::crypto::SigningKey::from_seed(signer),
+    )
+    .unwrap();
+    fs::write(
+        base.join("catalog.json"),
+        wist_core::jcs::canonicalize(&envelope).unwrap(),
+    )
+    .unwrap();
+    let catalog: wist_core::objects::Catalog = serde_json::from_value(inner.clone()).unwrap();
+    let mut change_list = None;
+    if let Some(previous) = previous {
+        let served: wist_core::objects::Catalog =
+            serde_json::from_value(previous.envelope["catalog"].clone()).unwrap();
+        if let Some(written) = wist_core::change_list::write(
+            Some(wist_core::change_list::Listed {
+                catalog: &served,
+                list: &previous.list,
+            }),
+            wist_core::change_list::Listed {
+                catalog: &catalog,
+                list: &list,
+            },
+        )
+        .unwrap()
+        {
+            fs::write(
+                base.join(format!("changes/{}.json", written.name)),
+                &written.octets,
+            )
+            .unwrap();
+            change_list = Some(written.name);
+        }
+    }
+    Published {
+        catalog_id: wist_core::catalog::catalog_id(&inner).unwrap(),
+        envelope,
+        list,
+        tree: built.files,
+        change_list,
+    }
+}
+
+pub fn pull_at(
+    db: &clave::db::Db,
+    client: &clave::fetch::Client,
+    data_dir: &std::path::Path,
+    host: &str,
+    now: &str,
+) -> clave::ingest::IngestReport {
+    clave::ingest::run(db, client, data_dir, host, now).unwrap()
+}
+
+pub const VECTOR_HOST: &str = "example.localhost";
+
+pub fn vector_site() -> (std::net::TcpListener, clave::fetch::Client, TestPub) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let client = clave::fetch::Client::with_builder(
+        true,
+        reqwest::blocking::Client::builder()
+            .no_proxy()
+            .resolve(VECTOR_HOST, listener.local_addr().unwrap()),
+    );
+    (listener, client, make_publisher(VECTOR_HOST))
+}
+
+pub fn to_vector_host(value: &serde_json::Value) -> serde_json::Value {
+    serde_json::from_str(
+        &serde_json::to_string(value)
+            .unwrap()
+            .replace("example.com", VECTOR_HOST),
+    )
+    .unwrap()
+}
+
+pub fn effective_code(
+    db: &clave::db::Db,
+    host: &str,
+    item: &serde_json::Value,
+    report: &clave::ingest::IngestReport,
+) -> Option<String> {
+    let id = item_id(item);
+    if report.items.iter().any(|admitted| admitted.ends_with(&id)) {
+        return None;
+    }
+    let rejection = db
+        .list_rejections(host)
+        .unwrap()
+        .into_iter()
+        .find(|rejection| rejection.id.as_deref() == Some(id.as_str()))
+        .unwrap_or_else(|| panic!("{id} is neither admitted nor rejected"));
+    Some(match (rejection.code.as_str(), rejection.detail) {
+        ("WIST2-E03", Some(detail)) => detail,
+        (code, _) => code.to_owned(),
+    })
+}
+
+pub fn payload_files(data_dir: &std::path::Path) -> usize {
+    fs::read_dir(data_dir.join("payloads")).map_or(0, |dir| dir.count())
 }

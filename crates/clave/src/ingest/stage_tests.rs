@@ -103,6 +103,7 @@ impl Site {
                 "publisher",
             ),
         );
+        site.collection("default", &[], "2026-08-09T08:00:00Z");
         site
     }
 
@@ -110,6 +111,67 @@ impl Site {
         let path = self.dir.path().join(".well-known/wist").join(path);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, serde_json::to_vec(doc).unwrap()).unwrap();
+    }
+
+    pub(crate) fn page_item(&self, url: &str, extract: &str) -> (Value, Value) {
+        let salt = wist_core::crypto::b64u_encode(&[5u8; 16]);
+        let content = serde_json::json!({
+            "extract": extract,
+            "links": {"total": 0, "urls": []},
+            "summary": {"title": url}
+        });
+        let item = serde_json::json!({
+            "publisher": self.host, "url": url, "observed_at": "2026-08-09T07:00:00Z",
+            "payload": {
+                "commitment": wist_core::item::commitment(&salt, &content).unwrap(),
+                "alg": "HMAC-SHA256",
+                "bytes": wist_core::jcs::canonicalize(&content).unwrap().len()
+            },
+            "meta": {"lang": "en"}
+        });
+        let payload =
+            serde_json::json!({"wist_version": "1.0.0", "salt": salt, "content": content});
+        (item, payload)
+    }
+
+    pub(crate) fn collection(&self, name: &str, items: &[(Value, Value)], generated_at: &str) {
+        let list: Vec<Value> = items.iter().map(|(item, _)| item.clone()).collect();
+        let bounds = wist_core::tree::TreeBounds::new(65_536, 16).unwrap();
+        let built = wist_core::tree::build(&list, &bounds).unwrap();
+        let root = wist_core::item::root(&list).unwrap();
+        let base = self
+            .dir
+            .path()
+            .join(format!(".well-known/wist/collections/{name}"));
+        std::fs::create_dir_all(base.join("tree")).unwrap();
+        std::fs::create_dir_all(base.join("payloads")).unwrap();
+        for (hex, octets) in &built.files {
+            std::fs::write(base.join("tree").join(hex), octets).unwrap();
+        }
+        for (item, payload) in items {
+            std::fs::write(
+                base.join(format!(
+                    "payloads/{}.json",
+                    wist_core::item::payload_name(item).unwrap()
+                )),
+                wist_core::jcs::canonicalize(payload).unwrap(),
+            )
+            .unwrap();
+        }
+        let catalog = sign(
+            &serde_json::json!({
+                "wist_version": "1.0.0", "publisher": self.host, "collection": name,
+                "generated_at": generated_at, "size": list.len(),
+                "root": format!("sha256:{}", wist_core::crypto::hex_encode(&root)),
+                "tree": built.tree,
+            }),
+            "catalog",
+        );
+        std::fs::write(
+            base.join("catalog.json"),
+            wist_core::jcs::canonicalize(&catalog).unwrap(),
+        )
+        .unwrap();
     }
 
     fn read(&self, path: &str) -> Value {
@@ -284,6 +346,11 @@ fn admitted_state(log: &Log) -> Vec<String> {
     for query in [
         "SELECT entry_type, domain, CAST(entry_json AS TEXT) FROM pending_entries ORDER BY rowid",
         "SELECT id, domain FROM seen_labels ORDER BY id",
+        "SELECT publisher, name, accepted_id, left_chain FROM collections ORDER BY publisher, name",
+        "SELECT publisher, name, catalog_id, idx, item_id, admission, code FROM list_items ORDER BY publisher, name, catalog_id, idx",
+        "SELECT publisher, url, collection, item_id FROM waiting_urls ORDER BY publisher, url",
+        "SELECT publisher, name, catalog_id, size FROM held_lists ORDER BY publisher, name, catalog_id",
+        "SELECT sha256 FROM tree_files ORDER BY sha256",
     ] {
         let mut statement = conn.prepare(query).unwrap();
         let columns = statement.column_count();
@@ -337,6 +404,11 @@ fn queue_writes(log: &Log) -> i64 {
 
 fn walked_site() -> (Site, [String; 3]) {
     let site = Site::new();
+    let pages = [
+        site.page_item("https://localhost/a", "first page"),
+        site.page_item("https://localhost/b", "second page"),
+    ];
+    site.collection("default", &pages, "2026-08-09T11:45:00Z");
     let paged = site.label("https://other.example/paged", "2026-08-09T10:00:00Z");
     let broken = site.unreadable_label(9);
     let live = site.label("https://other.example/live", "2026-08-09T11:30:00Z");
@@ -536,6 +608,8 @@ fn a_fresh_pull_after_an_interruption_at_any_commit_admits_what_one_pull_admits(
         let report = log.pull(&site).unwrap();
         assert_eq!(report.labels, [ids[0].clone(), ids[2].clone()]);
         assert_eq!(report.rejected, [(ids[1].clone(), "WIST2-E06".to_string())]);
+        assert_eq!(report.accepted.len(), 1, "the default Catalog is accepted");
+        assert_eq!(report.items.len(), 2, "both Items are admitted");
         assert!(!report.suspended && report.noise.is_none());
         admitted_state(&log)
     };
