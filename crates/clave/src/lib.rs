@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod collection;
 pub mod db;
 pub mod declaration;
 pub mod error;
