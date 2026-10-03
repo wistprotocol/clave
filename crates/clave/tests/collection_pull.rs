@@ -57,7 +57,6 @@ fn sealed_state() -> State {
         )
         .unwrap();
     state.height = Some(0);
-    state.sealed_at = Some(SEALED_AT.into());
     state
 }
 

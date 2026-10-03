@@ -5,7 +5,7 @@ use wist_core::declarations::Declarations;
 use wist_core::objects::status::{RejectionCondition, StatusRejection};
 use wist_core::withdrawal::{SealedItems, WithdrawalReplay};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(into = "Vec<u64>", try_from = "Vec<u64>")]
 pub struct Place {
     pub event: u64,
@@ -185,8 +185,27 @@ pub struct QueuedCatalog {
     pub envelope: Value,
     pub catalog_id: String,
     pub place: Place,
-    pub first_place: Place,
     pub sources: Vec<String>,
+}
+
+pub type QueueSlot = (String, String);
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RecoveryQueue {
+    pub owner: String,
+    pub end_s: Option<i128>,
+    pub queued: BTreeMap<QueueSlot, QueuedCatalog>,
+    pub first: BTreeMap<String, Place>,
+}
+
+impl RecoveryQueue {
+    pub fn opened(&self) -> bool {
+        self.end_s.is_some()
+    }
+
+    pub fn first_place(&self, name: &str) -> Option<Place> {
+        self.first.get(name).copied()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -239,26 +258,25 @@ pub struct Discovered {
     pub last_sealed_at_discovery: Option<u64>,
     pub reduces_authority: bool,
     pub last_seal_height: Option<u64>,
+    #[serde(default)]
+    pub competitor: bool,
 }
 
 pub type CollectionKey = (String, String);
 
 pub type ListKey = (String, String, String);
 
-pub type QueueKey = (String, String, String);
-
 #[derive(Debug, Clone, Default)]
 pub struct State {
     pub events: u64,
     pub height: Option<u64>,
-    pub sealed_at: Option<String>,
     pub declarations: Declarations,
     pub discovered: BTreeMap<String, Vec<Discovered>>,
     pub declaration_files: BTreeMap<String, ServedFile>,
     pub collections: BTreeMap<CollectionKey, CollectionState>,
     pub lists: BTreeMap<ListKey, Vec<ListItem>>,
     pub urls: BTreeMap<CollectionKey, WaitingUrl>,
-    pub queue: BTreeMap<QueueKey, QueuedCatalog>,
+    pub queues: BTreeMap<String, RecoveryQueue>,
     pub records: BTreeMap<CollectionKey, Record>,
     pub removals: BTreeMap<CollectionKey, Removal>,
     pub withdrawals: WithdrawalReplay,
@@ -297,6 +315,12 @@ impl State {
                 .filter(|found| found.reduces_authority)
                 .map(move |found| (publisher.as_str(), found))
         })
+    }
+
+    pub fn window_holds(&self, publisher: &str) -> bool {
+        self.queues
+            .get(publisher)
+            .is_some_and(RecoveryQueue::opened)
     }
 
     pub fn first_epoch_after(&self) -> u64 {

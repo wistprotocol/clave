@@ -1,4 +1,5 @@
 use super::pull::{self, Parameters};
+use super::queue::{self, Settled, Settling};
 use super::site::Held;
 use super::state::{
     Admission, CollectionKey, ItemKind, LabelKind, Place, Record, Removal, SealedCatalog, State,
@@ -225,6 +226,7 @@ pub struct UpdateRefused {
 #[derive(Debug, Clone)]
 pub struct Planned {
     pub event: u64,
+    pub settlement: Vec<Settled>,
     pub entries: Vec<Value>,
     pub sealed: Vec<Sealed>,
     pub left: Vec<Left>,
@@ -414,10 +416,12 @@ pub fn judge(state: &State, input: &EpochInput<'_>, entries: &[Value]) -> Result
         None => Replay::new(),
         Some(height) => Replay::resumed(
             height,
-            state
-                .sealed_at
-                .as_deref()
-                .ok_or_else(|| history("a sealed Epoch without its sealed_at"))?,
+            &wist_core::timestamp::instant(
+                state
+                    .declarations
+                    .sealed_at_s()
+                    .ok_or_else(|| history("a sealed Epoch without its sealed_at"))?,
+            )?,
             state.declarations.clone(),
             &tuples(state, &publishers),
         )?,
@@ -824,7 +828,8 @@ fn run_pass<H: Held>(
             .map(|(key, waiting)| (key.clone(), waiting.place, waiting.eligibility))
             .collect();
         for ((publisher, url), place, eligibility) in urls {
-            if gone.contains(&(publisher.clone(), url.clone())) || eligibility > height {
+            let due = eligibility <= height || next.window_holds(&publisher);
+            if gone.contains(&(publisher.clone(), url.clone())) || !due {
                 continue;
             }
             let (item, _) = waiting_item(next, turn.held, lists, &publisher, &url)?;
@@ -1200,6 +1205,52 @@ fn has(failed: &[Failure], condition: Condition) -> bool {
     failed.iter().any(|failure| failure.condition == condition)
 }
 
+/// WIST-1 §5.2, Settlement: the Epoch of settlement settles before any of its Declarations
+/// applies.
+fn settle_due(
+    next: &mut State,
+    held: &impl Held,
+    input: &EpochInput<'_>,
+    event: u64,
+) -> Result<Vec<Settled>> {
+    let sealed_at_s = wist_core::timestamp::log_seconds(input.sealed_at)?;
+    let due: Vec<String> = next
+        .queues
+        .keys()
+        .filter(|publisher| queue::due(next, publisher, sealed_at_s))
+        .cloned()
+        .collect();
+    let mut settled = Vec::new();
+    for publisher in due {
+        let source = queue::settlement_source(next, &publisher)?;
+        settled.extend(queue::settle(
+            next,
+            held,
+            &publisher,
+            &Settling {
+                source: &source,
+                order: &source,
+                clock: input.sealed_at,
+                parameters: input.parameters,
+                eligibility: input.height,
+                event,
+                waited: None,
+            },
+        )?);
+    }
+    let ended: Vec<String> = next
+        .declarations
+        .domains()
+        .keys()
+        .filter(|publisher| queue::sealed_window_ended(next, publisher, sealed_at_s))
+        .cloned()
+        .collect();
+    for publisher in ended {
+        queue::supersede(next, &publisher);
+    }
+    Ok(settled)
+}
+
 /// WIST-3 §3.2–§3.3 and §7.
 pub fn plan(state: &State, held: &impl Held, input: &EpochInput<'_>) -> Result<Planned> {
     let height = input.height;
@@ -1212,6 +1263,7 @@ pub fn plan(state: &State, held: &impl Held, input: &EpochInput<'_>) -> Result<P
     let mut updates: Vec<Value> = Vec::new();
     let mut updates_refused = Vec::new();
     let mut destroyed: BTreeSet<String> = BTreeSet::new();
+    let mut settlement = settle_due(&mut next, held, input, event)?;
     for update in input.updates {
         let inner = &update["update"];
         if inner["action"] != "payload_withdrawal" {
@@ -1232,6 +1284,14 @@ pub fn plan(state: &State, held: &impl Held, input: &EpochInput<'_>) -> Result<P
         }
     }
     let candidates = candidate_checks(&mut next, input.declarations, &limits)?;
+    settlement.extend(queue::settle_orphans(
+        &mut next,
+        held,
+        input.sealed_at,
+        parameters,
+        height,
+        event,
+    )?);
     let mut sealed_hashes: BTreeSet<String> = BTreeSet::new();
     for envelope in &candidates.envelopes {
         sealed_hashes.insert(declaration::inner_hash(envelope).map_err(Error::History)?);
@@ -1260,6 +1320,12 @@ pub fn plan(state: &State, held: &impl Held, input: &EpochInput<'_>) -> Result<P
         .iter()
         .filter(|(_, domain)| domain.window().is_some())
         .map(|(domain, _)| domain.clone())
+        .chain(
+            next.queues
+                .iter()
+                .filter(|(_, queue)| queue.opened())
+                .map(|(publisher, _)| publisher.clone()),
+        )
         .collect();
     refresh_all(&mut next, held, event, height + 1, &in_force, None)?;
     let holding: BTreeSet<String> = next
@@ -1548,7 +1614,6 @@ pub fn plan(state: &State, held: &impl Held, input: &EpochInput<'_>) -> Result<P
     }
     absorb(&mut next, &judged, height);
     next.height = Some(height);
-    next.sealed_at = Some(input.sealed_at.to_owned());
     for planned in &pass.planned {
         if let Publication::Item { publisher, .. } = &planned.publication {
             let body = &planned.entry["body"];
@@ -1563,6 +1628,7 @@ pub fn plan(state: &State, held: &impl Held, input: &EpochInput<'_>) -> Result<P
     next.discovered.retain(|_, found| !found.is_empty());
     let log = in_force_of(&next.declarations)?;
     refresh_all(&mut next, held, event, height + 1, &log, None)?;
+    queue::open_windows(&mut next)?;
     for deferred in &pass.deferred {
         match &deferred.publication {
             Publication::Catalog {
@@ -1580,6 +1646,9 @@ pub fn plan(state: &State, held: &impl Held, input: &EpochInput<'_>) -> Result<P
                 }
             }
             Publication::Item { publisher, url, .. } => {
+                if next.window_holds(publisher) {
+                    continue;
+                }
                 if let Some(waiting) = next.urls.get_mut(&(publisher.clone(), url.clone())) {
                     waiting.eligibility = height + 1;
                 }
@@ -1613,6 +1682,7 @@ pub fn plan(state: &State, held: &impl Held, input: &EpochInput<'_>) -> Result<P
         .collect();
     Ok(Planned {
         event,
+        settlement,
         entries,
         sealed,
         left: left.into_iter().map(|(_, left)| left).collect(),

@@ -1,10 +1,13 @@
 use clave::collection::plan::{
     self, Deferred, EpochInput, HeldBack, Inclusion, Left, Planned, Publication, Sealed, Unsealed,
 };
-use clave::collection::pull::{accept_labels, LabelOutcome, LabelReport};
+use clave::collection::pull::{
+    accept_labels, CatalogOutcome, CatalogReport, ItemOutcome, LabelOutcome, LabelReport,
+    PayloadSource,
+};
 use clave::collection::state::Place;
 use clave::collection::{
-    pull, MemoryHeld, Meter, Object, Parameters, PullInput, ServedSite, State,
+    pull, MemoryHeld, Meter, Object, Parameters, PullInput, PullReport, ServedSite, Settled, State,
 };
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -137,6 +140,16 @@ impl<'a> History<'a> {
             .unwrap_or_else(|| x.to_owned())
     }
 
+    fn key_id(&self, x: &str) -> String {
+        self.keys
+            .as_object()
+            .unwrap()
+            .values()
+            .find(|key| key["x"] == x)
+            .map(|key| key["kid"].as_str().unwrap().to_owned())
+            .unwrap_or_else(|| x.to_owned())
+    }
+
     fn ceiling(&self, eligibility: u64) -> u64 {
         self.inclusion.ceiling(eligibility)
     }
@@ -251,11 +264,11 @@ fn assert_left(history: &History<'_>, at: usize, got: &[Left], wanted: &Value) {
     }
 }
 
-fn state_view(history: &History<'_>, state: &State) -> Value {
+fn state_view(history: &History<'_>, state: &State, shown: &BTreeSet<(String, String)>) -> Value {
     let collections: Vec<Value> = state
         .collections
         .iter()
-        .filter(|(_, collection)| collection.latest.is_some() || collection.accepted.is_some())
+        .filter(|(key, _)| shown.contains(*key))
         .map(|((publisher, name), collection)| {
             json!({
                 "publisher": publisher,
@@ -284,31 +297,38 @@ fn state_view(history: &History<'_>, state: &State) -> Value {
     let urls: Vec<Value> = urls
         .into_iter()
         .map(|((publisher, url), waiting)| {
+            let held = state.window_holds(publisher);
             json!({
                 "publisher": publisher,
                 "url": url,
                 "collection": waiting.collection,
                 "item": waiting.item_id,
                 "place": place(waiting.place),
-                "eligibility": waiting.eligibility,
-                "ceiling": history.ceiling(waiting.eligibility),
+                "eligibility": (!held).then_some(waiting.eligibility),
+                "ceiling": (!held).then(|| history.ceiling(waiting.eligibility)),
             })
         })
         .collect();
-    let queue: Vec<Value> = state
-        .queue
-        .iter()
-        .map(|((publisher, name, key), queued)| {
-            json!({
-                "publisher": publisher,
-                "collection": name,
-                "key": history.key_name(key),
-                "catalog": queued.catalog_id,
-                "place": place(queued.place),
-                "first_place": place(queued.first_place),
-            })
-        })
-        .collect();
+    let mut queue: Vec<(String, Place, String, Value)> = Vec::new();
+    for (publisher, window) in &state.queues {
+        for ((name, key), queued) in &window.queued {
+            queue.push((
+                publisher.clone(),
+                queued.place,
+                history.key_id(key),
+                json!({
+                    "publisher": publisher,
+                    "collection": name,
+                    "key": history.key_name(key),
+                    "catalog": queued.catalog_id,
+                    "place": place(queued.place),
+                    "first_place": place(window.first_place(name).unwrap()),
+                }),
+            ));
+        }
+    }
+    queue.sort_by(|a, b| (&a.0, a.1, &a.2).cmp(&(&b.0, b.1, &b.2)));
+    let queue: Vec<Value> = queue.into_iter().map(|(_, _, _, row)| row).collect();
     let reductions: Vec<Value> = state
         .reductions_pending()
         .map(|(publisher, found)| {
@@ -361,6 +381,185 @@ fn state_view(history: &History<'_>, state: &State) -> Value {
             .collect();
     }
     out
+}
+
+fn settlement_view(history: &History<'_>, settled: &[Settled]) -> Value {
+    let mut rows: Vec<&Settled> = settled.iter().collect();
+    rows.sort_by(|a, b| {
+        (&a.publisher, a.place, history.key_id(&a.key)).cmp(&(
+            &b.publisher,
+            b.place,
+            history.key_id(&b.key),
+        ))
+    });
+    rows.into_iter()
+        .map(|row| {
+            let mut out = json!({
+                "publisher": row.publisher,
+                "collection": row.collection,
+                "key": history.key_name(&row.key),
+                "catalog": row.catalog,
+                "outcome": row.outcome.as_str(),
+            });
+            if let Some(code) = row.outcome.condition_code() {
+                out["condition_code"] = json!(code);
+            }
+            out
+        })
+        .collect()
+}
+
+fn catalog_outcome(outcome: CatalogOutcome) -> &'static str {
+    match outcome {
+        CatalogOutcome::Unavailable => "unavailable",
+        CatalogOutcome::Suspended => "suspended",
+        CatalogOutcome::Accepted => "accepted",
+        CatalogOutcome::Idempotent => "idempotent",
+        CatalogOutcome::Refused => "refused",
+    }
+}
+
+fn payload_source(source: PayloadSource) -> &'static str {
+    match source {
+        PayloadSource::Withdrawn => "withdrawn",
+        PayloadSource::Record => "record",
+        PayloadSource::Held => "held",
+        PayloadSource::Fetched => "fetched",
+        PayloadSource::Unavailable => "unavailable",
+        PayloadSource::Failed => "failed",
+    }
+}
+
+fn assert_codes(at: &str, got: &[&str], wanted: &Value) {
+    let wanted: Vec<&str> = wanted
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|code| code.as_str().unwrap())
+        .collect();
+    assert!(
+        !got.is_empty() && got.iter().all(|code| wanted.contains(code)),
+        "{at}: codes {got:?} outside {wanted:?}"
+    );
+}
+
+fn assert_catalog(history: &History<'_>, at: &str, got: &CatalogReport, wanted: &Value) {
+    let at = format!("{at} {}", got.collection);
+    let view = json!({
+        "collection": got.collection,
+        "outcome": catalog_outcome(got.outcome),
+        "catalog": got.catalog,
+        "sources": got.sources.iter().map(|hash| history.label_name(hash)).collect::<Vec<_>>(),
+        "tree_files_fetched": got.tree_files_fetched,
+        "base": got.base,
+        "key": got.key.as_deref().map(|x| history.key_name(x)),
+        "queued": got.queued,
+        "dropped": got.dropped,
+        "suspended": got.suspended,
+    });
+    if let Some(codes) = wanted.get("codes") {
+        assert_codes(&at, &got.codes, codes);
+    }
+    for (member, value) in wanted.as_object().unwrap() {
+        match member.as_str() {
+            "codes" | "reason" => {}
+            "tree_files_fetched" => {
+                for hex in value.as_array().unwrap() {
+                    assert!(
+                        got.tree_files_fetched.iter().any(|got| got == hex),
+                        "{at}: tree file {hex} not fetched"
+                    );
+                }
+            }
+            "items" => {
+                let items = value.as_array().unwrap();
+                assert_eq!(got.items.len(), items.len(), "{at}: items {:?}", got.items);
+                for (item, wanted) in got.items.iter().zip(items) {
+                    let mut out = json!({
+                        "url": item.url,
+                        "item": item.item,
+                        "outcome": match item.outcome {
+                            ItemOutcome::Admitted => "admitted",
+                            ItemOutcome::NotAdmitted => "not_admitted",
+                            ItemOutcome::Refused => "refused",
+                        },
+                    });
+                    if let Some(payload) = item.payload {
+                        out["payload"] = json!(payload_source(payload));
+                    }
+                    if let Some(code) = item.payload_code {
+                        out["payload_code"] = json!(code);
+                    }
+                    if let Some(codes) = wanted.get("codes") {
+                        assert_codes(&at, &item.codes, codes);
+                        out["codes"] = codes.clone();
+                    }
+                    if wanted.get("payload").is_some_and(Value::is_null) {
+                        out["payload"] = Value::Null;
+                    }
+                    assert_eq!(&out, wanted, "{at}: item");
+                }
+            }
+            _ => assert_eq!(&view[member.as_str()], value, "{at}: {member}"),
+        }
+    }
+}
+
+fn assert_pull(
+    history: &History<'_>,
+    at: usize,
+    report: &PullReport,
+    labels: usize,
+    wanted: &Value,
+) {
+    let at = format!("{} event {at}", history.name);
+    assert_eq!(
+        settlement_view(history, &report.settlement),
+        wanted["settlement"],
+        "{at}: settlement"
+    );
+    let declaration = &report.declaration;
+    assert_eq!(
+        json!({
+            "outcome": declaration.outcome,
+            "discovered": declaration.discovered,
+            "reduces_authority": declaration.reduces_authority,
+            "sources": declaration
+                .sources
+                .iter()
+                .map(|hash| history.label_name(hash))
+                .collect::<Vec<_>>(),
+            "window": declaration.window,
+        }),
+        wanted["declaration"],
+        "{at}: declaration"
+    );
+    assert_eq!(
+        json!(report.collections_pulled),
+        wanted["collections_pulled"],
+        "{at}: collections pulled"
+    );
+    let catalogs = wanted["catalogs"].as_array().unwrap();
+    assert_eq!(
+        report.catalogs.len(),
+        catalogs.len(),
+        "{at}: catalogs {:?}",
+        report.catalogs
+    );
+    for (got, wanted) in report.catalogs.iter().zip(catalogs) {
+        assert_catalog(history, &at, got, wanted);
+    }
+    assert_eq!(
+        report.suspended,
+        wanted.get("suspended").is_some_and(|value| value == true),
+        "{at}: suspended"
+    );
+    let resolution = report.resolution(labels);
+    assert_eq!(
+        resolution.noise && report.declaration.proceeds,
+        wanted.get("noise").is_some_and(|value| value == true),
+        "{at}: noise"
+    );
 }
 
 fn labels_view(reports: &[LabelReport]) -> Value {
@@ -421,6 +620,7 @@ fn serve_pull(history: &History<'_>, event: &Value) -> ServedSite {
 struct Run<'a> {
     history: History<'a>,
     state: State,
+    shown: BTreeSet<(String, String)>,
     held: MemoryHeld,
     full: Replay,
     compared: usize,
@@ -510,6 +710,7 @@ fn planned_view(history: &History<'_>, planned: &Planned) -> Value {
 fn expected_epoch(expected: &Value) -> Value {
     let list = |member: &str| expected.get(member).cloned().unwrap_or(json!([]));
     json!({
+        "settlement": list("settlement"),
         "entries": expected["entries"],
         "sealed": expected["sealed"],
         "deferred": expected["deferred"],
@@ -523,7 +724,34 @@ fn expected_epoch(expected: &Value) -> Value {
     })
 }
 
-impl Run<'_> {
+impl<'a> Run<'a> {
+    fn new(keys: &'a Value, vector: &'a Value) -> Self {
+        Run {
+            history: History::read(keys, vector),
+            state: State::default(),
+            shown: BTreeSet::new(),
+            held: MemoryHeld::default(),
+            full: Replay::new(),
+            compared: 0,
+            restricted: 0,
+        }
+    }
+
+    fn show(&mut self) {
+        for (key, collection) in &self.state.collections {
+            if collection.latest.is_some() || collection.accepted.is_some() {
+                self.shown.insert(key.clone());
+            }
+        }
+    }
+
+    fn show_settled(&mut self, settled: &[Settled]) {
+        for row in settled {
+            self.shown
+                .insert((row.publisher.clone(), row.collection.clone()));
+        }
+    }
+
     fn epoch(&mut self, at: usize, event: &Value, expected: &Value) {
         let history = &self.history;
         let (map, declarations, updates, unsealed) = epoch_input_parts(history, event);
@@ -575,10 +803,12 @@ impl Run<'_> {
         );
         self.compared += 1;
         let mut view = planned_view(history, &planned);
+        view["settlement"] = settlement_view(history, &planned.settlement);
         let wanted = expected_epoch(expected);
         assert_left(history, at, &planned.left, &expected["left"]);
         view["entries"] = json!(planned.entries);
         assert_eq!(view, wanted, "{} event {at}", history.name);
+        self.show_settled(&planned.settlement);
         for item_id in &planned.payloads_destroyed {
             self.held.payloads.remove(item_id);
         }
@@ -611,23 +841,17 @@ impl Run<'_> {
                 history.name
             );
         }
-        assert_eq!(
-            report.declaration.outcome, expected["declaration"]["outcome"],
-            "{} event {at}: declaration",
-            history.name
-        );
+        let admitted = labels
+            .iter()
+            .filter(|label| matches!(label.outcome, LabelOutcome::Accepted(_)))
+            .count();
+        assert_pull(history, at, &report, admitted, expected);
+        self.show_settled(&report.settlement);
     }
 }
 
 fn replay_history(keys: &Value, vector: &Value) -> (usize, usize) {
-    let mut run = Run {
-        history: History::read(keys, vector),
-        state: State::default(),
-        held: MemoryHeld::default(),
-        full: Replay::new(),
-        compared: 0,
-        restricted: 0,
-    };
+    let mut run = Run::new(keys, vector);
     let events = vector["events"].as_array().unwrap();
     let expected = vector["expected"].as_array().unwrap();
     assert_eq!(events.len(), expected.len());
@@ -637,8 +861,9 @@ fn replay_history(keys: &Value, vector: &Value) -> (usize, usize) {
             "pull" => run.pull(at, event, expected),
             other => panic!("unknown event {other}"),
         }
+        run.show();
         assert_eq!(
-            state_view(&run.history, &run.state),
+            state_view(&run.history, &run.state, &run.shown),
             expected["state"],
             "{} event {at}: state",
             run.history.name
@@ -663,6 +888,11 @@ fn every_catalog_waiting_history_replays_through_pull_and_plan() {
 #[test]
 fn every_collection_pull_history_replays_through_pull_and_plan() {
     assert_eq!(replay_file("vectors/wist2/collection-pull.json"), 20);
+}
+
+#[test]
+fn every_catalog_recovery_history_replays_through_pull_and_plan() {
+    assert_eq!(replay_file("vectors/wist1/catalog-recovery.json"), 30);
 }
 
 fn history_named<'a>(vector: &'a Value, name: &str) -> &'a Value {
@@ -724,14 +954,7 @@ fn a_planned_epoch_with_an_entry_the_judgment_ignores_or_out_of_order_fails_veri
         &vector,
         "a Catalog accepted at a pull and sealed with its Items in the next Epoch",
     );
-    let mut run = Run {
-        history: History::read(&vector["keys"], history),
-        state: State::default(),
-        held: MemoryHeld::default(),
-        full: Replay::new(),
-        compared: 0,
-        restricted: 0,
-    };
+    let mut run = Run::new(&vector["keys"], history);
     let events = history["events"].as_array().unwrap();
     let expected = history["expected"].as_array().unwrap();
     run.epoch(0, &events[0], &expected[0]);
@@ -808,9 +1031,9 @@ fn a_label_of_a_labeler_whose_recovery_window_is_open_waits_with_its_eligibility
             .unwrap();
         state.declarations.seed_head(0, "root", Some(sealed_at_s));
         state.height = Some(0);
-        state.sealed_at = Some("2026-10-01T00:00:00Z".into());
         let report = clave::collection::PullReport {
             event: 0,
+            settlement: Vec::new(),
             declaration: clave::collection::pull::DeclarationReport {
                 outcome: "idempotent".into(),
                 proceeds: true,
@@ -860,4 +1083,45 @@ fn a_label_of_a_labeler_whose_recovery_window_is_open_waits_with_its_eligibility
             assert!(waiting.is_empty());
         }
     }
+}
+
+#[test]
+fn a_pull_after_the_one_that_settled_the_queue_settles_nothing_again() {
+    let vector = read_vector("vectors/wist1/catalog-recovery.json");
+    let history = history_named(
+        &vector,
+        "settlement at a pull between the window's end and the Epoch of settlement",
+    );
+    let mut run = Run::new(&vector["keys"], history);
+    let events = history["events"].as_array().unwrap();
+    let expected = history["expected"].as_array().unwrap();
+    for at in 0..8 {
+        match events[at]["event"].as_str().unwrap() {
+            "epoch" => run.epoch(at, &events[at], &expected[at]),
+            _ => run.pull(at, &events[at], &expected[at]),
+        }
+    }
+    assert!(run.state.queues.is_empty());
+    let urls = run.state.urls.clone();
+    let events_before = run.state.events;
+    let again = &events[7];
+    let mut site = serve_pull(&run.history, again);
+    let map = parameters(&again["parameters"]);
+    let report = pull(
+        &mut run.state,
+        &mut site,
+        &mut run.held,
+        &PullInput {
+            publisher: again["publisher"].as_str().unwrap(),
+            at: "2026-10-08T02:30:00Z",
+            parameters: &map,
+        },
+    )
+    .unwrap();
+    assert!(report.settlement.is_empty());
+    assert!(!report.declaration.window);
+    assert_eq!(run.state.events, events_before + 1);
+    assert_eq!(report.catalogs[0].outcome, CatalogOutcome::Idempotent);
+    assert_eq!(run.state.urls, urls);
+    run.epoch(8, &events[8], &expected[8]);
 }

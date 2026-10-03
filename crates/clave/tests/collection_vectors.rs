@@ -118,7 +118,6 @@ fn a_pull_applies_the_fetched_declaration_against_the_current_one() {
             .unwrap();
         state.declarations.seed_head(0, "root", Some(sealed_at_s));
         state.height = Some(0);
-        state.sealed_at = Some(sealed_at.into());
         let known_octets = octets(known);
         state.declaration_files.insert(
             domain.into(),
@@ -193,7 +192,6 @@ fn replay_epochs(state: &mut State, case: &Value, history: &Value) -> BTreeMap<S
             )
             .unwrap();
         state.height = Some(height);
-        state.sealed_at = Some(sealed_at.into());
     }
     labels
 }
@@ -241,6 +239,7 @@ fn a_pull_reads_the_sources_the_publisher_state_gives_once_the_fetched_declarati
                     last_sealed_at_discovery: state.height,
                     reduces_authority: false,
                     last_seal_height: None,
+                    competitor: false,
                 });
         }
         let request = &case["pull"];
@@ -316,6 +315,7 @@ fn resolution_report(case: &Value) -> (PullReport, usize) {
     let declaration = case["declaration"].as_str().unwrap();
     let mut report = PullReport {
         event: 0,
+        settlement: Vec::new(),
         declaration: DeclarationReport {
             outcome: "idempotent".into(),
             proceeds: !declaration.starts_with("stopped"),
@@ -393,4 +393,96 @@ fn a_pull_that_discovers_accepts_and_admits_nothing_resolves_to_wist2_e02() {
         );
     }
     assert_eq!(cases.len(), 13);
+}
+
+fn state_pull_case<'a>(vector: &'a Value, name: &str) -> &'a Value {
+    vector["state_pull_cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|case| case["name"] == name)
+        .unwrap_or_else(|| panic!("no state_pull_case {name}"))
+}
+
+#[test]
+fn a_sealed_pending_head_due_at_the_pull_height_stays_pending_beside_a_fetched_replacement() {
+    let vector = read_vector("vectors/wist2/declaration-pull.json");
+    let case = state_pull_case(
+        &vector,
+        "replacement of the pending head signed by a recovery key is a pending replacement, pulled under the current Declaration alone",
+    );
+    let history = serde_json::json!({"declaration_activation_epochs": 1});
+    let mut state = State::default();
+    let labels = replay_epochs(&mut state, case, &history);
+    let domain = "example.com";
+    let pending = state.declarations.domains()[domain].pending().unwrap();
+    assert_eq!(pending.activation_height(), state.first_epoch_after());
+    let map = parameters(&[&history, &case["pull"]["parameters"]]);
+    let mut site = ServedSite::new(Meter::unbounded());
+    serve_declaration(
+        &mut state,
+        &mut site,
+        domain,
+        "new_octets",
+        Some(&case["declarations"]["Q"]),
+    );
+    let at = case["pull"]["sealed_at"].as_str().unwrap();
+    let report = run(&mut state, &mut site, domain, at, &map);
+    let view = declaration_view(&report.declaration, &labels);
+    assert_eq!(
+        view,
+        serde_json::json!({
+            "acceptance": "pending_replacement",
+            "proceeds": true,
+            "sources": ["G"],
+            "disposition": null,
+        })
+    );
+    assert_eq!(
+        report.collections_pulled,
+        case["expected"]["collections_pulled"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|name| name.as_str().unwrap())
+            .collect::<Vec<_>>()
+    );
+    let sealed = &state.declarations.domains()[domain];
+    assert_eq!(
+        sealed.current().hash(),
+        wist_core::declaration::inner_hash(&case["declarations"]["G"]).unwrap()
+    );
+    assert!(sealed.pending().is_some());
+}
+
+#[test]
+fn a_pull_whose_instant_precedes_the_last_sealed_at_proceeds_under_the_sealed_state() {
+    let vector = read_vector("vectors/wist2/declaration-pull.json");
+    let case = state_pull_case(
+        &vector,
+        "replacement of the pending head signed by a recovery key is a pending replacement, pulled under the current Declaration alone",
+    );
+    let history = serde_json::json!({});
+    let mut state = State::default();
+    let labels = replay_epochs(&mut state, case, &history);
+    let domain = "example.com";
+    let map = parameters(&[&history, &case["pull"]["parameters"]]);
+    let mut site = ServedSite::new(Meter::unbounded());
+    serve_declaration(
+        &mut state,
+        &mut site,
+        domain,
+        "new_octets",
+        Some(&case["declarations"]["P"]),
+    );
+    let report = run(&mut state, &mut site, domain, "2026-10-01T00:30:00Z", &map);
+    assert_eq!(
+        declaration_view(&report.declaration, &labels),
+        serde_json::json!({
+            "acceptance": "idempotent",
+            "proceeds": true,
+            "sources": ["G"],
+            "disposition": null,
+        })
+    );
 }

@@ -1,4 +1,5 @@
 use super::list::{self, ListStep, Listing, Target};
+use super::queue::{self, Settled, Settling};
 use super::site::{Answer, Held, Object, Request, Site};
 pub use super::state::Discard;
 use super::state::{
@@ -14,14 +15,11 @@ use wist_core::collection::{self, Limits};
 use wist_core::constants::CATALOG_FILE_READ_MAX_BYTES;
 use wist_core::crypto::PublicKey;
 use wist_core::declaration::{self, Decision};
-use wist_core::declarations::{Declarations, Domain, Projection};
+use wist_core::declarations::{Declarations, Domain, Projection, TransitionKind};
 use wist_core::item::{self, SizeCaps};
 use wist_core::objects::{Catalog, PageItem, Publisher};
 use wist_core::parameters::WIRE_INTEGER_MAX;
 use wist_core::tree::TreeBounds;
-
-/// WIST-1 §5.2, Sources of a pull: a pending head stays pending at every pull.
-const NEVER_ACTIVATES: i64 = WIRE_INTEGER_MAX;
 
 const UNAVAILABLE: &str = "WIST2-E01";
 const NOT_ADMITTED: &str = "WIST2-E03";
@@ -201,6 +199,7 @@ impl CatalogReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PullReport {
     pub event: u64,
+    pub settlement: Vec<Settled>,
     pub declaration: DeclarationReport,
     pub collections_pulled: Vec<String>,
     pub positions: u64,
@@ -273,17 +272,75 @@ struct Context<'a> {
     window_opened: bool,
 }
 
+/// WIST-1 §5.2, Settlement: a pull at or after the window's end settles first, as an event of
+/// its own.
+fn settle_window(
+    state: &mut State,
+    held: &impl Held,
+    input: &PullInput<'_>,
+    event: u64,
+) -> Result<Option<Vec<Settled>>> {
+    let at_s = wist_core::timestamp::log_seconds(input.at)?;
+    if queue::sealed_window_ended(state, input.publisher, at_s) {
+        queue::supersede(state, input.publisher);
+    }
+    if !queue::due(state, input.publisher, at_s) {
+        return Ok(None);
+    }
+    let source = queue::settlement_source(state, input.publisher)?;
+    let (_, view) = admission_view(state, input.publisher, input.at, input.parameters)?;
+    let head = view
+        .domains()
+        .get(input.publisher)
+        .map(|domain| declaration::publisher_of(domain.current().envelope()))
+        .transpose()
+        .map_err(Error::History)?
+        .unwrap_or_else(|| source.clone());
+    let eligibility = state.first_epoch_after();
+    queue::settle(
+        state,
+        held,
+        input.publisher,
+        &Settling {
+            source: &source,
+            order: &head,
+            clock: input.at,
+            parameters: input.parameters,
+            eligibility,
+            event,
+            waited: None,
+        },
+    )
+    .map(Some)
+}
+
 pub fn pull(
     state: &mut State,
     site: &mut impl Site,
     held: &mut impl Held,
     input: &PullInput<'_>,
 ) -> Result<PullReport> {
-    let event = state.events;
+    let mut event = state.events;
     state.events += 1;
+    let mut settlement = Vec::new();
+    if let Some(settled) = settle_window(state, held, input, event)? {
+        settlement = settled;
+        event = state.events;
+        state.events += 1;
+    }
     let (declaration, sources) = read_declaration(state, site, input, event)?;
+    let eligibility = state.first_epoch_after();
+    settlement.extend(queue::settle_orphans(
+        state,
+        held,
+        input.at,
+        input.parameters,
+        eligibility,
+        event,
+    )?);
     let mut report = PullReport {
         event,
+        settlement,
         declaration,
         collections_pulled: Vec::new(),
         positions: 0,
@@ -307,8 +364,8 @@ pub fn pull(
         publisher: input.publisher,
         at: input.at,
         parameters: input.parameters,
-        queues: sources.len() > 1,
-        window_opened: report.declaration.window,
+        queues: state.queues.contains_key(input.publisher),
+        window_opened: state.window_holds(input.publisher),
         sources,
         event,
     };
@@ -389,7 +446,7 @@ fn unbounded_limits() -> Result<Limits> {
 fn project(
     sealed: &Declarations,
     at: &str,
-    recovery_window_days: i64,
+    parameters: &Parameters,
     envelopes: &[&Value],
 ) -> Result<std::result::Result<Projection, String>> {
     let mut entries: Vec<Value> = envelopes
@@ -397,10 +454,10 @@ fn project(
         .map(|envelope| publisher_entry(envelope))
         .collect();
     wist_core::epoch::sort_entries(&mut entries)?;
-    match sealed.project(
+    match sealed.project_pull(
         at,
-        recovery_window_days,
-        NEVER_ACTIVATES,
+        parameters.value("recovery_window_days")?,
+        parameters.value("declaration_activation_epochs")?,
         &unbounded_limits()?,
         &entries,
     ) {
@@ -412,14 +469,27 @@ fn project(
     }
 }
 
-fn projection_instant(state: &State, at: &str) -> Result<(String, i64)> {
-    let at_s = wist_core::timestamp::log_seconds(at)?;
-    let after = match &state.sealed_at {
-        Some(sealed_at) => wist_core::timestamp::log_seconds(sealed_at)? + 1,
-        None => i64::MIN,
-    };
-    let instant_s = at_s.max(after);
-    Ok((wist_core::timestamp::instant(instant_s)?, instant_s))
+/// WIST-1 §5.2: the admission state applies the discovered Declarations still in the eligible
+/// sealing set, in the order of their acceptance.
+fn admission_view(
+    state: &State,
+    publisher: &str,
+    at: &str,
+    parameters: &Parameters,
+) -> Result<(Vec<Value>, Projection)> {
+    let mut admitted: Vec<Value> = Vec::new();
+    let mut view = project(&state.declarations, at, parameters, &[])?.map_err(Error::History)?;
+    for found in state.discovered.get(publisher).into_iter().flatten() {
+        let trial: Vec<&Value> = admitted
+            .iter()
+            .chain(std::iter::once(&found.envelope))
+            .collect();
+        if let Ok(projection) = project(&state.declarations, at, parameters, &trial)? {
+            admitted.push(found.envelope.clone());
+            view = projection;
+        }
+    }
+    Ok((admitted, view))
 }
 
 fn head_hashes(domain: &Domain) -> (Option<&str>, Option<&str>) {
@@ -442,34 +512,8 @@ fn read_declaration(
     event: u64,
 ) -> Result<(DeclarationReport, Vec<Source>)> {
     let publisher = input.publisher;
-    let recovery_window_days = input.parameters.value("recovery_window_days")?;
-    let (at, at_s) = projection_instant(state, input.at)?;
-    let sealed_domain = state.declarations.domains().get(publisher);
-    let mut admitted: Vec<Value> = Vec::new();
-    let mut view: Option<Projection> = None;
-    for found in state.discovered.get(publisher).into_iter().flatten() {
-        let trial: Vec<&Value> = admitted
-            .iter()
-            .chain(std::iter::once(&found.envelope))
-            .collect();
-        if let Ok(projection) = project(&state.declarations, &at, recovery_window_days, &trial)? {
-            admitted.push(found.envelope.clone());
-            view = Some(projection);
-        }
-    }
-    let settles = sealed_domain
-        .and_then(Domain::window)
-        .is_some_and(|window| window.end_s() <= i128::from(at_s));
-    if view.is_none() && settles {
-        view = Some(
-            project(&state.declarations, &at, recovery_window_days, &[])?
-                .map_err(Error::History)?,
-        );
-    }
-    let domain = match &view {
-        Some(projection) => projection.domains().get(publisher),
-        None => sealed_domain,
-    };
+    let (admitted, view) = admission_view(state, publisher, input.at, input.parameters)?;
+    let domain = view.domains().get(publisher);
     let first_contact = domain.is_none();
     let stopped = |outcome: &str| DeclarationReport {
         outcome: outcome.into(),
@@ -550,13 +594,12 @@ fn read_declaration(
             Classified::Install
         }
     };
-    let window_opened = sealed_domain.and_then(Domain::window).is_some();
     let (outcome, installed) = match classified {
         Classified::Idempotent => ("idempotent".to_owned(), None),
         Classified::ChainHead => ("recovery_chain_head".to_owned(), None),
         Classified::Install => {
             let trial: Vec<&Value> = admitted.iter().chain(std::iter::once(&fetched)).collect();
-            let projection = match project(&state.declarations, &at, recovery_window_days, &trial)?
+            let projection = match project(&state.declarations, input.at, input.parameters, &trial)?
             {
                 Ok(projection) => projection,
                 Err(code) => return Ok((stopped(&code), Vec::new())),
@@ -569,11 +612,11 @@ fn read_declaration(
                 .find(|transition| {
                     transition.domain == publisher && transition.declaration.hash() == hash
                 })
-                .map(|transition| transition.kind.as_str())
+                .map(|transition| transition.kind)
                 .ok_or_else(|| {
                     Error::History("an installed Declaration has no transition".into())
                 })?;
-            (kind.to_owned(), Some(projection))
+            (kind.as_str().to_owned(), Some((projection, kind)))
         }
     };
     let mut discovered = false;
@@ -617,15 +660,14 @@ fn read_declaration(
                 last_sealed_at_discovery: state.height,
                 reduces_authority: reduces,
                 last_seal_height,
+                competitor: installed
+                    .as_ref()
+                    .is_some_and(|(_, kind)| *kind == TransitionKind::InWindowCompetitor),
             });
     }
-    let sealed_domain = state.declarations.domains().get(publisher);
     let domain = match &installed {
-        Some(projection) => projection.domains().get(publisher),
-        None => match &view {
-            Some(projection) => projection.domains().get(publisher),
-            None => sealed_domain,
-        },
+        Some((projection, _)) => projection.domains().get(publisher),
+        None => view.domains().get(publisher),
     }
     .ok_or_else(|| Error::History("an accepted Declaration left no domain state".into()))?;
     let sources = domain
@@ -638,6 +680,9 @@ fn read_declaration(
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    if let [_, owner] = &sources[..] {
+        queue::open_discovery(state, publisher, &owner.hash);
+    }
     Ok((
         DeclarationReport {
             outcome,
@@ -646,7 +691,7 @@ fn read_declaration(
             discovered,
             reduces_authority: reduces,
             sources: sources.iter().map(|source| source.hash.clone()).collect(),
-            window: window_opened && domain.window().is_some(),
+            window: state.window_holds(publisher),
         },
         sources,
     ))
@@ -715,10 +760,12 @@ fn pull_collection(
         latest,
     };
     let queued: Vec<(Value, PublicKey)> = state
-        .queue
-        .iter()
-        .filter(|((p, n, _), _)| p == publisher && n == name)
-        .map(|((_, _, signer), queued)| {
+        .queues
+        .get(publisher)
+        .into_iter()
+        .flat_map(|queue| queue.queued.iter())
+        .filter(|((n, _), _)| n == name)
+        .map(|((_, signer), queued)| {
             Ok((queued.envelope["catalog"].clone(), catalog_signer(signer)?))
         })
         .collect::<Result<_>>()?;
@@ -860,21 +907,17 @@ fn pull_collection(
     report.key = Some(signer_key.clone());
     let place = Place::catalog(context.event, position);
     if context.queues {
-        let slot = (publisher.to_owned(), name.to_owned(), signer_key);
-        let first_place = state
-            .queue
-            .get(&slot)
-            .map_or(place, |queued| queued.first_place);
-        state.queue.insert(
-            slot,
+        queue::enqueue(
+            state.queues.entry(publisher.to_owned()).or_default(),
+            name,
+            &signer_key,
             QueuedCatalog {
                 envelope: envelope.clone(),
                 catalog_id: catalog_id.clone(),
                 place,
-                first_place,
                 sources: report.sources.clone(),
             },
-        );
+        )?;
         report.queued = true;
     } else {
         let next_epoch = state.first_epoch_after();
@@ -1204,6 +1247,9 @@ pub(super) fn refresh_waiting(
     in_force: Option<&Publisher>,
     eligibility: u64,
 ) -> Result<()> {
+    if state.window_holds(publisher) {
+        return Ok(());
+    }
     let candidates = waiting_candidates(state, held, publisher, in_force)?;
     state
         .urls
