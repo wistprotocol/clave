@@ -326,6 +326,7 @@ fn resolution_report(case: &Value) -> (PullReport, usize) {
             window: false,
         },
         collections_pulled: Vec::new(),
+        positions: 0,
         catalogs: Vec::new(),
         suspended: case["suspended"].as_bool().unwrap(),
     };

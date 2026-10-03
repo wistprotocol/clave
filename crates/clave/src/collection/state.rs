@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use wist_core::declarations::Declarations;
 use wist_core::objects::status::{RejectionCondition, StatusRejection};
-use wist_core::withdrawal::WithdrawalReplay;
+use wist_core::withdrawal::{SealedItems, WithdrawalReplay};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(into = "Vec<u64>", try_from = "Vec<u64>")]
@@ -199,6 +199,38 @@ pub struct Record {
     pub sealing_height: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Removal {
+    pub item_id: String,
+    pub catalog_id: String,
+    pub generated_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LabelKind {
+    Label,
+    Dispute,
+}
+
+impl LabelKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LabelKind::Label => "label",
+            LabelKind::Dispute => "dispute",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WaitingLabel {
+    pub kind: LabelKind,
+    pub publisher: String,
+    pub envelope: Value,
+    pub place: Place,
+    pub eligibility: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Discovered {
     pub envelope: Value,
@@ -228,7 +260,12 @@ pub struct State {
     pub urls: BTreeMap<CollectionKey, WaitingUrl>,
     pub queue: BTreeMap<QueueKey, QueuedCatalog>,
     pub records: BTreeMap<CollectionKey, Record>,
+    pub removals: BTreeMap<CollectionKey, Removal>,
     pub withdrawals: WithdrawalReplay,
+    pub sealed_items: SealedItems,
+    pub labels: BTreeMap<String, WaitingLabel>,
+    pub sealed_labels: BTreeSet<String>,
+    pub floors: BTreeMap<String, u64>,
 }
 
 impl State {

@@ -2,8 +2,8 @@ use super::list::{self, ListStep, Listing, Target};
 use super::site::{Answer, Held, Object, Request, Site};
 pub use super::state::Discard;
 use super::state::{
-    AcceptedCatalog, Admission, CollectionState, Discovered, ItemKind, ListItem, Place,
-    QueuedCatalog, ServedFile, State, WaitingUrl, CHAIN_DISCARDED,
+    AcceptedCatalog, Admission, CollectionState, Discovered, ItemKind, LabelKind, ListItem, Place,
+    QueuedCatalog, ServedFile, State, WaitingLabel, WaitingUrl, CHAIN_DISCARDED,
 };
 use crate::error::{Error, Result};
 use serde_json::{json, Value};
@@ -63,6 +63,12 @@ impl Parameters {
             self.value("links_cap_bytes")?,
             self.value("link_url_cap_bytes")?,
             self.value("summary_cap_bytes")?,
+        )?)
+    }
+
+    pub fn sealing(&self) -> Result<wist_core::sealing::Parameters> {
+        Ok(wist_core::sealing::Parameters::new(
+            self.0.iter().map(|(name, value)| (name.as_str(), *value)),
         )?)
     }
 
@@ -197,6 +203,7 @@ pub struct PullReport {
     pub event: u64,
     pub declaration: DeclarationReport,
     pub collections_pulled: Vec<String>,
+    pub positions: u64,
     pub catalogs: Vec<CatalogReport>,
     pub suspended: bool,
 }
@@ -279,6 +286,7 @@ pub fn pull(
         event,
         declaration,
         collections_pulled: Vec::new(),
+        positions: 0,
         catalogs: Vec::new(),
         suspended: false,
     };
@@ -293,7 +301,8 @@ pub fn pull(
             }
         }
     }
-    let order = place_order(state, input.publisher, &sources[0].publisher, &names);
+    let order = place_order(state, input.publisher, Some(&sources[0].publisher), &names);
+    report.positions = order.len() as u64;
     let context = Context {
         publisher: input.publisher,
         at: input.at,
@@ -314,18 +323,38 @@ pub fn pull(
     }
     report.collections_pulled = names;
     if !context.queues {
-        refresh_waiting(state, held, input.publisher, event, &order)?;
+        let in_force = log_declaration(state, input.publisher)?;
+        let eligibility = state.first_epoch_after();
+        refresh_waiting(
+            state,
+            held,
+            input.publisher,
+            event,
+            &order,
+            in_force.as_ref(),
+            eligibility,
+        )?;
     }
     Ok(report)
 }
 
-fn place_order(
+pub(super) fn log_declaration(state: &State, publisher: &str) -> Result<Option<Publisher>> {
+    state
+        .declarations
+        .domains()
+        .get(publisher)
+        .map(|domain| declaration::publisher_of(domain.current().envelope()))
+        .transpose()
+        .map_err(Error::History)
+}
+
+pub(super) fn place_order(
     state: &State,
     publisher: &str,
-    declaration: &Publisher,
+    declaration: Option<&Publisher>,
     pulled: &[String],
 ) -> BTreeMap<String, u64> {
-    let named: Vec<&str> = collection::names(declaration);
+    let named: Vec<&str> = declaration.map(collection::names).unwrap_or_default();
     let mut rest: BTreeSet<String> = state.collection_names(publisher).into_iter().collect();
     rest.extend(pulled.iter().cloned());
     named
@@ -496,11 +525,12 @@ fn read_declaration(
             } else if window_head == Some(hash.as_str()) {
                 Classified::ChainHead
             } else {
+                let floor = state.floors.get(publisher).copied().unwrap_or_default();
                 match declaration::evaluate_with_heads(
                     domain.current().envelope(),
                     domain.window().map(|window| window.head().envelope()),
                     domain.pending().map(|pending| pending.head().envelope()),
-                    domain.highest_accepted_seq(),
+                    domain.highest_accepted_seq().max(floor),
                     &fetched,
                     &limits,
                 ) {
@@ -574,6 +604,8 @@ fn read_declaration(
             (true, Some(height)) => collection::last_seal_height(height, epochs),
             (true, None) => Some(epochs),
         };
+        let floor = state.floors.entry(publisher.into()).or_default();
+        *floor = (*floor).max(incoming.seq);
         state
             .discovered
             .entry(publisher.into())
@@ -1058,10 +1090,10 @@ fn judge_item(
     }))
 }
 
-struct Candidate {
-    collection: String,
-    index: u64,
-    item_id: String,
+pub(super) struct Candidate {
+    pub(super) collection: String,
+    pub(super) index: u64,
+    pub(super) item_id: String,
     covered: bool,
     generated_at: String,
     catalog_id: String,
@@ -1079,7 +1111,7 @@ fn prefer(candidate: &Candidate, held: &Candidate) -> Result<bool> {
     })
 }
 
-fn reads_against_no_record(collection: &CollectionState) -> bool {
+pub(super) fn reads_against_no_record(collection: &CollectionState) -> bool {
     collection.accepted.as_ref().is_some_and(|accepted| {
         !accepted.failed_c1
             && accepted.base_against_floor
@@ -1091,7 +1123,13 @@ fn reads_against_no_record(collection: &CollectionState) -> bool {
 }
 
 /// WIST-3 §3.3, I7.
-fn i7_holds(state: &State, publisher: &str, name: &str, status: &ListItem, base: bool) -> bool {
+pub(super) fn i7_holds(
+    state: &State,
+    publisher: &str,
+    name: &str,
+    status: &ListItem,
+    base: bool,
+) -> bool {
     let record = state
         .record(publisher, &status.url)
         .filter(|record| !(base && record.collection == name));
@@ -1104,21 +1142,13 @@ fn i7_holds(state: &State, publisher: &str, name: &str, status: &ListItem, base:
     }
 }
 
-/// WIST-3 §3.3: a URL takes its place at the pull from which it waits.
-fn refresh_waiting(
-    state: &mut State,
+/// WIST-3 §3.3, Waiting.
+pub(super) fn waiting_candidates(
+    state: &State,
     held: &impl Held,
     publisher: &str,
-    event: u64,
-    order: &BTreeMap<String, u64>,
-) -> Result<()> {
-    let in_force = state
-        .declarations
-        .domains()
-        .get(publisher)
-        .map(|domain| declaration::publisher_of(domain.current().envelope()))
-        .transpose()
-        .map_err(Error::History)?;
+    in_force: Option<&Publisher>,
+) -> Result<BTreeMap<String, Candidate>> {
     let mut candidates: BTreeMap<String, Candidate> = BTreeMap::new();
     for name in state.collection_names(publisher) {
         let Some(collection) = state.collection(publisher, &name) else {
@@ -1148,7 +1178,6 @@ fn refresh_waiting(
                 index: index as u64,
                 item_id: status.item_id.clone(),
                 covered: in_force
-                    .as_ref()
                     .is_some_and(|declaration| collection::covers(declaration, &name, &status.url)),
                 generated_at: generated_at.to_owned(),
                 catalog_id: catalog_id.to_owned(),
@@ -1162,7 +1191,20 @@ fn refresh_waiting(
             }
         }
     }
-    let next_epoch = state.first_epoch_after();
+    Ok(candidates)
+}
+
+/// WIST-3 §3.3: a URL takes its place at the event from which it waits.
+pub(super) fn refresh_waiting(
+    state: &mut State,
+    held: &impl Held,
+    publisher: &str,
+    event: u64,
+    order: &BTreeMap<String, u64>,
+    in_force: Option<&Publisher>,
+    eligibility: u64,
+) -> Result<()> {
+    let candidates = waiting_candidates(state, held, publisher, in_force)?;
     state
         .urls
         .retain(|(p, url), _| p != publisher || candidates.contains_key(url));
@@ -1183,8 +1225,75 @@ fn refresh_waiting(
                 collection: candidate.collection.clone(),
                 item_id: candidate.item_id.clone(),
                 place: Place::url(event, position, candidate.index),
-                eligibility: next_epoch,
+                eligibility,
             });
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LabelOutcome {
+    Accepted(Place),
+    Seen,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LabelReport {
+    pub kind: LabelKind,
+    pub id: String,
+    pub outcome: LabelOutcome,
+}
+
+/// WIST-3 §3.3, Places.
+pub fn accept_labels(
+    state: &mut State,
+    report: &PullReport,
+    publisher: &str,
+    envelopes: &[Value],
+) -> Result<Vec<LabelReport>> {
+    if !report.declaration.proceeds {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for (index, envelope) in envelopes.iter().enumerate() {
+        let (kind, inner, host) = if envelope.get("label").is_some() {
+            (LabelKind::Label, &envelope["label"], "labeler")
+        } else {
+            (LabelKind::Dispute, &envelope["dispute"], "disputant")
+        };
+        if inner[host] != publisher {
+            return Err(Error::History(format!(
+                "a {} of another domain than the Label Feed of {publisher}",
+                kind.as_str()
+            )));
+        }
+        let id = wist_core::label::label_id(inner)
+            .map_err(|rejection| Error::History(rejection.code().into()))?;
+        if state.labels.contains_key(&id) || state.sealed_labels.contains(&id) {
+            out.push(LabelReport {
+                kind,
+                id,
+                outcome: LabelOutcome::Seen,
+            });
+            continue;
+        }
+        let place = Place::url(report.event, report.positions, index as u64);
+        let eligibility = state.first_epoch_after();
+        state.labels.insert(
+            id.clone(),
+            WaitingLabel {
+                kind,
+                publisher: publisher.to_owned(),
+                envelope: envelope.clone(),
+                place,
+                eligibility,
+            },
+        );
+        out.push(LabelReport {
+            kind,
+            id,
+            outcome: LabelOutcome::Accepted(place),
+        });
+    }
+    Ok(out)
 }
