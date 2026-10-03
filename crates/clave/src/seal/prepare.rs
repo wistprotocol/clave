@@ -5,7 +5,7 @@ use crate::error::{Error, Result};
 use crate::history::History;
 use crate::registry;
 use serde_json::Value;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use wist_core::aggregator_keys::{self, KeyAction, Outcome, Registry};
 use wist_core::crypto::SigningKey;
@@ -193,6 +193,18 @@ pub(super) fn epoch(
     let mut history = History::open(db, data_dir, db.last_epoch()?)?;
     while history.next_epoch()?.is_some() {}
     let sealed = db.sealed_from(&history)?;
+    for (domain, state) in sealed.declarations.domains() {
+        let Some(window) = state.window() else {
+            continue;
+        };
+        if i128::from(sealed_unix) < window.end_s()
+            && !db.recovery_queue_held(domain, window.owner().hash())?
+        {
+            return Err(Error::Seal(format!(
+                "the cadence slot {sealed_at} predates completed recovery settlement of {domain}: a pull settled its window at or after the window's end, so an Epoch inside the window could seal what the settlement superseded; seal at a later grid instant"
+            )));
+        }
+    }
     let mut scope = db.waiting_publishers()?;
     for (domain, state) in sealed.declarations.domains() {
         if state.window().is_some() || state.pending().is_some() {
@@ -284,6 +296,16 @@ pub(super) fn epoch(
             .map_err(|_| Error::Param("max_inclusion_epochs".into()))?,
     );
     let suffix_list = crate::suffix_list::in_force_at_epoch(db, epoch_number)?;
+    let deadlines: HashMap<String, u64> = state
+        .discovered
+        .values()
+        .flatten()
+        .filter_map(|found| {
+            found
+                .last_seal_height
+                .map(|deadline| (found.hash.clone(), deadline))
+        })
+        .collect();
     let held = crate::db::StoreHeld::new(db, data_dir, &sealed_at);
     let mut candidates = Candidates {
         declarations: state
@@ -338,7 +360,7 @@ pub(super) fn epoch(
                 .enumerate()
                 .map(|(index, entry)| seal_entry(index as i64, entry.clone()))
                 .collect::<Result<Vec<_>>>()?;
-            let (fit, _) = fit_to_cap(indexed, cap, &installed)?;
+            let (fit, _) = fit_to_cap(indexed, cap, &installed, &deadlines)?;
             let fit: HashSet<i64> = fit.iter().map(|entry| entry.rowid).collect();
             planned
                 .entries
@@ -441,6 +463,38 @@ pub(super) fn epoch(
                 )
             }),
     );
+    for found in state.discovered.values().flatten() {
+        let Some(deadline) = found.last_seal_height else {
+            continue;
+        };
+        let sealed = entries.iter().any(|entry| {
+            entry["type"] == "publisher_declaration" && entry["body"] == found.envelope
+        });
+        let eligible = planned
+            .state
+            .discovered
+            .values()
+            .flatten()
+            .any(|kept| kept.hash == found.hash);
+        if sealed && epoch_number > deadline {
+            late.push(format!(
+                "Declaration {}: sealed at Epoch {epoch_number}, past its sealing deadline {deadline}",
+                found.hash
+            ));
+        } else if !sealed && eligible && deadline <= epoch_number {
+            late.push(format!(
+                "Declaration {}: left unsealed at Epoch {epoch_number}, past its sealing deadline {deadline}",
+                found.hash
+            ));
+        }
+    }
+    late.extend(planned.held_late.iter().map(|held| {
+        format!(
+            "{}: held at Epoch {epoch_number} by a Declaration that reduces authority, past its inclusion ceiling {}",
+            publication_text(&held.publication),
+            held.ceiling
+        )
+    }));
     Ok(PreparedEpoch {
         log_id: history.log_id().to_owned(),
         signers,
@@ -848,24 +902,53 @@ pub(super) fn enforce_governance(
 
 /// WIST-3 §6: an Epoch's octets, each Entry's JCS serialization plus two,
 /// must not exceed the `epoch_cap_bytes` in force.
+/// A Declaration packs by the nearest sealing deadline of itself and of those naming it, which
+/// cannot seal before it.
 pub(super) fn fit_to_cap(
     entries: Vec<SealEntry>,
     cap: i64,
     installed: &HashSet<String>,
+    deadlines: &HashMap<String, u64>,
 ) -> Result<(Vec<SealEntry>, usize)> {
     let cap = u64::try_from(cap).map_err(|_| Error::Seal("invalid Epoch cap".into()))?;
-    let pending_declarations: HashSet<_> = entries
+    let named: HashMap<String, Option<String>> = entries
         .iter()
         .filter(|entry| entry.entry_type == "publisher_declaration")
-        .filter_map(|entry| crate::declaration::inner_hash(&entry.body).ok())
+        .filter_map(|entry| {
+            crate::declaration::inner_hash(&entry.body)
+                .ok()
+                .map(|hash| {
+                    let previous = entry.body["publisher"]["prev_declaration"]
+                        .as_str()
+                        .map(str::to_owned);
+                    (hash, previous)
+                })
+        })
         .collect();
+    let pending_declarations: HashSet<&String> = named.keys().collect();
+    let mut nearest: HashMap<&String, u64> = HashMap::new();
+    for (hash, deadline) in deadlines {
+        let mut at = named.get_key_value(hash).map(|(hash, _)| hash);
+        while let Some(hash) = at {
+            let slot = nearest.entry(hash).or_insert(*deadline);
+            *slot = (*slot).min(*deadline);
+            at = named[hash]
+                .as_ref()
+                .and_then(|previous| named.get_key_value(previous))
+                .map(|(hash, _)| hash);
+        }
+    }
     let mut entries = entries
         .into_iter()
         .map(|entry| {
             let declaration = if entry.entry_type == "publisher_declaration" {
                 let publisher =
                     crate::declaration::publisher_of(&entry.body).map_err(Error::Seal)?;
-                Some((publisher.domain, publisher.seq))
+                let deadline = crate::declaration::inner_hash(&entry.body)
+                    .ok()
+                    .and_then(|hash| nearest.get(&hash).copied())
+                    .unwrap_or(u64::MAX);
+                Some((deadline, publisher.domain, publisher.seq))
             } else {
                 None
             };
@@ -891,7 +974,8 @@ pub(super) fn fit_to_cap(
                 || e.body["publisher"]["prev_declaration"]
                     .as_str()
                     .is_some_and(|previous| {
-                        pending_declarations.contains(previous) && !selected.contains(previous)
+                        pending_declarations.contains(&previous.to_owned())
+                            && !selected.contains(previous)
                     })
         }) {
             deferred_domains.insert(declaration_domain.unwrap().to_string());
@@ -1076,11 +1160,17 @@ mod tests {
             let all = entries(count);
             let size: u64 = all.iter().map(|e| e.canonical.len() as u64 + 2).sum();
             assert_eq!(size, all.iter().map(SealEntry::octets).sum::<u64>());
-            let (fit, deferred) = fit_to_cap(all, size as i64, &HashSet::new()).unwrap();
+            let (fit, deferred) =
+                fit_to_cap(all, size as i64, &HashSet::new(), &HashMap::new()).unwrap();
             assert_eq!(fit.len(), count as usize);
             assert_eq!(deferred, 0);
-            let (fit, deferred) =
-                fit_to_cap(entries(count), size as i64 - 1, &HashSet::new()).unwrap();
+            let (fit, deferred) = fit_to_cap(
+                entries(count),
+                size as i64 - 1,
+                &HashSet::new(),
+                &HashMap::new(),
+            )
+            .unwrap();
             assert_eq!(fit.len(), count as usize - 1);
             assert_eq!(deferred, 1);
         }

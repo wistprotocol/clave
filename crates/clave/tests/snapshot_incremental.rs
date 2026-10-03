@@ -1,6 +1,10 @@
 mod common;
 
-use clave::snapshot::{shard_index, Mode, Outcome, Phase, SHARD_CACHE_DIRECTORY};
+use clave::snapshot::{Mode, Outcome, Phase, SHARD_CACHE_DIRECTORY};
+
+fn shard_index(domain: &str, count: u64) -> u64 {
+    wist_core::snapshot::shard_of(domain, std::num::NonZeroU64::new(count).unwrap())
+}
 use common::{add_label, make_publisher_with_scope, serve_static, write_label_feed, TestPub};
 use serde_json::{json, Value};
 use sha2::Digest;
@@ -320,11 +324,11 @@ fn table_rows(path: &Path) -> Vec<Vec<String>> {
             rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
                 .unwrap();
         let mut statement = conn
-            .prepare("SELECT url, publisher, delta_id, observed_at, title, abstract, lang FROM records ORDER BY rowid")
+            .prepare("SELECT url, publisher, item_id, observed_at, attested_at, title, abstract, lang, collection FROM records ORDER BY rowid")
             .unwrap();
         return statement
             .query_map([], |row| {
-                (0..7)
+                (0..9)
                     .map(|column| {
                         row.get::<_, Option<String>>(column)
                             .map(|value| value.unwrap_or_else(|| "NULL".into()))

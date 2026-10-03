@@ -25,6 +25,7 @@ pub use pull_schedule::{
     RETRY_BASE_SECONDS,
 };
 pub use pull_schedule::{AGE_PRIORITY_SECONDS, BYTES_PER_SLOT_SECOND};
+pub use restore::Restored;
 pub(crate) use sealing::remove_file;
 pub use sealing::{PayloadDutyRow, WaitingReport};
 pub use tree::StoredTree;

@@ -83,6 +83,12 @@ enum Command {
         #[arg(long)]
         data: PathBuf,
     },
+    /// Rebuilds the latest Catalogs, records, removals, sealed Items,
+    /// withdrawals and Payload duties from the sealed Log.
+    Restore {
+        #[arg(long)]
+        data: PathBuf,
+    },
     ParamChange {
         #[arg(long)]
         data: PathBuf,
@@ -340,6 +346,19 @@ fn main() -> Result<(), clave::Error> {
             println!(
                 "Aggregator keys valid at height {head_height}: {}",
                 valid.join(", ")
+            );
+        }
+        Command::Restore { data } => {
+            let db = clave::db::Db::open(&data.join("clave.sqlite"))?;
+            let restored = db.restore_from_log(&data)?;
+            println!(
+                "restored {} latest Catalogs, {} records, {} removals, {} sealed Items, {} withdrawals and {} Payload duties from the Log",
+                restored.collections,
+                restored.records,
+                restored.removals,
+                restored.sealed_items,
+                restored.withdrawals,
+                restored.payload_duties
             );
         }
         Command::ParamChange {

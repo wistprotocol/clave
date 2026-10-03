@@ -190,11 +190,15 @@ fn now_utc() -> String {
     utc(jiff::Timestamp::now().as_second())
 }
 
-fn load_status(db: &Db, domain: &str) -> Result<Option<Status>> {
+/// WIST-2 §7.1: `rejections` carries WIST-1 and WIST-2 codes alone.
+pub fn load_status(db: &Db, domain: &str) -> Result<Option<Status>> {
     let Some(row) = db.get_publisher_status(domain)? else {
         return Ok(None);
     };
-    let rejections = db.list_rejections(domain)?;
+    let mut rejections = db.list_rejections(domain)?;
+    rejections.retain(|rejection| {
+        rejection.code.starts_with("WIST1-E") || rejection.code.starts_with("WIST2-E")
+    });
     let now = now_utc();
     let quota_remaining = crate::quota::quota_remaining(db, domain, &now)?.max(0) as u64;
     Ok(Some(Status {
@@ -203,7 +207,7 @@ fn load_status(db: &Db, domain: &str) -> Result<Option<Status>> {
         last_pull_at: row.last_pull_at,
         quota_remaining,
         state: row.state,
-        collections: Vec::new(),
+        collections: db.collection_statuses(domain)?,
         rejections,
     }))
 }
@@ -425,6 +429,45 @@ async fn status_handler(
     outcome.map(Json).ok_or(StatusCode::NOT_FOUND)
 }
 
+/// WIST-3 §6.1, §6.2.
+pub fn served_payload(db: &Db, data_dir: &std::path::Path, name: &str) -> Result<Option<Vec<u8>>> {
+    let Some(hex) = name.strip_suffix(".json").filter(|hex| {
+        hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    }) else {
+        return Ok(None);
+    };
+    let item_id = format!("sha256:{hex}");
+    if !db.holds_payload_duty(&item_id)? {
+        return Ok(None);
+    }
+    match std::fs::read(crate::db::served_payload_path(data_dir, &item_id)?) {
+        Ok(octets) => Ok(Some(octets)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn payload_handler(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let outcome = tokio::task::spawn_blocking(move || {
+        let db = Db::connect(&state.db_path)?;
+        served_payload(&db, &state.data_dir, &name)
+    })
+    .await;
+    match outcome {
+        Ok(Ok(Some(octets))) => (
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            octets,
+        )
+            .into_response(),
+        Ok(Ok(None)) => StatusCode::NOT_FOUND.into_response(),
+        _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
 pub fn run(
     data_dir: PathBuf,
     db_path: PathBuf,
@@ -483,7 +526,7 @@ pub fn run_with_options(
         .route("/checkpoint", get(checkpoint_handler))
         .route("/tile/*path", get(tile_handler))
         .route("/log/*path", get(log_handler))
-        .nest_service("/payloads", ServeDir::new(data_dir.join("payloads")))
+        .route("/payloads/:name", get(payload_handler))
         .nest_service("/snapshots", ServeDir::new(data_dir.join("snapshots")))
         .route_service(
             "/log/anchor.json",

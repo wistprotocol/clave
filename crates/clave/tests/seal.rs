@@ -804,3 +804,318 @@ fn a_sealed_log_replays_through_core_with_every_entry_valid_and_the_records_of_t
     stored.sort();
     assert_eq!(stored, duties);
 }
+
+fn hold_list_before_pull(r: &Rig, items: &[(Value, Value)]) -> String {
+    use clave::collection::site::Held;
+    let mut list: Vec<Value> = items.iter().map(|(item, _)| item.clone()).collect();
+    list.sort_by_key(|item| wist_core::item::key(item["url"].as_str().unwrap()));
+    let base = collection_dir(&r.p, "default");
+    for (item, payload) in items {
+        let name = wist_core::item::payload_name(item).unwrap();
+        std::fs::write(
+            base.join(format!("payloads/{name}.json")),
+            wist_core::jcs::canonicalize(payload).unwrap(),
+        )
+        .unwrap();
+    }
+    let inner = json!({
+        "wist_version": "1.0.0", "publisher": r.host, "collection": "default",
+        "generated_at": "2026-08-09T12:00:00Z", "size": list.len(),
+        "root": format!("sha256:{}", wist_core::crypto::hex_encode(&wist_core::item::root(&list).unwrap())),
+        "tree": format!("sha256:{}", "0".repeat(64)),
+    });
+    let envelope = wist_core::envelope::sign_envelope(
+        &inner,
+        "catalog",
+        &kid(&K1_SEED),
+        &wist_core::crypto::SigningKey::from_seed(&K1_SEED),
+    )
+    .unwrap();
+    std::fs::write(
+        base.join("catalog.json"),
+        wist_core::jcs::canonicalize(&envelope).unwrap(),
+    )
+    .unwrap();
+    let catalog_id = wist_core::catalog::catalog_id(&inner).unwrap();
+    let mut held = clave::db::StoreHeld::new(&r.db, r.data.path(), PULLED);
+    held.hold_list(&r.host, "default", &catalog_id, &inner, &list)
+        .unwrap();
+    held.store().unwrap();
+    catalog_id
+}
+
+#[test]
+fn an_item_whose_entry_exceeds_65535_octets_leaves_reported_and_the_rest_of_the_epoch_seals() {
+    let r = Rig::new();
+    let small = r.page("a", "alpha");
+    let large = r.page(&"h".repeat(70_000), "huge");
+    hold_list_before_pull(&r, &[small.clone(), large.clone()]);
+    r.pull(PULLED);
+    let large_url = large.0["url"].as_str().unwrap().to_owned();
+    let large_id = item_id(&large.0);
+    let small_url = small.0["url"].as_str().unwrap().to_owned();
+    let connection = rusqlite::Connection::open(r.data.path().join("clave.sqlite")).unwrap();
+    connection
+        .execute(
+            "UPDATE list_items SET admission = 'admitted', code = NULL WHERE url = ?1",
+            [&large_url],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO waiting_urls(publisher, url, collection, item_id, place_event, place_position, place_index, eligibility) SELECT publisher, ?1, collection, ?2, place_event, place_position, place_index + 1, eligibility FROM waiting_urls WHERE url = ?3",
+            (&large_url, &large_id, &small_url),
+        )
+        .unwrap();
+    std::fs::write(
+        clave::db::held_payload_path(r.data.path(), &large_id).unwrap(),
+        wist_core::jcs::canonicalize(&large.1).unwrap(),
+    )
+    .unwrap();
+    let report = r.seal(&hour(0));
+    let entries = r.entries(report.epoch_number);
+    assert_eq!(sealed_item_ids(&entries), [item_id(&small.0)]);
+    assert!(types(&entries).contains(&"publisher_catalog".to_owned()));
+    assert!(
+        report
+            .dropped
+            .iter()
+            .any(|line| line.contains("WIST1-E04") && line.contains(&large_id)),
+        "{:?}",
+        report.dropped
+    );
+    assert!(r
+        .db
+        .list_rejections(&r.host)
+        .unwrap()
+        .iter()
+        .any(|rejection| rejection.code == "WIST1-E04"
+            && rejection.id.as_deref() == Some(large_id.as_str())));
+    assert!(r.state().urls.is_empty());
+    records_agree(&r, &replay_served(&r));
+}
+
+#[test]
+fn a_declaration_whose_entry_exceeds_65535_octets_fails_at_sealing_and_the_rest_of_the_epoch_seals()
+{
+    let r = Rig::new();
+    let a = r.page("a", "alpha");
+    r.publish(
+        &with_payloads(std::slice::from_ref(&a)),
+        "2026-08-09T12:00:00Z",
+        None,
+    );
+    r.pull(PULLED);
+    let current = current_declaration(&r.p);
+    let mut large = current["publisher"].clone();
+    large["seq"] = 1.into();
+    large["prev_declaration"] = declaration_hash(&current).into();
+    large["collections"] = json!((0..2)
+        .map(|n| json!({"name": format!("c{n}"), "scope": (0..20)
+            .map(|m| json!({"url": r.url(&format!("{n}/{m}/{}", "s".repeat(1900))), "match": "prefix"}))
+            .collect::<Vec<_>>()}))
+        .collect::<Vec<_>>());
+    let envelope = wist_core::envelope::sign_envelope(
+        &large,
+        "publisher",
+        &kid(&K1_SEED),
+        &wist_core::crypto::SigningKey::from_seed(&K1_SEED),
+    )
+    .unwrap();
+    let entry = json!({"type": "publisher_declaration", "body": envelope});
+    assert!(wist_core::jcs::canonicalize(&entry).unwrap().len() > 65_535);
+    r.db.hold_discovered_declaration(&r.host, &envelope)
+        .unwrap();
+    let report = r.seal(&hour(0));
+    let entries = r.entries(report.epoch_number);
+    assert!(entries.iter().all(|entry| entry["body"] != envelope));
+    assert_eq!(sealed_item_ids(&entries), [item_id(&a.0)]);
+    assert!(
+        report
+            .dropped
+            .iter()
+            .any(|line| line.starts_with("WIST1-E04") && line.contains("fails at sealing")),
+        "{:?}",
+        report.dropped
+    );
+    records_agree(&r, &replay_served(&r));
+}
+
+fn large_rotation(r: &Rig, keys: Value) -> Value {
+    let current = current_declaration(&r.p);
+    let mut rotation = current["publisher"].clone();
+    rotation["seq"] = (rotation["seq"].as_u64().unwrap() + 1).into();
+    rotation["prev_declaration"] = declaration_hash(&current).into();
+    rotation["keys"] = keys;
+    rotation["subdomain_scope"] = json!((0..32)
+        .map(|n| format!("s{n:02}{}.{}.{}", "a".repeat(57), "b".repeat(60), r.host))
+        .collect::<Vec<_>>());
+    write_declaration(&r.p, &rotation, &K1_SEED);
+    current_declaration(&r.p)
+}
+
+fn declaration_octets(envelope: &Value) -> i64 {
+    let entry = json!({"type": "publisher_declaration", "body": envelope});
+    wist_core::jcs::canonicalize(&entry).unwrap().len() as i64 + 2
+}
+
+fn at_height(height: i64) -> String {
+    wist_core::timestamp::instant(
+        wist_core::timestamp::log_seconds("2026-08-09T13:00:00Z").unwrap() + height * 3600,
+    )
+    .unwrap()
+}
+
+#[test]
+fn a_publishers_publications_wait_while_the_cap_keeps_out_a_declaration_its_pull_read() {
+    let r = Rig::new();
+    r.pull(PULLED);
+    r.seal(&hour(0));
+    let rotation = large_rotation(
+        &r,
+        json!([
+            key_entry(&K1_SEED, "2026-08-09T00:00:00Z"),
+            key_entry(&K2_SEED, "2026-08-09T00:00:00Z")
+        ]),
+    );
+    let a = r.page("a", "alpha");
+    publish_collection_signed(
+        &r.p,
+        "default",
+        &with_payloads(std::slice::from_ref(&a)),
+        "2026-08-09T13:20:00Z",
+        None,
+        &K2_SEED,
+    );
+    r.pull("2026-08-09T13:30:00Z");
+    let cap = declaration_octets(&rotation) - 1;
+    r.db.set_param("epoch_cap_bytes", cap).unwrap();
+    let kept_out = r.seal(&hour(1));
+    assert!(r.entries(kept_out.epoch_number).is_empty());
+    assert!(
+        kept_out
+            .dropped
+            .iter()
+            .all(|line| !line.contains("leaves at its turn")),
+        "{:?}",
+        kept_out.dropped
+    );
+    assert!(r
+        .db
+        .list_rejections(&r.host)
+        .unwrap()
+        .iter()
+        .all(|rejection| rejection.code != "WIST1-E02"));
+    r.db.set_param("epoch_cap_bytes", 1 << 28).unwrap();
+    let sealed = r.seal(&hour(2));
+    let entries = r.entries(sealed.epoch_number);
+    assert_eq!(
+        types(&entries),
+        [
+            "publisher_declaration",
+            "publisher_catalog",
+            "publisher_item"
+        ]
+    );
+    assert!(wist_core::epoch::epoch_octets(&entries[1..]).unwrap() < cap as u64);
+    assert_eq!(sealed_item_ids(&entries), [item_id(&a.0)]);
+}
+
+#[test]
+fn a_reducing_declaration_the_cap_keeps_out_is_reported_late_with_what_it_holds() {
+    let r = Rig::new();
+    r.pull(PULLED);
+    r.seal(&at_height(0));
+    let a = r.page("a", "alpha");
+    r.publish(
+        &with_payloads(std::slice::from_ref(&a)),
+        "2026-08-09T13:20:00Z",
+        None,
+    );
+    r.pull("2026-08-09T13:30:00Z");
+    let rotation = large_rotation(&r, json!([key_entry(&K2_SEED, "2026-08-09T00:00:00Z")]));
+    r.pull("2026-08-09T13:40:00Z");
+    r.db.set_param("max_inclusion_epochs", 1).unwrap();
+    r.db.set_param("epoch_cap_bytes", declaration_octets(&rotation) - 1)
+        .unwrap();
+    let mut late = Vec::new();
+    for height in 1..=25 {
+        let report = r.seal(&at_height(height));
+        assert!(r.entries(report.epoch_number).is_empty());
+        late.extend(report.late);
+    }
+    assert!(
+        late.iter().any(|line| line.contains("held at Epoch 2")
+            && line.contains("past its inclusion ceiling 2")),
+        "{late:?}"
+    );
+    let hash = declaration_hash(&rotation);
+    assert!(
+        late.iter().any(|line| line.contains(&hash)
+            && line.contains("left unsealed at Epoch 25, past its sealing deadline 25")),
+        "{late:?}"
+    );
+}
+
+#[test]
+fn a_declaration_leaving_with_one_that_fails_at_sealing_is_reported_at_the_status_endpoint() {
+    let r = Rig::new();
+    r.pull(PULLED);
+    let current = current_declaration(&r.p);
+    let mut large = current["publisher"].clone();
+    large["seq"] = 1.into();
+    large["prev_declaration"] = declaration_hash(&current).into();
+    large["collections"] = json!((0..2)
+        .map(|n| json!({"name": format!("c{n}"), "scope": (0..20)
+            .map(|m| json!({"url": r.url(&format!("{n}/{m}/{}", "s".repeat(1900))), "match": "prefix"}))
+            .collect::<Vec<_>>()}))
+        .collect::<Vec<_>>());
+    let signer = wist_core::crypto::SigningKey::from_seed(&K1_SEED);
+    let large =
+        wist_core::envelope::sign_envelope(&large, "publisher", &kid(&K1_SEED), &signer).unwrap();
+    let mut follower = current["publisher"].clone();
+    follower["seq"] = 2.into();
+    follower["prev_declaration"] = declaration_hash(&large).into();
+    let follower =
+        wist_core::envelope::sign_envelope(&follower, "publisher", &kid(&K1_SEED), &signer)
+            .unwrap();
+    r.db.hold_discovered_declaration(&r.host, &large).unwrap();
+    r.db.hold_discovered_declaration(&r.host, &follower)
+        .unwrap();
+    r.seal(&hour(0));
+    let rejections = r.db.list_rejections(&r.host).unwrap();
+    for envelope in [&large, &follower] {
+        let hash = declaration_hash(envelope);
+        assert!(
+            rejections
+                .iter()
+                .any(|rejection| rejection.code == "WIST1-E04"
+                    && rejection.id.as_deref() == Some(hash.as_str())),
+            "{rejections:?}"
+        );
+    }
+}
+
+#[test]
+fn retain_discards_a_held_payload_of_an_item_that_is_not_admitted() {
+    let r = Rig::new();
+    let a = r.page("a", "alpha");
+    r.publish(&[(a.0.clone(), None)], "2026-08-09T12:00:00Z", None);
+    let pulled = r.pull(PULLED);
+    let a_id = item_id(&a.0);
+    assert!(
+        pulled
+            .rejected
+            .iter()
+            .any(|(slot, code)| slot.ends_with(&a_id) && code == "WIST2-E03"),
+        "{pulled:?}"
+    );
+    let held = clave::db::held_payload_path(r.data.path(), &a_id).unwrap();
+    std::fs::create_dir_all(held.parent().unwrap()).unwrap();
+    std::fs::write(&held, a.1.to_string()).unwrap();
+    r.seal(&hour(0));
+    assert!(
+        !held.exists(),
+        "retain kept a Payload no admitted Item needs"
+    );
+}

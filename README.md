@@ -1,14 +1,14 @@
 # clave
 
-The signed Delta format targets [WIST specification revision `0127b0f2e5420e167a15d3f7afae6ed81030e158`](https://github.com/wistprotocol/spec/tree/0127b0f2e5420e167a15d3f7afae6ed81030e158). Object version `1.0.0` alone does not identify a compatible draft.
+The publication formats target [WIST specification revision `0127b0f2e5420e167a15d3f7afae6ed81030e158`](https://github.com/wistprotocol/spec/tree/0127b0f2e5420e167a15d3f7afae6ed81030e158). Object version `1.0.0` alone does not identify a compatible draft.
 
-Delta ingestion checks the signed canonical `publisher` against the logical Feed domain before source selection and duplicate suppression, including fetched predecessors. Chain tips use `(publisher, url)` and persist across reopen; legacy index restoration is described under [Delta index reconciliation](#delta-index-reconciliation). Sealing and recovery settlement reject mismatches between queue ownership and the signed author. Complete authenticated Delta eligibility remains a separate validation requirement.
-
-WIST Protocol aggregator. Clave pulls signed Deltas from Publishers through
-ping + pull, validates them, and seals hourly Epochs into one growing
-RFC 6962 Merkle tree. It serves that tree as C2SP tlog-tiles tiles and entry
-bundles, its head and archived Checkpoints as signed notes, and periodic
-Snapshots over HTTP for Consumer sync.
+WIST Protocol aggregator. Clave pulls each Publisher's Declaration, the
+Catalogs of its Collections with their Items and Payloads, and its Label
+Feed through ping + pull, judges them, and seals hourly Epochs into one
+growing RFC 6962 Merkle tree. It serves that tree as C2SP tlog-tiles tiles
+and entry bundles, its head and archived Checkpoints as signed notes, the
+Payloads of sealed Items, and periodic Snapshots over HTTP for Consumer
+sync.
 
 Subcommands: `init` (generate the log's genesis key and local store, and
 print the signed-note verifier key a Witness is configured with),
@@ -23,288 +23,154 @@ it prints the seal's and the production's wall time), `witness`
 (maintain the Witnesses each sealed Checkpoint is submitted to),
 `snapshot` (produce the signed, verifiable point-in-time Snapshot at the
 sealed head for cold-start sync, see [Snapshot production](#snapshot-production)),
-`param-change` (queue a signed
-`parameter_change` Registry Update, WIST-4 §5: bounds and combination
-rules checked, `effective_at` held past the grace period, applied to the
-live parameter set once its Epoch seals and the effective instant passes;
-a change whose grace window lapses while queued is dropped from the Epoch
-and reported by `seal`), `withdraw` (queue a `payload_withdrawal`, WIST-4
-§5.1 and WIST-3 §6.2: at sealing the act replays through core's
-withdrawal engine under the Log key, seals only beside or above the
-Delta it names, deletes the Payload, drops the record, removes every
-served and staged Snapshot, rewrites the index without them and leaves a
-`withdrawal` tuple in every later Snapshot state; a repeated withdrawal seals and changes nothing),
-`suffix-list` (pin a Public Suffix List file, WIST-4 §3.1: the octets are
-held in the store and served at `/log/suffix-lists/<hex>.dat` without
-expiry, and the queued `suffix_list_update` seals in the next Epoch and
-is in force from the Epoch after it; `init --suffix-list <file>` pins
-one for Epoch 0, and without a pinned snapshot every Canonical Host is
-its own accounting unit), `mirror` (maintain the signed
-`/log/mirrors.json`), `log-key` (rotate the Log's own Aggregator keys, see
+`verify-history` (authenticate every stored Epoch and replay it),
+`restore` (rebuild the tables derived from the Log, see
+[Restoring the Log-derived tables](#restoring-the-log-derived-tables)),
+`param-change` (queue a signed `parameter_change` Registry Update,
+WIST-4 §5: bounds and combination rules checked, `effective_at` held past
+the grace period, applied to the live parameter set once its Epoch seals
+and the effective instant passes; a change whose grace window lapses
+while queued is dropped from the Epoch and reported by `seal`),
+`withdraw --domain <Publisher> --item-id <Item ID>` (queue a
+`payload_withdrawal`, WIST-4 §5.1 and WIST-3 §6.2, naming a sealed Item:
+at sealing the act replays through core's withdrawal engine under the Log
+key and seals only beside or above an Item of the subject; its Epoch
+destroys the held and served Payload, ends its Payload duty, removes
+every served and staged Snapshot, rewrites the index without them and
+leaves a `withdrawal` tuple in every later Snapshot state; the record
+stays and is no longer materialized, and a later pull refuses the Item
+with `WIST2-E03`), `suffix-list` (pin a Public Suffix List file, WIST-4
+§3.1: the octets are held in the store and served at
+`/log/suffix-lists/<hex>.dat` without expiry, and the queued
+`suffix_list_update` seals in the next Epoch and is in force from the
+Epoch after it; `init --suffix-list <file>` pins one for Epoch 0, and
+without a pinned snapshot every Canonical Host is its own accounting
+unit), `mirror` (maintain the signed `/log/mirrors.json`), `log-key`
+(rotate the Log's own Aggregator keys, see
 [Aggregator key rotation](#aggregator-key-rotation)).
-
-Every Feed pull also pulls the domain's Label Feed where it serves one
-(WIST-2 §3.3): `label-feed.json` and its Pages walk under the Feed's
-rules and the ingest budget — a `next` failing the target rule records
-`WIST2-E01` and stops the walk there, without the Feed's backoff, whose
-schedule WIST-2 §7 ties to the Feed — each unseen Label or dispute is fetched
-from `labels/<id>.json` and validated through core under the accepted
-Declaration — fields, the registry name, self-labeling, the disputed
-Label's sealing and authority, the signature — and queued as a `label`
-or `dispute` Entry, sealed after the Deltas under the per-domain
-capacity and the per-Labeler cap; a failure is `WIST2-E06` at the status
-endpoint with the ID, pulled again on the next pull. `asserted_at` is
-checked against the whole-second clock and `clock_skew_seconds` captured
-when the Label's or dispute's attempt begins and kept through
-Declaration retries (WIST-1 §3.4); sealing repeats the check against the
-candidate Epoch's `sealed_at` and the allowance then in force, and a
-failing Entry is dropped with `WIST2-E06` and its ID at the status
-endpoint and its seen marker cleared, so the next pull fetches it
-again. The Snapshot state
-carries the current Labels and disputes as `label` and `dispute`
-tuples, and tier 1 carries `labels.parquet`, `disputes.parquet` and
-`labelers.parquet` (WIST-3 §7).
 
 `serve` additionally enforces the flat `quota_base` ping quota (429 +
 Retry-After; only WIST2-E02/E04 pings count as noise), accounted per
 Registrable Domain under the snapshot in force at the Ping and reported
 as the shared remainder at every host's status endpoint, and re-pulls
 every known publisher `baseline_poll_seconds` after its last pull
-without a Ping, as [Concurrency](#concurrency) describes. Ingest
-follows feed pages (WIST-2 §3.2) under the daily byte budget of the
-host's Registrable Domain, suspending the walk when the budget or the
-pull's own limits are spent and resuming it from the pages already
-walked. The
-seal's per-domain Epoch capacity counts Entries per Registrable Domain
-under the snapshot in force at the Epoch, and the Snapshot state carries
-the `suffix_list` tuple (WIST-3 §7). Ping admission and every fetch are
-bounded as [Fetch bounds and destination policy](#fetch-bounds-and-destination-policy)
-describes.
+without a Ping, as [Concurrency](#concurrency) describes. The seal's
+per-domain Epoch capacity counts Entries per Registrable Domain under
+the snapshot in force at the Epoch, and the Snapshot state carries the
+`suffix_list` tuple (WIST-3 §7).
 
-Ingest re-fetches each known publisher's Declaration and validates the
-chain (WIST-1 §5.2: `seq`/`prev_declaration` monotonicity, recovery-keys
-protection, signer classification into ordinary rotation, recovery
-rotation, or fresh identity — WIST1-E08 otherwise), and verifies every
-delta against the full declared key set (`sig.key_id` membership and
-`valid_from`; WIST1-E01/E02). A recovery rotation opens the WIST-1 §5.2
-recovery window at its sealing Epoch (the open window appears in snapshot
-state): the domain's deltas queue instead of sealing, declarations signed
-by superseded keys are rejected, and the first Epoch at or past the
-window's end settles the queue — survivors become eligible for sealing,
-failures surface as WIST1-E13 on the status endpoint. Snapshots carry tier0 SQLite and
-tier1 Parquet (extracts + link graph), optionally sharded
-(`snapshot_shard_count` in the local params table).
+## Pulling a Publisher
 
-## Delta field validation
+A pull (WIST-2 §5.1) fetches `/.well-known/wist/publisher.json` once,
+outside the ingest budget, and judges it under the Collection limits of
+the parameter map in force (WIST-1 §5). A first contact that fails is
+`WIST2-E04` noise and stores nothing; a later Declaration that fails is
+reported with its WIST-1 code and stops the pull at `WIST2-E01`. A
+discovered Declaration that reduces authority is held for sealing with
+the last height it may seal at (`record_seal_epochs`), and the Publisher's
+Catalogs and Items wait behind it.
 
-`declaration::delta::validate_fields` enforces WIST-1 §7's complete Delta
-Envelope field checks before Feed association, authority or signature use.
-`validate_version` applies those checks, then rejects unsupported majors with
-WIST1-E15. It supports major `1`, preserves minor/patch components without
-numeric conversion, and is used by Delta signature verification and
-`validate_static`. The latter also checks content/predecessor presence and
-URL/commitment caps. Its caller supplies valid stage-specific caps; the helper
-does not authenticate parameter profiles. Profile selection follows
-[Delta size-cap profiles](#delta-size-cap-profiles).
+Each Collection the Declaration in force names — with the recovery
+head's beside it during a recovery window — is then pulled in the
+Declaration's order, every pull restarting from the first:
 
-Typed ingestion and record materialization read canonical temporary copies so
-integral decimal/exponent byte counts remain admissible through fetched chains,
-restart and sealing; retained Envelopes and Payload files remain unchanged.
-Rejected Deltas receive persistent typed status entries without
-recording accepted IDs, changing URL tips or writing Payload files. Sealing
-retains E15 for unsupported queued Deltas and releases their accepted indexes.
+1. `collections/<name>/catalog.json` is fetched, read up to 16 385
+   octets, with `If-None-Match` carrying the validator of the octets last
+   read whole for that Collection. A Catalog not later than the last
+   accepted one that is no idempotent re-serve is `WIST2-E05`; one that
+   names another Publisher or Collection is `WIST2-E04`.
+2. The list of an accepted Catalog is a held list of the Catalog's
+   `size` and `root`; else, where a list of the Collection is held, the
+   chain of `changes/<hex>.json` change lists applied oldest first,
+   accepted only where the resulting count and root match; else the walk
+   of its `tree/` files under `tree_file_cap_bytes` and `tree_depth_max`,
+   reading held tree files first and holding every file read whole by its
+   hash. A discarded chain is `WIST2-E08` with its condition, the
+   fetched Catalog's ID and the change list where it was met; the walk
+   that follows decides the Catalog. A walk meeting a condition of
+   WIST-2 §5.3 is `WIST2-E07`, as is a list holding no Item for the URL of
+   a record the Log holds for the Collection, unless the Catalog is a base
+   against the floor; the report names those URLs.
+3. Each Item of the list not yet judged is judged in list order: an Item
+   whose Item ID a withdrawal names, or whose Payload
+   (`payloads/<hex>.json`) is missing or fails WIST-1 §7, is `WIST2-E03`;
+   the Payload of an admitted Item is held under `held/payloads/` until
+   the Item is sealed.
 
-`delta-fields.json` exercises field/version boundaries and diagnostic
-combinations. Live tests cover persistent rejection, active caps, decimal
-byte counts, fetched unsupported predecessors and signed version preservation
-across duplicate pulls, restart and sealing. These checks do not establish
-complete authenticated Delta history or other objects' version support.
-Live Declaration retries are described below.
+The Label Feed (`label-feed.json` and its Pages) is pulled once every
+Collection's pull has ended, under WIST-2 §3.2's rules; each unseen Label
+or dispute is validated through core and waits for sealing, and a
+failure is `WIST2-E06` with its ID.
 
-## Delta size-cap profiles
+Fetches are bounded while they stream: a Declaration, Label Feed page or
+Mirror list at 1 MiB, a Label at 16 KiB plus twice `url_cap_bytes`, a
+change list at the suite's change-list cap and a tree file at
+`tree_file_cap_bytes`. Content fetches are further bounded by the daily
+ingest budget of the host's Registrable Domain and by the pull's work
+limits (64 MiB, 4096 objects and 300 seconds); a pull that reaches one
+suspends, and the next pull resumes from the held files. Every fetch
+connects only to a public unicast address (WIST-2 §8); a redirect stays on
+the requested Canonical Host or a host the Declaration in force scopes.
 
-WIST-1 §3.6 and ADR-0020 determine size-cap timing. Ingestion reconstructs the
-pinned authenticated schedule when each fetched Delta begins validation and
-retains its five caps through Declaration refresh, predecessor retrieval,
-Payload validation and admission rechecks. Predecessors and attempts after
-rejection or restart obtain fresh profiles. The same captured clock and
-authenticated schedule supply [Delta clock eligibility](#delta-clock-eligibility).
-Local parameter overrides and amendment summaries cannot replace either profile.
+## Recovery windows
 
-Sealing checks each candidate Delta and its stored Payload against the
-candidate Epoch's authenticated profile. Pending amendments apply only from
-their effective instant. Delta URL/declared-byte failures retain WIST1-E11/E04;
-Payload cap failures use WIST2-E03 during pulls and WIST1-E04 at sealing.
-Sealing removes rejected copies and dependent successors under
-[Declaration key binding](#declaration-key-binding). Missing or
-invalid stored Payloads follow [Retained Payload validation](#retained-payload-validation).
+From the discovery of a recovery rotation until its window settles
+(WIST-1 §5.2), a pull judges Catalogs under the two frozen sources and
+queues each one it accepts per Collection name and signing key. The
+queue settles at the first pull or Epoch at or after the window's end:
+every queued Catalog is judged again by C1 under the settlement source
+with that event's instant, a failure being `WIST1-E13` and a Catalog not
+later than the floor `WIST2-E05`, and the survivor of each name becomes
+its last accepted Catalog. A seal whose cadence slot falls before the end
+of a window whose queue a pull already settled is refused and sealed at
+a later grid instant.
 
-`VerifiedEpoch::delta_size_caps` retains the committing Epoch's profile for
-later Payload or reference validation. `SizeCaps::validate_payload_sizes`
-measures original JSON values in JCS octets; callers must separately validate
-Payload fields and integrity. Index restoration checks sealed Delta URL and
-declared-byte caps against each Epoch's profile. It does not retrieve historical
-Payloads or recalculate completed unsealed admissions' original profiles.
+## Sealing
 
-`delta-cap-time.json` exercises authenticated histories, stage boundaries,
-reference profiles and invalid candidate Epochs. Live regressions cover
-Payload/predecessor timing, repeated rejected IDs, restart, dependent rejection,
-missing/corrupt Payload rollback and signed authority despite changed local
-summaries. Full-prefix reconstruction per attempt remains unbounded.
-[Historical Payload retrieval](#historical-payload-retrieval) preserves these
-profiles.
+Each Epoch is planned from the stored waiting state: discovered
+Declarations, Registry Updates, waiting Catalogs, Items with their
+inclusion proofs against the latest Catalog, removal markers, Labels and
+disputes, in place order under the per-domain capacity, the inclusion
+ceiling and the deferrals of WIST-3 §3.3. An Entry over 65 535 octets is
+never planned: an Item that large leaves with `WIST1-E04`, a Catalog
+leaves as one failing C1 would and the seal reports it with `WIST3-E03`,
+and a Declaration fails at sealing with `WIST1-E04`. The Epoch is fitted
+to `epoch_cap_bytes` by leaving Entries unsealed, judged by core's
+sealing replay resumed at the head, and committed only when every planned
+Entry is valid. The commit writes the latest Catalogs, records, removals,
+sealed Items, Payload duties and the deferrals and holds of the waiting
+publications in the sealing transaction. The Payload of every sealed
+page Item is served under `payloads/` before the Checkpoint is published
+and for as long as its record holds or its `payload_window_days` window
+runs.
 
-## Payload link admission
+The status endpoint (`/status/<domain>`, WIST-2 §7.1) lists one entry per
+Collection that the Declaration in force or the recovery head names or
+that the store holds, with its latest and last accepted Catalog IDs and
+every Catalog and Item that waits or is queued, with the deferrals of the
+last sealed Epoch and whether a Declaration that reduces authority held
+it there; rejections carry their Catalog or Item ID, Collection, URLs and,
+for `WIST2-E08`, the condition and change list.
 
-Ingestion enforces WIST-1 §3.6's WIST1-E12 checks before retaining a
-Payload or accepting its Delta: URL uniqueness, byte-identical normalization,
-external-host membership and `len(urls) <= total`. Externality uses the
-Delta's authenticated signed Publisher, including for scoped subject URLs;
-Declaration scope does not redefine internal links. A failed Payload rejects
-the pull with WIST2-E03, leaving its ID retryable, its chain tip unchanged
-and its content unstored. Fetched predecessors undergo the same checks.
+## Restoring the Log-derived tables
 
-`payload::validate_links` requires typed links and an already validated
-Canonical Publisher host. It checks neither fields, commitments nor size
-caps. It preserves URL order and accepts an incomplete prefix even when
-more links could fit: no party measures the page against the declared prefix.
+`clave restore --data <dir>` replays the stored Log through core and
+rewrites, in one transaction, every table the sealed Entries determine:
+the latest Catalogs with their sealing height and base flag, the records
+with the height that sealed each, the removals, the sealed Items, the
+withdrawals and the Payload duties in force at the head. Pull state is
+not in the Log and is not restored: held lists and tree files, list
+admission, waiting places and eligibility, the recovery queue, discovered
+Declarations not yet sealed, and the deferrals of the last seal. A
+restored Aggregator recovers them by pulling: each Collection's next
+pull walks or chains its list again and admits its Items, taking new
+places.
 
-`payload-links.json` supplies 31 signed commitment-valid probes. Live tests
-cover their pull dispositions, restart, accepted-byte preservation through
-sealing, scoped subjects and rejection of a retrieved predecessor.
-Field/version admission and retained validation are described below;
-historical validation remains outstanding.
+## Store layout
 
-## Fetch bounds and destination policy
-
-Every fetch reads its response while it streams and refuses it at a bound
-before buffering or parsing: a declared length above the bound is refused
-before the body is read, and a body that crosses it is refused where it
-crosses. A Declaration, Feed page or Mirror list is
-bounded at 1 MiB; a Delta file at 16 KiB plus twice `url_cap_bytes`; a
-Payload at `extract_cap_bytes + links_cap_bytes + summary_cap_bytes` plus
-4 KiB, each read from the schedule in force at the instant the request is
-issued. Content fetches under WIST-2 §5's daily budget are further
-bounded by the budget's remainder and by the pull's work limits (64 MiB,
-4096 objects and 300 seconds of wall time per pull): an object that
-would cross the budget or the work limit is not read past it, the bytes
-read are debited, and the walk suspends for a later pull to resume from
-where it stopped, exactly as budget exhaustion does; once the pull's
-wall time is spent the walk suspends the same way at the next request
-that begins an item — a page after the live one, or a queue item's own
-Delta or Label file once the pull has begun an item — while the requests
-that complete an item begun (its Payload, a predecessor, a Declaration
-retry) are still issued, so every pull begins at least one item; an
-object above its own cap is a failed fetch.
-`ingest_budget_bytes_day`, the host's Registrable Domain under the suffix
-list in force and the UTC day are read at each request too, so a pull
-that crosses midnight UTC, a `parameter_change` activation or a
-`suffix_list_update` activation meters the requests after the crossing
-against the row then in force while the requests before it stay debited
-where they were. The bound a request is issued under is reserved against
-that row before the request and settled there to the bytes actually read
-when the response is persisted, so neither a pull that stops mid-request
-nor two hosts pulling one Registrable Domain can read past a day's
-budget. A settlement below the reservation, and the release of a
-dropped run's unsettled reservations, credit the difference back to
-that row; while the row's day is the current UTC day and the row keeps
-at least a page's cap (1 MiB) of budget free after the credit, every
-`resume` pull deferred to a later instant whose domain is of that
-Registrable Domain becomes due at once, so a host that suspended while
-a sibling's reservation held the remainder resumes when the budget
-returns rather than the next day. The work limits are this Aggregator's own, not
-Registry parameters, and hold for the whole pull. Declaration requests
-stay outside the budget and carry only their own cap.
-
-A pull may fetch Delta files ahead of the item it is processing, each on
-its own thread: at most `prefetch_objects` at once (4 under `serve`;
-the library's pull stays sequential unless its caller sets it),
-reserving at most `prefetch_bytes` (8 MiB) together. Each is issued exactly as its
-on-demand request would be, with its bound reserved against the meter
-row in force and the redirect scope read at issue, and only for a
-listed ID not yet seen that the run holds no object for. Its reservation
-counts against the pull's remaining work as settled bytes do. Prefetching
-stops for the rest of the pull once the pull's wall time is spent or the
-budget's remainder, or the remaining work net of what is in flight, falls
-below `prefetch_objects` times the sum of the Delta file and Payload caps,
-or the remaining objects below twice `prefetch_objects`, and an
-on-demand request that finds the margin gone — a predecessor chain
-retrieved past it — first joins and settles the prefetches in flight,
-returning what they reserved but did not read; within the margin every
-budget or work bound is crossed at the object a sequential pull crosses
-it at, and past it the crossing can come earlier by at most the octets
-the prefetches read. The item that reaches a prefetched file joins its
-thread and settles it as its own request would have been settled; a
-prefetched file already landed is still processed once the pull's wall
-time is spent, since no request begins it. A pull that ends, suspends
-or fails first joins and settles every prefetch still in flight, so no
-fetch thread outlives the pull and no reservation stays issued. What a
-suspended pull fetched but had not admitted — the prefetched files it
-never reached and a predecessor chain retrieved up to the limit — is
-settled and debited with its run, whose closure drops the octets, and
-the next pull requests and debits it again; the prefetched share of
-that repetition is at most `prefetch_bytes`. Payloads,
-Label files and pages are fetched on demand.
-
-A fetch connects only to a public unicast address. Loopback addresses are
-allowed under `--allow-http`, the local-test exception; private,
-link-local, shared (100.64/10), multicast, broadcast, documentation,
-benchmarking, reserved and unspecified addresses, and IPv6 addresses that
-map or embed them, are never fetch destinations. The policy applies to a
-literal host, to every redirect hop and to what a name resolves to at
-the moment the connection is made: name resolution runs through a
-resolver that refuses the whole answer when any address fails the policy,
-so a name that rebinds between two fetches is refused on the second. A
-refused destination is a failed fetch with the address class named.
-A redirect may leave the requested Canonical Host only for a host the
-Publisher's Declaration lists in `subdomain_scope` at the moment the
-request is issued (WIST-2 §8): a replacement Declaration admitted, or a
-recovery settlement applied, earlier in the same pull governs the
-requests after it — including the Declaration retry a Delta's binding
-failure asks for — a scope it withdrew no longer authorizes a redirect,
-and before the first accepted Declaration a redirect stays on the
-requested host.
-
-`serve` bounds the work a Ping can start: at most 4 pulls run at once and
-at most 64 accepted Pings wait for a slot. A Ping for a host with a pull
-running or waiting is accepted (202) without new work; a Ping beyond the
-waiting bound is refused with 503 and `Retry-After: 30`, is not queued,
-and counts as neither noise nor a pull, so the Publisher retries later
-under its own backoff. Quota (429) is answered before admission.
-
-The order in which due pulls take free slots is this Aggregator's own; the
-specification orders no pulls across domains. Claims alternate between
-waiting Pings and scheduled duties (the WIST-2 §5 baseline poll, the
-WIST-2 §7 retry and the resumption of a suspended walk), so neither
-starves the other. Within each, a pull overdue by 300 seconds or more goes
-first, oldest first; otherwise the oldest pull of the lightest load class
-due goes. A domain's load score is the cost of its first pull, then moves
-halfway toward each later pull's cost, where a cost is the pull's wall
-seconds plus the octets it fetched under the ingest budget divided by
-1048576. Scores below 1, 10 and 100 are classes 0, 1 and 2, any higher
-score class 3; a waiting pull keeps the class its domain had when it was
-scheduled. At most one pull per Registrable Domain runs at once in a
-`serve` process: a due host whose Registrable Domain has a pull running
-or claimed waits for the next pass.
-
-Intake also pauses on sealing capacity, which the specification does not
-bound either. While the entries waiting to be sealed number at least
-1048576, or their octets, counted as WIST-3 §6 counts an Epoch's, reach
-twice the `epoch_cap_bytes` in force, only baseline polls and §7 retries
-serving no Ping are claimed; Ping-driven and resumption pulls wait with
-their due times unchanged and are the oldest once the backlog drains.
-Running pulls continue.
-
-The endpoint admits a Ping only when its `host` is byte-identical to its
-own Canonical Host (WIST-1 §2), the form WIST-2 §4 requires: an uppercase
-spelling, a trailing dot, an IDN U-label and a `host:port` authority are
-answered 400 instead of being canonicalized, and such a Ping schedules no
-pull, counts against no quota and records nothing. Under `--allow-http`,
-the local-test exception, the endpoint additionally admits `<host>:<port>`
-when `<host>` is a loopback name or address already in its Canonical Host
-form, so a loopback deployment on a nondefault port is pinged and pulled
-under that authority; every other spelling, `example.com:8443` and
-`LOCALHOST:8080` included, is answered 400 in both modes.
+The store carries a layout version. A store of an earlier layout is
+refused at open with an instruction to start a new data directory; no
+migration runs.
 
 ## The tree, its static layout and distribution
 
@@ -365,7 +231,7 @@ The served layout is:
 /tile/entries/<N>[.p/<W>]         (entry bundles: the leaf data)
 /log/checkpoints/<epoch_number>   (every Checkpoint published)
 /log/anchor.json /log/mirrors.json /log/suffix-lists/<hex>.dat
-/payloads/<delta-id-hex>.json
+/payloads/<hex>.json             (the Payloads of sealed Items, under duty)
 /snapshots/index.json /snapshots/<date>/<epoch_number>/...
 ```
 
@@ -463,12 +329,19 @@ the shard cache), `snapshot cache bytes written N` (bytes copied rather
 than hard-linked into the shard cache), `snapshot payloads read N` and
 `snapshot payload bytes read N` (Payload files read to build tier 1).
 
-A producer reads the head Epoch and every input of the build (records
-with withdrawn Deltas excluded, chain tips, withdrawals, parameters,
-suffix list, Labels, Aggregator keys, the Declaration replay) in one
-SQLite read transaction, so pulls and seals committing meanwhile are
-neither blocked nor included. A live record whose Payload is missing or
-does not parse fails the build with an error naming its `delta_id`
+A producer reads the head Epoch and every input of the build (the latest
+Catalogs, records, removals and withdrawals, parameters, suffix list,
+Labels, Aggregator keys, the Declaration replay) in one SQLite read
+transaction, so pulls and seals committing meanwhile are neither blocked
+nor included. The state file carries one `collection`, `record`,
+`removal` and `withdrawal` tuple per row of those tables, the tuples a
+full replay of the Log gives. The materialized records are chosen by
+WIST-3 §7's one-URL rule and ordered by Publisher, then URL, as UTF-8
+octets; the link rows follow them, each record's by ascending
+`position`. Tier 0's `records` table and `tier1/extracts.parquet` carry
+the columns WIST-3 §7 names, then `collection`. A materialized record
+whose Payload is missing, does not parse or does not reproduce its
+Item's commitment fails the build with an error naming its Item ID
 (WIST-3 §7). The files are written and synced into the staging directory
 `snapshot-build/<epoch number>/`, outside `/snapshots` and never served,
 then moved by one rename into `snapshots/<date>/<epoch>/`, the Epoch
@@ -494,8 +367,8 @@ time. Snapshots of earlier dates stay served until a withdrawal removes
 them.
 
 Tier files are reused per shard (unsharded: one shard). A shard whose
-record projections (WIST-3 §7 `content_digest` over the shard) and
-Labels, disputes and labeler rows are unchanged since the last build
+record projections (WIST-3 §7 `content_digest` over the shard), their
+Collections, and Labels, disputes and labeler rows are unchanged since the last build
 hard-links (else copies) its six tier files from
 `snapshot-shards/<shard>/` instead of rebuilding them, reading no
 Payloads; `content_digest`, `state.json` and the manifest are computed
@@ -521,7 +394,7 @@ Snapshot past its grace period. A withdrawal
 seal's transaction drops the withdrawn record and records the removal
 still owed; before any Checkpoint is published, the owed removal deletes
 the Payload file, every served Snapshot, every grace-period marker, the staging area and the
-`snapshot-shards/` entries of the withdrawn Deltas' Publisher shards,
+`snapshot-shards/` entries of the withdrawn Items' Publisher shards,
 writes an index listing none, then marks itself done and truncates the
 store's write-ahead log. A removal interrupted before it was marked done
 runs again at the next seal or start of `serve`, so no served Checkpoint
@@ -614,69 +487,28 @@ and dispatcher pass opens its own store connection (`Db::connect`), so a
 slow origin delays only its own domain while other domains, status
 answers and dispatching proceed; SQLite serializes the writes.
 
-A pull runs in four stages: it is scheduled, it fetches, it verifies what
-it fetched against the references it was issued with, and it admits the
-result. Fetching and verification hold no store connection; every
-admission is one write transaction. Every handoff between the stages is
-persisted under a run of the domain (`pull_runs`, at most one open per
+A pull runs under a run of the domain (`pull_runs`, at most one open per
 domain): each request enters `pull_objects` with the bytes it reserved
-before it is issued, and the response, its verification and its admission
-move that row forward; the domain's walk cursor (`pull_walk`) holds the
-pages walked; `pull_attempts` holds the Declaration retry each Delta ID
-spent and the predecessors it retrieved; and the run's phase, position,
-chain position and remaining work advance in the same transaction as the
-admission that moved them, its queue being written where a walk ends or a
-retrieved predecessor is spliced into it rather than at each item.
+before it is issued, and its response and admission move that row
+forward. The Collection pull machine holds no store connection while it
+fetches; each Collection's admission is one write transaction under the
+pull's fence. A pull that loaded its state before a seal committed
+reloads it and pulls that Collection again. A pull's position across
+pulls is the held tree files, the held lists with each list Item's
+admission state, and whether the Collection left its change-list chain;
+no cursor is kept. The Label Feed's walk keeps its cursor (`pull_walk`)
+of the pages walked, so a page chain longer than one pull's limits is
+walked across pulls; the cursor of one domain holds at most 1024 pages
+and 64 MiB of Envelope octets, and a `next` past either ends the walk as
+an absent `next` does.
 
-Within one pull, a response the run already holds is read from the run
-instead of requested again and an admission or rejection it already
-recorded is not repeated, so a second delivery of either changes nothing.
 A pull that stops before its run is closed — a crash, or a partition
 taken over mid-pull — leaves the run behind, and the next pull of that
 domain drops it with its objects and starts fresh, returning what a
 request that never settled had reserved to the budget row that request
-was issued against: resumption is a
-later pull (WIST-2 §5), which takes its own clock and schedule (WIST-1
-§3.4) and fetches `feed.json` again. Nothing is admitted twice across the
-interruption, because an ID already accepted for sealing is seen (WIST-1
-§3.5) and the walk cursor, which the run's deletion keeps, holds the
-pages already walked. Closing a run rebuilds the pull's report from the
-objects it admitted and rejected in the order it decided them, records
-whether the walk suspended, and drops the run's state.
-
-The pages a walk reads are the domain's walk cursor, which outlives the
-pull that walked them. A pull whose walk suspended keeps them; the next
-pull fetches the live `feed.json` again, since the Publisher rewrites it,
-and wherever the chain it reads names a page the cursor already holds it
-takes that page — a sealed Page is immutable — instead of fetching it,
-then continues from where the cursor stopped. The cursor retains each
-page's Envelope octets, and a page taken from it is admitted under every
-check a freshly fetched sealed Page passes — fields, domain, signature
-under §3.2's sealed sources at the height the pull pinned, and the target
-rule on `next` — with the same dispositions, since the Declarations those
-sources resolve may have changed since the page was walked: a recovery
-settlement can exclude the Declaration that signed it. Only the request
-and its debit against the budget are skipped. The walk stops, held page
-or fetched, at the first page listing no unseen ID, and at a `next` that
-is absent or fails the target rule. It stops the same way at a sealed
-Page it cannot fetch or whose fields fail: the Page records `WIST2-E01`,
-the pages walked before it stay held and their Deltas proceed (WIST-2
-§3.2), while an unusable `feed.json` leaves no Feed and ends the pull.
-The cursor is dropped once the Delta walk it fed completes, and the Label
-Feed's once its Labels have been processed, so a page chain longer than
-one pull's byte or object limit is walked across pulls instead of
-restarted at the head each time. The cursor of one domain and walk holds
-at most 1024 pages and 64 MiB of Envelope octets: a `next` whose page
-would exceed either, a page the cursor does not hold counting at the
-1 MiB page cap, ends the walk exactly as an absent `next` does, with no
-rejection recorded, and the pages walked feed the Deltas or Labels that
-proceed. A later pull's walk stops at the first page listing no unseen
-ID, so a chain beyond the bound is not reached.
-
-A Delta, Payload, Label or dispute object's fetched octets are dropped
-from `pull_objects` in the transaction that admits or rejects it, keeping
-its size, debit, checks and references; nothing reads them afterwards.
-Pages and Declarations keep their octets.
+was issued against. Nothing is admitted twice across the interruption:
+an admitted list Item, an accepted Catalog and a seen Label ID stay as
+they were.
 
 `serve` schedules pulls durably in the store. `pull_schedule` holds at
 most one due-time row per domain (`due_at` in Unix seconds, `reason`
@@ -776,15 +608,15 @@ taken the partition over, the transaction writes nothing and fails with
 `Error::Fenced`, and the pull is abandoned without a completion, since
 the takeover already returned the domain to the schedule. What it
 admitted before that stays, and the new holder pulls the domain fresh,
-admitting nothing a second time. A Payload
-file is written inside its Delta's admission transaction, after that
-check, and is named by the Delta ID and holds the bytes the Delta
-commits to, so a fenced-out pull writes none and a repeated admission
-writes the same file.
+admitting nothing a second time. A Payload is held under
+`held/payloads/<hex>.json`, named by its Item's Payload commitment
+name, by the transaction that admits its Item, after that check, so a
+fenced-out pull holds none and a repeated admission writes the same
+file; it is served under `payloads/` only from the seal of its Item.
 
 A finished pull, in one write transaction, closes its run — which
-rebuilds its report, reports the code the pull or its Feed walk ended
-at, records the walk's suspension and, for a completed walk, the pull
+rebuilds its report, reports the code the pull or its Label Feed walk
+ended at, records the walk's suspension and, for a completed walk, the pull
 instant — drops its task and schedules the next pull,
 combined with any Ping row that arrived meanwhile. A takeover between the
 pull's last admission and that transaction writes none of it, so the
@@ -798,11 +630,11 @@ completion:
   once, or at the next UTC day while the domain's daily ingest budget is
   spent, whatever the walk stopped at, and due at once again when a
   credit returns budget to that Registrable Domain's row for the day;
-- after a pull that ended at `WIST2-E01` — the Aggregator holds no usable
-  Feed — or that ran to its end with its Feed walk stopped at a `next`
-  failing the target rule or at a sealed Page it could not use, whose
-  Deltas already fetched proceeded regardless, or at an internal
-  failure, `retry` due
+- after a pull that ended at `WIST2-E01` — a pull stopped at its
+  Declaration outside first contact, or a `catalog.json` that cannot be
+  fetched — or that ran to its end with its Label Feed walk stopped at a
+  `next` failing the target rule or at a sealed Page it could not use, or
+  at an internal failure, `retry` due
   `RETRY_BASE_SECONDS` (60) quadrupled for every earlier consecutive such
   pull after the instant the pull ended, so WIST-2 §7's retries fall at
   1, 4, 16 and 64 minutes; these delays are absolute, so a
@@ -815,27 +647,8 @@ completion:
   alone.
 
 A domain that is still no known publisher after its pull gets no next
-pull. Running a returned pull again is safe because admission is
-transactional and deduplicates by Delta ID. One pull runs per domain at
-a time.
-Fetching and state-independent verification happen outside any write
-transaction. Each Delta attempt is issued, at its one clock sample, with
-references to the state it is verified under: the hash of the domain's
-accepted Declaration and of its recovery window's Declarations with the
-window's opening Epoch, and the size caps and clock allowance of the
-parameter schedule at the sampled clock with the height that schedule was
-read at. Each Delta's persistence is one immediate write transaction that
-first revalidates those references and the URL's chain tip, the caps only
-when an Epoch was sealed since; on any change it writes nothing, and the
-stored Delta and its verified Payload are verified again under fresh
-references at the same clock, so an Epoch sealed meanwhile, a recovery
-window another process settled or a concurrent admission cannot be
-bypassed. An amendment sealed after the issue is not effective at the
-issued clock (WIST-4 §5 places `effective_at` at least the grace period
-after its Epoch's `sealed_at`), so an Epoch sealed between issue and
-admission re-issues the attempt at unchanged caps. A Label or dispute revalidates its Declaration the same way. Every
-top-level write transaction begins immediately, taking the write lock
-before its reads.
+pull. One pull runs per domain at a time. Every top-level write
+transaction begins immediately, taking the write lock before its reads.
 
 Sealing is exclusive to the holder of the Log's sealer lease
 (`sealer_lease`: owner, `lease_until`, token). `serve`'s sealing
@@ -867,8 +680,8 @@ requirement.
 Fetched protocol JSON and retained object reads reject duplicate decoded member
 names before field, identity, signature or replay checks, including escaped
 names and nested objects or arrays (WIST-1 §4, RFC 8785 §3.1). This covers
-Declaration, Delta, Feed/Page, Payload, Log Anchor, Epoch, governance, Mirror
-and Snapshot inputs. Fetches retain the role-specific WIST-2 rejection wrappers;
+Declaration, `catalog.json`, change list, tree file, Payload, Label Feed and
+Page, Label, Log Anchor, Epoch, governance, Mirror and Snapshot inputs. Fetches retain the role-specific WIST-2 rejection wrappers;
 history readers stop on failure. Queue drains parse every selected Entry before
 deleting any, preserving malformed bytes and other queued work on rejection.
 
@@ -877,696 +690,6 @@ Value; discarded duplicate members cannot be recovered. These checks do not
 establish complete object eligibility or revalidate all existing state at open.
 `json_inputs` and `history` tests cover signed last-value duplicates, field and
 signature precedence, retry/restart, retained queues and history authority.
-
-## Payload field and version admission
-
-Ingestion applies WIST-1 §§3.1/3.6/7 and ADR-0030/0034 before commitment,
-link or size checks. `payload::validate_json` exposes the raw gate described in
-[JSON input eligibility](#json-input-eligibility), rejecting malformed JSON,
-invalid Unicode, nonfinite numbers and duplicate members with E05.
-`payload::validate_fields` checks parsed JCS eligibility and complete fields;
-`payload::validate_version` adds supported-major validation after E14 field
-precedence. Callers separately check links, integrity and active caps. Pulls
-retain the WIST2-E03 disposition in [Payload link admission](#payload-link-admission).
-
-Canonical parsing during ingestion and record materialization accepts
-integer-valued decimal/exponent forms without changing stored Payload bytes.
-Same-major minor/patch components have no numeric bound and need not match
-the Delta's version. Active octet caps govern extract and URL lengths;
-summary scalar limits remain independent of its octet cap.
-
-`payload-fields.json` supplies 128 signed candidates, consumed independently
-of the Python reference. Live tests exercise 103 default-profile candidates,
-restart, fetched predecessors, same-ID retry after version rejection,
-record materialization and original-byte preservation through sealing.
-Field vectors supply cap contexts; [Delta size-cap profiles](#delta-size-cap-profiles)
-covers authenticated profile timing. Historical copies use
-[Historical Payload retrieval](#historical-payload-retrieval).
-
-## Retained Payload validation
-
-Sealing validates each candidate's retained Payload fields, version, commitment,
-exact content length, links and candidate-Epoch caps before publication. Missing,
-unparseable or invalid retained content aborts the transaction, preserving
-queued Envelopes, seen IDs, chain tips and rejection history for repair and
-retry. Size-cap failures retain the exclusion and successor handling under
-[Delta size-cap profiles](#delta-size-cap-profiles). A local Payload mismatch
-does not reject its signed Delta (WIST-1 §7).
-
-Record materialization repeats validation when reading content and aborts on
-failure before publishing the Epoch or Checkpoint. Accepted Payload files and
-signed Envelopes retain their original bytes; successful retry after repair
-materializes the retained chains.
-Crash-safe publication and concurrent filesystem mutation remain outside this
-validation contract.
-
-`payload::validate` applies the same complete checks during ingestion and
-sealing and returns a typed Payload from a canonical temporary copy. Callers
-supply an eligible Delta's commitment, authenticated Publisher and
-stage-specific caps; the helper establishes neither Delta eligibility nor
-parameter provenance. Raw-input requirements follow
-[JSON input eligibility](#json-input-eligibility).
-
-Signed field vectors exercise the helper's permitted diagnostics and retained
-queue failures through restart. A same-length content substitution regression
-checks atomic failure, preserved dependent and independent chains, and repair
-before successful sealing. Previously sealed Payloads and recovery-held copies
-that are not candidates receive no new validation from these checks.
-
-## Delta clock eligibility
-
-WIST-1 §3.4 and ADR-0020 govern clock selection. Ingestion captures one
-validator clock and authenticated allowance when each fetched Delta begins
-validation. Declaration retries, Payload retrieval and waiting for predecessors
-retain that attempt; a predecessor starts its own. Rejection or restart permits
-a new attempt. Mutable parameter summaries cannot replace the signed schedule.
-
-Sealing repeats the check against the candidate Epoch's `sealed_at` and
-allowance. WIST1-E06 rejections release the queued copy and dependent successors
-through [Declaration key binding](#declaration-key-binding), allowing later
-pulls to retry. Historical Delta replay and sealed index restoration use each
-committing Epoch's time and allowance. `VerifiedEpoch::clock_skew_seconds()`
-and `DeltaSource::clock_skew_seconds()` expose the authenticated value; a
-verified Epoch alone still establishes no Delta eligibility.
-
-The exact inclusive comparison preserves arbitrary Publisher timestamp
-fractions, signed allowances and bounds outside the written year range.
-Later Epochs, parameter amendments or wall time cannot repair a clock-invalid
-sealed Delta. Historical failure stops the complete pinned reconstruction
-without a partial result, following [Historical Delta sources](#historical-delta-sources).
-Completed index repairs still skip rebuilding; this is not general legacy-state
-revalidation, Consumer ignored-Entry replay or proof of the Log clock's accuracy.
-
-`delta-clock-time.json` supplies 96 signed clock probes, exercised with
-authenticated parameter histories. Signed Delta histories cover committing
-profiles, rejected amendments, later Epochs, restart and corrupt-file repair.
-Live tests exercise fractional rejection across Declaration refresh, fresh
-attempts after restart, predecessor waits and queued chains crossing a reduction.
-
-## Historical Delta sources
-
-`history::deltas::DeltaSource::reconstruct(directory, pinned_head, delta_id)`
-returns one included Delta only after authenticating the entire pinned
-Epoch/parameter and Declaration prefix and checking every included Delta's
-fields, version, committing size caps, [clock eligibility](#delta-clock-eligibility),
-historical authority and predecessor chain. Authority uses [Declaration history replay](#declaration-history-replay)
-and [Declaration key binding](#declaration-key-binding); trust inputs and
-unsupported transitions follow [Authenticated history](#authenticated-history).
-
-Chains retain signed Publisher/URL ownership and exact predecessor observation
-times across scope changes, rotation, recovery and identity resets. Within each
-Epoch, predecessor links determine chain order independently of storage order.
-Missing predecessors, forks, duplicate IDs, invalid authority or non-increasing
-observations stop reconstruction, including failures after the requested Delta.
-This is a strict integrity check of the Aggregator's retained history; it does
-not implement Consumer ignored-Entry dispositions.
-
-The source retains its Delta ID, original Envelope, canonical Entry position,
-Epoch sealing time, authenticating Declaration, identity's first-installation
-or latest reset position and committing size caps.
-Later history cannot change those bindings. Contentless `attest`
-and `delete` Deltas are supported. Sealed-predecessor admission uses this source;
-index reconciliation shares its sealed Delta checks. Their unsealed-state
-policies remain under [Delta predecessor admission](#delta-predecessor-admission)
-and [Delta index reconciliation](#delta-index-reconciliation).
-
-Reconstruction changes no retained state and exposes no partial result. It scans
-the full prefix, retaining Declaration state, every seen ID and each Publisher/URL
-tip; bounded lookup remains required. It does not check Payload bodies or
-materialization, and does not replace live admission or `verify-history`.
-
-Signed tests cover exact predecessor vectors in same-Epoch and cross-Epoch chains,
-invalid ancestors and later unrelated Deltas, independent Publishers sharing a
-URL, identity resets, contentless successors, recreation after deletion, restart
-and repair/retry.
-
-## Historical Payload validation
-
-`history::payloads::PayloadSource::reconstruct(directory, pinned_head, delta_id)`
-requires a [historical Delta source](#historical-delta-sources) with a Payload
-commitment. `delta_source()` exposes its authenticated bindings.
-
-`PayloadSource::validate(raw)` applies the complete
-[Payload validator](#retained-payload-validation) to supplied bytes with the retained
-commitment, signed Publisher and caps. Reconstructing after restart selects the
-same profile; another Delta's profile cannot replace it.
-Invalid bytes return a Payload error without mutating the source or stored state,
-allowing another copy to be checked. Retrieval follows the contract below;
-availability and withdrawal remain separate requirements.
-
-Signed tests cover 103 default-profile Payload field cases, original-byte and
-numeric-value preservation, historical cap references and invalid cap Epochs,
-scope/key changes, recovery deadlines, missing/duplicate targets, full-prefix
-failures, restart and repair/retry.
-
-## Historical Payload retrieval
-
-`PayloadSource::read(directory)` reads `payloads/<delta-id-hex>.json` beneath
-the supplied directory. `fetch(client, url)` retrieves one explicitly selected
-URL; WIST-3 §6.1 permits copies from any source because the commitment
-authenticates the content. Both methods apply
-[Historical Payload validation](#historical-payload-validation) before returning
-a `RetrievedPayload`. Its `source()` retains the authenticated Delta bindings,
-`location()` records the file path or requested URL, `raw()` exposes the original
-file bytes, and `payload()` exposes the checked typed content.
-Preserve `raw()` when storing a copy; serializing `payload()`
-does not preserve the original representation.
-
-Invalid bytes return `Error::Payload` with the WIST-1 diagnostic. Disk and
-transport failures retain their respective errors; no failure establishes a
-withdrawal or a serving fault. Reads and fetches
-write no files or history state and retain no failure cache, so callers can
-retry another copy. An `attest` or `delete` Delta has no own Payload to
-retrieve.
-
-`retrieve(client, candidates)` tries `PayloadLocation` file paths or URLs in
-caller-supplied order, stopping at the first verified copy. `retained_location`
-derives the local path; `distribution_location` appends the WIST-3 §6.1 path
-to a configured HTTP(S) origin, preserving its port; `publisher_location`
-derives the WIST-2 §3.1 path from the Delta's signed Publisher. Each uses the
-Payload source's Delta ID. Parsed distribution origins must be bare, without
-credentials, query strings or fragments; the client enforces transport eligibility
-when fetching.
-
-Source order is caller policy under WIST-3 §6.1's permission to use any copy.
-The successful result's `failed_attempts()` retains earlier locations and typed
-errors; exhausted or empty candidates return `PayloadRetrievalError` with all attempts.
-These diagnostics describe retrieval attempts, not protocol fault findings.
-The selected location is an in-memory transport locator, not evidence of authorship
-or the final redirect destination. Every copy retains the same authenticated
-commitment and historical caps regardless of location.
-
-HTTP retrieval uses the client's HTTPS guard, explicit loopback HTTP opt-in,
-destination policy, 30-second request timeout and five-hop redirect limit
-within the same Canonical Host, and reads a Payload only up to the cap its
-content caps imply ([Fetch bounds and destination policy](#fetch-bounds-and-destination-policy));
-file reads remain unbounded. Callers enforce withdrawal,
-availability and Record eligibility before using or retaining content;
-durable replication and those policy integrations remain unimplemented.
-
-Tests exercise 103 signed Payload field cases through disk and HTTP, historical
-cap amendments after reconstruction, named references including contentless
-successors, malformed and substituted copies, missing files/HTTP responses,
-retry, exact-byte preservation and unchanged authenticated history. Fallback tests
-cover local and HTTP failures, Publisher attribution across scoped hosts, early
-termination, preserved diagnostics, historical caps and reconstruction after restart.
-
-## Historical Payload source discovery
-
-`PayloadSource::discover(client, directory, independent_origins)` returns
-`PayloadLocations` in this local policy order: retained file, independent origins
-in supplied order, origins from `directory/log/mirrors.json` in listed order,
-then the signed Publisher's well-known path. Pass `locations().iter().cloned()`
-to `retrieve` under [Historical Payload retrieval](#historical-payload-retrieval).
-Origins producing identical parsed URLs are tried once, preserving the first
-position. Every path uses the authenticated Payload anchor, including references
-through `attest` or `delete`.
-
-The optional local Mirror list supplies untrusted location hints under WIST-3
-§6.1's permission to obtain any copy. Discovery reads only its `mirror_urls`
-string array; it neither verifies the Envelope nor asserts list authorship,
-Log membership or administrative independence. Raw JSON eligibility still
-applies. Missing lists are normal; unreadable/malformed lists and invalid origins
-appear in `discovery_failures()` without suppressing other sources. A malformed
-array contributes no entries; individually invalid origins leave valid siblings
-available. Discovery errors name the list file or supplied origin and are
-separate from retrieval failures.
-
-`discover_with_remote_mirrors(client, directory, independent_origins,
-mirror_list_origins)` adds remote hints after local hints and before the Publisher.
-It fetches `/log/mirrors.json` from each distinct parsed origin in supplied order,
-using the same origin restrictions and transport client as Payload retrieval.
-Only explicitly supplied list origins are queried; independent origins and newly
-listed Mirrors trigger no list requests. Remote lists use the same untrusted-hint
-rules as local lists. HTTP failures, including absent lists, and malformed JSON
-are recorded against the requested list URL; invalid list origins retain the
-supplied origin. Each failure leaves subsequent lists and Payload candidates
-available. List retrieval does not fetch Payloads.
-
-`discover` performs no network requests. Neither method writes or caches state;
-another call observes repairs or configuration changes. Remote list reads share
-the [retrieval limits](#historical-payload-retrieval); neither signing-key time
-authentication nor durable selected-source provenance is implemented. Service
-admission/replay integration remains unimplemented.
-Signed-history tests cover
-independent/Mirror/Publisher fallback, malformed and duplicate-member lists,
-origin and request deduplication, explicit-only discovery, corruption, repair,
-restart, historical caps and contentless reference anchors.
-
-## Declaration key binding
-
-Declaration admission rejects repeated key identifiers, including identical
-entries, before resolving a signer. A replacement can reuse an old identifier
-for a different public key: verification checks both the previous and incoming
-bindings. Identity continuity follows the authenticated public key, so renaming
-a signing key preserves ordinary rotation and renaming a recovery key preserves
-its recovery authority. Recovery-set protection still applies. Public-key
-aliases within one set remain permitted; signing/recovery overlap is rejected.
-
-First-contact pulls apply the same checks before storing a Declaration. An
-invalid first Declaration remains a WIST2-E04 pull rejection, with its specific
-Declaration validation reason in the rejection detail.
-
-Replacement admission retains the highest accepted sequence separately from
-the current Declaration. Recovery restoration cannot lower that floor; a
-well-formed re-serve of the current publisher object remains idempotent even
-below it. Declaration, floor, pending Entry and recovery-head writes share a
-SQLite transaction. Database upgrades reconstruct missing floors from the
-authenticated pinned Epoch prefix and retained current/pending admission rows;
-corrupt history rejects restoration before any floor is written. Retained
-admission rows are local accepted state, not authenticated Log inclusion.
-
-Declaration sequence consumers use the validated numeric value under WIST-1
-§§4/5.1. Integral decimal/exponent spellings and negative zero preserve
-admission floors, pending recovery-head order, capped packing, sealed metadata
-and Snapshot sealing-height lookup. Retained Envelopes remain unchanged;
-Epochs and Snapshots use JCS serialization. Signed live/restart tests cover
-mixed spellings, recovery competitors/followers and idempotent re-serves.
-This does not reconstruct missing legacy metadata or establish Snapshot
-recovery conformance; see [Declaration history replay](#declaration-history-replay).
-
-Only an accepted replacement or a valid unchanged re-serve renews the cached
-Declaration's discovery timestamp. Rejected or unavailable responses preserve
-that timestamp; after attempted discovery, an expired cache stops the pull
-with WIST1-E02 before fetching the Feed. Restart preserves the same expiry
-basis. Initial, periodic and failure-triggered Declaration requests are outside
-the content byte budget under WIST-2 §5/ADR-0031; exhausted content fetching
-still suspends the walk.
-
-A failed live `feed.json` signature triggers one Declaration re-fetch under
-WIST-2 §5. Replacement admission uses the same transaction, sequence floor and
-recovery rules as periodic discovery. The same fetched Feed is checked
-again against the resulting current keys; a remaining failure records one
-WIST2-E04 pull rejection. This includes first-contact rotation races. An invalid
-replacement cannot supply Feed authority or renew the cache.
-
-A live Delta E01/E02 binding failure triggers one authenticated Declaration
-retry per requested ID per pull, independently of Feed retries. Both authority
-checks use post-settlement admission sources and the same attempt set;
-predecessor retrieval and reinsertion cannot grant another attempt. The same
-Delta Envelope is reverified, including scope. Invalid fields and foreign
-Publisher association reject before binding checks. Invalid or unavailable
-refreshes consume the attempt; a later pull can retry the ID again.
-
-`declaration-refresh.json` supplies 30 signed transport cases consumed through
-live HTTP, including ordinary rotation, reused identifiers, absent, excluded
-and future bindings, separate Feed/Delta/predecessor attempts, unsuccessful
-responses, sealed Page sources and content-budget boundaries. Additional tests
-cover recovery, frozen sources, settlement during Payload fetching, cache expiry,
-rollback and restart. Page authority is described under
-[Page source verification](#page-source-verification); the content budget
-does not bound Declaration traffic.
-
-During recovery, a replacement may name either the current Declaration or
-the accepted recovery-chain head. Its named predecessor determines signer
-classification and recovery-key protection. Only an ordinary or recovery
-rotation naming the recovery head advances that chain. Admission rebuilds
-the head from authenticated sealed history and pending followers, preserving
-unsealed continuations after partial packing and ignoring stale head summaries.
-Pending recovery owners are verified against their retained predecessor.
-This admission head does not replace the sealed authority used to settle
-queued Deltas.
-
-Before admission, `recovery::settle` authenticates the pinned Epoch prefix and
-closes due windows. It restores the accepted recovery head, retains legitimate
-pending followers and the sequence floor, and removes pending competitors and
-their descendants. Queued Deltas are revalidated against the distinct sealed
-head. Queue, rejection, seen-ID, Publisher-URL tip, current Declaration and
-per-owner settlement-marker changes commit atomically. Markers survive reopen
-and prevent later pulls or sealing from overwriting subsequent admissions.
-Pulls that cross a deadline refresh authority before Declaration admission,
-Delta verification and final queue insertion. The entry point replays the full
-prefix on each pull; bounded replay state and crash recovery across database
-and published files remain separate requirements.
-
-Admission and Declaration history replay validate complete Envelope fields
-before sequencing, conflicts, idempotence or signer resolution (WIST1-E14).
-Checks include required and unknown members, optional nulls, safe integer
-bounds, string lengths, release-version syntax, predecessor hashes, exact
-Unicode 16 Canonical Host spelling, Publisher timestamps and canonical
-unpadded base64url. Signed fields remain unchanged. All Declaration Entries
-in a candidate Epoch receive these checks before any group installs; rejection
-preserves the complete accepted state, including due recovery settlement.
-
-Canonically encoded public bytes that do not decode to an eligible Ed25519
-point are excluded from usable signing and recovery sets. Unused excluded keys
-remain in the signed Envelope and do not prevent acceptance. Signer resolution
-checks every usable named Declaration binding; no usable binding is WIST1-E02,
-while usable bindings without a valid signature are WIST1-E01. Original entries
-still determine identifier uniqueness, disjointness, hashes and recovery-set
-protection. Shared Delta/Feed verification also rejects malformed key/signature
-encoding and excludes unusable keys. Delta verification retains all supplied
-named bindings, filters each by usability and its inclusive timestamp bound,
-then accepts if any eligible binding verifies. No eligible binding is
-WIST1-E02; eligible bindings with no valid signature are WIST1-E01. Reused
-identifiers and public keys with different bounds cannot suppress a later
-eligible binding, and signature success cannot borrow another key's bound.
-
-Recovery queue admission retains complete pre-recovery and window-owner
-Declarations, pairing each source's scope with its signing bindings. A Delta
-must name that Publisher and verify under a usable, time-eligible binding in
-a source that covers its URL host. Reused identifiers, shared public bytes and
-differing timestamp bounds cannot transfer scope between sources. Later
-followers change neither frozen admission source. Both Envelopes persist in
-SQLite across restart; live Feed authentication still uses the current
-Declaration's signing set.
-
-`declaration::verify_delta_authority` checks already-selected, authenticated
-Publisher sources. It derives time from signed `observed_at`, checks every
-eligible binding before E01/E02, and returns E03 when no verifying source
-covers the URL. URLs must already equal their protocol normalization; scope
-compares canonical hostnames independently of a nondefault HTTPS port. Original
-signed bytes remain unchanged. Admission, recovery settlement and sealing use
-this check. Settlement maps binding/scope failure to E13; sealing preserves E03
-for scope and E02 for stranded signing authority. Malformed checked fields
-retain E14 in all three paths.
-
-The signed `recovery-scope.json` probes derive sources from authenticated
-Declaration histories, exercise exact timestamp bounds and reversed source
-order, and compare reconstructed prefixes. Live tests cover crossed source
-rejection, frozen sources through reopen, scope-only E13 settlement, survivor
-publication, and ordinary scope revocation with an unchanged signing key.
-
-Every seal reconstructs Declaration state from the complete authenticated Epoch
-prefix pinned by the database head before using recovery sources. Settlement
-uses the last recovery follower sealed inside the window, before the candidate
-Epoch's Declarations. Delta sealing uses the Declaration state projected from
-the Entries actually selected under the byte cap. A superseded competitor's
-higher sequence cannot displace the restored recovery head; an unsealed
-follower cannot change settlement authority. A deadline-Epoch replacement can
-still invalidate a settlement survivor with sealing E02 or scope E03.
-
-Declaration packing considers each domain's ascending sequences and defers a
-successor when its pending predecessor does not fit. Selected Entries are then
-stored in canonical type/leaf order and validated atomically. The final
-Declaration projection is recomputed after Entry filtering. Recovery lengths
-come from the authenticated schedule at the candidate instant, and existing
-window ends remain frozen. Successful seals refresh stored recovery heads and
-frozen sources from the projected state, without synthesizing a re-served
-Declaration at settlement. A retained recovery-signed follower first sealed
-after the deadline can own a new window; later Entries use that projection.
-Sealing rejects a cadence slot before a completed admission settlement's
-deadline, preserving closure until a valid deadline slot is available.
-
-Database mutations for a seal share one transaction, including queue movement,
-status rejections, stored recovery state and the committed Epoch head. A failed
-Declaration candidate rolls those changes back. Missing or corrupt pinned
-history stops sealing before settlement. Epoch/checkpoint file publication and
-Snapshot production do not share SQLite's transaction; Snapshot production
-recovers as described under [Snapshot production](#snapshot-production), and
-crash recovery across the other stores remains a separate requirement. The history reader also rejects
-prefixes produced off the signed cadence grid by local cadence overrides.
-
-Admission's predecessor choices, accepted sequence floor and deadline
-settlement are described at the start of
-[Declaration key binding](#declaration-key-binding).
-
-Pending and recovery copies share a persistent acceptance counter. Queue
-transfers retain that order and clear pre-window inclusion turns; every pending
-copy enters recovery when its window opens, including copies excluded by either
-Epoch cap. Settlement survivors become eligible in acceptance order, with the
-per-domain capacity determining their turns from the deadline onward. Rejected
-copies release their seen IDs and rewind Publisher/URL tips to surviving
-predecessors; accepted descendants of a rejected copy receive WIST1-E07. These
-changes and status rejections commit together, allowing the same signed Deltas
-to be re-served under later eligible authority after restart.
-
-Legacy queue rowids cannot establish original acceptance order: earlier
-transfers could insert copies in leaf order and propagate that order back to
-pending entries. An upgrade with multiple outstanding Deltas for one domain
-and missing acceptance positions stops without assigning positions or deleting
-copies. Restore independently retained admission-order evidence before
-reopening; do not infer positions from queue rowids, leaf hashes or observation
-timestamps. Stores with at most one outstanding Delta per domain can upgrade
-without deciding an unknown within-domain order. For already-discarded copies,
-see [Delta index reconciliation](#delta-index-reconciliation).
-
-A recovery Declaration whose window would end after 9999-12-31T23:59:59Z
-stops sealing before publication, and history replay rejects an Epoch sealing
-one under WIST1-E08 (WIST-1 §5.2); window ends up to that instant are spelled
-by `registry::instant`, which covers the whole four-digit-year range, so every
-published window end is a Log timestamp.
-Correct sealing source selection does not establish complete recovery admission,
-Delta chains or schema validation.
-
-Opening an older store restores missing owner Envelopes atomically. An opened
-window requires complete authenticated Declaration history through the
-operator-trusted database head, with a matching opening height and original
-predecessor. A pending window requires exactly one distinct pending recovery
-Declaration that authenticates against its stored predecessor. Missing,
-ambiguous or invalid evidence stops opening; restore the original history or
-pending entries before retrying. Migration never substitutes the evolving
-chain head for the owner.
-
-The signed `recovery-bindings.json` corpus exercises complete binding checks,
-authenticated source reconstruction and owner migration. Live tests cover
-followers, database reopen, admission diagnostics, settlement rejection and
-actual survivor sealing. `recovery-admission.json` also exercises all eleven
-signed pending-Declaration cases through SQLite reopen, exact deadline
-settlement, repeated calls and candidate projection. Live tests cover new
-post-deadline admissions, retained followers opening another window, injected
-transaction failure and cadence rounding after admission closure.
-Full authenticated Delta chains, signature-failure Declaration re-fetches and
-sealed Feed key provenance remain incomplete.
-
-Delta key-time checks compare `observed_at` and `valid_from` as instants,
-including numeric UTC offsets and decimal fractions of arbitrary precision.
-For example, `10:00:00.5Z` follows `10:00:00Z`; equal instants with different
-fraction lengths or offsets satisfy the inclusive key bound. Ingest, sealing
-and recovery settlement share this comparison. Timestamp strings remain
-unchanged in signed Envelopes.
-
-Publisher timestamps use the specified Gregorian clock: seconds 00–59, year
-zero, arbitrary decimal fractions and numeric offsets, including arithmetic
-beyond the written year range. Every leap-second label rejects with WIST1-E14;
-validation needs no external leap table. Missing or malformed Delta
-`observed_at` also rejects with WIST1-E14 before shared key verification.
-Ingest compares each authenticated Delta with the validator clock plus the
-`clock_skew_seconds` allowance in force at that instant (default 600 seconds).
-The bound is inclusive, preserves every signed fractional digit, and supports
-the Registry's signed integer range, including negative allowances. Rejection
-is WIST1-E06 and leaves the Delta unseen, its chain tip unchanged, and its
-Payload unstored; it enters neither pending sealing nor a recovery queue.
-The same ID can succeed when retried after the clock advances, including
-after reopening the database.
-
-HTTP ingest and baseline polling sample the system clock separately for each
-Delta, including fetched predecessors. `ingest::run_with_clock` accepts a clock
-callback for controlled validation; its `now` argument remains a whole-second
-Log timestamp for existing accounting and governance calls. `ingest::run`
-uses that supplied instant as a fixed validation clock. Clock comparison uses
-the full sampled precision; only parameter lookup floors to whole seconds,
-because amendments take effect on that grid. Tests cover signed clock vectors,
-zero and negative sealed amendments, exact activation, recovery queues and
-restart/retry followed by sealing.
-
-Log timestamps retain their distinct whole-second profile.
-Binding and scope checks precede clock, chain and Payload checks;
-WIST-1 §7 permits any established applicable semantic diagnostic after mandatory
-field checks. Signed `publisher` determines attribution under WIST-1 §3.8.
-
-## Feed field validation
-
-Ingestion applies WIST-2 §5/ADR-0032's complete Feed Envelope field gate
-before domain comparison, signature verification or Page source replay.
-It checks required/unknown members, Canonical Host spelling, unbounded
-release components, exact Gregorian Log timestamps, unique Delta IDs and
-the 1000-entry cap, nullable `next` syntax and canonical signature fields.
-Signed values remain unchanged. Field failures receive WIST2-E01 without
-noise or a failure-triggered Declaration retry; field-valid foreign domains
-receive WIST2-E04 without retry, even with a bad signature.
-
-`feed-fields.json` supplies 134 signed probes; live HTTP tests exercise 133
-through first contact and restart, checking persisted diagnostics, noise and
-request counts. A Page field regression stops the walk before that Page's own
-Deltas, while the Deltas already fetched proceed.
-The schema gate does not establish exact Page cardinality, publication/history
-partitioning, supported-major policy or durable selected-source provenance;
-target validation is described under [Feed next targets](#feed-next-targets).
-
-## Feed next targets
-
-The walk reads `next` only after the carrying Feed or Page passed the field,
-domain, signature and live regression checks and lists an unseen Delta ID. A
-read target is fetched only when it is byte-identical to its Normalized URL
-and begins with `https://`, the requested Canonical Host and
-`/.well-known/wist/` (WIST-2 §3.2, ADR-0038); no Declaration or
-`subdomain_scope` host takes part, and the query is requested as written. A
-loopback deployment under `--allow-http` rewrites only the scheme. A failing
-target records WIST2-E01 without noise, is never requested, and stops the
-walk while the Deltas of the objects already fetched proceed to admission.
-
-`feed-next.json` drives the field and target dispositions of every case
-through the same functions the walk uses; live HTTP tests show dot-segment,
-encoded, port, scope-host and encoded-separator spellings stop the walk
-without a Page request while the live Feed's Delta is admitted, a query
-survives retrieval byte for byte, and an ingested or empty object never
-reads its `next`.
-
-## Feed rollback protection
-
-Ingestion implements WIST-2 §3.2/ADR-0033 using an atomic SQLite comparison
-and update of each host's greatest authenticated live Feed timestamp.
-WIST2-E05 stops Page and Delta work without noise. Field/domain/signature
-failures retain their earlier diagnostics and cannot change that observation.
-Equal timestamps pass; older sealed Pages do not enter this comparison.
-The observation survives restart, subsequent retrieval failures, budget
-suspension, empty Feeds and Declaration changes.
-
-`feed-regression.json` supplies 21 signed observations, consumed over HTTP
-with database reopen between observations. Additional tests cover dependent
-Page/Delta/Payload failures, budget exhaustion, storage failure, older sealed
-Pages, ordinary rotation, identity reset and concurrent per-host storage.
-Recovery tests cover admission-time and sealing-time settlement with pending
-or sealed competitors. A superseded identity's maximum timestamp survives
-restoration of the lower-sequence recovery Declaration and restart; the
-restored signer can publish and seal new Deltas using that same Feed timestamp.
-
-Existing databases have no retained Feed observations to reconstruct; protection
-starts at the first authenticated live Feed after upgrade. Backups must preserve
-this table to preserve its observations. General crash recovery and concurrent
-pull serialization remain separate requirements; a restored store is refused
-sealing and publication below the published height, as described under
-[Restored stores and published heights](#restored-stores-and-published-heights).
-
-## Page source verification
-
-Sealed Page keys come from the complete authenticated Epoch prefix pinned by
-the database head, using WIST-2 §3.2's current and first-next Declaration
-cutoffs. Accepted unsealed Declarations supply no Page authority; first-contact
-and rotation Pages can require another pull after their Declaration seals.
-The `sealed_declarations` database summary supplies no verification evidence.
-
-Declaration replay authenticates every source and excludes competitors when
-recovery settles in that prefix; admission-time settlement alone changes no
-Page source. Repeated idempotent Declaration
-Entries retain their own Epoch times; the first-next search cannot skip them
-to borrow a later rotation. Each selected source retains its complete signing
-bindings, including reused identifiers. Missing or invalid pinned history
-stops the pull before Page-derived Deltas enter admission. Trust inputs and
-unsupported history transitions follow [Authenticated history](#authenticated-history).
-
-Signed HTTP/restart tests cover unsealed-to-sealed authority, retired and reused
-keys, alias renames, multiple Declarations in one Epoch, idempotent repetitions, recovery
-supersession and forged or absent database summaries. Reconstruction runs once
-when a pull first reaches a sealed Page and retains that prefix for the walk;
-bounded replay/cache work remains unimplemented.
-
-A failed Page signature uses WIST-2 §5's shared Feed/Page Declaration retry
-if the live Feed has not consumed it. The original Page is rechecked against
-the same authenticated prefix; an accepted unsealed replacement cannot
-authorize it. Failure records WIST2-E04 even at the content-budget boundary.
-Signed transport cases distinguish shared attempts, invalid/unavailable
-responses, retired and first-next sources, unsealed and later-source
-exclusion, and independent Delta retries. A restart regression preserves the
-discovered rotation, renews the next pull's attempt and admits the unchanged
-Page only after its authorizing Declaration seals.
-
-Page cutoff comparison uses the strict Log timestamp parser, including year
-zero and the final second of year 9999. Field checks and remaining Feed/Page
-obligations are described under [Feed field validation](#feed-field-validation).
-WIST-2 §3.2 named-entry fallback is covered by
-all 16 signed `page-bindings.json` probes, including excluded entries and
-rejection of aliases or public bytes available only from a later source.
-
-## Delta predecessor admission
-
-Ingest requires each Delta naming the accepted Publisher/URL tip to have a
-strictly later signed `observed_at`, using the exact Publisher timestamp
-comparison in WIST-1 §3.4. Equal instants, including equivalent offsets and
-trailing fractional zeros, reject with WIST1-E07. Rejection leaves the ID
-unseen, the tip unchanged and the Payload unstored; neither queue receives it.
-
-An unseen predecessor is fetched into the same admission loop before its
-links are followed. Each fetched Envelope receives its own validation and
-rejection disposition, even when an older predecessor is unavailable or its
-chain cannot join the requesting Delta's Publisher/URL tip. Valid predecessors
-enter their own chains before descendants. An unavailable predecessor rejects
-otherwise eligible fetched dependents with WIST1-E07; content-budget exhaustion
-suspends the pull without concluding unavailability. Fetched Envelopes are reused within that
-attempt; later pulls can retrieve rejected or suspended chains again.
-
-The predecessor Envelope comes from retained pending/recovery admissions or
-the [historical Delta source](#historical-delta-sources) pinned to the database
-head. Lookup checks its Delta ID; comparison also checks Publisher and URL ownership.
-Materialized record timestamps supply no comparison authority. Unsealed
-Envelopes remain trusted local admission state. Missing accepted evidence or
-invalid retained history stops the pull before accepting the dependent Delta
-or fetching its Payload. This storage failure does not reject the candidate;
-repairing the history permits a later attempt. Historical source bindings
-preserve the predecessor's authority across later Declaration changes.
-
-`declaration::verify_delta_predecessor` checks current Publisher/timestamp
-fields, predecessor ID and ownership, and strict observation ordering. Callers
-must separately establish both Envelopes' eligibility and predecessor
-acceptance; this helper does not verify signatures, retrieve Deltas, establish
-Log positions or select the canonical chain tip.
-
-Signed `declaration-fields.json` relation cases and live tests cover exact
-fractions, offset equality, both queues, restart, sealed evidence despite altered
-materialized timestamps, fetched predecessors, missing older links, independent
-URL chains, budget suspension/resumption and corrupt history. Signed-Epoch
-regressions cover invalid ancestor/target signatures, missing ancestors, later
-unrelated Delta failures, restart, repair/retry and retired-key authority.
-Lookup scans retained domain admissions and, when needed, the full pinned Epoch prefix for
-each predecessor; bounded lookup and complete authenticated Delta replay remain
-separate requirements.
-
-## Delta index reconciliation
-
-Opening a store without a completed reconciliation marker rebuilds seen IDs
-and Publisher/URL tips from its complete authenticated Epoch prefix and retained
-pending/recovery admissions. This removes orphaned IDs left by discarded copies
-and restores pairs overwritten by the former URL-only table. The Anchor and
-database head are operator-trusted inputs, as in [Authenticated history](#authenticated-history).
-
-Every retained Envelope passes the field and version checks in
-[Delta field validation](#delta-field-validation). A `new` or `update`
-without a `payload` commitment stops restoration with WIST1-E09;
-an `update`, `delete` or `attest` without `prev` stops it with WIST1-E07.
-Field/version checks run first. Sealed sources come from Declaration replay
-at each Epoch. Sealed size and clock checks follow
-[Delta size-cap profiles](#delta-size-cap-profiles) and
-[Delta clock eligibility](#delta-clock-eligibility). Restoration checks Delta
-signing bindings, key-time bounds and scope, then follows predecessor links
-within that Epoch. Retained unsealed copies follow persistent acceptance
-positions across both queues; their Envelopes remain trusted local admission
-state, without Log authentication or renewed authority, clock or Payload
-checks. They must agree with their stored ownership, ID and URL and extend
-their pair's tip.
-
-Every successor, sealed or unsealed, must have a strictly later signed
-`observed_at` than its predecessor under WIST-1 §3.4's exact comparison.
-Equal instants and decreasing times stop restoration with WIST1-E07.
-The predecessor time follows its Publisher/URL chain through Declaration
-changes and identity resets; materialized record timestamps supply no authority.
-
-Missing or corrupt history, unsupported versions/key transitions, invalid
-sealed authority, duplicate IDs, forks, disconnected chains or invalid
-acceptance positions stop restoration. Restore missing original Envelopes or
-independently retained acceptance-order evidence and reconcile invalid retained
-copies before retrying. No order is inferred from leaf hashes or timestamps.
-Original Envelopes lacking the signed `publisher` cannot be translated during
-restoration; their attribution requires separate resolution.
-
-Index replacement and its completion marker commit under one SQLite write
-transaction after the pinned prefix validates. Failure preserves both indexes;
-retry repeats restoration. Subsequent opens skip this completed repair. Queues,
-Payloads and rejection history are preserved. The repair retains all seen IDs
-in memory plus each tip's signed observation time. It does not establish
-complete Delta eligibility, governance replay, general legacy-state revalidation
-or crash-safe publication. Historical size-cap selection follows
-[Delta size-cap profiles](#delta-size-cap-profiles).
-
-Signed restart tests cover chain and ownership restoration, preserved versioned
-Envelopes across all three stores, field/version diagnostic precedence,
-exact predecessor times, shared-URL identity resets, corrupt history, invalid
-authority and atomic failure. Signed `delta-fields.json` missing-content and
-missing-predecessor cases exercise all three stores, retry and Envelope
-preservation; additional chains distinguish contentless successors from
-invalid content-bearing entries. The signed `declaration-fields.json` predecessor
-cases exercise same-Epoch chains, successive Epochs, sealed-to-queue transitions
-and both queue orders.
 
 ## Parameter schedules and Epoch sizes
 
@@ -1678,72 +801,13 @@ state and effects private until the complete pinned prefix validates.
 Each domain retains its current Declaration, highest accepted sequence,
 first-sealing position and latest fresh-identity reset position. An open
 recovery window also retains its owner, original predecessor, current recovery
-head and off-chain competitors. Its deadline uses the owner Epoch’s signed
-parameter schedule and exact 128-bit arithmetic, surviving later amendments
-and recovery followers. Settlement restores the recovery head without lowering
-the sequence floor or resetting identity. Returned installation and settlement
-effects identify resets, window openings and superseded competitors. They do
-not apply database or queue changes.
+head and off-chain competitors. Snapshot `declaration` and `recovery_window`
+tuples are built from this state (WIST-3 §7).
 
-`Declarations::project(sealed_at, recovery_window_days, entries)` evaluates
-one proposed next Epoch without changing the accepted prefix. Pass its complete
-Entries in canonical storage order after packing, and the recovery-window
-parameter from the authenticated schedule in force at that proposed instant.
-The method validates the parameter's value, timestamp profile and forward
-ordering, Entry wrappers/order, and Declaration fields, authors and acceptance.
-It does not authenticate the supplied parameter profile, check the cadence or
-Epoch size, or validate other Entry bodies. A successful projection is therefore
-conditional on those checks. Recompute it if the timestamp, profile or selected
-Entries change.
-
-Snapshot `declaration` and `recovery_window` tuples are built from this
-projection at each seal (WIST-3 §7, ADR-0040): the current Envelope, its
-sealing height and the highest accepted `seq`; and, for an open window, the
-owner height, the window end, the recovery-chain head Envelope and its
-sealing height, so a resuming Consumer verifies followers against the head
-and keeps the floor a restored lower-sequence head leaves above the current
-`seq`. The live recovery test checks both tuples after a recovery rotation.
-
-The returned `Projection` exposes proposed domain state and effects, without
-an accepted head or a way to install it as authenticated history. Its Declaration
-positions, sealing times, identity resets and window openings are prospective.
-Only `apply(VerifiedEpoch)` advances replay, using the same transition logic.
-Projection failure exposes no state or settlement effects. An unsealed follower
-cannot change the accepted recovery head, sequence floor or future settlement.
-
-`Domain::delta_admission_sources()` returns the frozen predecessor and owner
-while that state's window is open, otherwise its current Declaration.
-`delta_sealing_source()` returns no source during an open window, because its
-Deltas must queue. At a deadline, `Projection::effects().settlements` retains
-the sealed recovery head used to revalidate existing queued copies before any
-candidate Declaration applies. The projected domain's sources reflect all
-candidate replacements afterward. A deadline-Epoch replacement can therefore
-change sealing authority without changing the queue's settlement authority.
-These accessors describe the supplied prefix or projection; they do not refresh
-live admission state, settle SQLite queues, or perform Delta eligibility checks.
-
-Signed recovery probes exercise candidate rejection, retained sequence floors,
-unsealed follower isolation, deadline boundaries, distinct settlement/sealing
-scope and restart reconstruction. Live sealing consumes these projections
-after packing and filtering. Live admission still requires integration with
-durable queue, status and chain-tip updates, including preservation of
-acceptance order across queues.
-
-This API validates Declaration fields, sequencing and author authentication.
-Deltas and non-parameter Registry Updates receive no eligibility checks here.
-SQLite uses this state to restore missing owners of legacy opened recovery
-windows. Live sealing reconstructs and projects this state for source selection;
-general admission and database reconstruction still use separate state.
-`verify-history` retains its Epoch/parameter verification scope. Snapshot
-recovery state also requires the protocol’s unresolved Snapshot representation
-rules. Successful reconstruction is not full protocol conformance.
-
-Replay retains all domains’ current state and open-window competitors in memory;
-atomic application stages a copy of the domain map while sharing immutable
-Declaration Envelopes. It does not provide bounded-cache or Snapshot resume
-behavior. Tests consume signed recovery ownership, predecessor, conflict,
-identity and settlement histories, including corrupted or missing
-history and signed recovery-parameter transitions.
+History verification runs core's sealing replay over every Epoch beside the
+Epoch checks, with the Label-sealed-once check before each Epoch, so the
+latest Catalogs, records, removals, withdrawals and Payload duties of a
+verified prefix are the replay's.
 
 ## Build & test
 
@@ -1758,7 +822,7 @@ resolves `wist-core` from `../core` — both must be sibling checkouts.
 
 The ingestion fault cases — a worker lost with its pull leased, a
 partition taken over while its pull runs, and a Ping, a seal or a
-recovery settlement landing while a Delta is in flight — are
+recovery settlement landing while a Collection is pulled — are
 `crates/clave/tests/ingestion_faults.rs`, a test binary of its own:
 Cargo runs test binaries one at a time, so their load never runs beside
 the timing-sensitive dispatch tests in `tests/serve.rs`.
@@ -1815,4 +879,5 @@ Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
 
 Protocol definitions live in the sibling [spec repo](../spec) — WIST-3
 (logbook & distribution: the tree, tiles, checkpoints, snapshots) is
-what Clave implements, on top of the WIST-1 deltas it ingests.
+what Clave implements, on top of the WIST-1 Declarations, Catalogs and Items
+and the WIST-2 publication it pulls.

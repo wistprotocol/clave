@@ -1,4 +1,4 @@
-use crate::db::{Db, EpochRow, WithdrawalState};
+use crate::db::{Db, EpochRow};
 use crate::error::{Error, Result};
 use crate::history::declarations::{Declarations, DeclarationsReplay};
 use crate::WIST_VERSION;
@@ -6,29 +6,23 @@ use rusqlite::Connection;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use wist_core::crypto::{hex_encode, SigningKey};
 use wist_core::envelope::sign_envelope;
 use wist_core::label::{self, LabelerRow, SealedLabelCount};
-use wist_core::materialization::ContentTuple;
+use wist_core::materialization::{self, ContentTuple, LinkRow};
 use wist_core::objects::{
-    AggregatorKeyEntry, DeclarationEntry, DisputeEntry, LabelEntry, ParameterEntry,
+    AggregatorKeyEntry, DeclarationEntry, DisputeEntry, LabelEntry, ParameterEntry, Payload,
     PendingDeclarationEntry, RecoveryWindowEntry, SnapshotFile, SnapshotIndex, SnapshotIndexEntry,
     SnapshotManifest, SnapshotState, SnapshotStateFile, StateEntry, SuffixListEntry,
-    WithdrawalEntry,
 };
-use wist_core::snapshot::{content_digest, state_digest};
+use wist_core::sealing::Records;
+use wist_core::snapshot::{content_digest, shard_of, shard_path, state_digest, TIER_FILES};
+use wist_core::withdrawal::WithdrawalReplay;
 
 pub const SHARD_CACHE_DIRECTORY: &str = "snapshot-shards";
 const FINGERPRINT: &str = "fingerprint.json";
-const TIER_FILES: [(&str, u8); 6] = [
-    ("tier0/index.sqlite", 0),
-    ("tier1/extracts.parquet", 1),
-    ("tier1/links.parquet", 1),
-    ("tier1/labels.parquet", 1),
-    ("tier1/disputes.parquet", 1),
-    ("tier1/labelers.parquet", 1),
-];
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct CachedFile {
@@ -38,11 +32,13 @@ struct CachedFile {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Fingerprint {
     shard_count: u64,
     shard: u64,
     epoch_number: u64,
     record_digest: String,
+    tier_digest: String,
     label_digest: String,
     files: Vec<CachedFile>,
 }
@@ -57,137 +53,111 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex_encode(&Sha256::digest(bytes))
 }
 
-/// WIST-3 §7: shard assignment is the first 8 octets of SHA-256 of the
-/// UTF-8 Publisher domain, read big-endian, mod count.
-pub fn shard_index(domain: &str, count: u64) -> u64 {
-    let digest = Sha256::digest(domain.as_bytes());
-    let prefix: [u8; 8] = digest[..8].try_into().expect("SHA-256 has 32 octets");
-    u64::from_be_bytes(prefix) % count
+fn shard_count_of(count: u64) -> NonZeroU64 {
+    NonZeroU64::new(count).unwrap_or(NonZeroU64::MIN)
 }
 
-pub(crate) struct SnapshotRecord {
-    pub url: String,
-    pub publisher: String,
-    pub item_id: String,
-    pub observed_at: String,
-    pub attested_at: String,
-    pub title: String,
-    pub abstract_text: Option<String>,
-    pub lang: String,
+#[derive(Debug, Clone, PartialEq)]
+pub struct Materialized {
+    pub tuple: ContentTuple,
+    pub collection: String,
+    pub item: Value,
 }
 
-struct Tier1Row {
-    url: String,
-    publisher: String,
-    item_id: String,
-    extract: String,
-    links: Vec<String>,
+#[derive(Debug, Clone)]
+pub struct TierRecord {
+    pub tuple: ContentTuple,
+    pub collection: String,
+    pub lang: Option<String>,
+    pub payload: Payload,
+}
+
+/// WIST-3 §7, Materialization rule.
+pub fn materialize(
+    entries: &[StateEntry],
+    self_declared: impl Fn(&str) -> bool,
+) -> Result<Vec<Materialized>> {
+    let records = Records::from_state(entries)?;
+    let withdrawals = WithdrawalReplay::from_state(entries)?;
+    let tuples = materialization::materialized(records.records(), self_declared, |item_id| {
+        withdrawals.is_withdrawn(item_id)
+    })?;
+    tuples
+        .into_iter()
+        .map(|tuple| {
+            let record = records
+                .record(&tuple.publisher, &tuple.url)
+                .ok_or_else(|| Error::Snapshot(format!("{} has no record", tuple.url)))?;
+            Ok(Materialized {
+                collection: record.collection.clone(),
+                item: record.item.clone(),
+                tuple,
+            })
+        })
+        .collect()
+}
+
+/// WIST-3 §7: no content whose commitment the build did not verify.
+pub fn tier_record(record: &Materialized, octets: &[u8]) -> Result<TierRecord> {
+    let unverified = |why: &str| {
+        Error::Snapshot(format!(
+            "the Payload of live record {} {why}",
+            record.tuple.item_id
+        ))
+    };
+    let value: Value = crate::json::parse(octets).map_err(|_| unverified("does not parse"))?;
+    let payload: Payload =
+        serde_json::from_value(value.clone()).map_err(|_| unverified("is not a Payload"))?;
+    let content_octets = wist_core::jcs::canonicalize(&value["content"])?.len() as u64;
+    let commitment = wist_core::item::commitment(&payload.salt, &value["content"])?;
+    if record.item["payload"]["bytes"].as_u64() != Some(content_octets)
+        || record.item["payload"]["commitment"] != commitment.as_str()
+    {
+        return Err(unverified("does not reproduce its Item's commitment"));
+    }
+    Ok(TierRecord {
+        tuple: record.tuple.clone(),
+        collection: record.collection.clone(),
+        lang: record.item["meta"]["lang"].as_str().map(str::to_owned),
+        payload,
+    })
+}
+
+/// WIST-3 §7, Materialization rule.
+pub fn link_rows(records: &[&TierRecord]) -> Vec<LinkRow> {
+    records
+        .iter()
+        .flat_map(|record| materialization::links(&record.tuple.url, &record.payload))
+        .collect()
 }
 
 /// WIST-3 §7: a party missing a Payload that was never withdrawn reports
 /// that rather than emit a Snapshot silently missing a record.
-fn load_tier1_rows(
+fn load_tier_records(
     data_dir: &Path,
-    records: &[&SnapshotRecord],
+    records: &[&Materialized],
     cost: &mut Cost,
-) -> Result<Vec<Tier1Row>> {
-    let mut rows = Vec::with_capacity(records.len());
-    for r in records {
-        let hex = r.item_id.strip_prefix("sha256:").unwrap_or(&r.item_id);
-        let bytes = std::fs::read(data_dir.join("payloads").join(format!("{hex}.json"))).map_err(
-            |error| {
-                Error::Snapshot(format!(
-                    "the Payload of live record {} cannot be read: {error}",
-                    r.item_id
-                ))
-            },
-        )?;
-        cost.payloads_read += 1;
-        cost.payload_bytes_read += bytes.len() as u64;
-        let payload: Value = crate::json::parse(&bytes).map_err(|error| {
+) -> Result<Vec<TierRecord>> {
+    let mut loaded = Vec::with_capacity(records.len());
+    for record in records {
+        let item_id = &record.tuple.item_id;
+        let served = crate::db::served_payload_path(data_dir, item_id)?;
+        let octets = match std::fs::read(&served) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::read(crate::db::held_payload_path(data_dir, item_id)?)
+            }
+            read => read,
+        }
+        .map_err(|error| {
             Error::Snapshot(format!(
-                "the Payload of live record {} does not parse: {error}",
-                r.item_id
+                "the Payload of live record {item_id} cannot be read: {error}"
             ))
         })?;
-        let extract = payload["content"]["extract"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
-        let links = payload["content"]["links"]["urls"]
-            .as_array()
-            .map(|urls| {
-                urls.iter()
-                    .filter_map(|u| u.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
-        rows.push(Tier1Row {
-            url: r.url.clone(),
-            publisher: r.publisher.clone(),
-            item_id: r.item_id.clone(),
-            extract,
-            links,
-        });
+        cost.payloads_read += 1;
+        cost.payload_bytes_read += octets.len() as u64;
+        loaded.push(tier_record(record, &octets)?);
     }
-    Ok(rows)
-}
-
-fn write_parquet_strings(
-    path: &Path,
-    message_type: &str,
-    columns: &[Vec<Vec<u8>>],
-    int_column: Option<&[i64]>,
-) -> Result<Vec<u8>> {
-    use parquet::data_type::{ByteArray, ByteArrayType, Int64Type};
-    use parquet::file::properties::WriterProperties;
-    use parquet::file::writer::SerializedFileWriter;
-    use parquet::schema::parser::parse_message_type;
-    use std::sync::Arc;
-
-    let schema = Arc::new(
-        parse_message_type(message_type)
-            .map_err(|e| Error::Snapshot(format!("parquet schema: {e}")))?,
-    );
-    let file = std::fs::File::create(path)?;
-    let mut writer =
-        SerializedFileWriter::new(file, schema, Arc::new(WriterProperties::builder().build()))
-            .map_err(|e| Error::Snapshot(format!("parquet writer: {e}")))?;
-    let mut rg = writer
-        .next_row_group()
-        .map_err(|e| Error::Snapshot(format!("parquet row group: {e}")))?;
-    for column in columns {
-        let mut col = rg
-            .next_column()
-            .map_err(|e| Error::Snapshot(format!("parquet column: {e}")))?
-            .ok_or_else(|| Error::Snapshot("parquet schema/column mismatch".into()))?;
-        let values: Vec<ByteArray> = column
-            .iter()
-            .map(|v| ByteArray::from(v.as_slice()))
-            .collect();
-        col.typed::<ByteArrayType>()
-            .write_batch(&values, None, None)
-            .map_err(|e| Error::Snapshot(format!("parquet write: {e}")))?;
-        col.close()
-            .map_err(|e| Error::Snapshot(format!("parquet close: {e}")))?;
-    }
-    if let Some(ints) = int_column {
-        let mut col = rg
-            .next_column()
-            .map_err(|e| Error::Snapshot(format!("parquet column: {e}")))?
-            .ok_or_else(|| Error::Snapshot("parquet schema/column mismatch".into()))?;
-        col.typed::<Int64Type>()
-            .write_batch(ints, None, None)
-            .map_err(|e| Error::Snapshot(format!("parquet write: {e}")))?;
-        col.close()
-            .map_err(|e| Error::Snapshot(format!("parquet close: {e}")))?;
-    }
-    rg.close()
-        .map_err(|e| Error::Snapshot(format!("parquet close: {e}")))?;
-    writer
-        .close()
-        .map_err(|e| Error::Snapshot(format!("parquet close: {e}")))?;
-    Ok(std::fs::read(path)?)
+    Ok(loaded)
 }
 
 enum Column {
@@ -364,56 +334,35 @@ fn label_state(
     Ok((labels, disputes, labelers))
 }
 
-fn build_tier1(dir: &Path, rows: &[Tier1Row]) -> Result<(Vec<u8>, Vec<u8>)> {
+/// WIST-3 §7, Tier layout.
+fn build_tier1(dir: &Path, records: &[&TierRecord]) -> Result<(Vec<u8>, Vec<u8>)> {
     std::fs::create_dir_all(dir)?;
-    let extracts_bytes = write_parquet_strings(
+    let extracts_bytes = write_parquet_table(
         &dir.join("extracts.parquet"),
-        "message extracts { required binary url (UTF8); required binary publisher (UTF8); required binary delta_id (UTF8); required binary extract (UTF8); }",
+        "message extracts { required binary url (UTF8); required binary publisher (UTF8); required binary item_id (UTF8); required binary extract (UTF8); required binary collection (UTF8); }",
         &[
-            rows.iter().map(|r| r.url.clone().into_bytes()).collect(),
-            rows.iter()
-                .map(|r| r.publisher.clone().into_bytes())
-                .collect(),
-            rows.iter()
-                .map(|r| r.item_id.clone().into_bytes())
-                .collect(),
-            rows.iter()
-                .map(|r| r.extract.clone().into_bytes())
-                .collect(),
+            text(records.iter().map(|r| r.tuple.url.clone())),
+            text(records.iter().map(|r| r.tuple.publisher.clone())),
+            text(records.iter().map(|r| r.tuple.item_id.clone())),
+            text(records.iter().map(|r| r.payload.content.extract.clone())),
+            text(records.iter().map(|r| r.collection.clone())),
         ],
-        None,
     )?;
-
-    let mut sources = Vec::new();
-    let mut targets = Vec::new();
-    let mut positions = Vec::new();
-    for r in rows {
-        for (i, target) in r.links.iter().enumerate() {
-            sources.push(r.url.clone().into_bytes());
-            targets.push(target.clone().into_bytes());
-            positions.push(i as i64);
-        }
-    }
-    let links_bytes = write_parquet_strings(
+    let links = link_rows(records);
+    let links_bytes = write_parquet_table(
         &dir.join("links.parquet"),
         "message links { required binary source_url (UTF8); required binary target_url (UTF8); required int64 position; }",
-        &[sources, targets],
-        Some(&positions),
+        &[
+            text(links.iter().map(|row| row.source_url.clone())),
+            text(links.iter().map(|row| row.target_url.clone())),
+            Column::Int(links.iter().map(|row| row.position as i64).collect()),
+        ],
     )?;
     Ok((extracts_bytes, links_bytes))
 }
 
-fn content_tuple(r: &SnapshotRecord) -> ContentTuple {
-    ContentTuple {
-        url: r.url.clone(),
-        publisher: r.publisher.clone(),
-        item_id: r.item_id.clone(),
-        observed_at: r.observed_at.clone(),
-        attested_at: r.attested_at.clone(),
-    }
-}
-
-fn build_tier0(dir: &Path, records: &[&SnapshotRecord]) -> Result<Vec<u8>> {
+/// WIST-3 §7, Tier layout.
+fn build_tier0(dir: &Path, records: &[&TierRecord]) -> Result<Vec<u8>> {
     std::fs::create_dir_all(dir)?;
     let sqlite_path = dir.join("index.sqlite");
     if sqlite_path.exists() {
@@ -421,13 +370,24 @@ fn build_tier0(dir: &Path, records: &[&SnapshotRecord]) -> Result<Vec<u8>> {
     }
     let conn = Connection::open(&sqlite_path)?;
     conn.execute_batch(
-        "CREATE TABLE records(url TEXT, publisher TEXT, delta_id TEXT, observed_at TEXT, title TEXT, abstract TEXT, lang TEXT);
+        "CREATE TABLE records(url TEXT, publisher TEXT, item_id TEXT, observed_at TEXT, attested_at TEXT, title TEXT, abstract TEXT, lang TEXT, collection TEXT);
          CREATE VIRTUAL TABLE records_fts USING fts5(title, abstract, content=records, content_rowid=rowid);",
     )?;
     for r in records {
+        let summary = &r.payload.content.summary;
         conn.execute(
-            "INSERT INTO records(url, publisher, delta_id, observed_at, title, abstract, lang) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            (&r.url, &r.publisher, &r.item_id, &r.observed_at, &r.title, &r.abstract_text, &r.lang),
+            "INSERT INTO records(url, publisher, item_id, observed_at, attested_at, title, abstract, lang, collection) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                r.tuple.url,
+                r.tuple.publisher,
+                r.tuple.item_id,
+                r.tuple.observed_at,
+                r.tuple.attested_at,
+                summary.title,
+                summary.r#abstract,
+                r.lang,
+                r.collection,
+            ],
         )?;
     }
     conn.execute("INSERT INTO records_fts(records_fts) VALUES('rebuild')", [])?;
@@ -435,11 +395,47 @@ fn build_tier0(dir: &Path, records: &[&SnapshotRecord]) -> Result<Vec<u8>> {
     Ok(std::fs::read(&sqlite_path)?)
 }
 
+pub fn write_tier_files(
+    base: &Path,
+    records: &[&TierRecord],
+    labels: &[LabelEntry],
+    disputes: &[DisputeEntry],
+    labelers: &[LabelerRow],
+) -> Result<Vec<Vec<u8>>> {
+    let sqlite_bytes = build_tier0(&base.join("tier0"), records)?;
+    let (extracts_bytes, links_bytes) = build_tier1(&base.join("tier1"), records)?;
+    let tables = build_label_tables(&base.join("tier1"), labels, disputes, labelers)?;
+    Ok(vec![
+        sqlite_bytes,
+        extracts_bytes,
+        links_bytes,
+        tables.labels,
+        tables.disputes,
+        tables.labelers,
+    ])
+}
+
+/// WIST-3 §7, Sharding.
+pub fn file_layout(count: u64) -> Vec<(String, u8, Option<u64>)> {
+    let sharded = count > 1;
+    (0..count.max(1))
+        .flat_map(|shard| {
+            TIER_FILES.iter().map(move |(path, tier)| {
+                if sharded {
+                    (shard_path(shard, path), *tier, Some(shard))
+                } else {
+                    ((*path).to_owned(), *tier, None)
+                }
+            })
+        })
+        .collect()
+}
+
 struct ReadState {
     head: EpochRow,
     signer: (String, SigningKey),
-    records: Vec<SnapshotRecord>,
-    withdrawals: Vec<WithdrawalState>,
+    log_entries: Vec<StateEntry>,
+    records: Vec<Materialized>,
     parameters: Vec<(String, i64, String)>,
     suffix_list: Option<(String, u64)>,
     labels: Vec<LabelEntry>,
@@ -451,8 +447,6 @@ struct ReadState {
 }
 
 fn read_state(db: &Db, data_dir: &Path, head: EpochRow) -> Result<ReadState> {
-    let withdrawals = db.withdrawal_state()?;
-    let records = prefer_one_publisher(db, Vec::new())?;
     let (labels, disputes, labelers) = label_state(db, &head.sealed_at)?;
     let mut key_entries = db.aggregator_key_entries()?;
     if key_entries.is_empty() {
@@ -466,8 +460,13 @@ fn read_state(db: &Db, data_dir: &Path, head: EpochRow) -> Result<ReadState> {
             removing_act: None,
         });
     }
+    let declarations = Declarations::reconstruct(db, data_dir, Some(head.clone()))?;
+    let log_entries = db.log_state_entries()?;
+    let domains = declarations.domains();
+    let records = materialize(&log_entries, |host| domains.contains_key(host))?;
     Ok(ReadState {
         signer: crate::keys::head_signer(data_dir, db)?,
+        log_entries,
         records,
         parameters: db.parameter_state(&head.sealed_at)?,
         suffix_list: db.suffix_list_at_epoch(head.epoch_number)?,
@@ -476,15 +475,14 @@ fn read_state(db: &Db, data_dir: &Path, head: EpochRow) -> Result<ReadState> {
         labelers,
         key_entries,
         shard_count: db.param("snapshot_shard_count").unwrap_or(1).max(1) as u64,
-        declarations: Declarations::reconstruct(db, data_dir, Some(head.clone()))?,
-        withdrawals,
+        declarations,
         head,
     })
 }
 
 fn build_state(read: &ReadState) -> Result<(SnapshotState, String)> {
     let domains = read.declarations.domains();
-    let mut entries = Vec::with_capacity(2 + domains.len() + read.records.len());
+    let mut entries = Vec::with_capacity(2 + domains.len() + read.log_entries.len());
     // WIST-3 §7: one `aggregator_key` tuple per admitted key, removed keys
     // included, so a resuming Consumer judges a Checkpoint at or below the
     // Snapshot under the keys valid at its height (§3.4).
@@ -545,13 +543,7 @@ fn build_state(read: &ReadState) -> Result<(SnapshotState, String)> {
             head_height: window.head().position().epoch_number,
         }));
     }
-    for (item_id, publisher, sealing_height) in &read.withdrawals {
-        entries.push(StateEntry::Withdrawal(WithdrawalEntry {
-            item_id: item_id.clone(),
-            publisher: publisher.clone(),
-            sealing_height: *sealing_height,
-        }));
-    }
+    entries.extend(read.log_entries.iter().cloned());
 
     let entry_values = entries
         .iter()
@@ -666,12 +658,20 @@ fn plan_served(data_dir: &Path, now: jiff::Timestamp) -> Result<ServedPlan> {
         }
         kept.push(manifest);
     }
-    kept.sort_by(|a, b| {
+    Ok(ServedPlan {
+        entries: index_entries(kept),
+        removals,
+    })
+}
+
+/// WIST-3 §6.
+pub fn index_entries(mut manifests: Vec<SnapshotManifest>) -> Vec<SnapshotIndexEntry> {
+    manifests.sort_by(|a, b| {
         b.snapshot_date
             .cmp(&a.snapshot_date)
             .then(b.epoch_number.cmp(&a.epoch_number))
     });
-    let entries = kept
+    manifests
         .into_iter()
         .map(|manifest| SnapshotIndexEntry {
             manifest_url: format!(
@@ -683,8 +683,7 @@ fn plan_served(data_dir: &Path, now: jiff::Timestamp) -> Result<ServedPlan> {
             tree_size: manifest.tree_size,
             content_digest: manifest.content_digest,
         })
-        .collect();
-    Ok(ServedPlan { entries, removals })
+        .collect()
 }
 
 fn remove_unlisted(data_dir: &Path, removals: &[PathBuf]) -> Result<()> {
@@ -914,50 +913,14 @@ pub fn resign_unsealed(db: &Db, data_dir: &Path) -> Result<Vec<String>> {
     Ok(rewritten)
 }
 
-/// WIST-3 §7, one URL, one Publisher: a self-declared host's own record,
-/// else the nearest ancestor Publisher's, else the least non-ancestor
-/// domain in ascending octet order; the other records are excluded.
-fn prefer_one_publisher(db: &Db, records: Vec<SnapshotRecord>) -> Result<Vec<SnapshotRecord>> {
-    let mut by_url: std::collections::HashMap<&str, Vec<usize>> = std::collections::HashMap::new();
-    for (index, record) in records.iter().enumerate() {
-        by_url.entry(record.url.as_str()).or_default().push(index);
-    }
-    let mut declared: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
-    let mut keep = vec![true; records.len()];
-    for (url, indices) in by_url {
-        let host = crate::declaration::url_host(url);
-        let own = indices
-            .iter()
-            .copied()
-            .find(|index| records[*index].publisher == host);
-        if indices.len() == 1 && own.is_some() {
-            continue;
-        }
-        let self_declared = own.is_some()
-            || match declared.get(host) {
-                Some(known) => *known,
-                None => {
-                    let sealed = !db.sealed_declarations(host)?.is_empty();
-                    declared.insert(host.to_owned(), sealed);
-                    sealed
-                }
-            };
-        let preferred = wist_core::materialization::preferred(
-            host,
-            self_declared,
-            indices
-                .iter()
-                .map(|index| (records[*index].publisher.as_str(), false)),
-        );
-        for index in indices {
-            keep[index] = preferred == Some(records[index].publisher.as_str());
-        }
-    }
-    Ok(records
-        .into_iter()
-        .zip(keep)
-        .filter_map(|(record, kept)| kept.then_some(record))
-        .collect())
+fn tier_digest(records: &[&Materialized]) -> Result<String> {
+    let rows: Vec<Value> = records
+        .iter()
+        .map(|record| serde_json::json!([record.tuple, record.collection]))
+        .collect();
+    Ok(sha256_hex(&wist_core::jcs::canonicalize(&Value::Array(
+        rows,
+    ))?))
 }
 
 fn label_digest(
@@ -1010,6 +973,7 @@ fn reusable(entry: &Path, wanted: &Fingerprint) -> Option<Vec<CachedFile>> {
     let matches = cached.shard_count == wanted.shard_count
         && cached.shard == wanted.shard
         && cached.record_digest == wanted.record_digest
+        && cached.tier_digest == wanted.tier_digest
         && cached.label_digest == wanted.label_digest
         && cached.files.len() == TIER_FILES.len()
         && cached
@@ -1075,11 +1039,12 @@ fn build_staged(
     let (key_id, sk) = (&read.signer.0, &read.signer.1);
     let shard_count = read.shard_count;
     let sharded = shard_count > 1;
-    let mut partitions: Vec<Vec<&SnapshotRecord>> = (0..shard_count).map(|_| Vec::new()).collect();
+    let count = shard_count_of(shard_count);
+    let mut partitions: Vec<Vec<&Materialized>> = (0..shard_count).map(|_| Vec::new()).collect();
     let mut whole_projection = Vec::with_capacity(read.records.len());
-    for r in &read.records {
-        whole_projection.push(content_tuple(r));
-        partitions[shard_index(&r.publisher, shard_count) as usize].push(r);
+    for record in &read.records {
+        whole_projection.push(record.tuple.clone());
+        partitions[shard_of(&record.tuple.publisher, count) as usize].push(record);
     }
     let content_digest_value = content_digest(&whole_projection)?;
 
@@ -1094,7 +1059,7 @@ fn build_staged(
             (String::new(), None)
         };
         let shard_base = shard_base(staged, shard_count, shard);
-        let in_shard = |domain: &str| !sharded || shard_index(domain, shard_count) == shard;
+        let in_shard = |domain: &str| !sharded || shard_of(domain, count) == shard;
         let shard_labels: Vec<LabelEntry> = read
             .labels
             .iter()
@@ -1113,13 +1078,13 @@ fn build_staged(
             .filter(|r| in_shard(&r.labeler))
             .cloned()
             .collect();
-        let projection: Vec<ContentTuple> =
-            shard_records.iter().map(|r| content_tuple(r)).collect();
+        let projection: Vec<ContentTuple> = shard_records.iter().map(|r| r.tuple.clone()).collect();
         let mut fingerprint = Fingerprint {
             shard_count,
             shard,
             epoch_number: read.head.epoch_number,
             record_digest: content_digest(&projection)?,
+            tier_digest: tier_digest(&shard_records)?,
             label_digest: label_digest(&shard_labels, &shard_disputes, &shard_labelers)?,
             files: Vec::new(),
         };
@@ -1145,27 +1110,17 @@ fn build_staged(
         if let Some(cached) = cached {
             fingerprint.files = cached;
         } else {
-            let sqlite_bytes = build_tier0(&shard_base.join("tier0"), &shard_records)?;
-            let tier1_rows = load_tier1_rows(data_dir, &shard_records, cost)?;
-            let (extracts_bytes, links_bytes) =
-                build_tier1(&shard_base.join("tier1"), &tier1_rows)?;
-            let tables = build_label_tables(
-                &shard_base.join("tier1"),
+            let loaded = load_tier_records(data_dir, &shard_records, cost)?;
+            let written = write_tier_files(
+                &shard_base,
+                &loaded.iter().collect::<Vec<_>>(),
                 &shard_labels,
                 &shard_disputes,
                 &shard_labelers,
             )?;
-            let written = [
-                &sqlite_bytes,
-                &extracts_bytes,
-                &links_bytes,
-                &tables.labels,
-                &tables.disputes,
-                &tables.labelers,
-            ];
             fingerprint.files = TIER_FILES
                 .iter()
-                .zip(written)
+                .zip(&written)
                 .map(|((path, _), bytes)| CachedFile {
                     path: (*path).to_string(),
                     sha256: sha256_hex(bytes),
@@ -1425,7 +1380,7 @@ fn withdraw_served(db: &Db, data_dir: &Path, publishers: &[&str]) -> Result<()> 
     for (_, path) in cache_entries(data_dir)? {
         let affected = read_fingerprint(&path).is_none_or(|fingerprint| {
             publishers.iter().any(|publisher| {
-                shard_index(publisher, fingerprint.shard_count) == fingerprint.shard
+                shard_of(publisher, shard_count_of(fingerprint.shard_count)) == fingerprint.shard
             })
         });
         if affected {
@@ -1612,33 +1567,6 @@ mod tests {
         jiff::Timestamp::from_second(unix).unwrap().to_string()
     }
 
-    fn seal_declarations(db: &Db, epoch: u64, sealed_unix: i64, declared: &[&str]) {
-        let declarations: Vec<crate::db::SealedDeclarationRow<'_>> = declared
-            .iter()
-            .map(|domain| crate::db::SealedDeclarationRow {
-                domain,
-                seq: 0,
-                declaration_json: b"{}",
-            })
-            .collect();
-        db.commit_seal(
-            &crate::db::tests::signing_key(),
-            crate::db::tests::LOG_ID,
-            &[],
-            epoch,
-            &ts(sealed_unix),
-            &[],
-            0,
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &declarations,
-        )
-        .unwrap();
-    }
-
     #[test]
     fn a_superseded_snapshot_expires_when_the_grace_period_has_fully_elapsed() {
         let at = jiff::Timestamp::from_second(T0).unwrap();
@@ -1657,43 +1585,45 @@ mod tests {
 
     #[test]
     fn one_url_one_publisher_prefers_self_then_nearest_ancestor_then_octet_order() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
-        let rows: [(&str, &str, &[&str]); 11] = [
-            ("https://a.example.com/x", "example.com", &[]),
-            (
-                "https://a.example.com/x",
-                "a.example.com",
-                &["a.example.com"],
-            ),
-            ("https://d.example.com/x", "example.com", &["d.example.com"]),
-            ("https://a.b.example.com/x", "example.com", &[]),
-            ("https://a.b.example.com/x", "b.example.com", &[]),
-            ("https://c.example.com/x", "zeta.example", &[]),
-            ("https://c.example.com/x", "example.com", &[]),
-            ("https://e.example.com/x", "zeta.example", &[]),
-            ("https://e.example.com/x", "alpha.example", &[]),
-            ("https://a.notexample.com/x", "example.com", &[]),
-            ("https://a.notexample.com/x", "beta.example", &[]),
+        let rows: [(&str, &str, bool); 11] = [
+            ("https://a.example.com/x", "example.com", false),
+            ("https://a.example.com/x", "a.example.com", true),
+            ("https://d.example.com/x", "example.com", true),
+            ("https://a.b.example.com/x", "example.com", false),
+            ("https://a.b.example.com/x", "b.example.com", false),
+            ("https://c.example.com/x", "zeta.example", false),
+            ("https://c.example.com/x", "example.com", false),
+            ("https://e.example.com/x", "zeta.example", false),
+            ("https://e.example.com/x", "alpha.example", false),
+            ("https://a.notexample.com/x", "example.com", false),
+            ("https://a.notexample.com/x", "beta.example", false),
         ];
-        let mut records = Vec::new();
-        for (epoch, (url, publisher, declared)) in rows.iter().enumerate() {
-            seal_declarations(&db, epoch as u64, T0 + epoch as i64, declared);
-            records.push(SnapshotRecord {
-                url: url.to_string(),
-                publisher: publisher.to_string(),
-                item_id: format!("sha256:{epoch:064x}"),
-                observed_at: ts(T0),
-                attested_at: ts(T0),
-                title: String::new(),
-                abstract_text: None,
-                lang: "en".into(),
-            });
-        }
-        let kept = prefer_one_publisher(&db, records).unwrap();
+        let declared: Vec<String> = rows
+            .iter()
+            .filter(|(_, _, declares)| *declares)
+            .map(|(url, _, _)| crate::declaration::url_host(url).to_owned())
+            .collect();
+        let entries: Vec<StateEntry> = rows
+            .iter()
+            .map(|(url, publisher, _)| {
+                StateEntry::Record(wist_core::objects::RecordEntry {
+                    publisher: (*publisher).to_owned(),
+                    url: (*url).to_owned(),
+                    item: serde_json::json!({
+                        "publisher": publisher, "url": url, "observed_at": ts(T0),
+                        "payload": {"commitment": format!("hmac-sha256:{}", "0".repeat(64)), "alg": "HMAC-SHA256", "bytes": 1},
+                        "meta": {"lang": "en"}
+                    }),
+                    collection: "default".into(),
+                    catalog_id: format!("sha256:{}", "1".repeat(64)),
+                    generated_at: ts(T0),
+                })
+            })
+            .collect();
+        let kept = materialize(&entries, |host| declared.iter().any(|d| d == host)).unwrap();
         let mut pairs: Vec<(&str, &str)> = kept
             .iter()
-            .map(|r| (r.url.as_str(), r.publisher.as_str()))
+            .map(|r| (r.tuple.url.as_str(), r.tuple.publisher.as_str()))
             .collect();
         pairs.sort();
         assert_eq!(

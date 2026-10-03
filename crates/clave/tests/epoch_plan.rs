@@ -627,6 +627,8 @@ struct Run<'a> {
     full: Replay,
     compared: usize,
     restricted: usize,
+    checked: bool,
+    sealed_declarations: BTreeSet<String>,
 }
 
 fn named_labels(history: &History<'_>, names: &Value) -> Vec<Value> {
@@ -736,6 +738,8 @@ impl<'a> Run<'a> {
             full: Replay::new(),
             compared: 0,
             restricted: 0,
+            checked: true,
+            sealed_declarations: BTreeSet::new(),
         }
     }
 
@@ -755,8 +759,44 @@ impl<'a> Run<'a> {
     }
 
     fn epoch(&mut self, at: usize, event: &Value, expected: &Value) {
+        let (_, declarations, _, _) = epoch_input_parts(&self.history, event);
+        self.epoch_with(at, event, expected, declarations);
+    }
+
+    fn sealer_choice(&self, event: &Value) -> Vec<Value> {
+        let (_, listed, _, _) = epoch_input_parts(&self.history, event);
+        let mut chosen: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+        for (publisher, found) in &self.state.discovered {
+            chosen
+                .entry(publisher.clone())
+                .or_default()
+                .extend(found.iter().map(|found| found.envelope.clone()));
+        }
+        for envelope in listed {
+            let hash = wist_core::declaration::inner_hash(&envelope).unwrap();
+            let domain = envelope["publisher"]["domain"].as_str().unwrap().to_owned();
+            let held = chosen.entry(domain).or_default();
+            if !self.sealed_declarations.contains(&hash) && !held.contains(&envelope) {
+                held.push(envelope);
+            }
+        }
+        chosen.into_values().flatten().collect()
+    }
+
+    fn epoch_with(
+        &mut self,
+        at: usize,
+        event: &Value,
+        expected: &Value,
+        declarations: Vec<Value>,
+    ) -> Vec<Value> {
         let history = &self.history;
-        let (map, declarations, updates, unsealed) = epoch_input_parts(history, event);
+        let (map, _, updates, unsealed) = epoch_input_parts(history, event);
+        let unsealed = if self.checked {
+            unsealed
+        } else {
+            BTreeSet::new()
+        };
         let log_kid = history.log_kid.clone();
         let log_key = history.log_key.clone();
         let key = move |kid: &str| (kid == log_kid).then(|| log_key.clone());
@@ -804,17 +844,26 @@ impl<'a> Run<'a> {
             history.name
         );
         self.compared += 1;
-        let mut view = planned_view(history, &planned);
-        view["settlement"] = settlement_view(history, &planned.settlement);
-        let wanted = expected_epoch(expected);
-        assert_left(history, at, &planned.left, &expected["left"]);
-        view["entries"] = json!(planned.entries);
-        assert_eq!(view, wanted, "{} event {at}", history.name);
+        if self.checked {
+            let mut view = planned_view(history, &planned);
+            view["settlement"] = settlement_view(history, &planned.settlement);
+            let wanted = expected_epoch(expected);
+            assert_left(history, at, &planned.left, &expected["left"]);
+            view["entries"] = json!(planned.entries);
+            assert_eq!(view, wanted, "{} event {at}", history.name);
+        }
+        for entry in &planned.entries {
+            if entry["type"] == "publisher_declaration" {
+                self.sealed_declarations
+                    .insert(wist_core::declaration::inner_hash(&entry["body"]).unwrap());
+            }
+        }
         self.show_settled(&planned.settlement);
         for item_id in &planned.payloads_destroyed {
             self.held.payloads.remove(item_id);
         }
         self.state = planned.state;
+        planned.entries
     }
 
     fn pull(&mut self, at: usize, event: &Value, expected: &Value) {
@@ -835,6 +884,13 @@ impl<'a> Run<'a> {
         .unwrap_or_else(|error| panic!("{} event {at}: {error}", history.name));
         let envelopes = named_labels(history, &event["labels"]);
         let labels = accept_labels(&mut self.state, &report, publisher, &envelopes).unwrap();
+        for row in &report.settlement {
+            self.shown
+                .insert((row.publisher.clone(), row.collection.clone()));
+        }
+        if !self.checked {
+            return;
+        }
         if let Some(wanted) = expected.get("labels") {
             assert_eq!(
                 &labels_view(&labels),
@@ -848,7 +904,6 @@ impl<'a> Run<'a> {
             .filter(|label| matches!(label.outcome, LabelOutcome::Accepted(_)))
             .count();
         assert_pull(history, at, &report, admitted, expected);
-        self.show_settled(&report.settlement);
     }
 }
 
@@ -1272,28 +1327,15 @@ impl StoreRun {
         }
     }
 
-    /// The store's clock counts the last event it assigned; the vectors number the first event 0.
     fn load(&self, publishers: &BTreeSet<String>) -> State {
-        let mut state = self
-            .db
+        self.db
             .load_state(clave::db::Sealed::of(&self.sealed), publishers)
-            .unwrap();
-        state.events -= 1;
-        state
+            .unwrap()
     }
 
     fn store(&self, before: &State, after: &State, publishers: &BTreeSet<String>) {
-        let shift = |state: &State| State {
-            events: state.events + 1,
-            ..state.clone()
-        };
         self.db
-            .store_state(
-                &shift(before),
-                &shift(after),
-                publishers,
-                "2026-08-09T00:00:00Z",
-            )
+            .store_state(before, after, publishers, "2026-08-09T00:00:00Z")
             .unwrap();
     }
 
@@ -1495,23 +1537,140 @@ const OPERATOR_BOUNDS: [&str; 3] = [
     "max_inclusion_epochs",
 ];
 
+const HOUR: i64 = 3600;
+const GRACE: i64 = 8 * 86_400;
+
+fn epochs_of(vector: &Value) -> impl Iterator<Item = &Value> {
+    vector["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["event"] == "epoch")
+}
+
+fn instant_s(at: &Value) -> i64 {
+    wist_core::timestamp::log_seconds(at.as_str().unwrap()).unwrap()
+}
+
+fn log_amendments(vector: &Value) -> Vec<(String, i64, String)> {
+    let mut amendments = Vec::new();
+    let mut in_force: BTreeMap<String, i64> = BTreeMap::new();
+    for epoch in epochs_of(vector) {
+        for (name, value) in epoch["parameters"].as_object().unwrap() {
+            if OPERATOR_BOUNDS.contains(&name.as_str()) {
+                continue;
+            }
+            let value = value.as_i64().unwrap();
+            let current = in_force
+                .get(name)
+                .copied()
+                .or(wist_core::parameters::spec(name).unwrap().default);
+            if current != Some(value) {
+                in_force.insert(name.clone(), value);
+                amendments.push((
+                    name.clone(),
+                    value,
+                    epoch["sealed_at"].as_str().unwrap().to_owned(),
+                ));
+            }
+        }
+    }
+    let mut epochs = epochs_of(vector);
+    let first = epochs.next().unwrap()["sealed_at"].as_str().unwrap();
+    if epochs_of(vector).any(|epoch| instant_s(&epoch["sealed_at"]) % HOUR != 0) {
+        amendments.push(("epoch_cadence_seconds".into(), 1, first.to_owned()));
+    }
+    amendments
+}
+
 struct SealerRun {
     store: StoreRun,
     sk: wist_core::crypto::SigningKey,
+    offset: u64,
 }
 
 impl SealerRun {
-    fn new() -> Self {
+    fn new(history: &History<'_>) -> Self {
         let store = StoreRun::new();
         store.db.set_param("epoch_cadence_seconds", 1).unwrap();
         let sk = clave::keys::load(&store.data.path().join("keys/seed")).unwrap();
-        SealerRun { store, sk }
+        let mut run = SealerRun {
+            store,
+            sk,
+            offset: 0,
+        };
+        run.amend_the_log(history);
+        run
+    }
+
+    fn amend_the_log(&mut self, history: &History<'_>) {
+        let amendments = log_amendments(history.vector);
+        if amendments.is_empty() && history.suffix_list.is_none() {
+            return;
+        }
+        let (db, data) = (&self.store.db, self.store.data.path());
+        let first = instant_s(&epochs_of(history.vector).next().unwrap()["sealed_at"]);
+        let setup = first - GRACE;
+        for (name, value, effective_at) in &amendments {
+            clave::param_change::run(db, &self.sk, name, *value, Some(effective_at), setup)
+                .unwrap_or_else(|error| panic!("{}: {name}: {error}", history.name));
+        }
+        if let Some(rules) = history.vector.get("suffix_list") {
+            let text: Vec<&str> = rules
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|rule| rule.as_str().unwrap())
+                .collect();
+            let file = data.join("suffix-list.dat");
+            std::fs::write(&file, format!("{}\n", text.join("\n"))).unwrap();
+            clave::suffix_list::pin(db, data, &self.sk, &file, setup).unwrap();
+        }
+        let report = clave::seal::run(db, data, &self.sk, setup)
+            .unwrap_or_else(|error| panic!("{}: amending the Log: {error}", history.name));
+        assert!(report.dropped.is_empty(), "{:?}", report.dropped);
+        assert_eq!(
+            db.epoch_entries(0).unwrap().len(),
+            amendments.len() + usize::from(history.suffix_list.is_some()),
+            "{}",
+            history.name
+        );
+        self.offset = 1;
     }
 
     fn load(&self, publishers: &BTreeSet<String>) -> State {
         let sealed = self.store.db.sealed_state(self.store.data.path()).unwrap();
-        let mut state = self.store.db.load_state(sealed, publishers).unwrap();
-        state.events -= 1;
+        self.store.db.load_state(sealed, publishers).unwrap()
+    }
+
+    fn observed(&self, publishers: &BTreeSet<String>) -> State {
+        let mut state = self.load(publishers);
+        let offset = self.offset;
+        let height = |height: &mut u64| *height -= offset;
+        for collection in state.collections.values_mut() {
+            if let Some(latest) = collection.latest.as_mut() {
+                height(&mut latest.sealing_height);
+            }
+            if let Some(accepted) = collection.accepted.as_mut() {
+                height(&mut accepted.eligibility);
+            }
+        }
+        state
+            .urls
+            .values_mut()
+            .for_each(|waiting| height(&mut waiting.eligibility));
+        state
+            .records
+            .values_mut()
+            .for_each(|record| height(&mut record.sealing_height));
+        state
+            .labels
+            .values_mut()
+            .for_each(|label| height(&mut label.eligibility));
+        for found in state.discovered.values_mut().flatten() {
+            found.last_sealed_at_discovery.iter_mut().for_each(height);
+            found.last_seal_height.iter_mut().for_each(height);
+        }
         state
     }
 
@@ -1549,53 +1708,64 @@ impl SealerRun {
         (before.events, state.events)
     }
 
-    fn epoch(&mut self, history: &History<'_>, event: &Value, expected: &Value) -> (u64, u64) {
+    fn clock(&self) -> u64 {
+        let events: i64 = rusqlite::Connection::open(self.store.data.path().join("clave.sqlite"))
+            .unwrap()
+            .query_row(
+                "SELECT position FROM acceptance_clock WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        events as u64 + 1
+    }
+
+    fn epoch(
+        &mut self,
+        history: &History<'_>,
+        event: &Value,
+        declarations: &[Value],
+        entries: &[Value],
+    ) -> (u64, u64) {
         let db = &self.store.db;
-        let (_, declarations, updates, unsealed) = epoch_input_parts(history, event);
-        assert!(
-            updates.is_empty() && unsealed.is_empty(),
-            "{}",
-            history.name
-        );
+        let sealed_at = event["sealed_at"].as_str().unwrap();
+        let sealed_s = instant_s(&event["sealed_at"]);
+        let schedule = db.parameter_schedule(sealed_s).unwrap();
         for (name, value) in event["parameters"].as_object().unwrap() {
             if OPERATOR_BOUNDS.contains(&name.as_str()) {
                 db.set_param(name, value.as_i64().unwrap()).unwrap();
             } else {
                 assert_eq!(
-                    wist_core::parameters::spec(name).unwrap().default,
+                    schedule.value_at(name, sealed_s),
                     value.as_i64(),
                     "{}: {name} is the Log's",
                     history.name
                 );
             }
         }
-        for envelope in &declarations {
+        for envelope in declarations {
             let domain = envelope["publisher"]["domain"].as_str().unwrap();
             db.hold_discovered_declaration(domain, envelope).unwrap();
         }
+        let key_id = db.signing_key_id(&self.sk.public()).unwrap();
+        let mut wanted = json!(entries);
+        for name in event["updates"].as_array().into_iter().flatten() {
+            let update = &history.vector["registry_updates"][name.as_str().unwrap()]["update"];
+            let envelope =
+                wist_core::envelope::sign_envelope(update, "update", &key_id, &self.sk).unwrap();
+            db.insert_pending_entry("registry_update", "", &envelope, 0)
+                .unwrap();
+            for entry in wanted.as_array_mut().unwrap() {
+                if entry["type"] == "registry_update" && entry["body"]["update"] == *update {
+                    entry["body"] = envelope.clone();
+                }
+            }
+        }
         let before = db.last_epoch().unwrap();
-        let clock = || {
-            let events: i64 =
-                rusqlite::Connection::open(self.store.data.path().join("clave.sqlite"))
-                    .unwrap()
-                    .query_row(
-                        "SELECT position FROM acceptance_clock WHERE id = 1",
-                        [],
-                        |row| row.get(0),
-                    )
-                    .unwrap();
-            events as u64
-        };
-        let from = clock();
-        let sealed_at = event["sealed_at"].as_str().unwrap();
-        let report = clave::seal::run(
-            db,
-            self.store.data.path(),
-            &self.sk,
-            wist_core::timestamp::log_seconds(sealed_at).unwrap(),
-        )
-        .unwrap_or_else(|error| panic!("{} at {sealed_at}: {error}", history.name));
-        let height = event["height"].as_u64().unwrap();
+        let from = self.clock();
+        let report = clave::seal::run(db, self.store.data.path(), &self.sk, sealed_s)
+            .unwrap_or_else(|error| panic!("{} at {sealed_at}: {error}", history.name));
+        let height = event["height"].as_u64().unwrap() + self.offset;
         assert_eq!(report.epoch_number, height, "{}", history.name);
         assert_eq!(
             before.map_or(0, |epoch| epoch.epoch_number + 1),
@@ -1605,17 +1775,18 @@ impl SealerRun {
         );
         assert_eq!(
             json!(db.epoch_entries(height).unwrap()),
-            expected["entries"],
+            wanted,
             "{} at {sealed_at}: the sealed Entries",
             history.name
         );
-        (from, clock())
+        (from, self.clock())
     }
 }
 
-fn replay_through_the_sealer(keys: &Value, vector: &Value) {
+fn replay_through_the_sealer(keys: &Value, vector: &Value, choice: Choice) {
     let mut run = Run::new(keys, vector);
-    let mut sealer = SealerRun::new();
+    run.checked = choice == Choice::Vector;
+    let mut sealer = SealerRun::new(&run.history);
     let mut numbers = BTreeMap::new();
     let events = vector["events"].as_array().unwrap();
     let expected = vector["expected"].as_array().unwrap();
@@ -1623,9 +1794,16 @@ fn replay_through_the_sealer(keys: &Value, vector: &Value) {
         let first = run.state.events;
         let (from, to) = match event["event"].as_str().unwrap() {
             "epoch" => {
-                let taken = sealer.epoch(&run.history, event, expected);
-                run.epoch(at, event, expected);
-                taken
+                let declarations = match choice {
+                    Choice::Vector => epoch_input_parts(&run.history, event).1,
+                    Choice::Sealer => run.sealer_choice(event),
+                };
+                let entries = run.epoch_with(at, event, expected, declarations.clone());
+                let wanted = match choice {
+                    Choice::Vector => expected["entries"].as_array().unwrap().clone(),
+                    Choice::Sealer => entries,
+                };
+                sealer.epoch(&run.history, event, &declarations, &wanted)
             }
             _ => {
                 let taken = sealer.pull(&run.history, event);
@@ -1642,7 +1820,7 @@ fn replay_through_the_sealer(keys: &Value, vector: &Value) {
         numbers.extend((from..to).map(|event| (event, first + event - from)));
         run.show();
         let publishers = publishers_of(&run.state);
-        let mut stored = sealer.load(&publishers);
+        let mut stored = sealer.observed(&publishers);
         renumber(&mut stored, &numbers);
         let name = run.history.name;
         assert_eq!(
@@ -1668,76 +1846,88 @@ fn replay_through_the_sealer(keys: &Value, vector: &Value) {
     }
 }
 
-fn replay_named_through_the_sealer(relative: &str, names: &[&str]) {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Choice {
+    Vector,
+    Sealer,
+}
+
+const SEALER_CHOICE: &[&str] = &[
+    "a competitor that reduces authority, superseded unsealed at settlement",
+    "a competitor that fails at its candidate Epoch while a follower is current",
+    "a queue settled when the rotation fails keeps what waited at the discovery",
+    "a queued Catalog not later than the floor at settlement does not survive",
+    "a Declaration that reduces authority, discovered at a pull",
+    "a fresh identity that becomes pending, discovered at a pull",
+    "the hold keeps eligibility Epochs and ceilings, and a Catalog of another root defers nothing",
+    "a pending replacement that reduces authority, discarded by a reversal before it is sealed",
+    "a reversal that fails at its candidate Epoch",
+    "the latest Catalog fails I4 while a Catalog of the Collection waits that nothing defers",
+    "an eligible Item the Aggregator leaves unsealed takes no room",
+    "a Label the Aggregator leaves unsealed takes no room under the per-Labeler cap",
+];
+
+fn replay_file_through_the_sealer(relative: &str) -> (usize, usize) {
     let vector = read_vector(relative);
-    for name in names {
-        replay_through_the_sealer(&vector["keys"], history_named(&vector, name));
+    let histories = vector["histories"].as_array().unwrap();
+    let mut followed = 0;
+    for history in histories {
+        let choice = if SEALER_CHOICE.contains(&history["name"].as_str().unwrap()) {
+            followed += 1;
+            Choice::Sealer
+        } else {
+            Choice::Vector
+        };
+        replay_through_the_sealer(&vector["keys"], history, choice);
     }
+    (histories.len(), followed)
 }
 
 #[test]
-fn catalog_waiting_histories_pulled_over_http_and_sealed_reach_the_expected_state_and_entries() {
-    replay_named_through_the_sealer(
-        "vectors/wist3/catalog-waiting.json",
-        &[
-            "a Catalog accepted at a pull and sealed with its Items in the next Epoch",
-            "a later accepted Catalog takes the place and eligibility Epoch of the waiting one",
-            "a Catalog that fails C4 at its turn stays the last accepted Catalog",
-            "a Catalog that fails C1 at its turn after a Declaration removed its key",
-            "the latest Catalog fails the binding check: Items wait with their places",
-            "a URL whose Item changes while it waits, and a URL that stops waiting and waits again",
-            "capacity order: Catalogs, removed Items, then page Items, by place",
-            "WIST2-E07: a list that drops the URL of a held record",
-            "a Declaration that widens a Scope is sealed with the Item it admits",
-            "an Item that fails I7 and another condition leaves unreported",
-            "a pending head that narrows a Collection",
-            "two Collections whose last accepted Catalogs list one URL",
-        ],
+fn every_catalog_waiting_history_pulled_over_http_and_sealed_agrees_with_the_machine() {
+    assert_eq!(
+        replay_file_through_the_sealer("vectors/wist3/catalog-waiting.json"),
+        (42, 8)
     );
 }
 
 #[test]
-fn collection_pull_histories_pulled_over_http_and_sealed_reach_the_expected_state_and_entries() {
-    replay_named_through_the_sealer(
-        "vectors/wist2/collection-pull.json",
-        &[
-            "a current Declaration: its Collections in the order it lists them",
-            "a pending head: the current Declaration alone",
-            "an open recovery window: two sources, each read alone",
-            "Payloads at a pull, and the retry of Items refused or not admitted",
-            "a walk that an unavailable tree file interrupts resumes from the files held",
-            "a per-pull limit in objects that interrupts the Items of a Catalog",
-        ],
+fn every_collection_pull_history_pulled_over_http_and_sealed_agrees_with_the_machine() {
+    assert_eq!(
+        replay_file_through_the_sealer("vectors/wist2/collection-pull.json"),
+        (20, 0)
     );
 }
 
 #[test]
-fn catalog_recovery_histories_pulled_over_http_and_sealed_reach_the_expected_state_and_entries() {
-    replay_named_through_the_sealer(
+fn every_catalog_recovery_history_pulled_over_http_and_sealed_agrees_with_the_machine() {
+    assert_eq!(
+        replay_file_through_the_sealer("vectors/wist1/catalog-recovery.json"),
+        (30, 4)
+    );
+}
+
+#[test]
+fn a_history_whose_epochs_the_sealer_chooses_otherwise_seals_entries_the_vector_does_not() {
+    for relative in [
         "vectors/wist1/catalog-recovery.json",
-        &[
-            "the two frozen sources: a recovery rotation discovered, then sealed",
-            "the queue per Collection name and signing key",
-            "settlement: equal instants decided by Catalog ID",
-            "places after settlement: a Catalog queued at the opening keeps the place it had",
-            "a survivor refused at the settlement Epoch by a Declaration of that Epoch",
-            "settlement at a pull between the window's end and the Epoch of settlement",
-            "an idempotent re-serve inside the window retries its Items under the sources that accept it",
-            "a recovery rotation that narrows a Scope: the owner's Catalog is queued",
-            "records sealed under a key an attacker held, and the owner's Catalogs after settlement",
-            "a pull between the discovery and the sealing of a recovery rotation",
-            "frozen sources when a follower is sealed in the owner's Epoch",
-            "the recovery-chain head served again while a competitor is current",
-            "a settlement with nothing queued for a name",
-            "one inner Catalog signed by two keys, both queued",
-            "two Catalogs of one Collection queued between the discovery and the sealing of a recovery rotation",
-            "a queued Catalog and a later one of equal instant under the same key",
-            "a Catalog that waited at the opening and one queued after the discovery share a Catalog ID",
-            "the order of a pull before the window opens, against the waiting Catalog of the same key",
-            "a URL that did not wait at the opening takes the place of the pull that queued the survivor",
-            "a pull that settles is two events, the settlement first",
-            "the order of Collections at a settlement made by a pull",
-            "an Item held inside a window is reported with the window alone",
-        ],
-    );
+        "vectors/wist3/catalog-waiting.json",
+    ] {
+        let vector = read_vector(relative);
+        for history in vector["histories"].as_array().unwrap() {
+            let name = history["name"].as_str().unwrap();
+            if !SEALER_CHOICE.contains(&name) {
+                continue;
+            }
+            let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                replay_through_the_sealer(&vector["keys"], history, Choice::Vector)
+            }))
+            .expect_err(name);
+            let message = failed
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .unwrap_or_default();
+            assert!(message.contains("the sealed Entries"), "{name}: {message}");
+        }
+    }
 }

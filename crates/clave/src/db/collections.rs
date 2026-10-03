@@ -12,6 +12,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use wist_core::declarations::Declarations;
+use wist_core::objects::{CollectionEntry, RecordEntry, RemovalEntry, StateEntry, WithdrawalEntry};
 use wist_core::withdrawal::{SealedItems, WithdrawalReplay};
 
 const SCHEMA: &str = "
@@ -167,6 +168,74 @@ impl Db {
             sealed_items.seal(&item_id, &publisher, kind, uint(height));
         }
         Ok(sealed_items)
+    }
+
+    pub fn log_state_entries(&self) -> Result<Vec<StateEntry>> {
+        let mut entries = Vec::new();
+        let mut statement = self.conn.prepare(
+            "SELECT publisher, name, latest_envelope, latest_height FROM collections WHERE latest_envelope IS NOT NULL ORDER BY publisher, name",
+        )?;
+        for row in statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })? {
+            let (publisher, collection, envelope, height) = row?;
+            entries.push(StateEntry::Collection(CollectionEntry {
+                publisher,
+                collection,
+                envelope: parse(&envelope)?,
+                sealing_height: uint(height),
+            }));
+        }
+        let mut statement = self.conn.prepare(
+            "SELECT publisher, url, item, collection, catalog_id, generated_at FROM records ORDER BY publisher, url",
+        )?;
+        for row in statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })? {
+            let (publisher, url, item, collection, catalog_id, generated_at) = row?;
+            entries.push(StateEntry::Record(RecordEntry {
+                publisher,
+                url,
+                item: parse(&item)?,
+                collection,
+                catalog_id,
+                generated_at,
+            }));
+        }
+        let mut statement = self.conn.prepare(
+            "SELECT publisher, url, item_id, catalog_id, generated_at FROM removals ORDER BY publisher, url",
+        )?;
+        for row in statement.query_map([], |row| {
+            Ok(RemovalEntry {
+                publisher: row.get(0)?,
+                url: row.get(1)?,
+                item_id: row.get(2)?,
+                catalog_id: row.get(3)?,
+                generated_at: row.get(4)?,
+            })
+        })? {
+            entries.push(StateEntry::Removal(row?));
+        }
+        for (item_id, publisher, sealing_height) in self.withdrawal_state()? {
+            entries.push(StateEntry::Withdrawal(WithdrawalEntry {
+                item_id,
+                publisher,
+                sealing_height,
+            }));
+        }
+        Ok(entries)
     }
 
     pub fn record_sealed_item(

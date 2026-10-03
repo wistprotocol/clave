@@ -1,11 +1,12 @@
 use super::Db;
-use crate::collection::plan::{Deferred, HeldBack, Publication};
+use crate::collection::plan::{Deferred, HeldBack, Hold, Publication};
 use crate::error::{Error, Result};
 use rusqlite::OptionalExtension;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use wist_core::declarations::Domain;
+use wist_core::objects::{CollectionStatus, Deferral, WaitingStatus};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PayloadDutyRow {
@@ -32,6 +33,37 @@ type KeptRow = (
     Option<String>,
     Option<Vec<u8>>,
 );
+
+fn empty_status(name: String) -> CollectionStatus {
+    CollectionStatus {
+        name,
+        latest: None,
+        accepted: None,
+        waiting: Vec::new(),
+    }
+}
+
+/// WIST-3 §3.3, Eligibility; WIST-2 §7.1.
+fn waiting_status(
+    id: String,
+    url: Option<String>,
+    deferrals: Option<String>,
+    held: Option<String>,
+) -> Result<WaitingStatus> {
+    let mut deferrals: Vec<Deferral> = match deferrals {
+        Some(names) => serde_json::from_str(&names)?,
+        None => Vec::new(),
+    };
+    deferrals.sort_by_key(|deferral| *deferral as u8);
+    deferrals.dedup();
+    let held = deferrals.is_empty() && held.as_deref() == Some(Hold::AuthorityReduction.as_str());
+    Ok(WaitingStatus {
+        id,
+        url,
+        deferrals,
+        held,
+    })
+}
 
 fn envelope_octets(value: &Value) -> Result<Vec<u8>> {
     Ok(serde_json::to_vec(value)?)
@@ -120,6 +152,141 @@ impl Db {
             .collect()
     }
 
+    fn named_collections(&self, domain: &str) -> Result<BTreeSet<String>> {
+        let mut names = BTreeSet::new();
+        for sql in [
+            "SELECT declaration_json FROM publishers WHERE domain = ?1",
+            "SELECT declaration_json FROM sealed_in_force WHERE domain = ?1",
+            "SELECT declaration_json FROM recovery_windows WHERE domain = ?1",
+            "SELECT prior_declaration_json FROM recovery_windows WHERE domain = ?1",
+            "SELECT owner_declaration_json FROM recovery_windows WHERE domain = ?1",
+        ] {
+            let octets: Option<Vec<u8>> = self
+                .conn
+                .query_row(sql, [domain], |row| row.get(0))
+                .optional()?;
+            let Some(envelope) = octets.and_then(|octets| crate::json::parse(&octets).ok()) else {
+                continue;
+            };
+            if let Ok(publisher) = crate::declaration::publisher_of(&envelope) {
+                names.extend(
+                    wist_core::collection::names(&publisher)
+                        .into_iter()
+                        .map(str::to_owned),
+                );
+            }
+        }
+        Ok(names)
+    }
+
+    /// WIST-2 §7.1, `collections`.
+    pub fn collection_statuses(&self, domain: &str) -> Result<Vec<CollectionStatus>> {
+        let mut statuses: BTreeMap<String, CollectionStatus> = self
+            .named_collections(domain)?
+            .into_iter()
+            .map(|name| (name.clone(), empty_status(name)))
+            .collect();
+        let mut statement = self.conn.prepare(
+            "SELECT name, latest_id, accepted_id, accepted_failed_c1, accepted_failed_c4, waiting_deferrals, waiting_held FROM collections WHERE publisher = ?1",
+        )?;
+        let rows = statement
+            .query_map([domain], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<bool>>(3)?.unwrap_or(false),
+                    row.get::<_, Option<bool>>(4)?.unwrap_or(false),
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (name, latest, accepted, failed_c1, failed_c4, deferrals, held) in rows {
+            let status = statuses
+                .entry(name.clone())
+                .or_insert_with(|| empty_status(name));
+            status.accepted = if failed_c1 {
+                latest.clone()
+            } else {
+                accepted.clone().or_else(|| latest.clone())
+            };
+            if let (Some(accepted), false, false) = (&accepted, failed_c1, failed_c4) {
+                if latest.as_ref() != Some(accepted) {
+                    status
+                        .waiting
+                        .push(waiting_status(accepted.clone(), None, deferrals, held)?);
+                }
+            }
+            status.latest = latest;
+        }
+        let mut statement = self.conn.prepare(
+            "SELECT q.name, q.catalog_id, qs.end_s IS NOT NULL FROM catalog_queue q JOIN catalog_queues qs ON qs.publisher = q.publisher WHERE q.publisher = ?1 ORDER BY q.name, q.key_x",
+        )?;
+        let queued = statement
+            .query_map([domain], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, bool>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (name, catalog_id, opened) in queued {
+            let status = statuses
+                .entry(name.clone())
+                .or_insert_with(|| empty_status(name));
+            if status
+                .waiting
+                .iter()
+                .any(|waiting| waiting.id == catalog_id)
+            {
+                continue;
+            }
+            status.waiting.push(WaitingStatus {
+                id: catalog_id,
+                url: None,
+                deferrals: if opened {
+                    vec![wist_core::objects::Deferral::RecoveryWindow]
+                } else {
+                    Vec::new()
+                },
+                held: false,
+            });
+        }
+        let mut statement = self.conn.prepare(
+            "SELECT collection, url, item_id, deferrals, held FROM waiting_urls WHERE publisher = ?1 ORDER BY place_event, place_position, place_index, url",
+        )?;
+        let urls = statement
+            .query_map([domain], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (name, url, item_id, deferrals, held) in urls {
+            let status = statuses
+                .entry(name.clone())
+                .or_insert_with(|| empty_status(name));
+            status
+                .waiting
+                .push(waiting_status(item_id, Some(url), deferrals, held)?);
+        }
+        Ok(statuses.into_values().collect())
+    }
+
+    pub(crate) fn recovery_queue_held(&self, publisher: &str, owner: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM catalog_queues WHERE publisher = ?1 AND owner = ?2)",
+            (publisher, owner),
+            |row| row.get(0),
+        )?)
+    }
+
     pub(crate) fn add_payload_duty(
         &self,
         item_id: &str,
@@ -176,6 +343,14 @@ impl Db {
             .query_map([now], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    pub fn holds_payload_duty(&self, item_id: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM payload_duties WHERE item_id = ?1)",
+            [item_id],
+            |row| row.get(0),
+        )?)
     }
 
     pub fn payload_under_duty(&self, item_id: &str, now: &str) -> Result<bool> {
@@ -342,7 +517,7 @@ impl Db {
         let mut needed: BTreeSet<String> = BTreeSet::new();
         for (publisher, name, catalog_id) in self.kept_catalogs()? {
             let mut statement = self.conn.prepare_cached(
-                "SELECT item_id FROM list_items WHERE publisher = ?1 AND name = ?2 AND catalog_id = ?3",
+                "SELECT item_id FROM list_items WHERE publisher = ?1 AND name = ?2 AND catalog_id = ?3 AND admission IN ('admitted', 'unjudged')",
             )?;
             needed.extend(
                 statement
@@ -362,6 +537,13 @@ impl Db {
                     .query_map([], |row| row.get::<_, String>(0))?
                     .collect::<rusqlite::Result<Vec<_>>>()?,
             );
+        }
+        for item_id in self
+            .conn
+            .prepare("SELECT item_id FROM withdrawals")?
+            .query_map([], |row| row.get::<_, String>(0))?
+        {
+            needed.remove(&item_id?);
         }
         Ok(needed)
     }
@@ -394,6 +576,12 @@ impl Db {
         windows: &Domain,
         floor: u64,
     ) -> Result<()> {
+        if let Some(sealed) = sealed {
+            self.conn.execute(
+                "INSERT INTO sealed_in_force(domain, declaration_json) VALUES (?1, ?2) ON CONFLICT(domain) DO UPDATE SET declaration_json = excluded.declaration_json",
+                (domain, envelope_octets(sealed.current().envelope())?),
+            )?;
+        }
         let current = admission.current().envelope();
         let publisher = crate::declaration::publisher_of(current).map_err(Error::History)?;
         let key = &publisher.keys[0];

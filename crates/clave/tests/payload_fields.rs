@@ -49,6 +49,7 @@ fn a_retained_payload_is_read_from_the_path_its_item_names_and_judged_against_it
     assert_eq!(case["name"], "valid");
     let source = clave::history::payloads::PayloadSource::from_item(
         case["item"].clone(),
+        "default",
         0,
         SizeCaps::suite(),
     )

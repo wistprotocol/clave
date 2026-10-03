@@ -8,6 +8,7 @@ use wist_core::objects::{PageItem, Payload};
 pub struct PayloadSource {
     item: Value,
     page: PageItem,
+    collection: String,
     name: String,
     epoch_number: u64,
     size_caps: SizeCaps,
@@ -70,13 +71,19 @@ impl PayloadLocations {
 }
 
 impl PayloadSource {
-    pub fn from_item(item: Value, epoch_number: u64, size_caps: SizeCaps) -> Result<Self> {
+    pub fn from_item(
+        item: Value,
+        collection: &str,
+        epoch_number: u64,
+        size_caps: SizeCaps,
+    ) -> Result<Self> {
         let page: PageItem = serde_json::from_slice(&wist_core::jcs::canonicalize(&item)?)
             .map_err(|_| failure("the sealed Item is not of kind page"))?;
         let name = wist_core::item::payload_name(&item)?;
         Ok(Self {
             item,
             page,
+            collection: collection.to_owned(),
             name,
             epoch_number,
             size_caps,
@@ -106,7 +113,15 @@ impl PayloadSource {
                     && valid
                     && wist_core::item::item_id(item).ok().as_deref() == Some(item_id)
                 {
-                    found = Some((item.clone(), epoch.epoch_number(), *epoch.size_caps()));
+                    found = Some((
+                        item.clone(),
+                        entry["body"]["collection"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_owned(),
+                        epoch.epoch_number(),
+                        *epoch.size_caps(),
+                    ));
                     break;
                 }
             }
@@ -116,9 +131,9 @@ impl PayloadSource {
                 "a withdrawal sealed for the Item removed its Payload",
             ));
         }
-        let (item, epoch_number, size_caps) =
+        let (item, collection, epoch_number, size_caps) =
             found.ok_or_else(|| failure("no Epoch seals a valid Item of that ID"))?;
-        Self::from_item(item, epoch_number, size_caps)
+        Self::from_item(item, &collection, epoch_number, size_caps)
     }
 
     pub fn item(&self) -> &Value {
@@ -174,11 +189,13 @@ impl PayloadSource {
         Ok(format!("{parsed}{path}"))
     }
 
+    /// WIST-2 §3, §3.1.
     pub fn publisher_location(&self, client: &crate::fetch::Client) -> PayloadLocation {
         let publisher = self.page.publisher.as_str();
         let scheme = crate::fetch::scheme_for_host(publisher, client.allow_http());
         PayloadLocation::Url(format!(
-            "{scheme}://{publisher}/.well-known/wist/{}",
+            "{scheme}://{publisher}/.well-known/wist/collections/{}/{}",
+            self.collection,
             self.relative_path(),
         ))
     }

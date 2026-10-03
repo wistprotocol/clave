@@ -815,3 +815,159 @@ pub fn sealed_item_ids(entries: &[serde_json::Value]) -> Vec<String> {
         .map(|entry| item_id(&entry["body"]["item"]))
         .collect()
 }
+
+pub fn schema(name: &str) -> serde_json::Value {
+    serde_json::from_slice(&fs::read(spec_dir().join("schemas").join(name)).unwrap()).unwrap()
+}
+
+pub fn schema_errors(
+    schema: &serde_json::Value,
+    value: &serde_json::Value,
+    at: &str,
+) -> Vec<String> {
+    use serde_json::Value;
+    let mut errors = Vec::new();
+    let Some(rules) = schema.as_object() else {
+        return errors;
+    };
+    let mut fail = |message: String| errors.push(format!("{at}: {message}"));
+    if let Some(types) = rules.get("type") {
+        let allowed: Vec<&str> = match types {
+            Value::String(one) => vec![one.as_str()],
+            Value::Array(many) => many.iter().filter_map(Value::as_str).collect(),
+            _ => Vec::new(),
+        };
+        let matches = |kind: &str| match kind {
+            "object" => value.is_object(),
+            "array" => value.is_array(),
+            "string" => value.is_string(),
+            "integer" => value.is_i64() || value.is_u64(),
+            "number" => value.is_number(),
+            "boolean" => value.is_boolean(),
+            "null" => value.is_null(),
+            _ => false,
+        };
+        if !allowed.iter().any(|kind| matches(kind)) {
+            fail(format!("{value} is not of type {types}"));
+        }
+    }
+    if let Some(options) = rules.get("enum").and_then(Value::as_array) {
+        if !options.contains(value) {
+            fail(format!("{value} is not one of {options:?}"));
+        }
+    }
+    if let Some(expected) = rules.get("const") {
+        if expected != value {
+            fail(format!("{value} is not {expected}"));
+        }
+    }
+    if let (Some(pattern), Some(text)) =
+        (rules.get("pattern").and_then(Value::as_str), value.as_str())
+    {
+        let pattern = pattern.replace("(?![\\s\\S])", "");
+        if !regex::Regex::new(&pattern).unwrap().is_match(text) {
+            fail(format!("{text:?} does not match {pattern}"));
+        }
+    }
+    if let Some(text) = value.as_str() {
+        let length = text.chars().count() as u64;
+        if rules
+            .get("minLength")
+            .and_then(Value::as_u64)
+            .is_some_and(|min| length < min)
+        {
+            fail(format!("{text:?} is shorter than minLength"));
+        }
+        if rules
+            .get("maxLength")
+            .and_then(Value::as_u64)
+            .is_some_and(|max| length > max)
+        {
+            fail(format!("{text:?} is longer than maxLength"));
+        }
+    }
+    if let (Some(minimum), Some(number)) =
+        (rules.get("minimum").and_then(Value::as_f64), value.as_f64())
+    {
+        if number < minimum {
+            fail(format!("{number} is below {minimum}"));
+        }
+    }
+    if let Some(object) = value.as_object() {
+        for required in rules
+            .get("required")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if !object.contains_key(required.as_str().unwrap()) {
+                fail(format!("missing required member {required}"));
+            }
+        }
+        let properties = rules.get("properties").and_then(Value::as_object);
+        for (member, member_value) in object {
+            match properties.and_then(|properties| properties.get(member)) {
+                Some(member_schema) => errors.extend(schema_errors(
+                    member_schema,
+                    member_value,
+                    &format!("{at}/{member}"),
+                )),
+                None if rules.get("additionalProperties") == Some(&Value::Bool(false)) => {
+                    errors.push(format!("{at}: member {member} is not allowed"))
+                }
+                None => {}
+            }
+        }
+    }
+    if let Some(items) = value.as_array() {
+        if let Some(item_schema) = rules.get("items") {
+            for (index, item) in items.iter().enumerate() {
+                errors.extend(schema_errors(item_schema, item, &format!("{at}/{index}")));
+            }
+        }
+        if rules
+            .get("minItems")
+            .and_then(Value::as_u64)
+            .is_some_and(|min| (items.len() as u64) < min)
+        {
+            errors.push(format!("{at}: fewer than minItems"));
+        }
+        if rules.get("uniqueItems") == Some(&Value::Bool(true))
+            && items
+                .iter()
+                .enumerate()
+                .any(|(index, item)| items[..index].contains(item))
+        {
+            errors.push(format!("{at}: items are not unique"));
+        }
+    }
+    if let Some(negated) = rules.get("not") {
+        if schema_errors(negated, value, at).is_empty() {
+            errors.push(format!("{at}: matches a schema it must not"));
+        }
+    }
+    if let Some(any) = rules.get("anyOf").and_then(Value::as_array) {
+        if !any
+            .iter()
+            .any(|option| schema_errors(option, value, at).is_empty())
+        {
+            errors.push(format!("{at}: matches no anyOf option"));
+        }
+    }
+    if let Some(condition) = rules.get("if") {
+        let branch = if schema_errors(condition, value, at).is_empty() {
+            rules.get("then")
+        } else {
+            rules.get("else")
+        };
+        if let Some(branch) = branch {
+            errors.extend(schema_errors(branch, value, at));
+        }
+    }
+    errors
+}
+
+pub fn assert_valid(schema_name: &str, value: &serde_json::Value) {
+    let errors = schema_errors(&schema(schema_name), value, "");
+    assert!(errors.is_empty(), "{schema_name}: {errors:?}\n{value}");
+}

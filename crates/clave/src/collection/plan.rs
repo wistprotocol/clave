@@ -20,6 +20,8 @@ const CANDIDATE_ROOT: &str = "candidate";
 const NOT_ADMITTED: &str = "WIST2-E03";
 const LABEL_REJECTED: &str = "WIST2-E06";
 const CONTRACT_FAILED: &str = "WIST4-E04";
+const ITEM_OVER_BOUND: &str = "WIST1-E04";
+const ENTRY_OVER_BOUND: &str = "WIST3-E03";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Inclusion {
@@ -155,6 +157,7 @@ pub enum LeftCondition {
     I5,
     I7,
     Payload,
+    EntrySize,
 }
 
 impl LeftCondition {
@@ -165,6 +168,7 @@ impl LeftCondition {
             LeftCondition::I5 => "I5",
             LeftCondition::I7 => "I7",
             LeftCondition::Payload => "payload",
+            LeftCondition::EntrySize => "entry_size",
         }
     }
 }
@@ -282,6 +286,11 @@ fn item_kind(item: &Value) -> ItemKind {
 
 fn history(message: impl Into<String>) -> Error {
     Error::History(message.into())
+}
+
+/// WIST-3 §3.3, An Entry fits one leaf.
+fn over_entry_bound(entry: &Value) -> Result<bool> {
+    Ok(wist_core::jcs::canonicalize(entry)?.len() as u64 > wist_core::tiles::ENTRY_MAX_BYTES)
 }
 
 fn declaration_entry(envelope: &Value) -> Value {
@@ -857,6 +866,27 @@ fn run_pass<H: Held>(
             leave_unsealed(&mut pass, publication, accepted.place, accepted.eligibility)?;
             continue;
         }
+        let entry = json!({"type": "publisher_catalog", "body": accepted.envelope});
+        if over_entry_bound(&entry)? {
+            if let Some(waiting) = next
+                .collections
+                .get_mut(&key)
+                .and_then(|collection| collection.accepted.as_mut())
+            {
+                waiting.failed_c1 = true;
+            }
+            pass.dropped.push((
+                (0, place_key(accepted.place, &publisher)),
+                Left {
+                    publication,
+                    condition: LeftCondition::EntrySize,
+                    codes: vec![ENTRY_OVER_BOUND],
+                    reported: true,
+                    payload_code: None,
+                },
+            ));
+            continue;
+        }
         take(&mut room, &publisher);
         sealed_names.insert(
             key,
@@ -865,7 +895,7 @@ fn run_pass<H: Held>(
         pass.planned.push(PlannedEntry {
             publication,
             catalog: None,
-            entry: json!({"type": "publisher_catalog", "body": accepted.envelope}),
+            entry,
             eligibility: accepted.eligibility,
         });
     }
@@ -1049,7 +1079,6 @@ fn run_pass<H: Held>(
             }
             let (latest_id, latest_envelope) =
                 latest.ok_or_else(|| history(format!("{url} waits with no latest Catalog")))?;
-            take(&mut room, &publisher);
             let inner = &latest_envelope["catalog"];
             let catalog: wist_core::objects::Catalog = serde_json::from_value(inner.clone())?;
             let (list, positions) =
@@ -1058,10 +1087,34 @@ fn run_pass<H: Held>(
                 .get(&url)
                 .ok_or_else(|| history(format!("the latest Catalog does not list {url}")))?;
             let body = wist_core::publisher_item::build(list, at as u64, &catalog)?;
+            let entry = json!({"type": "publisher_item", "body": body});
+            if over_entry_bound(&entry)? {
+                set_admission(
+                    next,
+                    &publisher,
+                    &name,
+                    index,
+                    Admission::Refused,
+                    ITEM_OVER_BOUND,
+                );
+                gone.insert((publisher.clone(), url.clone()));
+                pass.dropped.push((
+                    (kind_turn(kind), key),
+                    Left {
+                        publication,
+                        condition: LeftCondition::EntrySize,
+                        codes: vec![ITEM_OVER_BOUND],
+                        reported: true,
+                        payload_code: None,
+                    },
+                ));
+                continue;
+            }
+            take(&mut room, &publisher);
             pass.planned.push(PlannedEntry {
                 publication,
                 catalog: Some(latest_id),
-                entry: json!({"type": "publisher_item", "body": body}),
+                entry,
                 eligibility: waiting.eligibility,
             });
         }

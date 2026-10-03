@@ -29,4 +29,5 @@ url = { workspace = true }
 ed25519-dalek = "2"
 
 [dev-dependencies]
+regex = "1"
 tempfile = "3"

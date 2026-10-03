@@ -202,3 +202,53 @@ fn retained_declaration_duplicates_cannot_authorize_a_pull() {
         .unwrap();
     assert_eq!(retained, raw);
 }
+
+#[test]
+fn duplicate_members_in_the_declaration_and_label_feed_reject_before_admission_and_retry_after_restart(
+) {
+    for (object, name, escaped) in [
+        ("publisher", "publisher", "publishe\\u0072"),
+        ("publisher", "domain", "\\u0064omain"),
+        ("publisher", "x", "x"),
+        ("publisher", "kid", "kid"),
+        ("label-feed", "feed", "feed"),
+        ("label-feed", "domain", "\\u0064omain"),
+        ("label-feed", "generated_at", "generated_at"),
+    ] {
+        let (listener, host, client) = reserve_addr();
+        let p = make_publisher(&host);
+        serve_static(listener, p.dir.path().to_path_buf());
+        let data = tempfile::tempdir().unwrap();
+        clave::init::run(&host, data.path()).unwrap();
+        let path = data.path().join("clave.sqlite");
+        let db = Db::open(&path).unwrap();
+        let id = add_label(&p, "https://subject.example/page", "2026-08-09T11:00:00Z");
+        write_label_feed(&p, &host, std::slice::from_ref(&id), "2026-08-09T12:00:00Z");
+        let source = p.dir.path().join(format!(".well-known/wist/{object}.json"));
+        let original = std::fs::read(&source).unwrap();
+        std::fs::write(&source, duplicate(&original, name, escaped)).unwrap();
+        let report =
+            clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:02Z").unwrap();
+        assert!(report.labels.is_empty(), "{object}/{name}: {report:?}");
+        assert!(
+            !db.is_label_seen_for(&id, &host).unwrap(),
+            "{object}/{name}"
+        );
+        if object == "publisher" {
+            let rejected = db.list_rejections(&host).unwrap();
+            assert_eq!(
+                rejected.first().unwrap().code,
+                "WIST2-E04",
+                "{object}/{name}"
+            );
+            assert!(db.get_publisher(&host).unwrap().is_none());
+            assert_eq!(report.noise, Some("WIST2-E04"));
+        }
+        std::fs::write(&source, &original).unwrap();
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        let report =
+            clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:03Z").unwrap();
+        assert_eq!(report.labels, std::slice::from_ref(&id), "{object}/{name}");
+    }
+}

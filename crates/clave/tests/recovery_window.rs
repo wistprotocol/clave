@@ -634,6 +634,18 @@ fn recovery_flow_queues_settles_and_seals_the_survivor() {
         report.entry_count, 0,
         "a queued Catalog is held through the window"
     );
+    let status =
+        serde_json::to_value(clave::serve::load_status(&r.db, &r.host).unwrap().unwrap()).unwrap();
+    assert_valid("status.schema.json", &status);
+    let queued = status["collections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|collection| collection["waiting"].as_array().unwrap())
+        .find(|entry| entry["id"] == catalog.catalog_id.as_str())
+        .unwrap_or_else(|| panic!("{status}"));
+    assert_eq!(queued["deferrals"], serde_json::json!(["recovery_window"]));
+    assert_eq!(queued["held"], false);
     let window_end = start + 3600 + 7 * DAY;
     clave::seal::run(&r.db, r.data.path(), &r.sk, window_end - 3600).unwrap();
     assert!(stored_entries(&r, 3).is_empty());
@@ -733,4 +745,581 @@ fn a_rejected_candidate_rolls_back_a_due_settlement() {
         .unwrap()
         .iter()
         .all(|rejection| rejection.at.as_str() < "2026-08-16"));
+}
+
+#[test]
+fn cadence_rounding_cannot_reopen_a_settled_admission_window() {
+    const T0: i64 = 1_786_276_800;
+    let r = rig(make_publisher_with_recovery);
+    let at = |seconds| jiff::Timestamp::from_second(seconds).unwrap().to_string();
+    r.db.set_param("epoch_cadence_seconds", 3600).unwrap();
+    ingest(&r, &at(T0));
+    let effective = T0 + 30 * DAY;
+    let update = wist_core::envelope::sign_envelope(&serde_json::json!({
+        "wist_version": "1.0.0", "action": "parameter_change", "subject": "epoch_cadence_seconds",
+        "details": {"parameter": "epoch_cadence_seconds", "value": 3599}, "effective_at": at(effective)
+    }), "update", "log1", &r.sk).unwrap();
+    r.db.insert_pending_entry("registry_update", "", &update, 0)
+        .unwrap();
+    let report = clave::seal::run(&r.db, r.data.path(), &r.sk, T0).unwrap();
+    assert!(report.dropped.is_empty(), "{:?}", report.dropped);
+    clave::seal::run(&r.db, r.data.path(), &r.sk, effective).unwrap();
+    let prior = current_declaration(&r.p);
+    let mut owner = prior["publisher"].clone();
+    owner["seq"] = 1.into();
+    owner["prev_declaration"] = declaration_hash(&prior).into();
+    owner["keys"] = serde_json::json!([key_entry(&K2_SEED, "2026-08-09T13:00:00Z")]);
+    write_declaration(&r.p, &owner, &R1_SEED);
+    let opened = (effective.div_euclid(3599) + 1) * 3599;
+    ingest(&r, &at(opened));
+    clave::seal::run(&r.db, r.data.path(), &r.sk, opened).unwrap();
+    let (catalog, item) = queued_catalog(&r, &at(opened));
+    let report = ingest(&r, &at(opened + 5));
+    assert_eq!(report.queued, [format!("default/{}", catalog.catalog_id)]);
+    let deadline = opened + 7 * DAY;
+    ingest(&r, &at(deadline));
+    let scope = std::collections::BTreeSet::from([r.host.clone()]);
+    let settled =
+        r.db.load_state(r.db.sealed_state(r.data.path()).unwrap(), &scope)
+            .unwrap();
+    assert!(
+        settled.queues.is_empty(),
+        "the pull at the deadline settles"
+    );
+    let error = clave::seal::run(&r.db, r.data.path(), &r.sk, deadline)
+        .err()
+        .unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("predates completed recovery settlement"),
+        "{error}"
+    );
+    let unchanged =
+        r.db.load_state(r.db.sealed_state(r.data.path()).unwrap(), &scope)
+            .unwrap();
+    assert!(unchanged.queues.is_empty());
+    let next = (deadline.div_euclid(3599) + 1) * 3599;
+    let report = clave::seal::run(&r.db, r.data.path(), &r.sk, next).unwrap();
+    let sealed = stored_entries(&r, report.epoch_number);
+    assert!(sealed
+        .iter()
+        .any(|entry| entry["type"] == "publisher_catalog" && entry["body"] == catalog.envelope));
+    assert_eq!(sealed_item_ids(&sealed), [item_id(&item.0)]);
+    clave::history::declarations::Declarations::reconstruct(
+        &r.db,
+        r.data.path(),
+        r.db.last_epoch().unwrap(),
+    )
+    .unwrap();
+}
+
+fn queued_catalog_signed(
+    r: &Rig,
+    url: &str,
+    at: &str,
+    signer: &[u8; 32],
+) -> (Published, (serde_json::Value, serde_json::Value)) {
+    let item = page_item(&r.p, url, "queued");
+    let catalog = publish_collection_signed(
+        &r.p,
+        "default",
+        &[(item.0.clone(), Some(item.1.clone()))],
+        at,
+        None,
+        signer,
+    );
+    (catalog, item)
+}
+
+#[test]
+fn authenticated_sealing_separates_settlement_from_packed_authority() {
+    for case in [
+        "competitor",
+        "deferred_follower",
+        "deadline_key",
+        "deadline_scope",
+    ] {
+        let (mut r, start, owner) = sealed_recovery();
+        let (rejected, _) = queued_catalog_signed(
+            &r,
+            "https://example.com/rejected",
+            "2026-08-09T14:00:00Z",
+            &K1_SEED,
+        );
+        assert_eq!(
+            ingest(&r, "2026-08-09T14:00:05Z").queued,
+            [format!("default/{}", rejected.catalog_id)],
+            "{case}"
+        );
+        let (survivor, item) = queued_catalog_signed(
+            &r,
+            "https://example.com/survivor",
+            "2026-08-09T15:00:00Z",
+            &K2_SEED,
+        );
+        assert_eq!(
+            ingest(&r, "2026-08-09T15:00:05Z").queued,
+            [format!("default/{}", survivor.catalog_id)],
+            "{case}"
+        );
+        let mut replacement = owner.clone();
+        replacement["seq"] = 2.into();
+        replacement["prev_declaration"] = declaration_hash(&current_declaration(&r.p)).into();
+        let seed = if case == "competitor" {
+            &X1_SEED
+        } else {
+            &K2_SEED
+        };
+        match case {
+            "competitor" => {
+                replacement["keys"] =
+                    serde_json::json!([key_entry(&X1_SEED, "2026-08-09T13:00:00Z")]);
+            }
+            "deadline_scope" => replacement["subdomain_scope"] = serde_json::json!([]),
+            "deadline_key" => replacement["keys"][0]["nbf"] = nbf("2026-08-10T00:00:00Z").into(),
+            _ => {}
+        }
+        if case == "deferred_follower" {
+            replacement["subdomain_scope"] =
+                serde_json::json!(std::iter::once("example.com".to_string())
+                    .chain((0..70).map(|i| format!("explicit-host-{i}.example.com")))
+                    .collect::<Vec<_>>());
+        }
+        write_declaration(&r.p, &replacement, seed);
+        ingest(&r, "2026-08-09T16:00:00Z");
+        assert_eq!(
+            r.db.count_discovered_declarations(&r.host).unwrap(),
+            1,
+            "{case}"
+        );
+        if case == "deferred_follower" {
+            r.db.set_param("epoch_cap_bytes", 1800).unwrap();
+        } else {
+            clave::seal::run(&r.db, r.data.path(), &r.sk, start + 7200).unwrap();
+        }
+        r.db = clave::db::Db::open(&r.data.path().join("clave.sqlite")).unwrap();
+        let report = clave::seal::run(&r.db, r.data.path(), &r.sk, start + 3600 + 7 * DAY).unwrap();
+        let entries = stored_entries(&r, report.epoch_number);
+        assert_eq!(entries.len() as u64, report.entry_count, "{case}");
+        let state = clave::history::declarations::Declarations::reconstruct(
+            &r.db,
+            r.data.path(),
+            r.db.last_epoch().unwrap(),
+        )
+        .unwrap();
+        let current = &state.domains()[&r.host];
+        assert!(current.window().is_none(), "{case}");
+        let survivor_sealed = entries.iter().any(|entry| {
+            entry["type"] == "publisher_catalog" && entry["body"] == survivor.envelope
+        });
+        assert_eq!(survivor_sealed, case != "deadline_key", "{case}");
+        let recorded = sealed_item_ids(&entries).contains(&item_id(&item.0));
+        assert_eq!(
+            recorded,
+            matches!(case, "competitor" | "deferred_follower"),
+            "{case}"
+        );
+        assert_eq!(
+            current.current().envelope()["publisher"]["seq"],
+            if matches!(case, "competitor" | "deferred_follower") {
+                1
+            } else {
+                2
+            },
+            "{case}"
+        );
+        let rejections = r.db.list_rejections(&r.host).unwrap();
+        assert!(
+            rejections.iter().any(|rejection| rejection.id.as_deref()
+                == Some(rejected.catalog_id.as_str())
+                && rejection.code == "WIST1-E13"),
+            "{case}: {rejections:?}"
+        );
+        let survivor_rejected = rejections.iter().any(|rejection| {
+            rejection.id.as_deref() == Some(survivor.catalog_id.as_str())
+                && rejection.code == "WIST1-E13"
+        });
+        assert_eq!(
+            survivor_rejected,
+            case == "deadline_key",
+            "{case}: {rejections:?}"
+        );
+        assert_eq!(
+            r.db.count_discovered_declarations(&r.host).unwrap(),
+            i64::from(case == "deferred_follower"),
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn failed_admission_settlement_rolls_back_every_database_effect() {
+    let (mut r, _, _) = sealed_recovery();
+    let (rejected, _) = queued_catalog_signed(
+        &r,
+        "https://example.com/old",
+        "2026-08-09T14:00:00Z",
+        &K1_SEED,
+    );
+    ingest(&r, "2026-08-09T14:00:05Z");
+    let before = r.db.list_rejections(&r.host).unwrap().len();
+    let path = r.data.path().join("clave.sqlite");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("CREATE TRIGGER refuse_settlement BEFORE DELETE ON catalog_queues BEGIN SELECT RAISE(ABORT, 'injected failure'); END;").unwrap();
+    assert!(clave::ingest::run(
+        &r.db,
+        &r.client,
+        r.data.path(),
+        &r.host,
+        "2026-08-16T13:00:00Z"
+    )
+    .is_err());
+    r.db = clave::db::Db::open(&path).unwrap();
+    let scope = std::collections::BTreeSet::from([r.host.clone()]);
+    let state =
+        r.db.load_state(r.db.sealed_state(r.data.path()).unwrap(), &scope)
+            .unwrap();
+    assert!(state.queues[&r.host]
+        .queued
+        .values()
+        .any(|queued| queued.catalog_id == rejected.catalog_id));
+    assert_eq!(r.db.list_rejections(&r.host).unwrap().len(), before);
+    conn.execute_batch("DROP TRIGGER refuse_settlement;")
+        .unwrap();
+    ingest(&r, "2026-08-16T13:00:00Z");
+    let state =
+        r.db.load_state(r.db.sealed_state(r.data.path()).unwrap(), &scope)
+            .unwrap();
+    assert!(state.queues.is_empty());
+    assert!(r
+        .db
+        .list_rejections(&r.host)
+        .unwrap()
+        .iter()
+        .any(|rejection| rejection.code == "WIST1-E13"
+            && rejection.id.as_deref() == Some(rejected.catalog_id.as_str())));
+}
+
+#[test]
+fn a_pull_started_before_the_deadline_reads_the_window_at_its_own_instant_however_the_clock_crosses(
+) {
+    for crossing_call in [0, 1, 2, 3, 5] {
+        let (r, _, _) = sealed_recovery();
+        let (catalog, _) = queued_catalog_signed(
+            &r,
+            "https://example.com/crossing",
+            "2026-08-16T12:59:59Z",
+            &K1_SEED,
+        );
+        let calls = std::cell::Cell::new(0);
+        let report = clave::ingest::run_with_clock(
+            &r.db,
+            &r.client,
+            r.data.path(),
+            &r.host,
+            "2026-08-16T12:59:59Z",
+            || {
+                let call = calls.get();
+                calls.set(call + 1);
+                if call < crossing_call {
+                    "2026-08-16T12:59:59Z"
+                } else {
+                    "2026-08-16T13:00:00Z"
+                }
+                .parse()
+                .unwrap()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            report.queued,
+            [format!("default/{}", catalog.catalog_id)],
+            "{crossing_call}"
+        );
+        ingest(&r, "2026-08-16T13:00:00Z");
+        let scope = std::collections::BTreeSet::from([r.host.clone()]);
+        let state =
+            r.db.load_state(r.db.sealed_state(r.data.path()).unwrap(), &scope)
+                .unwrap();
+        assert!(state.queues.is_empty(), "{crossing_call}");
+        assert!(r
+            .db
+            .list_rejections(&r.host)
+            .unwrap()
+            .iter()
+            .any(|rejection| rejection.code == "WIST1-E13"
+                && rejection.id.as_deref() == Some(catalog.catalog_id.as_str())));
+    }
+}
+
+#[test]
+fn a_queued_catalog_rejected_at_settlement_is_judged_again_when_served_again() {
+    let (r, start, _) = sealed_recovery();
+    let (queued, item) = queued_catalog_signed(
+        &r,
+        "https://example.com/retry",
+        "2026-08-09T14:00:00Z",
+        &K1_SEED,
+    );
+    ingest(&r, "2026-08-09T14:00:05Z");
+    let deadline = "2026-08-16T13:00:00Z";
+    ingest(&r, deadline);
+    assert!(r
+        .db
+        .list_rejections(&r.host)
+        .unwrap()
+        .iter()
+        .any(|rejection| rejection.code == "WIST1-E13"
+            && rejection.id.as_deref() == Some(queued.catalog_id.as_str())));
+    let resigned = wist_core::envelope::sign_envelope(
+        &queued.envelope["catalog"],
+        "catalog",
+        &kid(&K2_SEED),
+        &wist_core::crypto::SigningKey::from_seed(&K2_SEED),
+    )
+    .unwrap();
+    std::fs::write(
+        collection_dir(&r.p, "default").join("catalog.json"),
+        wist_core::jcs::canonicalize(&resigned).unwrap(),
+    )
+    .unwrap();
+    let report = ingest(&r, "2026-08-16T13:00:05Z");
+    assert!(report.queued.is_empty(), "{report:?}");
+    let report = clave::seal::run(&r.db, r.data.path(), &r.sk, start + 3600 + 7 * DAY).unwrap();
+    let entries = stored_entries(&r, report.epoch_number);
+    assert!(entries
+        .iter()
+        .any(|entry| entry["type"] == "publisher_catalog" && entry["body"] == resigned));
+    assert_eq!(sealed_item_ids(&entries), [item_id(&item.0)]);
+}
+
+#[test]
+fn admission_deadline_preserves_pending_followers_and_later_replacements() {
+    let (mut r, start, owner) = sealed_recovery();
+    let owner_envelope = current_declaration(&r.p);
+    let (rejected, _) = queued_catalog_signed(
+        &r,
+        "https://example.com/old",
+        "2026-08-09T14:00:00Z",
+        &K1_SEED,
+    );
+    ingest(&r, "2026-08-09T14:00:05Z");
+    let mut competitor = owner.clone();
+    competitor["seq"] = 2.into();
+    competitor["prev_declaration"] = declaration_hash(&owner_envelope).into();
+    competitor["keys"] = serde_json::json!([key_entry(&X1_SEED, "2026-08-09T13:00:00Z")]);
+    write_declaration(&r.p, &competitor, &X1_SEED);
+    ingest(&r, "2026-08-09T15:00:00Z");
+    let mut follower = owner;
+    follower["seq"] = 3.into();
+    follower["prev_declaration"] = declaration_hash(&owner_envelope).into();
+    follower["keys"] = serde_json::json!([key_entry(&K1_SEED, "2026-08-09T13:00:00Z")]);
+    write_declaration(&r.p, &follower, &K2_SEED);
+    let follower_envelope = current_declaration(&r.p);
+    ingest(&r, "2026-08-09T16:00:00Z");
+    let deadline = "2026-08-16T13:00:00Z";
+    r.db = clave::db::Db::open(&r.data.path().join("clave.sqlite")).unwrap();
+    ingest(&r, deadline);
+    assert_eq!(
+        r.db.highest_accepted_declaration_seq(&r.host).unwrap(),
+        Some(3)
+    );
+    assert!(r
+        .db
+        .list_rejections(&r.host)
+        .unwrap()
+        .iter()
+        .any(
+            |rejection| rejection.id.as_deref() == Some(rejected.catalog_id.as_str())
+                && rejection.code == "WIST1-E13"
+        ));
+    competitor["seq"] = 4.into();
+    competitor["prev_declaration"] = declaration_hash(&follower_envelope).into();
+    write_declaration(&r.p, &competitor, &K1_SEED);
+    let replacement = current_declaration(&r.p);
+    let (after, item) = queued_catalog_signed(&r, "https://example.com/after", deadline, &X1_SEED);
+    let report = ingest(&r, "2026-08-16T13:00:05Z");
+    assert_eq!(
+        report.accepted,
+        [format!("default/{}", after.catalog_id)],
+        "{report:?}"
+    );
+    r.db = clave::db::Db::open(&r.data.path().join("clave.sqlite")).unwrap();
+    ingest(&r, "2026-08-16T13:00:05Z");
+    let report = clave::seal::run(&r.db, r.data.path(), &r.sk, start + 3600 + 7 * DAY).unwrap();
+    let state = clave::history::declarations::Declarations::reconstruct(
+        &r.db,
+        r.data.path(),
+        r.db.last_epoch().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(state.domains()[&r.host].current().envelope(), &replacement);
+    assert_eq!(
+        r.db.highest_accepted_declaration_seq(&r.host).unwrap(),
+        Some(4)
+    );
+    let sealed = sealed_item_ids(&stored_entries(&r, report.epoch_number));
+    assert!(sealed.contains(&item_id(&item.0)));
+    assert!(state.domains()[&r.host].window().is_none());
+}
+
+fn held_deferrals(r: &Rig, url: &str) -> serde_json::Value {
+    let status =
+        serde_json::to_value(clave::serve::load_status(&r.db, &r.host).unwrap().unwrap()).unwrap();
+    assert_valid("status.schema.json", &status);
+    status["collections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|collection| collection["waiting"].as_array().unwrap())
+        .find(|entry| entry["url"] == url)
+        .unwrap_or_else(|| panic!("{status}"))["deferrals"]
+        .clone()
+}
+
+#[test]
+fn a_window_opened_over_a_waiting_catalog_defers_its_held_items_at_every_epoch_inside_it() {
+    use clave::collection::plan::{self, Deferral, EpochInput, Inclusion, Publication};
+    let r = rig(make_publisher_with_recovery);
+    let start = wist_core::timestamp::log_seconds("2026-08-09T12:00:00Z").unwrap();
+    ingest(&r, "2026-08-09T12:00:00Z");
+    clave::seal::run(&r.db, r.data.path(), &r.sk, start).unwrap();
+    let url = format!("https://{}/held", r.host);
+    let (waiting, _) = queued_catalog_signed(&r, &url, "2026-08-09T12:30:00Z", &K1_SEED);
+    let report = ingest(&r, "2026-08-09T12:30:05Z");
+    assert_eq!(report.accepted, [format!("default/{}", waiting.catalog_id)]);
+    let prior = current_declaration(&r.p);
+    let mut owner = prior["publisher"].clone();
+    owner["seq"] = 1.into();
+    owner["prev_declaration"] = declaration_hash(&prior).into();
+    owner["keys"] = serde_json::json!([key_entry(&K2_SEED, "2026-08-09T13:00:00Z")]);
+    write_declaration(&r.p, &owner, &R1_SEED);
+    ingest(&r, "2026-08-09T12:45:00Z");
+    clave::seal::run(&r.db, r.data.path(), &r.sk, start + 3600).unwrap();
+
+    let scope = std::collections::BTreeSet::from([r.host.clone()]);
+    let mut state =
+        r.db.load_state(r.db.sealed_state(r.data.path()).unwrap(), &scope)
+            .unwrap();
+    let held = clave::db::StoreHeld::new(&r.db, r.data.path(), "2026-08-09T13:00:00Z");
+    let parameters = clave::collection::Parameters::new(Default::default());
+    let inclusion = Inclusion::constant(24);
+    let unsealed = std::collections::BTreeSet::new();
+    for (height, sealed_at) in [(2, "2026-08-09T14:00:00Z"), (3, "2026-08-09T15:00:00Z")] {
+        let planned = plan::plan(
+            &state,
+            &held,
+            &EpochInput {
+                height,
+                sealed_at,
+                parameters: &parameters,
+                inclusion: &inclusion,
+                suffix_list: None,
+                declarations: &[],
+                updates: &[],
+                unsealed: &unsealed,
+                log_key: &|_| None,
+            },
+        )
+        .unwrap_or_else(|error| panic!("in memory at {height}: {error}"));
+        assert!(planned.entries.is_empty());
+        let deferred = planned
+            .deferred
+            .iter()
+            .find(|deferred| {
+                matches!(&deferred.publication, Publication::Item { url: held, .. } if *held == url)
+            })
+            .unwrap_or_else(|| panic!("in memory at {height}: {:?}", planned.deferred));
+        assert_eq!(deferred.reasons, [Deferral::RecoveryWindow]);
+        state = planned.state;
+        state.declarations.seed_head(
+            height,
+            "root",
+            Some(wist_core::timestamp::log_seconds(sealed_at).unwrap()),
+        );
+    }
+
+    for hour in 2..=3 {
+        let report = clave::seal::run(&r.db, r.data.path(), &r.sk, start + hour * 3600)
+            .unwrap_or_else(|error| panic!("through the store at {hour}: {error}"));
+        assert_eq!(report.entry_count, 0);
+        assert_eq!(
+            held_deferrals(&r, &url),
+            serde_json::json!(["recovery_window"])
+        );
+    }
+}
+
+#[test]
+fn a_seal_inside_a_window_that_a_pull_settled_is_refused_while_a_follower_queue_is_held() {
+    let (r, start, owner) = sealed_recovery();
+    let owner_envelope = current_declaration(&r.p);
+    let mut follower = owner;
+    follower["seq"] = 2.into();
+    follower["prev_declaration"] = declaration_hash(&owner_envelope).into();
+    follower["keys"] = serde_json::json!([key_entry(&K1_SEED, "2026-08-09T13:00:00Z")]);
+    write_declaration(&r.p, &follower, &R1_SEED);
+    let url = format!("https://{}/later", r.host);
+    let (later, _) = queued_catalog_signed(&r, &url, "2026-08-09T15:30:00Z", &K1_SEED);
+    let report = ingest(&r, "2026-08-09T16:00:00Z");
+    assert_eq!(report.queued, [format!("default/{}", later.catalog_id)]);
+    let settled = |r: &Rig| {
+        r.db.list_rejections(&r.host)
+            .unwrap()
+            .into_iter()
+            .filter(|rejection| {
+                rejection.code == "WIST1-E13"
+                    && rejection.id.as_deref() == Some(later.catalog_id.as_str())
+            })
+            .count()
+    };
+    let window_end = start + 3600 + 7 * DAY;
+    ingest(&r, "2026-08-16T13:00:00Z");
+    assert_eq!(settled(&r), 1);
+    assert!(r.db.count_discovered_declarations(&r.host).unwrap() > 0);
+    let inside = clave::seal::run(&r.db, r.data.path(), &r.sk, window_end - 3600);
+    assert!(
+        inside.is_err(),
+        "a slot below the end sealed after a pull settled the window"
+    );
+    clave::seal::run(&r.db, r.data.path(), &r.sk, window_end).unwrap();
+    assert_eq!(settled(&r), 1, "the queue is settled once");
+}
+
+#[test]
+fn a_status_inside_a_window_names_the_collections_of_both_frozen_sources() {
+    let r = rig(make_publisher_with_recovery);
+    let url = |path: &str| format!("https://{}/{path}", r.host);
+    let mut first = current_declaration(&r.p)["publisher"].clone();
+    first["collections"] = serde_json::json!([
+        {"name": "journal", "scope": [{"url": url("journal/"), "match": "prefix"}]},
+        {"name": "archive", "scope": [{"url": url("archive/"), "match": "prefix"}]},
+    ]);
+    write_declaration(&r.p, &first, &K1_SEED);
+    let start = wist_core::timestamp::log_seconds("2026-08-09T12:00:00Z").unwrap();
+    ingest(&r, "2026-08-09T12:00:00Z");
+    clave::seal::run(&r.db, r.data.path(), &r.sk, start).unwrap();
+    let prior = current_declaration(&r.p);
+    let mut owner = prior["publisher"].clone();
+    owner["seq"] = 1.into();
+    owner["prev_declaration"] = declaration_hash(&prior).into();
+    owner["keys"] = serde_json::json!([key_entry(&K2_SEED, "2026-08-09T13:00:00Z")]);
+    owner["collections"] = serde_json::json!([
+        {"name": "journal", "scope": [{"url": url("journal/"), "match": "prefix"}]},
+    ]);
+    write_declaration(&r.p, &owner, &R1_SEED);
+    ingest(&r, "2026-08-09T13:00:00Z");
+    clave::seal::run(&r.db, r.data.path(), &r.sk, start + 3600).unwrap();
+    ingest(&r, "2026-08-09T14:00:00Z");
+    let status =
+        serde_json::to_value(clave::serve::load_status(&r.db, &r.host).unwrap().unwrap()).unwrap();
+    assert_valid("status.schema.json", &status);
+    let names: Vec<&str> = status["collections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|collection| collection["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["archive", "journal"], "{status}");
 }

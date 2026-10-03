@@ -1147,3 +1147,33 @@ fn demand_pulls_wait_while_the_sealing_backlog_is_full_and_resume_once_sealed() 
         std::thread::sleep(Duration::from_millis(50));
     }
 }
+
+#[test]
+fn a_payload_file_is_served_only_under_a_payload_duty() {
+    let tmp = tempfile::tempdir().unwrap();
+    clave::init::run("127.0.0.1:0", tmp.path()).unwrap();
+    let hex = "ab".repeat(32);
+    std::fs::create_dir_all(tmp.path().join("payloads")).unwrap();
+    std::fs::write(
+        tmp.path().join("payloads").join(format!("{hex}.json")),
+        b"{\"wist_version\":\"1.0.0\"}",
+    )
+    .unwrap();
+    let addr = spawn_server(tmp.path());
+    let c = reqwest::blocking::Client::new();
+    let get = || {
+        c.get(format!("{addr}/payloads/{hex}.json"))
+            .send()
+            .unwrap()
+            .status()
+    };
+    assert_eq!(get(), 404, "a file with no duty row is served");
+    rusqlite::Connection::open(tmp.path().join("clave.sqlite"))
+        .unwrap()
+        .execute(
+            "INSERT INTO payload_duties(item_id, publisher, url, until, served) VALUES (?1, 'example.com', 'https://example.com/', '9999-12-31T23:59:59Z', 1)",
+            [format!("sha256:{hex}")],
+        )
+        .unwrap();
+    assert_eq!(get(), 200);
+}

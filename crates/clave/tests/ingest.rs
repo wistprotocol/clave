@@ -1,5 +1,6 @@
 mod common;
 
+use clave::history::declarations::DeclarationsReplay;
 use common::{make_publisher, make_publisher_with_scope, reserve_addr, serve_static};
 
 #[test]
@@ -676,4 +677,261 @@ fn a_store_of_the_layout_before_collections_is_refused_at_open() {
     drop(conn);
     let error = clave::db::Db::open(&path).err().unwrap().to_string();
     assert!(error.contains("superseded layout 2"), "{error}");
+}
+
+#[test]
+fn a_declaration_that_fails_verification_is_e01_and_an_unknown_key_is_e02() {
+    let (listener, host, client) = reserve_addr();
+    let p = make_publisher(&host);
+    serve_static(listener, p.dir.path().to_path_buf());
+    let tmp = tempfile::tempdir().unwrap();
+    clave::init::run(&host, tmp.path()).unwrap();
+    let db = clave::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+    clave::ingest::run(&db, &client, tmp.path(), &host, "2026-08-09T12:00:05Z").unwrap();
+    let path = p.dir.path().join(".well-known/wist/publisher.json");
+    let stored: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let mut tampered = stored.clone();
+    tampered["publisher"]["seq"] = 1.into();
+    tampered["publisher"]["prev_declaration"] = common::declaration_hash(&stored).as_str().into();
+    std::fs::write(&path, serde_json::to_vec(&tampered).unwrap()).unwrap();
+    clave::ingest::run(&db, &client, tmp.path(), &host, "2026-08-09T13:00:05Z").unwrap();
+    let codes: Vec<String> = db
+        .list_rejections(&host)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.code)
+        .collect();
+    assert!(codes.contains(&"WIST1-E01".to_string()), "codes {codes:?}");
+    let mut unknown = tampered.clone();
+    unknown["sig"]["key_id"] = "kX".into();
+    std::fs::write(&path, serde_json::to_vec(&unknown).unwrap()).unwrap();
+    clave::ingest::run(&db, &client, tmp.path(), &host, "2026-08-09T14:00:05Z").unwrap();
+    let codes: Vec<String> = db
+        .list_rejections(&host)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.code)
+        .collect();
+    assert!(codes.contains(&"WIST1-E02".to_string()), "codes {codes:?}");
+    assert_eq!(db.count_discovered_declarations(&host).unwrap(), 1);
+}
+
+#[test]
+fn ingest_rejects_publisher_domain_mismatch() {
+    let (listener, host, client) = reserve_addr();
+    let p = make_publisher("not-the-host.example");
+    serve_static(listener, p.dir.path().to_path_buf());
+    let tmp = tempfile::tempdir().unwrap();
+    clave::init::run(&host, tmp.path()).unwrap();
+    let db = clave::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+    let report =
+        clave::ingest::run(&db, &client, tmp.path(), &host, "2026-08-09T12:00:05Z").unwrap();
+    assert!(report.accepted.is_empty());
+    assert_eq!(report.noise, Some("WIST2-E04"));
+    assert!(db.get_publisher(&host).unwrap().is_none());
+    let rejections = db.list_rejections(&host).unwrap();
+    assert_eq!(rejections.len(), 1);
+    assert_eq!(rejections[0].code, "WIST2-E04");
+}
+
+#[test]
+fn invalid_first_declarations_remain_e04_noise_without_persistence() {
+    for (mutation, reason) in [
+        ("duplicate", "WIST1-E08"),
+        ("unknown", "WIST1-E02"),
+        ("signature", "WIST1-E01"),
+        ("shape", "WIST1-E14"),
+        ("encoding", "WIST1-E14"),
+        ("excluded", "WIST1-E02"),
+        ("host", "WIST1-E14"),
+        ("scope", "WIST1-E14"),
+        ("timestamp", "WIST1-E14"),
+        ("optional-null", "WIST1-E14"),
+    ] {
+        let (listener, host, client) = reserve_addr();
+        let publisher = make_publisher(&host);
+        let path = publisher.dir.path().join(".well-known/wist/publisher.json");
+        let mut doc: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let resign = |doc: &serde_json::Value, key: &wist_core::crypto::SigningKey| {
+            wist_core::envelope::sign_envelope(&doc["publisher"], "publisher", &publisher.kid, key)
+                .unwrap()
+        };
+        match mutation {
+            "duplicate" => {
+                let key = doc["publisher"]["keys"][0].clone();
+                doc["publisher"]["keys"].as_array_mut().unwrap().push(key);
+                doc = resign(&doc, &publisher.sk);
+            }
+            "unknown" => doc["sig"]["key_id"] = "unknown".into(),
+            "signature" => {
+                doc = resign(&doc, &wist_core::crypto::SigningKey::from_seed(&[22; 32]));
+            }
+            "encoding" => {
+                let mut encoded = doc["sig"]["value"].as_str().unwrap().to_string();
+                let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+                let last = encoded.pop().unwrap() as u8;
+                let index = alphabet.iter().position(|byte| *byte == last).unwrap();
+                encoded.push(alphabet[index + 1] as char);
+                doc["sig"]["value"] = encoded.into();
+            }
+            "excluded" => {
+                common::rekey(
+                    &mut doc["publisher"]["keys"][0],
+                    &wist_core::crypto::b64u_encode(&[0; 32]),
+                );
+                doc = resign(&doc, &publisher.sk);
+            }
+            "host" => doc["publisher"]["domain"] = format!("{host}:8080").into(),
+            "scope" => doc["publisher"]["subdomain_scope"] = serde_json::json!(["EXAMPLE.com"]),
+            "timestamp" => doc["publisher"]["keys"][0]["nbf"] = (-1).into(),
+            "optional-null" => doc["publisher"]["contact"] = serde_json::Value::Null,
+            _ => doc["extra"] = true.into(),
+        }
+        std::fs::write(&path, serde_json::to_vec(&doc).unwrap()).unwrap();
+        serve_static(listener, publisher.dir.path().to_path_buf());
+        let data = tempfile::tempdir().unwrap();
+        clave::init::run("log.example", data.path()).unwrap();
+        let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
+        let report =
+            clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:05Z").unwrap();
+        assert!(report.accepted.is_empty(), "{mutation}");
+        assert_eq!(report.noise, Some("WIST2-E04"), "{mutation}");
+        assert!(db.get_publisher(&host).unwrap().is_none(), "{mutation}");
+        assert_eq!(db.count_discovered_declarations(&host).unwrap(), 0);
+        let rejected = db.list_rejections(&host).unwrap();
+        let stopped = rejected
+            .iter()
+            .find(|rejection| rejection.code == "WIST2-E04")
+            .unwrap_or_else(|| panic!("{mutation}: {rejected:?}"));
+        assert!(
+            stopped.detail.as_deref().unwrap().contains(reason),
+            "{mutation}: {rejected:?}"
+        );
+        assert!(
+            rejected
+                .iter()
+                .all(|rejection| [reason, "WIST2-E04"].contains(&rejection.code.as_str())),
+            "{mutation}: {rejected:?}"
+        );
+    }
+}
+
+#[test]
+fn declaration_field_rejections_preserve_signed_state_through_reopen_and_sealing() {
+    let (listener, host, client) = reserve_addr();
+    let publisher = make_publisher_with_scope(
+        &host,
+        &["example.com", "xn--bcher-kva.example", "-foo.example"],
+    );
+    let path = publisher.dir.path().join(".well-known/wist/publisher.json");
+    let mut initial = common::current_declaration(&publisher)["publisher"].clone();
+    initial["contact"] = "😀".repeat(256).into();
+    initial["keys"][0]["nbf"] = 0.into();
+    let signed =
+        wist_core::envelope::sign_envelope(&initial, "publisher", &publisher.kid, &publisher.sk)
+            .unwrap();
+    std::fs::write(&path, serde_json::to_vec(&signed).unwrap()).unwrap();
+    serve_static(listener, publisher.dir.path().to_path_buf());
+    let data = tempfile::tempdir().unwrap();
+    clave::init::run("log.example", data.path()).unwrap();
+    let database = data.path().join("clave.sqlite");
+    let mut db = clave::db::Db::open(&database).unwrap();
+    let report =
+        clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:05Z").unwrap();
+    assert_eq!(report.noise, None);
+    assert_eq!(db.count_discovered_declarations(&host).unwrap(), 1);
+    for field in [
+        "signature",
+        "timestamp",
+        "hostname",
+        "optional-null",
+        "length",
+    ] {
+        let mut incoming = signed.clone();
+        match field {
+            "signature" => incoming["sig"]["alg"] = "other".into(),
+            "timestamp" => incoming["publisher"]["keys"][0]["nbf"] = 253_402_300_800u64.into(),
+            "hostname" => incoming["publisher"]["domain"] = "LOCALHOST".into(),
+            "optional-null" => incoming["publisher"]["recovery_keys"] = serde_json::Value::Null,
+            _ => incoming["publisher"]["contact"] = "😀".repeat(257).into(),
+        }
+        std::fs::write(&path, serde_json::to_vec(&incoming).unwrap()).unwrap();
+        let before = db.list_rejections(&host).unwrap().len();
+        clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:01:00Z").unwrap();
+        let rejections = db.list_rejections(&host).unwrap();
+        let codes: Vec<&str> = rejections[..rejections.len() - before]
+            .iter()
+            .map(|rejection| rejection.code.as_str())
+            .collect();
+        assert_eq!(codes, ["WIST2-E01", "WIST1-E14"], "{field}");
+        drop(db);
+        db = clave::db::Db::open(&database).unwrap();
+        let stored: serde_json::Value =
+            serde_json::from_slice(&db.get_publisher_declaration(&host).unwrap().unwrap()).unwrap();
+        assert_eq!(stored, signed, "{field}");
+        assert_eq!(db.count_discovered_declarations(&host).unwrap(), 1);
+    }
+    let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
+    let at = wist_core::timestamp::log_seconds("2026-08-09T13:00:00Z").unwrap();
+    clave::seal::run(&db, data.path(), &sk, at).unwrap();
+    let state = clave::history::declarations::Declarations::reconstruct(
+        &db,
+        data.path(),
+        db.last_epoch().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(*state.domains()[&host].current().envelope(), signed);
+}
+
+#[test]
+fn unused_excluded_keys_survive_ingest_reopen_and_sealing_without_blocking_usable_keys() {
+    let (listener, host, client) = reserve_addr();
+    let publisher = make_publisher(&host);
+    let path = publisher.dir.path().join(".well-known/wist/publisher.json");
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let mut excluded = doc["publisher"]["keys"][0].clone();
+    common::rekey(&mut excluded, &wist_core::crypto::b64u_encode(&[0; 32]));
+    doc["publisher"]["keys"]
+        .as_array_mut()
+        .unwrap()
+        .insert(0, excluded);
+    let signed = wist_core::envelope::sign_envelope(
+        &doc["publisher"],
+        "publisher",
+        &publisher.kid,
+        &publisher.sk,
+    )
+    .unwrap();
+    std::fs::write(&path, serde_json::to_vec(&signed).unwrap()).unwrap();
+    let (item, payload) =
+        common::page_item(&publisher, &format!("https://{host}/a"), "eligible content");
+    common::publish_collection(
+        &publisher,
+        "default",
+        &[(item.clone(), Some(payload))],
+        "2026-08-09T12:00:00Z",
+        None,
+    );
+    serve_static(listener, publisher.dir.path().to_path_buf());
+    let data = tempfile::tempdir().unwrap();
+    clave::init::run("log.example", data.path()).unwrap();
+    let database = data.path().join("clave.sqlite");
+    let db = clave::db::Db::open(&database).unwrap();
+    let report =
+        clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:05Z").unwrap();
+    assert_eq!(
+        report.items,
+        [format!("default/{}", common::item_id(&item))]
+    );
+    assert!(report.rejected.is_empty(), "{report:?}");
+    drop(db);
+    let db = clave::db::Db::open(&database).unwrap();
+    let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
+    let at = wist_core::timestamp::log_seconds("2026-08-09T13:00:00Z").unwrap();
+    let sealed = clave::seal::run(&db, data.path(), &sk, at).unwrap();
+    let entries = db.epoch_entries(sealed.epoch_number).unwrap();
+    assert_eq!(entries[0]["body"], signed);
+    assert_eq!(common::sealed_item_ids(&entries), [common::item_id(&item)]);
 }
