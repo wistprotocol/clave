@@ -134,22 +134,6 @@ pub(super) fn next_page_url(next: &str, host: &str, allow_http: bool) -> Option<
     ))
 }
 
-pub(super) fn initial_declaration(
-    value: &Value,
-    host: &str,
-    limits: &wist_core::collection::Limits,
-) -> Result<Publisher, String> {
-    let publisher = declaration::evaluate_initial(value, limits)
-        .map_err(|(code, detail)| format!("{code}: {detail}"))?;
-    if super::canonical_authority(&publisher.domain).as_deref() != Some(host) {
-        return Err("publisher declaration domain does not match ping host".into());
-    }
-    if publisher.keys.is_empty() {
-        return Err("publisher has no keys".into());
-    }
-    Ok(publisher)
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum LabelKind {
     Label,

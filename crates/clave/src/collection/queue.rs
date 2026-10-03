@@ -11,6 +11,7 @@ use wist_core::timestamp::log_seconds;
 
 pub const REJECTED: &str = "WIST1-E13";
 pub const REGRESSED: &str = "WIST2-E05";
+const NO_CANDIDATE: &str = "WIST1-E02";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettledOutcome {
@@ -49,8 +50,8 @@ pub struct Settled {
 }
 
 pub(super) struct Settling<'a> {
-    pub source: &'a Publisher,
-    pub order: &'a Publisher,
+    pub source: Option<&'a Publisher>,
+    pub order: Option<&'a Publisher>,
     pub clock: &'a str,
     pub parameters: &'a Parameters,
     pub eligibility: u64,
@@ -110,7 +111,7 @@ fn absorb(state: &mut State, publisher: &str) -> Result<BTreeMap<String, u64>> {
                 envelope: waiting.envelope,
                 catalog_id: waiting.catalog_id,
                 place: waiting.place,
-                sources: Vec::new(),
+                sources: waiting.read,
             },
         )?;
         if let Some(collection) = state.collections.get_mut(&key) {
@@ -188,12 +189,24 @@ fn drop_discovered(state: &mut State, publisher: &str, hashes: BTreeSet<String>)
 
 /// WIST-1 §5.2, Unsealed Declarations at settlement.
 pub(super) fn supersede(state: &mut State, publisher: &str) {
+    let ended = state
+        .declarations
+        .domains()
+        .get(publisher)
+        .and_then(|domain| domain.window())
+        .map(|window| window.owner().hash().to_owned());
     let competitors: BTreeSet<String> = state
         .discovered
         .get(publisher)
         .into_iter()
         .flatten()
-        .filter(|found| found.competitor)
+        .filter(|found| {
+            found.competitor
+                && found
+                    .competes_with
+                    .as_ref()
+                    .is_none_or(|owner| Some(owner) == ended.as_ref())
+        })
         .map(|found| found.hash.clone())
         .collect();
     if !competitors.is_empty() {
@@ -240,7 +253,10 @@ pub(super) fn settle(
     };
     let skew = settling.parameters.value("clock_skew_seconds")?;
     let items_max = settling.parameters.value("catalog_items_max")?;
-    let attempt = Attempt::new(settling.source, settling.clock, skew, items_max)?;
+    let attempt = settling
+        .source
+        .map(|source| Attempt::new(source, settling.clock, skew, items_max))
+        .transpose()?;
     let mut rows: Vec<(&(String, String), &QueuedCatalog)> = queue.queued.iter().collect();
     rows.sort_by(|a, b| (a.1.place, &a.0 .1).cmp(&(b.1.place, &b.0 .1)));
     let mut results = Vec::new();
@@ -255,9 +271,13 @@ pub(super) fn settle(
         let outcome = if floor.is_some_and(|floor| at <= floor) {
             SettledOutcome::Regressed
         } else {
-            match catalog::judge(&queued.envelope, &attempt) {
-                Err(code) => SettledOutcome::Rejected(code),
-                Ok(_) => {
+            match attempt
+                .as_ref()
+                .map(|attempt| catalog::judge(&queued.envelope, attempt))
+            {
+                None => SettledOutcome::Rejected(NO_CANDIDATE),
+                Some(Err(code)) => SettledOutcome::Rejected(code),
+                Some(Ok(_)) => {
                     let better = match survivors.get(name) {
                         Some((_, survivor)) => later(queued, survivor)?,
                         None => true,
@@ -316,6 +336,7 @@ pub(super) fn settle(
                     failed_c4: false,
                     place,
                     eligibility,
+                    read: queued.sources.clone(),
                 })
             }
             None => None,
@@ -329,8 +350,8 @@ pub(super) fn settle(
         .map(|((_, url), waiting)| (url.clone(), waiting.clone()))
         .collect();
     state.urls.retain(|(owner, _), _| owner != publisher);
-    let candidates = pull::waiting_candidates(state, held, publisher, Some(settling.order))?;
-    let order = pull::place_order(state, publisher, Some(settling.order), &[]);
+    let candidates = pull::waiting_candidates(state, held, publisher, settling.order)?;
+    let order = pull::place_order(state, publisher, settling.order, &[]);
     let fallback = order.len() as u64;
     for (url, candidate) in candidates {
         let (place, eligibility) = match frozen.get(&url) {
@@ -394,19 +415,15 @@ pub(super) fn settle_orphans(
         .collect();
     let mut results = Vec::new();
     for publisher in orphans {
-        let source = pull::log_declaration(state, &publisher)?.ok_or_else(|| {
-            Error::History(format!(
-                "{publisher} settles a queue with no Declaration in the Log"
-            ))
-        })?;
+        let source = pull::log_declaration(state, &publisher)?;
         let waited = absorb(state, &publisher)?;
         results.extend(settle(
             state,
             held,
             &publisher,
             &Settling {
-                source: &source,
-                order: &source,
+                source: source.as_ref(),
+                order: source.as_ref(),
                 clock,
                 parameters,
                 eligibility,
@@ -416,4 +433,48 @@ pub(super) fn settle_orphans(
         )?);
     }
     Ok(results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::collection::MemoryHeld;
+
+    #[test]
+    fn a_queue_of_a_publisher_with_no_declaration_in_force_settles_with_every_catalog_failing_c1() {
+        let mut state = State::default();
+        let mut queue = RecoveryQueue {
+            owner: "sha256:gone".into(),
+            ..RecoveryQueue::default()
+        };
+        enqueue(
+            &mut queue,
+            "default",
+            "key",
+            QueuedCatalog {
+                envelope: serde_json::json!({"catalog": {"generated_at": "2026-08-09T12:00:00Z"}}),
+                catalog_id: "sha256:queued".into(),
+                place: Place::catalog(0, 0),
+                sources: Vec::new(),
+            },
+        )
+        .unwrap();
+        state.queues.insert("example.com".into(), queue);
+        let settled = settle_orphans(
+            &mut state,
+            &MemoryHeld::default(),
+            "2026-08-09T13:00:00Z",
+            &Parameters::default(),
+            1,
+            2,
+        )
+        .unwrap();
+        assert_eq!(settled.len(), 1);
+        assert_eq!(settled[0].catalog, "sha256:queued");
+        assert_eq!(settled[0].outcome, SettledOutcome::Rejected("WIST1-E02"));
+        assert!(state.queues.is_empty());
+        assert!(state
+            .collection("example.com", "default")
+            .is_some_and(|collection| collection.accepted.is_none()));
+    }
 }

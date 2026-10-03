@@ -694,7 +694,11 @@ impl Db {
     /// plus two.
     pub fn sealing_backlog(&self) -> Result<(u64, u64)> {
         Ok(self.conn.query_row(
-            "SELECT COUNT(*), COALESCE(SUM(LENGTH(entry_json) + LENGTH(entry_type) + 21), 0) FROM pending_entries",
+            "SELECT COALESCE(SUM(entries), 0), COALESCE(SUM(octets), 0) FROM (
+                SELECT COUNT(*) AS entries, SUM(LENGTH(entry_json) + LENGTH(entry_type) + 21) AS octets FROM pending_entries
+                UNION ALL SELECT COUNT(*), SUM(LENGTH(envelope) + 42) FROM discovered_declarations
+                UNION ALL SELECT COUNT(*), SUM(LENGTH(accepted_envelope) + 38) FROM collections WHERE accepted_id IS NOT NULL AND (latest_id IS NULL OR latest_id != accepted_id) AND NOT COALESCE(accepted_failed_c1, 0) AND NOT COALESCE(accepted_failed_c4, 0)
+                UNION ALL SELECT COUNT(*), 0 FROM waiting_urls)",
             [],
             |row| {
                 Ok((

@@ -199,11 +199,20 @@ fn labels_and_disputes_are_pulled_sealed_and_carried() {
 
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
     let r0 = clave::seal::run(&db, data.path(), &sk, SEAL_START).unwrap();
-    assert_eq!((r0.epoch_number, r0.entry_count), (0, 2));
-    assert_eq!(db.epoch_entries(0).unwrap()[1]["type"], "label");
+    assert_eq!((r0.epoch_number, r0.entry_count), (0, 3));
+    let types: Vec<String> = db
+        .epoch_entries(0)
+        .unwrap()
+        .iter()
+        .map(|entry| entry["type"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        types,
+        ["publisher_declaration", "publisher_catalog", "label"]
+    );
     let sealed = db.sealed_labels().unwrap();
     assert_eq!(sealed.len(), 1);
-    assert_eq!((sealed[0].height, sealed[0].entry_index), (0, 1));
+    assert_eq!((sealed[0].height, sealed[0].entry_index), (0, 2));
     assert_eq!(
         db.sealed_label_subject(&id).unwrap().as_deref(),
         Some(subject)
@@ -301,13 +310,21 @@ fn labels_and_disputes_are_pulled_sealed_and_carried() {
     assert_eq!(report.labels, vec![retraction.0.clone()]);
 
     let r1 = clave::seal::run(&db, data.path(), &sk, SEAL_START + 7200).unwrap();
-    assert_eq!((r1.epoch_number, r1.entry_count), (1, 3));
+    assert_eq!((r1.epoch_number, r1.entry_count), (1, 4));
     let sealed_entries = db.epoch_entries(1).unwrap();
     let types: Vec<&str> = sealed_entries
         .iter()
         .map(|e| e["type"].as_str().unwrap())
         .collect();
-    assert_eq!(types, ["publisher_declaration", "label", "dispute"]);
+    assert_eq!(
+        types,
+        [
+            "publisher_declaration",
+            "publisher_catalog",
+            "label",
+            "dispute"
+        ]
+    );
     let entries = state_entries(data.path());
     assert!(!entries.iter().any(|e| e[0] == "label"), "{entries:?}");
     assert!(entries.contains(&json!([

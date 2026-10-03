@@ -8,6 +8,8 @@ use wist_core::crypto::SigningKey;
 
 mod prepare;
 mod publish;
+#[cfg(test)]
+mod withdrawal_tests;
 
 pub(crate) use prepare::validate_pending_parameter;
 
@@ -127,6 +129,47 @@ pub fn run_with_client(
     now_unix: i64,
 ) -> Result<SealReport> {
     run_confirming(db, data_dir, sk, client, now_unix, &mut HashSet::new())
+}
+
+/// WIST-3 §6.1: a Payload whose duty ended is no longer served; WIST-2 §5.3: a held Payload,
+/// list or tree file nothing kept names is discarded. Files go after the rows that named them.
+pub(crate) fn retain(db: &Db, data_dir: &Path, now: &str) -> Result<()> {
+    let mutation = db.mutation()?;
+    let lapsed = db.lapsed_payload_duties(now)?;
+    for item_id in &lapsed {
+        db.end_payload_duty(item_id)?;
+    }
+    let needed = db.payload_items_needed()?;
+    let mut unneeded = Vec::new();
+    match std::fs::read_dir(data_dir.join("held/payloads")) {
+        Ok(entries) => {
+            for entry in entries {
+                let path = entry?.path();
+                let Some(hex) = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| name.strip_suffix(".json"))
+                else {
+                    continue;
+                };
+                if !needed.contains(&format!("sha256:{hex}")) {
+                    unneeded.push(path);
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    db.discard_unkept_lists()?;
+    db.discard_unnamed_tree_files()?;
+    for path in &unneeded {
+        crate::db::remove_file(path)?;
+    }
+    mutation.commit()?;
+    for item_id in &lapsed {
+        crate::db::remove_file(&crate::db::served_payload_path(data_dir, item_id)?)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn run_confirming(

@@ -56,7 +56,7 @@ fn admitted(path: &std::path::Path, item: &serde_json::Value) -> i64 {
 }
 
 fn payload_files(data_dir: &std::path::Path) -> usize {
-    std::fs::read_dir(data_dir.join("payloads")).map_or(0, |dir| dir.count())
+    std::fs::read_dir(data_dir.join("held/payloads")).map_or(0, |dir| dir.count())
 }
 
 #[test]

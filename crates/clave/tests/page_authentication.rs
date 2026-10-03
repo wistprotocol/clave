@@ -261,13 +261,16 @@ fn page_sources_ignore_unauthenticated_declaration_rows() {
 fn repeated_declaration_entries_bound_the_first_next_page_source() {
     let mut fixture = Fixture::new();
     fixture.install(0, page_key(&K2_SEED), "2026-08-09T12:00:00Z", true);
+    let repeated = current_declaration(&fixture.publisher);
+    let key = &repeated["publisher"]["keys"][0];
     fixture
         .db
-        .insert_pending_entry(
-            "publisher_declaration",
+        .update_publisher_declaration(
             &fixture.host,
-            &current_declaration(&fixture.publisher),
-            0,
+            &serde_json::to_vec(&repeated).unwrap(),
+            key["kid"].as_str().unwrap(),
+            key["x"].as_str().unwrap(),
+            &repeated,
         )
         .unwrap();
     let signing = clave::keys::load(&fixture.directory.path().join("keys/seed")).unwrap();
@@ -320,7 +323,6 @@ fn contested_recovery() -> Fixture {
 }
 
 fn settle_and_seal(fixture: &Fixture, at: &str) {
-    clave::recovery::settle(&fixture.db, fixture.directory.path(), at).unwrap();
     let signing = clave::keys::load(&fixture.directory.path().join("keys/seed")).unwrap();
     clave::seal::run(
         &fixture.db,

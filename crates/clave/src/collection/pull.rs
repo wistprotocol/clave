@@ -302,8 +302,8 @@ fn settle_window(
         held,
         input.publisher,
         &Settling {
-            source: &source,
-            order: &head,
+            source: Some(&source),
+            order: Some(&head),
             clock: input.at,
             parameters: input.parameters,
             eligibility,
@@ -315,6 +315,7 @@ fn settle_window(
 }
 
 pub struct Pulling {
+    publisher: String,
     report: PullReport,
     sources: Vec<Source>,
     order: BTreeMap<String, u64>,
@@ -370,16 +371,7 @@ impl Pulling {
             self.report.suspended = true;
         }
         self.report.catalogs.push(catalog);
-        Ok(self.report.catalogs.last())
-    }
-
-    pub fn finish(
-        self,
-        state: &mut State,
-        held: &impl Held,
-        input: &PullInput<'_>,
-    ) -> Result<PullReport> {
-        if self.report.declaration.proceeds && !self.queues {
+        if !self.queues {
             let in_force = log_declaration(state, input.publisher)?;
             let eligibility = state.first_epoch_after();
             refresh_waiting(
@@ -392,7 +384,59 @@ impl Pulling {
                 eligibility,
             )?;
         }
-        Ok(self.report)
+        Ok(self.report.catalogs.last())
+    }
+
+    /// WIST-1 §5.2, Sources of a pull.
+    pub fn retry_last(&mut self, state: &mut State, input: &PullInput<'_>) -> Result<()> {
+        if let Some(last) = self.report.catalogs.pop() {
+            self.next -= 1;
+            if last.outcome == CatalogOutcome::Suspended || last.suspended {
+                self.report.suspended = self.report.catalogs.iter().any(|catalog| {
+                    catalog.outcome == CatalogOutcome::Suspended || catalog.suspended
+                });
+            }
+        }
+        self.report.event = state.events;
+        state.events += 1;
+        let (_, view) = admission_view(state, &self.publisher, input.at, input.parameters)?;
+        let Some(domain) = view.domains().get(&self.publisher) else {
+            self.report.suspended = true;
+            return Ok(());
+        };
+        self.sources = sources_of(domain)?;
+        if let [_, owner] = &self.sources[..] {
+            queue::open_discovery(state, &self.publisher, &owner.hash);
+        }
+        self.queues = state.queues.contains_key(&self.publisher);
+        self.window_opened = state.window_holds(&self.publisher);
+        self.report.declaration.sources = self
+            .sources
+            .iter()
+            .map(|source| source.hash.clone())
+            .collect();
+        self.report.declaration.window = self.window_opened;
+        let mut names: Vec<String> = self.report.collections_pulled[..self.next].to_vec();
+        for source in &self.sources {
+            for name in collection::names(&source.publisher) {
+                if !names.iter().any(|known| known == name) {
+                    names.push(name.to_owned());
+                }
+            }
+        }
+        self.order = place_order(
+            state,
+            &self.publisher,
+            Some(&self.sources[0].publisher),
+            &names,
+        );
+        self.report.positions = self.order.len() as u64;
+        self.report.collections_pulled = names;
+        Ok(())
+    }
+
+    pub fn finish(self) -> PullReport {
+        self.report
     }
 }
 
@@ -404,7 +448,7 @@ pub fn pull(
 ) -> Result<PullReport> {
     let mut pulling = begin(state, site, held, input)?;
     while pulling.pull_next(state, site, held, input)?.is_some() {}
-    pulling.finish(state, held, input)
+    Ok(pulling.finish())
 }
 
 pub fn begin(
@@ -432,6 +476,7 @@ pub fn begin(
         event,
     )?);
     let mut pulling = Pulling {
+        publisher: input.publisher.to_owned(),
         report: PullReport {
             event,
             settlement,
@@ -566,6 +611,26 @@ fn admission_view(
     Ok((admitted, view))
 }
 
+pub fn admission_domain(
+    state: &State,
+    publisher: &str,
+    at: &str,
+    parameters: &Parameters,
+) -> Result<Option<Domain>> {
+    Ok(admission(state, publisher, at, parameters)?.1)
+}
+
+/// WIST-1 §5.2.
+pub fn admission(
+    state: &State,
+    publisher: &str,
+    at: &str,
+    parameters: &Parameters,
+) -> Result<(Vec<Value>, Option<Domain>)> {
+    let (admitted, view) = admission_view(state, publisher, at, parameters)?;
+    Ok((admitted, view.domains().get(publisher).cloned()))
+}
+
 fn head_hashes(domain: &Domain) -> (Option<&str>, Option<&str>) {
     (
         domain.window().map(|window| window.head().hash()),
@@ -695,6 +760,7 @@ fn read_declaration(
     };
     let mut discovered = false;
     let mut reduces = false;
+    let mut recovery_signed = false;
     if installed.is_some()
         && !state
             .discovered
@@ -712,11 +778,21 @@ fn read_declaration(
             let predecessor =
                 declaration::publisher_of(predecessor.envelope()).map_err(Error::History)?;
             reduces = collection::reduces_authority(&predecessor, &incoming);
+            recovery_signed = predecessor
+                .recovery_keys
+                .iter()
+                .flatten()
+                .any(|key| fetched["sig"]["key_id"] == key.kid.as_str());
         }
+        let recovery = installed.as_ref().is_some_and(|(_, kind)| match kind {
+            TransitionKind::RecoveryRotation | TransitionKind::ReversalRecoveryRotation => true,
+            TransitionKind::InWindowChain => recovery_signed,
+            _ => false,
+        });
         let epochs = input.parameters.value("record_seal_epochs")?;
         let epochs =
             u64::try_from(epochs).map_err(|_| Error::Param("record_seal_epochs".into()))?;
-        let last_seal_height = match (reduces, state.height) {
+        let last_seal_height = match (reduces || recovery, state.height) {
             (false, _) => None,
             (true, Some(height)) => collection::last_seal_height(height, epochs),
             (true, None) => Some(epochs),
@@ -737,6 +813,12 @@ fn read_declaration(
                 competitor: installed
                     .as_ref()
                     .is_some_and(|(_, kind)| *kind == TransitionKind::InWindowCompetitor),
+                competes_with: installed
+                    .as_ref()
+                    .filter(|(_, kind)| *kind == TransitionKind::InWindowCompetitor)
+                    .and_then(|(projection, _)| projection.domains().get(publisher))
+                    .and_then(|domain| domain.window())
+                    .map(|window| window.owner().hash().to_owned()),
             });
     }
     let domain = match &installed {
@@ -744,16 +826,7 @@ fn read_declaration(
         None => view.domains().get(publisher),
     }
     .ok_or_else(|| Error::History("an accepted Declaration left no domain state".into()))?;
-    let sources = domain
-        .admission_sources()
-        .into_iter()
-        .map(|source| {
-            Ok(Source {
-                hash: source.hash().to_owned(),
-                publisher: declaration::publisher_of(source.envelope()).map_err(Error::History)?,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let sources = sources_of(domain)?;
     if let [_, owner] = &sources[..] {
         queue::open_discovery(state, publisher, &owner.hash);
     }
@@ -769,6 +842,19 @@ fn read_declaration(
         },
         sources,
     ))
+}
+
+fn sources_of(domain: &Domain) -> Result<Vec<Source>> {
+    domain
+        .admission_sources()
+        .into_iter()
+        .map(|source| {
+            Ok(Source {
+                hash: source.hash().to_owned(),
+                publisher: declaration::publisher_of(source.envelope()).map_err(Error::History)?,
+            })
+        })
+        .collect()
 }
 
 fn catalog_signer(key: &str) -> Result<PublicKey> {
@@ -993,7 +1079,7 @@ fn pull_collection(
                 envelope: envelope.clone(),
                 catalog_id: catalog_id.clone(),
                 place,
-                sources: report.sources.clone(),
+                sources: read_sources(context),
             },
         )?;
         report.queued = true;
@@ -1013,6 +1099,7 @@ fn pull_collection(
             failed_c4: false,
             place,
             eligibility,
+            read: read_sources(context),
         });
     }
     state.lists.insert(
@@ -1035,6 +1122,15 @@ fn pull_collection(
     Ok(report)
 }
 
+/// WIST-3 §3.3, Declaration sealing obligation.
+fn read_sources(context: &Context<'_>) -> Vec<String> {
+    context
+        .sources
+        .iter()
+        .map(|source| source.hash.clone())
+        .collect()
+}
+
 fn unjudged(list: &[Value]) -> Result<Vec<ListItem>> {
     list.iter()
         .map(|item| {
@@ -1047,6 +1143,7 @@ fn unjudged(list: &[Value]) -> Result<Vec<ListItem>> {
                 },
                 admission: Admission::Unjudged,
                 code: None,
+                read: Vec::new(),
             })
         })
         .collect()
@@ -1121,6 +1218,7 @@ fn judge_items(
                 ItemOutcome::Refused => Admission::Refused,
             };
             status.code = report.codes.first().map(|code| code.to_string());
+            status.read = read_sources(context);
         }
         out.push(report);
     }

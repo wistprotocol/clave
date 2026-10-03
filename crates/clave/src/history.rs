@@ -5,6 +5,7 @@ use crate::db::{Db, EpochRow};
 use crate::error::{Error, Result};
 use crate::registry;
 use serde_json::Value;
+use std::collections::BTreeSet;
 use std::path::Path;
 use wist_core::aggregator_keys::Registry;
 use wist_core::checkpoint::{self, AggregatorKey, Checkpoint};
@@ -13,6 +14,7 @@ use wist_core::objects::{
     AggregatorKeyEntry, GenesisKey, LogAnchorEnvelope, RegistryUpdateEnvelope,
 };
 use wist_core::parameters::{Amendment, Schedule};
+use wist_core::sealing::{Epoch, Judgment, Outcome, Removed, Replay};
 
 pub struct LogAnchor {
     pub log_id: String,
@@ -63,6 +65,9 @@ pub struct VerifiedEpoch {
     size_caps: wist_core::item::SizeCaps,
     pub(crate) limits: wist_core::collection::Limits,
     clock_skew_seconds: i64,
+    rejected: Option<Vec<String>>,
+    judgments: Vec<Option<Judgment>>,
+    records_removed: Vec<Removed>,
 }
 
 impl VerifiedEpoch {
@@ -110,6 +115,29 @@ impl VerifiedEpoch {
     pub fn rejected_parameters(&self) -> &[usize] {
         &self.rejected_parameters
     }
+
+    /// WIST-3 §3.3: a rejected Epoch stays in the Log and applies nothing.
+    pub fn rejected(&self) -> Option<&[String]> {
+        self.rejected.as_deref()
+    }
+
+    pub fn judgments(&self) -> &[Option<Judgment>] {
+        &self.judgments
+    }
+
+    pub fn records_removed(&self) -> &[Removed] {
+        &self.records_removed
+    }
+}
+
+pub fn sealing_parameters(schedule: &Schedule, at: i64) -> Result<wist_core::sealing::Parameters> {
+    Ok(wist_core::sealing::Parameters::new(
+        wist_core::parameters::PARAMS.iter().filter_map(|spec| {
+            schedule
+                .value_at(spec.name, at)
+                .map(|value| (spec.name, value))
+        }),
+    )?)
 }
 
 pub struct History<'a> {
@@ -123,6 +151,8 @@ pub struct History<'a> {
     largest: u64,
     schedule: Option<Schedule>,
     failed: bool,
+    replay: Replay,
+    labels: BTreeSet<String>,
 }
 
 impl<'a> History<'a> {
@@ -144,6 +174,8 @@ impl<'a> History<'a> {
             largest: 0,
             schedule: None,
             failed: false,
+            replay: Replay::new(),
+            labels: BTreeSet::new(),
         })
     }
 
@@ -153,6 +185,14 @@ impl<'a> History<'a> {
 
     pub fn log_id(&self) -> &str {
         &self.log_id
+    }
+
+    pub fn height(&self) -> Option<u64> {
+        self.next_height.checked_sub(1)
+    }
+
+    pub fn replay(&self) -> &Replay {
+        &self.replay
     }
 
     pub fn key_registry(&self) -> &Registry {
@@ -259,6 +299,39 @@ impl<'a> History<'a> {
         if largest > schedule.epoch_size_bounds(at).0 {
             return Err(failure("Epoch exceeds the accepted size schedule"));
         }
+        for entry in entries.iter().filter(|entry| entry["type"] == "label") {
+            if let Ok(id) = wist_core::label::label_id(&entry["body"]["label"]) {
+                if !self.labels.insert(id) {
+                    return Err(failure("a Label ID is carried by a lower label Entry"));
+                }
+            }
+        }
+        let parameters = sealing_parameters(&schedule, at)?;
+        let suffix_list = crate::suffix_list::in_force_at_epoch(self.db, height)?;
+        let log_key = |key_id: &str| {
+            keys.iter()
+                .find(|key| key.key_id == key_id)
+                .map(|key| key.public_key.clone())
+        };
+        let (rejected, judgments, records_removed) = match self
+            .replay
+            .epoch(&Epoch {
+                height,
+                root: &row.root,
+                sealed_at: &row.sealed_at,
+                parameters: &parameters,
+                suffix_list: suffix_list.as_deref(),
+                log_key: &log_key,
+                entries: &entries,
+            })
+            .map_err(|e| failure(&e.to_string()))?
+        {
+            Outcome::Rejected { codes } => (Some(codes), Vec::new(), Vec::new()),
+            Outcome::Accepted {
+                entries,
+                records_removed,
+            } => (None, entries, records_removed),
+        };
         self.next_height = height
             .checked_add(1)
             .ok_or_else(|| failure("Epoch height overflow"))?;
@@ -288,6 +361,9 @@ impl<'a> History<'a> {
             size_caps,
             limits,
             clock_skew_seconds,
+            rejected,
+            judgments,
+            records_removed,
         }))
     }
 }

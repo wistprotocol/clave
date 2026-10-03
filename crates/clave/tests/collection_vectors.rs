@@ -240,6 +240,7 @@ fn a_pull_reads_the_sources_the_publisher_state_gives_once_the_fetched_declarati
                     reduces_authority: false,
                     last_seal_height: None,
                     competitor: false,
+                    competes_with: None,
                 });
         }
         let request = &case["pull"];

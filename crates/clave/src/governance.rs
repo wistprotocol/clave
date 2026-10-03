@@ -75,6 +75,6 @@ pub fn withdraw(
     Ok(GovernanceReport { update_id: id })
 }
 
-pub(crate) fn sealed_items(_db: &Db) -> Result<SealedItems> {
-    Ok(SealedItems::new())
+pub(crate) fn sealed_items(db: &Db) -> Result<SealedItems> {
+    db.sealed_items()
 }

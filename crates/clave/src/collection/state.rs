@@ -75,6 +75,8 @@ pub struct AcceptedCatalog {
     pub failed_c4: bool,
     pub place: Place,
     pub eligibility: u64,
+    #[serde(default)]
+    pub read: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -170,6 +172,8 @@ pub struct ListItem {
     pub kind: ItemKind,
     pub admission: Admission,
     pub code: Option<String>,
+    #[serde(default)]
+    pub read: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -260,6 +264,8 @@ pub struct Discovered {
     pub last_seal_height: Option<u64>,
     #[serde(default)]
     pub competitor: bool,
+    #[serde(default)]
+    pub competes_with: Option<String>,
 }
 
 pub type CollectionKey = (String, String);

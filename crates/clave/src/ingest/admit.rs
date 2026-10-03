@@ -1,9 +1,7 @@
 use crate::db::{Db, Phase, PullRun, Status, WalkPage};
-use crate::declaration::{self, Decision};
 use crate::error::Result;
 use serde_json::Value;
-use std::path::Path;
-use wist_core::objects::{FeedEnvelope, Publisher, PublisherEnvelope};
+use wist_core::objects::{FeedEnvelope, PublisherEnvelope};
 
 use super::fetch_stage::{ObjectKey, Walk};
 use super::verify::{DeclarationRef, IssuedRefs, LabelKind};
@@ -32,79 +30,6 @@ pub(super) fn unseen(db: &Db, host: &str, walk: Walk, ids: &[String]) -> Result<
     Ok(false)
 }
 
-/// WIST-1 §5.2: a settlement due is applied before an admission decision
-/// under the open window.
-pub(super) fn settle_if_due(
-    db: &Db,
-    data_dir: &Path,
-    host: &str,
-    clock: &impl Fn() -> jiff::Timestamp,
-) -> Result<()> {
-    if db
-        .get_recovery_window(host)?
-        .is_some_and(|window| window.opened_epoch.is_some())
-    {
-        crate::recovery::settle(db, data_dir, &clock().to_string())?;
-    }
-    Ok(())
-}
-
-fn accepted_recovery_head(
-    db: &Db,
-    data_dir: &Path,
-    host: &str,
-    window: &crate::db::RecoveryWindowRow,
-    limits: &wist_core::collection::Limits,
-) -> Result<Value> {
-    use crate::history::declarations::DeclarationsReplay;
-    let mut head = if window.opened_epoch.is_some() {
-        let state = crate::history::declarations::Declarations::reconstruct(
-            db,
-            data_dir,
-            db.last_epoch()?,
-        )?;
-        state
-            .domains()
-            .get(host)
-            .and_then(|domain| domain.window())
-            .ok_or_else(|| {
-                crate::error::Error::History(
-                    "stored recovery window has no authenticated open window".into(),
-                )
-            })?
-            .head()
-            .envelope()
-            .clone()
-    } else {
-        let owner: Value = crate::json::parse(&window.owner_declaration_json)?;
-        let prior: Value = crate::json::parse(&window.prior_declaration_json)?;
-        if declaration::evaluate(&prior, &owner, limits) != Ok(Decision::Recovery) {
-            return Err(crate::error::Error::History(
-                "invalid pending recovery owner".into(),
-            ));
-        }
-        owner
-    };
-    let mut pending: Vec<_> = db
-        .peek_pending_entries()?
-        .0
-        .into_iter()
-        .filter(|entry| entry.domain == host && entry.entry_type == "publisher_declaration")
-        .map(|entry| {
-            let publisher = declaration::publisher_of(&entry.entry_json)
-                .map_err(crate::error::Error::History)?;
-            Ok((publisher.seq, entry))
-        })
-        .collect::<Result<_>>()?;
-    pending.sort_by_key(|(seq, _)| *seq);
-    for (_, entry) in pending {
-        if declaration::follows_chain_head(&head, &entry.entry_json) {
-            head = entry.entry_json;
-        }
-    }
-    Ok(head)
-}
-
 fn consume(db: &Db, run: &mut PullRun, key: &ObjectKey) -> Result<()> {
     db.advance_pull_object(
         run.run_id,
@@ -117,140 +42,8 @@ fn consume(db: &Db, run: &mut PullRun, key: &ObjectKey) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn onboard(
-    db: &Db,
-    run: &mut PullRun,
-    host: &str,
-    key: &ObjectKey,
-    raw: &[u8],
-    value: &Value,
-    publisher: &Publisher,
-) -> Result<()> {
-    let mutation = db.mutation()?;
-    let entry = &publisher.keys[0];
-    db.record_publisher_declaration(host, raw, &entry.kid, &entry.x, value)?;
-    run.discovered = true;
-    db.update_pull_run(run)?;
-    consume(db, run, key)?;
-    mutation.commit()
-}
-
-pub(super) enum Admitted {
-    Proceeds,
-    Refused(String),
-}
-
-/// WIST-1 §§5.1–5.2, after any recovery settlement due first. WIST-2 §5.1
-/// step 0: a refused Declaration stops the pull, except an open window's
-/// recovery-chain head served again.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn admit_declaration(
-    db: &Db,
-    data_dir: &Path,
-    run: &mut PullRun,
-    host: &str,
-    clock: &impl Fn() -> jiff::Timestamp,
-    key: &ObjectKey,
-    raw: &[u8],
-    value: Value,
-    limits: &wist_core::collection::Limits,
-) -> Result<Admitted> {
-    settle_if_due(db, data_dir, host, clock)?;
-    let mutation = db.mutation()?;
-    let now = run.now.clone();
-    let stored_raw = db.get_publisher_declaration(host)?.ok_or_else(|| {
-        crate::error::Error::History("publisher row lost before Declaration admission".into())
-    })?;
-    let current_doc: Value = crate::json::parse(&stored_raw)?;
-    let open_window = db.get_recovery_window(host)?;
-    let recovery_head = open_window
-        .as_ref()
-        .map(|window| accepted_recovery_head(db, data_dir, host, window, limits))
-        .transpose()?;
-    if let Some(head) = &recovery_head {
-        db.update_recovery_chain_head(host, &serde_json::to_vec(head)?)?;
-    }
-    let floor = db.highest_accepted_declaration_seq(host)?.ok_or_else(|| {
-        crate::error::Error::History("missing accepted Declaration sequence floor".into())
-    })?;
-    let pending_head = db
-        .get_pending_identity(host)?
-        .map(|raw| crate::json::parse(&raw))
-        .transpose()?;
-    let admitted = match declaration::evaluate_with_heads(
-        &current_doc,
-        recovery_head.as_ref(),
-        pending_head.as_ref(),
-        floor,
-        &value,
-        limits,
-    ) {
-        Ok(Decision::Unchanged) => Admitted::Proceeds,
-        Ok(decision) => {
-            let names_pending = pending_head.as_ref().is_some_and(|head| {
-                declaration::inner_hash(head).ok().as_deref()
-                    == value["publisher"]["prev_declaration"].as_str()
-            });
-            if names_pending {
-                db.record_pending_identity(host, raw, &value)?;
-                run.discovered = true;
-                Admitted::Proceeds
-            } else if decision == Decision::FreshIdentity && open_window.is_none() {
-                if pending_head.is_some() {
-                    let detail =
-                        "fresh identity names the current Declaration beside a pending head";
-                    reject(db, host, "WIST1-E08", &now, None, detail)?;
-                    Admitted::Refused(format!("WIST1-E08: {detail}"))
-                } else {
-                    db.record_pending_identity(host, raw, &value)?;
-                    run.discovered = true;
-                    Admitted::Proceeds
-                }
-            } else {
-                let (kid, x) = value
-                    .pointer("/publisher/keys/0")
-                    .map(|k| {
-                        (
-                            k["kid"].as_str().unwrap_or_default().to_string(),
-                            k["x"].as_str().unwrap_or_default().to_string(),
-                        )
-                    })
-                    .unwrap_or_default();
-                db.update_publisher_declaration(host, raw, &kid, &x, &value)?;
-                db.clear_pending_identity(host)?;
-                match &open_window {
-                    None => {
-                        if decision == Decision::Recovery {
-                            db.open_recovery_window(host, raw, &stored_raw)?;
-                        }
-                    }
-                    Some(_) => {
-                        if declaration::follows_chain_head(recovery_head.as_ref().unwrap(), &value)
-                        {
-                            db.update_recovery_chain_head(host, raw)?;
-                        }
-                    }
-                }
-                run.discovered = true;
-                Admitted::Proceeds
-            }
-        }
-        Err((code, detail)) => {
-            reject(db, host, code, &now, None, &detail)?;
-            let head_served_again = recovery_head.as_ref().is_some_and(|head| {
-                declaration::inner_hash(head).ok() == declaration::inner_hash(&value).ok()
-            });
-            if head_served_again {
-                Admitted::Proceeds
-            } else {
-                Admitted::Refused(format!("{code}: {detail}"))
-            }
-        }
-    };
-    db.update_pull_run(run)?;
-    consume(db, run, key)?;
-    mutation.commit()?;
-    Ok(admitted)
+pub(super) fn consume_declaration(db: &Db, run: &mut PullRun, key: &ObjectKey) -> Result<()> {
+    consume(db, run, key)
 }
 
 pub(super) fn abort(

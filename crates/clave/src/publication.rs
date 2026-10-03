@@ -303,6 +303,7 @@ pub fn finish_committed(db: &Db, data_dir: &Path) -> Result<Vec<u64>> {
     db.check_fence()?;
     guard_published(db, data_dir)?;
     crate::snapshot::apply_pending_removals(db, data_dir)?;
+    serve_duty_payloads(db, data_dir)?;
     let mut published = Vec::new();
     for (epoch_number, note) in db.unpublished_publications()? {
         db.check_fence()?;
@@ -311,6 +312,26 @@ pub fn finish_committed(db: &Db, data_dir: &Path) -> Result<Vec<u64>> {
         published.push(epoch_number);
     }
     Ok(published)
+}
+
+/// WIST-3 §6.1: the Payload of every page Item an Epoch seals is served before its Checkpoint.
+fn serve_duty_payloads(db: &Db, data_dir: &Path) -> Result<()> {
+    for duty in db.payload_duties()?.into_iter().filter(|duty| !duty.served) {
+        db.check_fence()?;
+        let served = crate::db::served_payload_path(data_dir, &duty.item_id)?;
+        if !served.exists() {
+            let held = crate::db::held_payload_path(data_dir, &duty.item_id)?;
+            let octets = std::fs::read(&held).map_err(|error| {
+                Error::Seal(format!(
+                    "the Payload of {}, sealed under a duty, is not held: {error}",
+                    duty.item_id
+                ))
+            })?;
+            write_durable(&served, &octets)?;
+        }
+        db.mark_payload_served(&duty.item_id)?;
+    }
+    Ok(())
 }
 
 /// WIST-3 §3.4: unsealed documents a key removed at or below the head

@@ -726,5 +726,92 @@ pub fn effective_code(
 }
 
 pub fn payload_files(data_dir: &std::path::Path) -> usize {
-    fs::read_dir(data_dir.join("payloads")).map_or(0, |dir| dir.count())
+    fs::read_dir(data_dir.join("held/payloads")).map_or(0, |dir| dir.count())
+}
+
+pub struct Rig {
+    pub p: TestPub,
+    pub host: String,
+    pub client: clave::fetch::Client,
+    pub data: tempfile::TempDir,
+    pub db: clave::db::Db,
+    pub sk: wist_core::crypto::SigningKey,
+}
+
+impl Rig {
+    pub fn new() -> Rig {
+        let (listener, host, client) = reserve_addr();
+        let p = make_publisher(&host);
+        serve_static(listener, p.dir.path().to_path_buf());
+        let data = tempfile::tempdir().unwrap();
+        clave::init::run(&host, data.path()).unwrap();
+        let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
+        db.set_param("epoch_cadence_seconds", 1).unwrap();
+        let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
+        Rig {
+            p,
+            host,
+            client,
+            data,
+            db,
+            sk,
+        }
+    }
+
+    pub fn url(&self, path: &str) -> String {
+        format!("https://{}/{path}", self.host)
+    }
+
+    pub fn page(&self, path: &str, extract: &str) -> (serde_json::Value, serde_json::Value) {
+        page_item(&self.p, &self.url(path), extract)
+    }
+
+    pub fn publish(
+        &self,
+        items: &[(serde_json::Value, Option<serde_json::Value>)],
+        generated_at: &str,
+        previous: Option<&Published>,
+    ) -> Published {
+        publish_collection(&self.p, "default", items, generated_at, previous)
+    }
+
+    pub fn pull(&self, at: &str) -> clave::ingest::IngestReport {
+        pull_at(&self.db, &self.client, self.data.path(), &self.host, at)
+    }
+
+    pub fn seal(&self, at: &str) -> clave::seal::SealReport {
+        clave::seal::run(
+            &self.db,
+            self.data.path(),
+            &self.sk,
+            wist_core::timestamp::log_seconds(at).unwrap(),
+        )
+        .unwrap()
+    }
+
+    pub fn state(&self) -> clave::collection::State {
+        let scope = std::collections::BTreeSet::from([self.host.clone()]);
+        self.db
+            .load_state(self.db.sealed_state(self.data.path()).unwrap(), &scope)
+            .unwrap()
+    }
+
+    pub fn entries(&self, height: u64) -> Vec<serde_json::Value> {
+        self.db.epoch_entries(height).unwrap()
+    }
+}
+
+pub fn types(entries: &[serde_json::Value]) -> Vec<String> {
+    entries
+        .iter()
+        .map(|entry| entry["type"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+pub fn sealed_item_ids(entries: &[serde_json::Value]) -> Vec<String> {
+    entries
+        .iter()
+        .filter(|entry| entry["type"] == "publisher_item")
+        .map(|entry| item_id(&entry["body"]["item"]))
+        .collect()
 }

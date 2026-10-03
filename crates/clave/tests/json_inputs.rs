@@ -171,12 +171,19 @@ fn retained_declaration_duplicates_cannot_authorize_a_pull() {
     let path = data.path().join("clave.sqlite");
     let db = Db::open(&path).unwrap();
     clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:02Z").unwrap();
-    let original = db.get_publisher_declaration(&host).unwrap().unwrap();
+    let original: Vec<u8> = Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT envelope FROM discovered_declarations WHERE domain = ?1",
+            [&host],
+            |row| row.get(0),
+        )
+        .unwrap();
     let raw = duplicate(&original, "x", "\\u0078");
     Connection::open(&path)
         .unwrap()
         .execute(
-            "UPDATE publishers SET declaration_json = ?1 WHERE domain = ?2",
+            "UPDATE discovered_declarations SET envelope = ?1 WHERE domain = ?2",
             (&raw, &host),
         )
         .unwrap();
@@ -185,5 +192,13 @@ fn retained_declaration_duplicates_cannot_authorize_a_pull() {
     let err =
         clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:03Z").unwrap_err();
     assert!(err.to_string().contains("duplicate JSON member name"));
-    assert_eq!(db.get_publisher_declaration(&host).unwrap().unwrap(), raw);
+    let retained: Vec<u8> = Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT envelope FROM discovered_declarations WHERE domain = ?1",
+            [&host],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(retained, raw);
 }

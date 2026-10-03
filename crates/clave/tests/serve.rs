@@ -1128,8 +1128,8 @@ fn demand_pulls_wait_while_the_sealing_backlog_is_full_and_resume_once_sealed() 
     let waiting = hosts.into_iter().find(|host| !done.contains(host)).unwrap();
     assert_eq!(
         store(tmp.path()).sealing_backlog().unwrap().0,
-        4,
-        "each first pull leaves its Declaration's entry and its Label's"
+        6,
+        "each first pull leaves its Declaration, its Catalog and its Label waiting"
     );
     let row = store(tmp.path()).scheduled_pull(waiting).unwrap().unwrap();
     assert_eq!(row.reason, clave::db::Reason::Ping);

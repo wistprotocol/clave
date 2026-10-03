@@ -1,11 +1,11 @@
+use crate::collection::plan::{self, EpochInput, Inclusion, Planned, Publication, Unsealed};
+use crate::collection::{Parameters, State};
 use crate::db::{Db, PendingEntryRow};
 use crate::error::{Error, Result};
-use crate::history::declarations::DeclarationsReplay;
-use crate::history::declarations::{Declarations, Projection};
 use crate::history::History;
 use crate::registry;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
 use wist_core::aggregator_keys::{self, KeyAction, Outcome, Registry};
 use wist_core::crypto::SigningKey;
@@ -25,33 +25,19 @@ pub(super) struct PreparedEpoch {
     pub(super) octets: u64,
     pub(super) epoch_number: u64,
     pub(super) sealed_at: String,
-    pub(super) seal_entries: Vec<SealEntry>,
     pub(super) sealed_rowids: Vec<i64>,
     pub(super) accepted_changes: Vec<AcceptedParamChange>,
     pub(super) withdrawals: Vec<OwnedWithdrawal>,
     pub(super) suffix_lists: Vec<String>,
     pub(super) dropped: Vec<String>,
     pub(super) late: Vec<String>,
-    pub(super) entry_count: u64,
-    pub(super) projection: Projection,
-    pub(super) windows: Vec<SealedWindow>,
+    pub(super) before: State,
+    pub(super) planned: Planned,
+    pub(super) scope: BTreeSet<String>,
+    pub(super) payload_window_days: i64,
 }
 
-pub(super) struct SealedWindow {
-    pub(super) domain: String,
-    pub(super) head: Vec<u8>,
-    pub(super) before: Vec<u8>,
-    pub(super) owner: Vec<u8>,
-    pub(super) opened_epoch: u64,
-    pub(super) window_end: String,
-}
-
-pub(super) fn epoch(
-    db: &Db,
-    data_dir: &Path,
-    sk: &SigningKey,
-    now_unix: i64,
-) -> Result<PreparedEpoch> {
+fn sealing_slot(db: &Db, now_unix: i64) -> Result<(u64, i64, String)> {
     let now_at = jiff::Timestamp::from_second(now_unix)
         .map_err(|_| Error::Seal("now out of range".into()))?
         .to_string();
@@ -69,7 +55,6 @@ pub(super) fn epoch(
     let sealed_at = jiff::Timestamp::from_second(sealed_unix)
         .map_err(|_| Error::Seal("sealed_at out of range".into()))?
         .to_string();
-
     let epoch_number = match &prev {
         Some(p) => {
             if sealed_at.as_str() <= p.sealed_at.as_str() {
@@ -79,56 +64,154 @@ pub(super) fn epoch(
         }
         None => 0,
     };
+    Ok((epoch_number, sealed_unix, sealed_at))
+}
 
-    let mut history = History::open(db, data_dir, db.last_epoch()?)?;
-    let mut declarations = Declarations::default();
-    while let Some(epoch) = history.next_epoch()? {
-        declarations.apply(&epoch)?;
+/// WIST-4 §5: the Log's map, which a replaying Consumer reads; an operator value of a bound
+/// on what one Epoch carries may only tighten it.
+fn sealing_parameters(db: &Db, sealed_unix: i64, sealed_at: &str) -> Result<Parameters> {
+    let schedule = db.parameter_schedule(sealed_unix)?;
+    let mut parameters = Parameters::new(
+        registry::PARAMS
+            .iter()
+            .filter_map(|spec| {
+                schedule
+                    .value_at(spec.name, sealed_unix)
+                    .map(|value| (spec.name.to_owned(), value))
+            })
+            .collect(),
+    );
+    for name in [
+        "domain_epoch_entries_max",
+        "labeler_epoch_entries_max",
+        "max_inclusion_epochs",
+    ] {
+        let local = registry::effective(db, name, sealed_at)?;
+        let logged = parameters.value(name)?;
+        parameters.set(name, logged.min(local));
     }
-    for (domain, state) in declarations.domains() {
-        if let Some(window) = state.window() {
-            if window.end_s() > i128::from(sealed_unix)
-                && db.recovery_settled(domain, window.owner().hash())?
-            {
-                return Err(Error::Seal(
-                    "cadence slot predates completed recovery settlement".into(),
-                ));
+    let domain = parameters.value("domain_epoch_entries_max")?;
+    let labeler = parameters.value("labeler_epoch_entries_max")?;
+    parameters.set("labeler_epoch_entries_max", labeler.min(domain));
+    Ok(parameters)
+}
+
+fn publication_text(publication: &Publication) -> String {
+    match publication {
+        Publication::Catalog {
+            publisher,
+            collection,
+            catalog,
+        } => format!("Catalog {catalog} of {publisher} {collection}"),
+        Publication::Item {
+            publisher,
+            url,
+            item,
+            ..
+        } => format!("Item {item} of {publisher} {url}"),
+        Publication::Label { kind, id, .. } => format!("{} {id}", kind.as_str()),
+    }
+}
+
+fn label_entry_id(entry: &Value) -> Result<String> {
+    let body = &entry["body"];
+    match entry["type"].as_str() {
+        Some("dispute") => wist_core::label::dispute_id(&body["dispute"]),
+        _ => wist_core::label::label_id(&body["label"]),
+    }
+    .map_err(|error| Error::Seal(format!("a planned Label Entry has no ID: {error:?}")))
+}
+
+struct Candidates {
+    declarations: Vec<Value>,
+    updates: Vec<Value>,
+    unsealed: BTreeSet<Unsealed>,
+}
+
+impl Candidates {
+    /// WIST-3 §3.3, Capacity order.
+    fn keep_out(&mut self, planned: &Planned, entry: &Value) -> Result<()> {
+        let body = &entry["body"];
+        match entry["type"].as_str() {
+            Some("publisher_declaration") => self.declarations.retain(|kept| kept != body),
+            Some("registry_update") => self.updates.retain(|kept| kept != body),
+            Some("publisher_catalog") => {
+                self.unsealed.insert(Unsealed::Catalog {
+                    publisher: body["catalog"]["publisher"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned(),
+                    collection: body["catalog"]["collection"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned(),
+                });
+            }
+            Some("publisher_item") => {
+                let item_id = wist_core::item::item_id(&body["item"])?;
+                let url = body["item"]["url"].as_str().unwrap_or_default();
+                let publisher = planned
+                    .sealed
+                    .iter()
+                    .find_map(|sealed| match &sealed.publication {
+                        Publication::Item {
+                            publisher,
+                            url: sealed_url,
+                            item,
+                            ..
+                        } if *item == item_id && sealed_url == url => Some(publisher.clone()),
+                        _ => None,
+                    })
+                    .ok_or_else(|| Error::Seal(format!("a planned Item of {url} is not sealed")))?;
+                self.unsealed.insert(Unsealed::Item {
+                    publisher,
+                    url: url.to_owned(),
+                });
+            }
+            _ => {
+                self.unsealed.insert(Unsealed::Label {
+                    id: label_entry_id(entry)?,
+                });
             }
         }
+        Ok(())
     }
-    let recovery_days = history
-        .schedule()
-        .and_then(|schedule| schedule.value_at("recovery_window_days", sealed_unix))
-        .unwrap_or_else(|| {
-            registry::spec("recovery_window_days")
-                .unwrap()
-                .default
-                .unwrap()
-        });
-    let activation_epochs = history
-        .schedule()
-        .and_then(|schedule| schedule.value_at("declaration_activation_epochs", sealed_unix))
-        .unwrap_or_else(|| {
-            registry::spec("declaration_activation_epochs")
-                .unwrap()
-                .default
-                .unwrap()
-        });
-    crate::recovery::settle_due(db, &declarations, &sealed_at)?;
-    let default_schedule = wist_core::parameters::Schedule::new(sealed_unix);
-    let sealing_schedule = history.schedule().unwrap_or(&default_schedule);
-    let limits = crate::declaration::limits(sealing_schedule, sealed_unix)?;
-    let clock_skew_seconds = sealing_schedule
-        .value_at("clock_skew_seconds", sealed_unix)
-        .ok_or_else(|| Error::Param("clock_skew_seconds".into()))?;
-    let settlement =
-        declarations.project(&sealed_at, recovery_days, activation_epochs, &limits, &[])?;
+}
 
-    let (peeked, _up_to_rowid) = db.peek_pending_entries()?;
-    let domain_cap = registry::effective(db, "domain_epoch_entries_max", &sealed_at)?;
-    let labeler_cap = registry::effective(db, "labeler_epoch_entries_max", &sealed_at)?;
-    let peeked = fit_to_domain_cap(db, peeked, domain_cap, labeler_cap, epoch_number)?;
-    let (seal_entries, oversized) = hold_out_oversize_entries(storage_order(peeked)?);
+fn entry_octets(entry: &Value) -> Result<u64> {
+    Ok(jcs::canonicalize(entry)?.len() as u64 + 2)
+}
+
+/// WIST-3 §3.3, Waiting.
+pub(super) fn epoch(
+    db: &Db,
+    data_dir: &Path,
+    sk: &SigningKey,
+    now_unix: i64,
+) -> Result<PreparedEpoch> {
+    let (epoch_number, sealed_unix, sealed_at) = sealing_slot(db, now_unix)?;
+    let mut history = History::open(db, data_dir, db.last_epoch()?)?;
+    while history.next_epoch()?.is_some() {}
+    let sealed = db.sealed_from(&history)?;
+    let mut scope = db.waiting_publishers()?;
+    for (domain, state) in sealed.declarations.domains() {
+        if state.window().is_some() || state.pending().is_some() {
+            scope.insert(domain.clone());
+        }
+    }
+    let state = db.load_state(sealed, &scope)?;
+    let parameters = sealing_parameters(db, sealed_unix, &sealed_at)?;
+    let payload_window_days = parameters.value("payload_window_days")?;
+
+    let (pending, _) = db.peek_pending_entries()?;
+    let (updates, oversize): (Vec<SealEntry>, Vec<SealEntry>) = storage_order(
+        pending
+            .into_iter()
+            .filter(|row| row.entry_type == "registry_update")
+            .collect(),
+    )?
+    .into_iter()
+    .partition(|entry| entry.canonical.len() as u64 <= tiles::ENTRY_MAX_BYTES);
     let schedule = db.parameter_schedule(sealed_unix)?;
     let mut cap = registry::epoch_cap(&schedule, sealed_unix).min(registry::effective(
         db,
@@ -137,10 +220,9 @@ pub(super) fn epoch(
     )?);
     let mut tentative = schedule.clone();
     let largest = db.largest_epoch_bytes()?;
-    for (index, entry) in seal_entries.iter().enumerate() {
+    for (index, entry) in updates.iter().enumerate() {
         let update = &entry.body["update"];
-        if entry.entry_type == "registry_update"
-            && update["action"] == "parameter_change"
+        if update["action"] == "parameter_change"
             && check_param_change(
                 &mut tentative,
                 update,
@@ -154,95 +236,211 @@ pub(super) fn epoch(
             cap = cap.min(registry::epoch_cap(&tentative, sealed_unix));
         }
     }
-    let installed = settlement
+    let GovernanceOutcome {
+        kept,
+        param_changes,
+        withdrawals,
+        suffix_lists,
+        mut dropped,
+        dropped_rowids,
+        key_registry,
+    } = enforce_governance(
+        db,
+        history.key_registry(),
+        updates,
+        sealed_unix,
+        epoch_number,
+        0,
+    )?;
+    for entry in &oversize {
+        dropped.push(format!(
+            "WIST3-E03 {} Entry over 65 535 octets is not sealed",
+            entry.entry_type
+        ));
+    }
+    let mut dropped_rowids = dropped_rowids;
+    dropped_rowids.extend(oversize.iter().map(|entry| entry.rowid));
+    let signers = held_signers(data_dir, db, sk, &key_registry, epoch_number)?;
+    let keys = key_registry.valid_at(epoch_number);
+    let log_key = |key_id: &str| {
+        keys.iter()
+            .find(|key| key.key_id == key_id)
+            .map(|key| key.public_key.clone())
+    };
+    let installed: HashSet<String> = state
+        .declarations
         .domains()
         .values()
-        .flat_map(|state| {
-            std::iter::once(state.current().hash().to_string()).chain(
-                state
+        .flat_map(|domain| {
+            std::iter::once(domain.current().hash().to_string()).chain(
+                domain
                     .window()
                     .map(|window| window.head().hash().to_string()),
             )
         })
         .collect();
-    let (seal_entries, _deferred) = fit_to_cap(seal_entries, cap, &installed)?;
-    let (seal_entries, retired_rowids, retired) =
-        revalidate_labels(db, clock_skew_seconds, seal_entries, &sealed_at)?;
-    let ceiling = registry::effective(db, "max_inclusion_epochs", &sealed_at)?;
-    let late = late_inclusions(&seal_entries, epoch_number, ceiling);
-    let candidate_octets = seal_entries.iter().map(SealEntry::octets).sum();
-    let mut outcome = enforce_governance(
-        db,
-        history.key_registry(),
-        seal_entries,
-        sealed_unix,
-        epoch_number,
-        candidate_octets,
-    )?;
-    outcome.dropped.extend(retired);
-    outcome.dropped_rowids.extend(retired_rowids);
-    outcome.dropped.extend(oversized.iter().map(|e| {
-        format!(
-            "WIST3-E03 {} Entry of {} over 65 535 octets is not sealed",
-            e.entry_type, e.domain
-        )
-    }));
-    outcome
-        .dropped_rowids
-        .extend(oversized.iter().map(|e| e.rowid));
-    let GovernanceOutcome {
-        kept: seal_entries,
-        param_changes: accepted_changes,
-        withdrawals,
-        suffix_lists,
-        dropped,
-        dropped_rowids,
-        key_registry,
-    } = outcome;
-    let signers = held_signers(data_dir, db, sk, &key_registry, epoch_number)?;
-    let sealed_rowids: Vec<i64> = seal_entries
-        .iter()
-        .map(|e| e.rowid)
-        .chain(dropped_rowids.iter().copied())
+    let inclusion = Inclusion::constant(
+        u64::try_from(parameters.value("max_inclusion_epochs")?)
+            .map_err(|_| Error::Param("max_inclusion_epochs".into()))?,
+    );
+    let suffix_list = crate::suffix_list::in_force_at_epoch(db, epoch_number)?;
+    let held = crate::db::StoreHeld::new(db, data_dir, &sealed_at);
+    let mut candidates = Candidates {
+        declarations: state
+            .discovered
+            .values()
+            .flatten()
+            .map(|found| found.envelope.clone())
+            .collect(),
+        updates: kept.iter().map(|entry| entry.body.clone()).collect(),
+        unsealed: BTreeSet::new(),
+    };
+    for (id, label) in &state.labels {
+        let wrapped = serde_json::json!({"type": label.kind.as_str(), "body": label.envelope});
+        if jcs::canonicalize(&wrapped)?.len() as u64 > tiles::ENTRY_MAX_BYTES {
+            dropped.push(format!(
+                "WIST3-E03 {} Entry {id} over 65 535 octets is left unsealed",
+                label.kind.as_str()
+            ));
+            candidates
+                .unsealed
+                .insert(Unsealed::Label { id: id.clone() });
+        }
+    }
+    let planned = loop {
+        let input = EpochInput {
+            height: epoch_number,
+            sealed_at: &sealed_at,
+            parameters: &parameters,
+            inclusion: &inclusion,
+            suffix_list: suffix_list.as_deref(),
+            declarations: &candidates.declarations,
+            updates: &candidates.updates,
+            unsealed: &candidates.unsealed,
+            log_key: &log_key,
+        };
+        let planned = plan::plan(&state, &held, &input)?;
+        let mut octets = 0u64;
+        let mut oversize = Vec::new();
+        for entry in &planned.entries {
+            let size = entry_octets(entry)?;
+            if size - 2 > tiles::ENTRY_MAX_BYTES {
+                oversize.push(entry.clone());
+            }
+            octets += size;
+        }
+        let out: Vec<Value> = if !oversize.is_empty() {
+            oversize
+        } else if octets > u64::try_from(cap).unwrap_or_default() {
+            let indexed = planned
+                .entries
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| seal_entry(index as i64, entry.clone()))
+                .collect::<Result<Vec<_>>>()?;
+            let (fit, _) = fit_to_cap(indexed, cap, &installed)?;
+            let fit: HashSet<i64> = fit.iter().map(|entry| entry.rowid).collect();
+            planned
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !fit.contains(&(*index as i64)))
+                .map(|(_, entry)| entry.clone())
+                .collect()
+        } else {
+            plan::verify(&state, &input, &planned.entries)?;
+            break planned;
+        };
+        if out.is_empty() {
+            return Err(Error::Seal(
+                "the Epoch exceeds epoch_cap_bytes and no Entry can be kept out".into(),
+            ));
+        }
+        for entry in &out {
+            candidates.keep_out(&planned, entry)?;
+        }
+    };
+
+    let entries = planned.entries.clone();
+    let octets = entries.iter().map(entry_octets).sum::<Result<u64>>()?;
+    let in_epoch = |body: &Value| {
+        entries
+            .iter()
+            .any(|entry| entry["type"] == "registry_update" && entry["body"] == *body)
+    };
+    let mut sealed_rowids = dropped_rowids;
+    let mut accepted_changes = Vec::new();
+    for change in param_changes {
+        if in_epoch(&change.body) {
+            accepted_changes.push(change);
+        }
+    }
+    let withdrawals: Vec<OwnedWithdrawal> = withdrawals
+        .into_iter()
+        .filter(|withdrawal| in_epoch(&withdrawal.body))
         .collect();
-    let entries: Vec<Value> = seal_entries.iter().map(|e| e.wrapped.clone()).collect();
-    let octets: u64 = seal_entries.iter().map(SealEntry::octets).sum();
-    let entry_count = entries.len() as u64;
-    if octets > cap.max(0) as u64 {
-        return Err(Error::Seal(
-            "the Epoch's entry-bundle octets exceed epoch_cap_bytes".into(),
+    for entry in &kept {
+        let refused = planned.updates_refused.iter().any(|refused| {
+            entry.body["update"]["details"]["delta_id"] == refused.item_id.as_str()
+                && entry.body["update"]["subject"] == refused.subject.as_str()
+        });
+        if refused || in_epoch(&entry.body) {
+            sealed_rowids.push(entry.rowid);
+        }
+    }
+    for refused in &planned.updates_refused {
+        dropped.push(format!(
+            "{} payload_withdrawal {} of {} is not sealed: no Item of the subject is sealed below this Epoch",
+            refused.code, refused.item_id, refused.subject
         ));
     }
-    let projection = declarations.project(
-        &sealed_at,
-        recovery_days,
-        activation_epochs,
-        &limits,
-        &entries,
-    )?;
-    let windows = projection
-        .domains()
+    for rejection in &planned.rejections {
+        dropped.push(format!("{}: {}", rejection.id, rejection.code));
+    }
+    for left in planned.left.iter().filter(|left| left.reported) {
+        dropped.push(format!(
+            "{} {} leaves at its turn",
+            left.codes.join(", "),
+            publication_text(&left.publication)
+        ));
+    }
+    for failed in &planned.declarations_failed {
+        dropped.push(format!(
+            "{} Declaration {} fails at sealing",
+            failed.code, failed.declaration
+        ));
+    }
+    for left in &planned.declarations_left {
+        dropped.push(format!(
+            "{} Declaration {} leaves with the Declaration it names",
+            left.code, left.declaration
+        ));
+    }
+    let mut late: Vec<String> = planned
+        .sealed
         .iter()
-        .filter_map(|(domain, state)| {
-            state.window().map(|window| {
-                let window_end = i64::try_from(window.end_s())
-                    .ok()
-                    .and_then(|end| crate::registry::instant(end).ok())
-                    .ok_or_else(|| {
-                        Error::Seal("recovery window end exceeds the Log timestamp range".into())
-                    })?;
-                Ok(SealedWindow {
-                    domain: domain.clone(),
-                    head: serde_json::to_vec(window.head().envelope())?,
-                    before: serde_json::to_vec(window.before().envelope())?,
-                    owner: serde_json::to_vec(window.owner().envelope())?,
-                    opened_epoch: window.owner().position().epoch_number,
-                    window_end,
-                })
-            })
+        .filter(|sealed| epoch_number > sealed.ceiling)
+        .map(|sealed| {
+            format!(
+                "{}: sealed at Epoch {epoch_number}, past its inclusion ceiling {}",
+                publication_text(&sealed.publication),
+                sealed.ceiling
+            )
         })
-        .collect::<Result<Vec<_>>>()?;
-
+        .collect();
+    late.extend(
+        planned
+            .unsealed
+            .iter()
+            .filter(|unsealed| unsealed.ceiling <= epoch_number)
+            .map(|unsealed| {
+                format!(
+                    "{}: left unsealed at Epoch {epoch_number}, past its inclusion ceiling {}",
+                    publication_text(&unsealed.publication),
+                    unsealed.ceiling
+                )
+            }),
+    );
     Ok(PreparedEpoch {
         log_id: history.log_id().to_owned(),
         signers,
@@ -251,27 +449,29 @@ pub(super) fn epoch(
         octets,
         epoch_number,
         sealed_at,
-        seal_entries,
         sealed_rowids,
         accepted_changes,
         withdrawals,
         suffix_lists,
         dropped,
         late,
-        entry_count,
-        projection,
-        windows,
+        before: state,
+        planned,
+        scope,
+        payload_window_days,
     })
 }
 
 pub(super) struct AcceptedParamChange {
     pub(super) rowid: i64,
+    pub(super) body: Value,
     pub(super) parameter: String,
     pub(super) value: i64,
     pub(super) effective_at: String,
 }
 
 pub(super) struct OwnedWithdrawal {
+    pub(super) body: Value,
     pub(super) update_id: String,
     pub(super) item_id: String,
     pub(super) domain: String,
@@ -316,6 +516,7 @@ pub(super) fn check_param_change(
         .map_err(|e| format!("{parameter}: {e}"))?;
     Ok(AcceptedParamChange {
         rowid: 0,
+        body: Value::Null,
         parameter: parameter.into(),
         value,
         effective_at: effective_at.into(),
@@ -331,8 +532,12 @@ pub(crate) fn validate_pending_parameter(
     let mut schedule = db.parameter_schedule(at)?;
     let height = db.last_epoch()?.map_or(0, |b| b.epoch_number + 1);
     let largest = db.largest_epoch_bytes()?;
-    let (mut pending, _) = db.peek_pending_entries()?;
+    let (pending, _) = db.peek_pending_entries()?;
     let rowid = pending.iter().map(|p| p.rowid).max().unwrap_or(0) + 1;
+    let mut pending: Vec<PendingEntryRow> = pending
+        .into_iter()
+        .filter(|row| row.entry_type == "registry_update")
+        .collect();
     pending.push(PendingEntryRow {
         rowid,
         entry_type: "registry_update".into(),
@@ -364,113 +569,6 @@ pub(crate) fn validate_pending_parameter(
     ))
 }
 
-/// WIST-3 §3.2: the per-Registrable-Domain caps apply under the snapshot
-/// in force (WIST-4 §3.1); the surplus waits its turn in acceptance order,
-/// and WIST-4 §6.4's inclusion ceiling runs from the Epoch its turn arrives
-/// in.
-pub(super) fn fit_to_domain_cap(
-    db: &Db,
-    peeked: Vec<PendingEntryRow>,
-    cap: i64,
-    labeler_cap: i64,
-    epoch_number: u64,
-) -> Result<Vec<PendingEntryRow>> {
-    let cap = cap.max(0) as usize;
-    let labeler_cap = labeler_cap.max(0) as usize;
-    let list = crate::suffix_list::in_force_at_epoch(db, epoch_number)?;
-    let mut taken: HashMap<String, usize> = HashMap::new();
-    let mut labeled: HashMap<String, usize> = HashMap::new();
-    let mut kept = Vec::with_capacity(peeked.len());
-    for p in peeked {
-        if !matches!(p.entry_type.as_str(), "label" | "dispute") {
-            kept.push(p);
-            continue;
-        }
-        let unit = wist_core::suffix_list::registrable_domain(&p.domain, list.as_deref()).domain;
-        let count = taken.entry(unit.clone()).or_insert(0);
-        if *count >= cap {
-            continue;
-        }
-        let opinions = labeled.entry(unit).or_insert(0);
-        if *opinions >= labeler_cap {
-            continue;
-        }
-        *opinions += 1;
-        *count += 1;
-        db.set_turn_epoch(p.rowid, epoch_number)?;
-        kept.push(p);
-    }
-    Ok(kept)
-}
-
-/// WIST-4 §6.4: an accepted Entry MUST be sealed no later than
-/// `max_inclusion_epochs` Epochs after the Epoch its turn arrived in.
-pub(super) fn late_inclusions(
-    entries: &[SealEntry],
-    epoch_number: u64,
-    ceiling: i64,
-) -> Vec<String> {
-    let ceiling = ceiling.max(0) as u64;
-    entries
-        .iter()
-        .filter(|e| matches!(e.entry_type.as_str(), "label" | "dispute"))
-        .filter_map(|e| {
-            let turn = e.turn_epoch?;
-            (epoch_number > turn + ceiling).then(|| {
-                format!(
-                    "{}: sealed at Epoch {epoch_number}, {} Epochs after its turn at {turn}",
-                    e.domain,
-                    epoch_number - turn
-                )
-            })
-        })
-        .collect()
-}
-
-/// WIST-2 §3.3: a Label or dispute whose `asserted_at` the sealing clock
-/// no longer allows is rejected rather than sealed.
-pub(super) fn revalidate_labels(
-    db: &Db,
-    clock_skew_seconds: i64,
-    entries: Vec<SealEntry>,
-    sealed_at: &str,
-) -> Result<(Vec<SealEntry>, Vec<i64>, Vec<String>)> {
-    let clock = sealed_at
-        .parse::<jiff::Timestamp>()
-        .map_err(|e| Error::Clock(e.to_string()))?;
-    let mut kept = Vec::with_capacity(entries.len());
-    let mut dropped_rowids = Vec::new();
-    let mut late_labels = Vec::new();
-    for e in entries {
-        if !matches!(e.entry_type.as_str(), "label" | "dispute") {
-            kept.push(e);
-            continue;
-        }
-        let asserted_at = e.body[e.entry_type.as_str()]["asserted_at"]
-            .as_str()
-            .unwrap_or_default();
-        if wist_core::publisher_time::within_clock_bound(
-            asserted_at,
-            clock.as_second(),
-            clock_skew_seconds,
-        ) == Some(true)
-        {
-            kept.push(e);
-            continue;
-        }
-        let id = if e.entry_type == "label" {
-            wist_core::label::label_id(&e.body["label"])
-        } else {
-            wist_core::label::dispute_id(&e.body["dispute"])
-        }
-        .map_err(|err| Error::Seal(format!("queued Label Entry has no ID: {err:?}")))?;
-        dropped_rowids.push(e.rowid);
-        late_labels.push((e.rowid, e.domain, e.entry_type, id));
-    }
-    let dropped = db.reject_label_entries(&late_labels, sealed_at)?;
-    Ok((kept, dropped_rowids, dropped))
-}
-
 /// WIST-4 §5.1: the act must verify under the Log key and name an Item
 /// sealed for the subject at or below this Epoch; a repeated withdrawal
 /// seals and changes nothing.
@@ -486,6 +584,7 @@ fn check_withdrawal(
         Disposition::Accepted {
             item_id, publisher, ..
         } => Ok(Some(OwnedWithdrawal {
+            body: body.clone(),
             update_id: crate::governance::update_id(&body["update"]).map_err(|e| e.to_string())?,
             item_id,
             domain: publisher,
@@ -686,6 +785,7 @@ pub(super) fn enforce_governance(
                 ) {
                     Ok(mut change) => {
                         change.rowid = e.rowid;
+                        change.body = e.body.clone();
                         out.param_changes.push(change);
                         out.kept.push(e);
                     }
@@ -826,12 +926,9 @@ pub(super) fn fit_to_cap(
 pub(super) struct SealEntry {
     pub(super) rowid: i64,
     pub(super) entry_type: String,
-    pub(super) domain: String,
     pub(super) body: Value,
-    pub(super) wrapped: Value,
     pub(super) canonical: Vec<u8>,
     pub(super) leaf: [u8; 32],
-    pub(super) turn_epoch: Option<u64>,
 }
 
 impl SealEntry {
@@ -842,17 +939,6 @@ impl SealEntry {
     }
 }
 
-/// WIST-3 §3.3: an Entry whose JCS serialization exceeds 65 535 octets
-/// never fits an entry-bundle leaf. It is held out here, the last point at
-/// which the Aggregator still decides membership.
-pub(super) fn hold_out_oversize_entries(
-    entries: Vec<SealEntry>,
-) -> (Vec<SealEntry>, Vec<SealEntry>) {
-    entries
-        .into_iter()
-        .partition(|entry| entry.canonical.len() as u64 <= tiles::ENTRY_MAX_BYTES)
-}
-
 pub(super) fn entry_type_rank(entry_type: &str) -> usize {
     ENTRY_TYPE_ORDER
         .iter()
@@ -860,23 +946,26 @@ pub(super) fn entry_type_rank(entry_type: &str) -> usize {
         .unwrap_or(ENTRY_TYPE_ORDER.len())
 }
 
+fn seal_entry(rowid: i64, wrapped: Value) -> Result<SealEntry> {
+    let canonical = jcs::canonicalize(&wrapped)?;
+    let leaf = merkle::leaf_hash(&canonical);
+    Ok(SealEntry {
+        rowid,
+        entry_type: wrapped["type"].as_str().unwrap_or_default().to_owned(),
+        body: wrapped["body"].clone(),
+        canonical,
+        leaf,
+    })
+}
+
 pub(super) fn storage_order(peeked: Vec<PendingEntryRow>) -> Result<Vec<SealEntry>> {
     let mut entries = peeked
         .into_iter()
         .map(|p| {
-            let wrapped = serde_json::json!({"type": p.entry_type, "body": p.entry_json});
-            let canonical = jcs::canonicalize(&wrapped)?;
-            let leaf = merkle::leaf_hash(&canonical);
-            Ok(SealEntry {
-                rowid: p.rowid,
-                entry_type: p.entry_type,
-                domain: p.domain,
-                body: p.entry_json,
-                wrapped,
-                canonical,
-                leaf,
-                turn_epoch: p.turn_epoch,
-            })
+            seal_entry(
+                p.rowid,
+                serde_json::json!({"type": p.entry_type, "body": p.entry_json}),
+            )
         })
         .collect::<Result<Vec<_>>>()?;
     entries.sort_by(|a, b| {
@@ -893,38 +982,63 @@ mod tests {
 
     #[test]
     fn domain_cap_counts_per_registrable_domain() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
-        let list = b"com\ngithub.io\n";
-        let identifier = wist_core::suffix_list::identifier(list);
-        db.store_suffix_list(&identifier, list).unwrap();
-        db.commit_seal(
-            &crate::db::tests::signing_key(),
-            crate::db::tests::LOG_ID,
-            &[],
-            0,
-            "2026-08-09T00:00:00Z",
-            &[],
-            0,
-            &[],
-            &[],
-            std::slice::from_ref(&identifier),
-            &[],
-            &[],
-            &[],
-        )
-        .unwrap();
-        for domain in ["a.example.com", "b.example.com", "alice.github.io"] {
-            db.insert_pending_entry("label", domain, &serde_json::json!({}), 0)
-                .unwrap();
+        use crate::collection::state::{LabelKind, Place, WaitingLabel};
+        let mut state = State::default();
+        let signer = SigningKey::from_seed(&[3; 32]);
+        for (index, labeler) in ["a.example.com", "b.example.com", "alice.github.io"]
+            .into_iter()
+            .enumerate()
+        {
+            let inner = serde_json::json!({"wist_version": WIST_VERSION, "labeler": labeler,
+                "subject": "https://subject.example/", "name": "wist:spam",
+                "asserted_at": "2026-08-09T00:00:00Z"});
+            state.labels.insert(
+                wist_core::label::label_id(&inner).unwrap(),
+                WaitingLabel {
+                    kind: LabelKind::Label,
+                    publisher: labeler.into(),
+                    envelope: sign_envelope(&inner, "label", "labeler-key", &signer).unwrap(),
+                    place: Place::url(0, 0, index as u64),
+                    eligibility: 0,
+                },
+            );
         }
-        let peeked = db.peek_pending_entries().unwrap().0;
-        let under_none = fit_to_domain_cap(&db, peeked, 1, 1, 0).unwrap();
-        assert_eq!(under_none.len(), 3);
-        let peeked = db.peek_pending_entries().unwrap().0;
-        let under_list = fit_to_domain_cap(&db, peeked, 1, 1, 1).unwrap();
-        let kept: Vec<&str> = under_list.iter().map(|p| p.domain.as_str()).collect();
-        assert_eq!(kept, ["a.example.com", "alice.github.io"]);
+        let mut parameters = Parameters::new(Default::default());
+        parameters.set("domain_epoch_entries_max", 1);
+        parameters.set("labeler_epoch_entries_max", 1);
+        let list = wist_core::suffix_list::SuffixList::parse(b"com\ngithub.io\n").unwrap();
+        let sealed = |suffix_list| {
+            let planned = plan::plan(
+                &state,
+                &crate::collection::MemoryHeld::default(),
+                &EpochInput {
+                    height: 0,
+                    sealed_at: "2026-08-09T01:00:00Z",
+                    parameters: &parameters,
+                    inclusion: &Inclusion::constant(24),
+                    suffix_list,
+                    declarations: &[],
+                    updates: &[],
+                    unsealed: &BTreeSet::new(),
+                    log_key: &|_| None,
+                },
+            )
+            .unwrap();
+            let mut labelers: Vec<String> = planned
+                .entries
+                .iter()
+                .map(|entry| {
+                    entry["body"]["label"]["labeler"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned()
+                })
+                .collect();
+            labelers.sort();
+            labelers
+        };
+        assert_eq!(sealed(None).len(), 3);
+        assert_eq!(sealed(Some(&list)), ["a.example.com", "alice.github.io"]);
     }
 
     use super::*;
@@ -960,10 +1074,7 @@ mod tests {
         };
         for count in [9, 10, 99, 100] {
             let all = entries(count);
-            let size: u64 = all
-                .iter()
-                .map(|e| jcs::canonicalize(&e.wrapped).unwrap().len() as u64 + 2)
-                .sum();
+            let size: u64 = all.iter().map(|e| e.canonical.len() as u64 + 2).sum();
             assert_eq!(size, all.iter().map(SealEntry::octets).sum::<u64>());
             let (fit, deferred) = fit_to_cap(all, size as i64, &HashSet::new()).unwrap();
             assert_eq!(fit.len(), count as usize);

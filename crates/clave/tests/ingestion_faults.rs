@@ -160,7 +160,7 @@ fn utc(second: i64) -> String {
 }
 
 fn payload_files(data_dir: &Path) -> usize {
-    std::fs::read_dir(data_dir.join("payloads")).map_or(0, |dir| dir.count())
+    std::fs::read_dir(data_dir.join("held/payloads")).map_or(0, |dir| dir.count())
 }
 
 fn open_runs(data_dir: &Path) -> i64 {

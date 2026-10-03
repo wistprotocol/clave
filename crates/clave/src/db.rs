@@ -11,10 +11,11 @@ mod pull_runs;
 mod pull_schedule;
 mod restore;
 mod schema;
+mod sealing;
 mod tree;
 
 pub(crate) use collections::store_changes;
-pub use collections::{Sealed, StoreHeld};
+pub use collections::{held_payload_path, served_payload_path, Sealed, StoreHeld};
 pub use leases::{
     process_owner, Fence, Lease, PARTITIONS, PARTITION_LEASE_SECONDS, SEALER_LEASE_SECONDS,
 };
@@ -24,7 +25,11 @@ pub use pull_schedule::{
     RETRY_BASE_SECONDS,
 };
 pub use pull_schedule::{AGE_PRIORITY_SECONDS, BYTES_PER_SLOT_SECOND};
+pub(crate) use sealing::remove_file;
+pub use sealing::{PayloadDutyRow, WaitingReport};
 pub use tree::StoredTree;
+
+const DETAIL_MAX_CHARS: usize = 256;
 
 /// A top-level transaction takes the write lock before any read, so a
 /// concurrent connection can neither invalidate what it read nor make its
@@ -250,6 +255,21 @@ fn exec_insert_pending_entry(
     Ok(())
 }
 
+fn exec_discover_declaration(conn: &Connection, domain: &str, envelope: &Value) -> Result<()> {
+    let hash = crate::declaration::inner_hash(envelope).map_err(Error::History)?;
+    let height: Option<i64> =
+        conn.query_row("SELECT MAX(epoch_number) FROM epochs", [], |row| row.get(0))?;
+    conn.execute(
+        "INSERT OR IGNORE INTO discovered_declarations(domain, hash, ord, envelope, event, last_sealed_at_discovery, reduces_authority, last_seal_height, competitor) VALUES (?1, ?2, (SELECT COALESCE(MAX(ord), -1) + 1 FROM discovered_declarations WHERE domain = ?1), ?3, (SELECT position FROM acceptance_clock WHERE id = 1), ?4, 0, NULL, 0)",
+        (domain, &hash, serde_json::to_vec(envelope)?, height),
+    )?;
+    conn.execute(
+        "INSERT INTO discovery_floors(domain, seq) VALUES (?1, ?2) ON CONFLICT(domain) DO UPDATE SET seq = MAX(seq, excluded.seq)",
+        (domain, accepted_declaration_seq(domain, envelope)? as i64),
+    )?;
+    Ok(())
+}
+
 pub(super) fn exec_retain_declaration_seq(conn: &Connection, domain: &str, seq: u64) -> Result<()> {
     conn.execute(
         "INSERT INTO declaration_floors(domain, seq) VALUES (?1, ?2) ON CONFLICT(domain) DO UPDATE SET seq = MAX(seq, excluded.seq)",
@@ -426,7 +446,7 @@ impl Db {
     ) -> Result<()> {
         let tx = self.mutation()?;
         exec_insert_publisher(&tx, domain, declaration_json, key_id, public_key)?;
-        exec_insert_pending_entry(&tx, "publisher_declaration", domain, entry_json, 0)?;
+        exec_discover_declaration(&tx, domain, entry_json)?;
         exec_retain_declaration_seq(&tx, domain, accepted_declaration_seq(domain, entry_json)?)?;
         tx.commit()?;
         Ok(())
@@ -445,10 +465,14 @@ impl Db {
             "UPDATE publishers SET declaration_json = ?2, key_id = ?3, public_key = ?4 WHERE domain = ?1",
             (domain, declaration_json, key_id, public_key),
         )?;
-        exec_insert_pending_entry(&tx, "publisher_declaration", domain, entry_json, 0)?;
+        exec_discover_declaration(&tx, domain, entry_json)?;
         exec_retain_declaration_seq(&tx, domain, accepted_declaration_seq(domain, entry_json)?)?;
         tx.commit()?;
         Ok(())
+    }
+
+    pub fn hold_discovered_declaration(&self, domain: &str, envelope: &Value) -> Result<()> {
+        self.write(|conn| exec_discover_declaration(conn, domain, envelope))
     }
 
     /// WIST-1 §5.2: a fresh identity's pending head is held beside the current
@@ -475,7 +499,7 @@ impl Db {
             "INSERT INTO pending_identities(domain, declaration_json) VALUES (?1, ?2) ON CONFLICT(domain) DO UPDATE SET declaration_json = excluded.declaration_json",
             (domain, declaration_json),
         )?;
-        exec_insert_pending_entry(&tx, "publisher_declaration", domain, entry_json, 0)?;
+        exec_discover_declaration(&tx, domain, entry_json)?;
         exec_retain_declaration_seq(&tx, domain, accepted_declaration_seq(domain, entry_json)?)?;
         tx.commit()?;
         Ok(())
@@ -483,37 +507,6 @@ impl Db {
 
     pub fn clear_pending_identity(&self, domain: &str) -> Result<()> {
         self.execute("DELETE FROM pending_identities WHERE domain = ?1", [domain])?;
-        Ok(())
-    }
-
-    pub(crate) fn restore_publisher_declaration(
-        &self,
-        domain: &str,
-        declaration_json: &[u8],
-        key_id: &str,
-        public_key: &str,
-    ) -> Result<()> {
-        self.execute(
-            "UPDATE publishers SET declaration_json = ?2, key_id = ?3, public_key = ?4 WHERE domain = ?1",
-            (domain, declaration_json, key_id, public_key),
-        )?;
-        Ok(())
-    }
-
-    pub(crate) fn store_sealed_recovery_window(
-        &self,
-        domain: &str,
-        head: &[u8],
-        before: &[u8],
-        owner: &[u8],
-        opened_epoch: u64,
-        window_end: &str,
-    ) -> Result<()> {
-        self.execute(
-            "INSERT INTO recovery_windows(domain, declaration_json, prior_declaration_json, owner_declaration_json, opened_epoch, window_end) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(domain) DO UPDATE SET declaration_json = excluded.declaration_json, prior_declaration_json = excluded.prior_declaration_json, owner_declaration_json = excluded.owner_declaration_json, opened_epoch = excluded.opened_epoch, window_end = excluded.window_end",
-            (domain, head, before, owner, opened_epoch, window_end),
-        )?;
         Ok(())
     }
 
@@ -635,64 +628,9 @@ impl Db {
             .map_err(Error::Db)
     }
 
-    pub(crate) fn recovery_settled(&self, domain: &str, owner_hash: &str) -> Result<bool> {
-        Ok(self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM recovery_settlements WHERE domain = ?1 AND owner_hash = ?2)",
-            (domain, owner_hash),
-            |row| row.get(0),
-        )?)
-    }
-
-    pub(crate) fn mark_recovery_settled(&self, domain: &str, owner_hash: &str) -> Result<()> {
-        self.execute(
-            "INSERT INTO recovery_settlements(domain, owner_hash) VALUES (?1, ?2)",
-            (domain, owner_hash),
-        )?;
-        Ok(())
-    }
-
-    pub(crate) fn remove_pending_declaration(&self, rowid: i64) -> Result<()> {
-        self.execute(
-            "DELETE FROM pending_entries WHERE rowid = ?1 AND entry_type = 'publisher_declaration'",
-            [rowid],
-        )?;
-        Ok(())
-    }
-
     pub fn close_recovery_window(&self, domain: &str) -> Result<()> {
         self.execute("DELETE FROM recovery_windows WHERE domain = ?1", [domain])?;
         Ok(())
-    }
-
-    pub(crate) fn reject_label_entries(
-        &self,
-        rejected: &[(i64, String, String, String)],
-        at: &str,
-    ) -> Result<Vec<String>> {
-        if rejected.is_empty() {
-            return Ok(Vec::new());
-        }
-        let tx = self.mutation()?;
-        let mut report = Vec::with_capacity(rejected.len());
-        for (rowid, domain, entry_type, id) in rejected {
-            tx.execute(
-                "INSERT INTO rejections(domain, code, at, id, detail) VALUES (?1, 'WIST2-E06', ?2, ?3, ?4)",
-                (
-                    domain,
-                    at,
-                    id,
-                    format!("queued {entry_type} asserted_at exceeds the clock_skew_seconds allowance at sealing"),
-                ),
-            )?;
-            tx.execute(
-                "DELETE FROM seen_labels WHERE domain = ?1 AND id = ?2",
-                (domain, id),
-            )?;
-            tx.execute("DELETE FROM pending_entries WHERE rowid = ?1", [rowid])?;
-            report.push(format!("{id}: WIST2-E06"));
-        }
-        tx.commit()?;
-        Ok(report)
     }
 
     pub fn set_publisher_pulled(&self, domain: &str, now: &str) -> Result<()> {
@@ -786,7 +724,11 @@ impl Db {
     }
 
     pub fn tree_size(&self) -> Result<u64> {
-        self.size_before(u64::MAX)
+        Ok(self.conn.query_row(
+            "SELECT COALESCE(MAX(tree_size), 0) FROM epochs",
+            [],
+            |row| row.get::<_, i64>(0),
+        )? as u64)
     }
 
     pub fn log_tree(&self) -> StoredTree<'_> {
@@ -1252,6 +1194,11 @@ impl Db {
             )
             .optional()?
             .is_some())
+    }
+
+    pub(crate) fn forget_seen_label(&self, id: &str) -> Result<()> {
+        self.execute("DELETE FROM seen_labels WHERE id = ?1", [id])?;
+        Ok(())
     }
 
     pub fn insert_seen_label(&self, id: &str, domain: &str) -> Result<()> {
@@ -1720,19 +1667,39 @@ impl Db {
         id: Option<&str>,
         detail: Option<&str>,
     ) -> Result<()> {
-        self.execute(
-            "INSERT INTO rejections(domain, code, at, id, detail) VALUES (?1, ?2, ?3, ?4, ?5)",
-            (domain, code, at, id, detail),
-        )?;
-        Ok(())
+        self.record_rejection(
+            domain,
+            &StatusRejection {
+                code: code.to_owned(),
+                at: at.to_owned(),
+                id: id.map(str::to_owned),
+                collection: None,
+                urls: None,
+                condition: None,
+                change_list: None,
+                detail: detail.map(str::to_owned),
+            },
+        )
     }
 
+    /// WIST-2 §7.1, against `schemas/status.schema.json`.
     pub(crate) fn record_rejection(&self, domain: &str, rejection: &StatusRejection) -> Result<()> {
         let condition = rejection
             .condition
             .map(serde_json::to_value)
             .transpose()?
             .and_then(|condition| condition.as_str().map(str::to_owned));
+        let detail = rejection
+            .detail
+            .as_ref()
+            .map(|detail| detail.chars().take(DETAIL_MAX_CHARS).collect::<String>());
+        let mut urls: Vec<&String> = Vec::new();
+        for url in rejection.urls.iter().flatten() {
+            if url.starts_with("https://") && !url.contains('#') && !urls.contains(&url) {
+                urls.push(url);
+            }
+        }
+        let urls = (!urls.is_empty()).then_some(urls);
         self.execute(
             "INSERT INTO rejections(domain, code, at, id, detail, collection, urls_json, condition, change_list) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             rusqlite::params![
@@ -1740,9 +1707,9 @@ impl Db {
                 rejection.code,
                 rejection.at,
                 rejection.id,
-                rejection.detail,
+                detail,
                 rejection.collection,
-                rejection.urls.as_ref().map(serde_json::to_string).transpose()?,
+                urls.as_ref().map(serde_json::to_string).transpose()?,
                 condition,
                 rejection.change_list,
             ],
@@ -1851,7 +1818,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn update_publisher_declaration_updates_row_and_enqueues_entry() {
+    fn update_publisher_declaration_updates_row_and_holds_it_among_the_discovered() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
         record_test_declaration(&db).unwrap();
@@ -1872,9 +1839,10 @@ pub(crate) mod tests {
                 .unwrap(),
             serde_json::to_vec(&test_declaration(1)).unwrap()
         );
+        assert_eq!(db.count_discovered_declarations("example.com").unwrap(), 2);
         assert_eq!(
             db.count_pending_entries("publisher_declaration").unwrap(),
-            2
+            0
         );
     }
 
@@ -2089,22 +2057,17 @@ pub(crate) mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
         record_test_declaration(&db).unwrap();
-        assert_eq!(
-            db.count_pending_entries("publisher_declaration").unwrap(),
-            1
-        );
+        assert_eq!(db.count_discovered_declarations("example.com").unwrap(), 1);
         assert!(record_test_declaration(&db).is_err());
-        assert_eq!(
-            db.count_pending_entries("publisher_declaration").unwrap(),
-            1
-        );
+        assert_eq!(db.count_discovered_declarations("example.com").unwrap(), 1);
     }
 
     #[test]
     fn drain_pending_entries_orders_by_rowid_and_empties_table() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
-        record_test_declaration(&db).unwrap();
+        db.insert_pending_entry("registry_update", "", &serde_json::json!({"n": 0}), 0)
+            .unwrap();
         db.insert_pending_entry("label", "example.com", &serde_json::json!({"n": 1}), 0)
             .unwrap();
         db.insert_pending_entry("label", "example.com", &serde_json::json!({"n": 2}), 0)
@@ -2112,7 +2075,7 @@ pub(crate) mod tests {
 
         let entries = db.drain_pending_entries().unwrap();
         assert_eq!(entries.len(), 3);
-        assert_eq!(entries[0].entry_type, "publisher_declaration");
+        assert_eq!(entries[0].entry_type, "registry_update");
         assert_eq!(entries[1].entry_type, "label");
         assert_eq!(entries[1].entry_json, serde_json::json!({"n": 1}));
         assert_eq!(entries[2].entry_type, "label");
@@ -2125,13 +2088,14 @@ pub(crate) mod tests {
     fn peek_pending_entries_orders_without_deleting_then_commit_seal_drains_up_to_rowid() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
-        record_test_declaration(&db).unwrap();
+        db.insert_pending_entry("registry_update", "", &serde_json::json!({"n": 0}), 0)
+            .unwrap();
         db.insert_pending_entry("label", "example.com", &serde_json::json!({"n": 1}), 0)
             .unwrap();
 
         let (peeked, up_to) = db.peek_pending_entries().unwrap();
         assert_eq!(peeked.len(), 2);
-        assert_eq!(peeked[0].entry_type, "publisher_declaration");
+        assert_eq!(peeked[0].entry_type, "registry_update");
         assert_eq!(peeked[1].entry_type, "label");
         assert_eq!(up_to, peeked[1].rowid);
         let (peeked_again, _) = db.peek_pending_entries().unwrap();

@@ -75,3 +75,138 @@ fn withdraw_refuses_an_id_that_names_no_item_sealed_for_the_subject() {
         .iter()
         .all(|e| e.entry_type != "registry_update"));
 }
+
+fn sealed_log() -> (common::Rig, serde_json::Value, common::Published, String) {
+    let log = common::Rig::new();
+    let (item, payload) = log.page("a", "withdrawable body");
+    let published = log.publish(
+        &[(item.clone(), Some(payload))],
+        "2026-08-09T12:00:00Z",
+        None,
+    );
+    log.pull("2026-08-09T12:00:05Z");
+    log.seal("2026-08-09T13:00:00Z");
+    let id = common::item_id(&item);
+    (log, item, published, id)
+}
+
+fn withdraw(log: &common::Rig, id: &str, at: &str) -> clave::error::Result<String> {
+    clave::governance::withdraw(
+        &log.db,
+        &log.sk,
+        &log.host,
+        id,
+        "court order",
+        "DE",
+        wist_core::timestamp::log_seconds(at).unwrap(),
+    )
+    .map(|report| report.update_id)
+}
+
+fn withdrawn_at(log: &common::Rig, id: &str) -> Option<u64> {
+    log.db
+        .withdrawal_state()
+        .unwrap()
+        .into_iter()
+        .find(|(item_id, _, _)| item_id == id)
+        .map(|(_, _, height)| height)
+}
+
+#[test]
+fn a_payload_withdrawal_destroys_the_payload_and_stale_snapshots_and_leaves_the_record() {
+    let (log, _, _, id) = sealed_log();
+    let served = clave::db::served_payload_path(log.data.path(), &id).unwrap();
+    assert!(served.exists());
+    clave::snapshot::produce(&log.data.path().join("clave.sqlite"), log.data.path()).unwrap();
+    assert!(!common::listed_snapshots(log.data.path()).is_empty());
+    withdraw(&log, &id, "2026-08-09T13:30:00Z").unwrap();
+    let report = log.seal("2026-08-09T14:00:00Z");
+    assert_eq!(report.entry_count, 1);
+    let entries = log.entries(1);
+    assert_eq!(entries[0]["body"]["update"]["action"], "payload_withdrawal");
+    assert_eq!(
+        entries[0]["body"]["update"]["details"]["delta_id"],
+        id.as_str()
+    );
+    assert_eq!(withdrawn_at(&log, &id), Some(1));
+    assert!(!served.exists());
+    assert!(!clave::db::held_payload_path(log.data.path(), &id)
+        .unwrap()
+        .exists());
+    assert!(common::listed_snapshots(log.data.path()).is_empty());
+    assert!(log.db.payload_duties().unwrap().is_empty());
+    let state = log.state();
+    assert_eq!(state.record(&log.host, &log.url("a")).unwrap().item_id, id);
+    assert!(state.withdrawals.is_withdrawn(&id));
+}
+
+#[test]
+fn a_repeated_withdrawal_seals_and_keeps_the_first_height() {
+    let (log, _, _, id) = sealed_log();
+    withdraw(&log, &id, "2026-08-09T13:30:00Z").unwrap();
+    log.seal("2026-08-09T14:00:00Z");
+    withdraw(&log, &id, "2026-08-09T14:30:00Z").unwrap();
+    let report = log.seal("2026-08-09T15:00:00Z");
+    assert_eq!(report.entry_count, 1, "{:?}", report.dropped);
+    assert!(report.dropped.is_empty());
+    assert_eq!(withdrawn_at(&log, &id), Some(1));
+}
+
+#[test]
+fn a_withdrawal_names_an_item_sealed_below_it_and_never_one_waiting() {
+    let log = common::Rig::new();
+    let (item, payload) = log.page("a", "waiting body");
+    log.publish(
+        &[(item.clone(), Some(payload))],
+        "2026-08-09T12:00:00Z",
+        None,
+    );
+    log.pull("2026-08-09T12:00:05Z");
+    let id = common::item_id(&item);
+    assert!(matches!(
+        withdraw(&log, &id, "2026-08-09T12:30:00Z"),
+        Err(clave::Error::Governance(_))
+    ));
+    let report = log.seal("2026-08-09T13:00:00Z");
+    assert_eq!(
+        common::sealed_item_ids(&log.entries(0)),
+        std::slice::from_ref(&id)
+    );
+    assert!(report.dropped.is_empty());
+    withdraw(&log, &id, "2026-08-09T13:30:00Z").unwrap();
+    log.seal("2026-08-09T14:00:00Z");
+    assert_eq!(withdrawn_at(&log, &id), Some(1));
+}
+
+#[test]
+fn a_withdrawn_item_is_not_admitted_at_a_later_pull() {
+    let (log, item, published, id) = sealed_log();
+    withdraw(&log, &id, "2026-08-09T13:30:00Z").unwrap();
+    log.seal("2026-08-09T14:00:00Z");
+    let replacement = log.page("a", "a new body under a fresh salt");
+    let two = log.publish(
+        &[(replacement.0.clone(), Some(replacement.1.clone()))],
+        "2026-08-09T14:30:00Z",
+        Some(&published),
+    );
+    log.pull("2026-08-09T14:30:05Z");
+    log.seal("2026-08-09T15:00:00Z");
+    let payload = wist_core::item::payload_name(&item).unwrap();
+    std::fs::write(
+        common::collection_dir(&log.p, "default").join(format!("payloads/{payload}.json")),
+        b"{}",
+    )
+    .unwrap();
+    log.publish(&[(item.clone(), None)], "2026-08-09T15:30:00Z", Some(&two));
+    let report = log.pull("2026-08-09T15:30:05Z");
+    assert!(
+        report
+            .rejected
+            .iter()
+            .any(|(object, code)| object.ends_with(&id) && code == "WIST2-E03"),
+        "{report:?}"
+    );
+    assert!(!report.items.iter().any(|object| object.ends_with(&id)));
+    let sealed = log.seal("2026-08-09T16:00:00Z");
+    assert!(common::sealed_item_ids(&log.entries(sealed.epoch_number)).is_empty());
+}

@@ -15,7 +15,7 @@ use wist_core::declarations::Declarations;
 use wist_core::withdrawal::{SealedItems, WithdrawalReplay};
 
 const SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS collections(publisher TEXT NOT NULL, name TEXT NOT NULL, latest_envelope BLOB, latest_id TEXT, latest_height INTEGER, latest_base INTEGER, accepted_envelope BLOB, accepted_id TEXT, accepted_key TEXT, accepted_base INTEGER, accepted_failed_c1 INTEGER, accepted_failed_c4 INTEGER, accepted_event INTEGER, accepted_position INTEGER, accepted_eligibility INTEGER, left_chain INTEGER NOT NULL, catalog_octets BLOB, catalog_validator TEXT, PRIMARY KEY(publisher, name));
+CREATE TABLE IF NOT EXISTS collections(publisher TEXT NOT NULL, name TEXT NOT NULL, latest_envelope BLOB, latest_id TEXT, latest_height INTEGER, latest_base INTEGER, accepted_envelope BLOB, accepted_id TEXT, accepted_key TEXT, accepted_base INTEGER, accepted_failed_c1 INTEGER, accepted_failed_c4 INTEGER, accepted_event INTEGER, accepted_position INTEGER, accepted_eligibility INTEGER, left_chain INTEGER NOT NULL, catalog_octets BLOB, catalog_validator TEXT, waiting_deferrals TEXT, waiting_held TEXT, accepted_read TEXT, PRIMARY KEY(publisher, name));
 CREATE TABLE IF NOT EXISTS catalog_queues(publisher TEXT PRIMARY KEY, owner TEXT NOT NULL, end_s INTEGER);
 CREATE TABLE IF NOT EXISTS catalog_queue(publisher TEXT NOT NULL, name TEXT NOT NULL, key_x TEXT NOT NULL, envelope BLOB NOT NULL, catalog_id TEXT NOT NULL, place_event INTEGER NOT NULL, place_position INTEGER NOT NULL, sources_json TEXT NOT NULL, PRIMARY KEY(publisher, name, key_x));
 CREATE TABLE IF NOT EXISTS catalog_queue_first(publisher TEXT NOT NULL, name TEXT NOT NULL, place_event INTEGER NOT NULL, place_position INTEGER NOT NULL, PRIMARY KEY(publisher, name));
@@ -23,13 +23,13 @@ CREATE TABLE IF NOT EXISTS held_lists(publisher TEXT NOT NULL, name TEXT NOT NUL
 CREATE INDEX IF NOT EXISTS held_lists_root ON held_lists(publisher, name, size, root);
 CREATE TABLE IF NOT EXISTS tree_files(sha256 TEXT PRIMARY KEY, octets BLOB NOT NULL, last_read TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS lists(publisher TEXT NOT NULL, name TEXT NOT NULL, catalog_id TEXT NOT NULL, PRIMARY KEY(publisher, name, catalog_id));
-CREATE TABLE IF NOT EXISTS list_items(publisher TEXT NOT NULL, name TEXT NOT NULL, catalog_id TEXT NOT NULL, idx INTEGER NOT NULL, url TEXT NOT NULL, item_id TEXT NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('page','removed')), admission TEXT NOT NULL CHECK(admission IN ('unjudged','admitted','refused','not_admitted')), code TEXT, PRIMARY KEY(publisher, name, catalog_id, idx));
-CREATE TABLE IF NOT EXISTS waiting_urls(publisher TEXT NOT NULL, url TEXT NOT NULL, collection TEXT NOT NULL, item_id TEXT NOT NULL, place_event INTEGER NOT NULL, place_position INTEGER NOT NULL, place_index INTEGER NOT NULL, eligibility INTEGER NOT NULL, PRIMARY KEY(publisher, url));
+CREATE TABLE IF NOT EXISTS list_items(publisher TEXT NOT NULL, name TEXT NOT NULL, catalog_id TEXT NOT NULL, idx INTEGER NOT NULL, url TEXT NOT NULL, item_id TEXT NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('page','removed')), admission TEXT NOT NULL CHECK(admission IN ('unjudged','admitted','refused','not_admitted')), code TEXT, read TEXT, PRIMARY KEY(publisher, name, catalog_id, idx));
+CREATE TABLE IF NOT EXISTS waiting_urls(publisher TEXT NOT NULL, url TEXT NOT NULL, collection TEXT NOT NULL, item_id TEXT NOT NULL, place_event INTEGER NOT NULL, place_position INTEGER NOT NULL, place_index INTEGER NOT NULL, eligibility INTEGER NOT NULL, deferrals TEXT, held TEXT, PRIMARY KEY(publisher, url));
 CREATE TABLE IF NOT EXISTS records(publisher TEXT NOT NULL, url TEXT NOT NULL, item BLOB NOT NULL, item_id TEXT NOT NULL, collection TEXT NOT NULL, catalog_id TEXT NOT NULL, generated_at TEXT NOT NULL, sealing_height INTEGER NOT NULL, PRIMARY KEY(publisher, url));
 CREATE TABLE IF NOT EXISTS removals(publisher TEXT NOT NULL, url TEXT NOT NULL, item_id TEXT NOT NULL, catalog_id TEXT NOT NULL, generated_at TEXT NOT NULL, PRIMARY KEY(publisher, url));
 CREATE TABLE IF NOT EXISTS sealed_items(item_id TEXT NOT NULL, publisher TEXT NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('page','removed')), first_height INTEGER NOT NULL, PRIMARY KEY(item_id, publisher, kind));
-CREATE TABLE IF NOT EXISTS payload_duties(item_id TEXT PRIMARY KEY, publisher TEXT NOT NULL, url TEXT NOT NULL, until TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS discovered_declarations(domain TEXT NOT NULL, hash TEXT NOT NULL, ord INTEGER NOT NULL, envelope BLOB NOT NULL, event INTEGER NOT NULL, last_sealed_at_discovery INTEGER, reduces_authority INTEGER NOT NULL, last_seal_height INTEGER, competitor INTEGER NOT NULL, PRIMARY KEY(domain, hash));
+CREATE TABLE IF NOT EXISTS payload_duties(item_id TEXT PRIMARY KEY, publisher TEXT NOT NULL, url TEXT NOT NULL, until TEXT NOT NULL, served INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS discovered_declarations(domain TEXT NOT NULL, hash TEXT NOT NULL, ord INTEGER NOT NULL, envelope BLOB NOT NULL, event INTEGER NOT NULL, last_sealed_at_discovery INTEGER, reduces_authority INTEGER NOT NULL, last_seal_height INTEGER, competitor INTEGER NOT NULL, competes_with TEXT, PRIMARY KEY(domain, hash));
 CREATE TABLE IF NOT EXISTS discovery_floors(domain TEXT PRIMARY KEY, seq INTEGER NOT NULL);
 ";
 
@@ -93,6 +93,13 @@ fn admission_of(value: &str) -> Result<Admission> {
     })
 }
 
+fn read_of(read: Option<String>) -> Result<Vec<String>> {
+    Ok(match read {
+        Some(read) => serde_json::from_str(&read)?,
+        None => Vec::new(),
+    })
+}
+
 fn kind_str(kind: ItemKind) -> &'static str {
     match kind {
         ItemKind::Page => "page",
@@ -117,25 +124,28 @@ fn condition_str(discard: &Discard) -> Result<String> {
 
 impl Db {
     pub fn sealed_state(&self, data_dir: &Path) -> Result<Sealed> {
-        use crate::history::declarations::DeclarationsReplay;
-        let head = self.last_epoch()?;
-        let height = head.as_ref().map(|epoch| epoch.epoch_number);
-        let declarations = Declarations::reconstruct(self, data_dir, head)?;
-        let mut withdrawals = WithdrawalReplay::new();
-        for (item_id, domain, height) in self
+        let mut history = crate::history::History::open(self, data_dir, self.last_epoch()?)?;
+        while history.next_epoch()?.is_some() {}
+        self.sealed_from(&history)
+    }
+
+    pub fn sealed_from(&self, history: &crate::history::History<'_>) -> Result<Sealed> {
+        let replay = history.replay();
+        let sealed_labels = self
             .conn
-            .prepare("SELECT item_id, domain, epoch_number FROM withdrawals")?
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-        {
-            withdrawals.adopt(&item_id, &domain, uint(height));
-        }
+            .prepare("SELECT label_id FROM labels UNION SELECT dispute_id FROM disputes")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+        Ok(Sealed {
+            height: history.height(),
+            declarations: replay.declarations().clone(),
+            withdrawals: replay.withdrawals().clone(),
+            sealed_items: self.sealed_items()?,
+            sealed_labels,
+        })
+    }
+
+    pub fn sealed_items(&self) -> Result<SealedItems> {
         let mut sealed_items = SealedItems::new();
         for (item_id, publisher, kind, height) in self
             .conn
@@ -156,18 +166,7 @@ impl Db {
             };
             sealed_items.seal(&item_id, &publisher, kind, uint(height));
         }
-        let sealed_labels = self
-            .conn
-            .prepare("SELECT label_id FROM labels UNION SELECT dispute_id FROM disputes")?
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<BTreeSet<_>>>()?;
-        Ok(Sealed {
-            height,
-            declarations,
-            withdrawals,
-            sealed_items,
-            sealed_labels,
-        })
+        Ok(sealed_items)
     }
 
     pub fn record_sealed_item(
@@ -260,7 +259,7 @@ fn place(event: i64, position: i64, index: Option<i64>) -> Place {
 }
 
 fn load_publisher(conn: &Connection, state: &mut State, publisher: &str) -> Result<()> {
-    let mut statement = conn.prepare_cached("SELECT name, latest_envelope, latest_id, latest_height, latest_base, accepted_envelope, accepted_id, accepted_key, accepted_base, accepted_failed_c1, accepted_failed_c4, accepted_event, accepted_position, accepted_eligibility, left_chain, catalog_octets, catalog_validator FROM collections WHERE publisher = ?1")?;
+    let mut statement = conn.prepare_cached("SELECT name, latest_envelope, latest_id, latest_height, latest_base, accepted_envelope, accepted_id, accepted_key, accepted_base, accepted_failed_c1, accepted_failed_c4, accepted_event, accepted_position, accepted_eligibility, left_chain, catalog_octets, catalog_validator, accepted_read FROM collections WHERE publisher = ?1")?;
     let rows = statement
         .query_map([publisher], |row| {
             Ok((
@@ -283,6 +282,7 @@ fn load_publisher(conn: &Connection, state: &mut State, publisher: &str) -> Resu
                 row.get::<_, bool>(14)?,
                 row.get::<_, Option<Vec<u8>>>(15)?,
                 row.get::<_, Option<String>>(16)?,
+                row.get::<_, Option<String>>(17)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -297,6 +297,7 @@ fn load_publisher(conn: &Connection, state: &mut State, publisher: &str) -> Resu
         left_chain,
         octets,
         validator,
+        read,
     ) in rows
     {
         let latest = match (latest, latest_id) {
@@ -328,6 +329,7 @@ fn load_publisher(conn: &Connection, state: &mut State, publisher: &str) -> Resu
                 failed_c4: failed_c4.unwrap_or_default(),
                 place: place(event, position, None),
                 eligibility: uint(eligibility),
+                read: read_of(read)?,
             }),
             _ => None,
         };
@@ -385,7 +387,7 @@ fn load_publisher(conn: &Connection, state: &mut State, publisher: &str) -> Resu
     for key in keys {
         state.lists.insert(key, Vec::new());
     }
-    let mut statement = conn.prepare_cached("SELECT name, catalog_id, idx, url, item_id, kind, admission, code FROM list_items WHERE publisher = ?1 ORDER BY name, catalog_id, idx")?;
+    let mut statement = conn.prepare_cached("SELECT name, catalog_id, idx, url, item_id, kind, admission, code, read FROM list_items WHERE publisher = ?1 ORDER BY name, catalog_id, idx")?;
     let rows = statement
         .query_map([publisher], |row| {
             Ok((
@@ -396,11 +398,12 @@ fn load_publisher(conn: &Connection, state: &mut State, publisher: &str) -> Resu
                 row.get::<_, String>(5)?,
                 row.get::<_, String>(6)?,
                 row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(statement);
-    for (name, catalog_id, url, item_id, kind, admission, code) in rows {
+    for (name, catalog_id, url, item_id, kind, admission, code, read) in rows {
         state
             .lists
             .entry((publisher.to_owned(), name, catalog_id))
@@ -411,6 +414,7 @@ fn load_publisher(conn: &Connection, state: &mut State, publisher: &str) -> Resu
                 kind: kind_of(&kind)?,
                 admission: admission_of(&admission)?,
                 code,
+                read: read_of(read)?,
             });
     }
 
@@ -535,7 +539,7 @@ fn load_publisher(conn: &Connection, state: &mut State, publisher: &str) -> Resu
         state.removals.insert((publisher.to_owned(), url), removal);
     }
 
-    let mut statement = conn.prepare_cached("SELECT envelope, hash, event, last_sealed_at_discovery, reduces_authority, last_seal_height, competitor FROM discovered_declarations WHERE domain = ?1 ORDER BY ord")?;
+    let mut statement = conn.prepare_cached("SELECT envelope, hash, event, last_sealed_at_discovery, reduces_authority, last_seal_height, competitor, competes_with FROM discovered_declarations WHERE domain = ?1 ORDER BY ord")?;
     let rows = statement
         .query_map([publisher], |row| {
             Ok((
@@ -546,11 +550,21 @@ fn load_publisher(conn: &Connection, state: &mut State, publisher: &str) -> Resu
                 row.get::<_, bool>(4)?,
                 row.get::<_, Option<i64>>(5)?,
                 row.get::<_, bool>(6)?,
+                row.get::<_, Option<String>>(7)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(statement);
-    for (envelope, hash, event, sealed_at_discovery, reduces, last_seal_height, competitor) in rows
+    for (
+        envelope,
+        hash,
+        event,
+        sealed_at_discovery,
+        reduces,
+        last_seal_height,
+        competitor,
+        competes_with,
+    ) in rows
     {
         state
             .discovered
@@ -564,6 +578,7 @@ fn load_publisher(conn: &Connection, state: &mut State, publisher: &str) -> Resu
                 reduces_authority: reduces,
                 last_seal_height: last_seal_height.map(uint),
                 competitor,
+                competes_with,
             });
     }
     if let Some(seq) = conn
@@ -643,7 +658,7 @@ fn store_collection(
     let latest = collection.latest.as_ref();
     let accepted = collection.accepted.as_ref();
     conn.execute(
-        "INSERT OR REPLACE INTO collections(publisher, name, latest_envelope, latest_id, latest_height, latest_base, accepted_envelope, accepted_id, accepted_key, accepted_base, accepted_failed_c1, accepted_failed_c4, accepted_event, accepted_position, accepted_eligibility, left_chain, catalog_octets, catalog_validator) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+        "INSERT OR REPLACE INTO collections(publisher, name, latest_envelope, latest_id, latest_height, latest_base, accepted_envelope, accepted_id, accepted_key, accepted_base, accepted_failed_c1, accepted_failed_c4, accepted_event, accepted_position, accepted_eligibility, left_chain, catalog_octets, catalog_validator, accepted_read) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
         rusqlite::params![
             publisher,
             name,
@@ -666,6 +681,9 @@ fn store_collection(
                 .catalog_file
                 .as_ref()
                 .and_then(|file| file.validator.as_ref()),
+            accepted
+                .map(|accepted| serde_json::to_string(&accepted.read))
+                .transpose()?,
         ],
     )?;
     let previous = before.and_then(|before| before.discarded_chain.as_ref());
@@ -695,7 +713,7 @@ fn store_collection(
 
 fn insert_list_item(conn: &Connection, key: &ListKey, idx: usize, item: &ListItem) -> Result<()> {
     conn.execute(
-        "INSERT OR REPLACE INTO list_items(publisher, name, catalog_id, idx, url, item_id, kind, admission, code) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        "INSERT OR REPLACE INTO list_items(publisher, name, catalog_id, idx, url, item_id, kind, admission, code, read) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         rusqlite::params![
             key.0,
             key.1,
@@ -706,6 +724,7 @@ fn insert_list_item(conn: &Connection, key: &ListKey, idx: usize, item: &ListIte
             kind_str(item.kind),
             admission_str(item.admission),
             item.code,
+            serde_json::to_string(&item.read)?,
         ],
     )?;
     Ok(())
@@ -801,7 +820,7 @@ fn store_discovered(
     )?;
     for (ord, found) in found.into_iter().flatten().enumerate() {
         conn.execute(
-            "INSERT INTO discovered_declarations(domain, hash, ord, envelope, event, last_sealed_at_discovery, reduces_authority, last_seal_height, competitor) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO discovered_declarations(domain, hash, ord, envelope, event, last_sealed_at_discovery, reduces_authority, last_seal_height, competitor, competes_with) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             rusqlite::params![
                 publisher,
                 found.hash,
@@ -812,6 +831,7 @@ fn store_discovered(
                 found.reduces_authority,
                 found.last_seal_height.map(int),
                 found.competitor,
+                found.competes_with,
             ],
         )?;
     }
@@ -865,6 +885,11 @@ pub(crate) fn store_changes(
 ) -> Result<()> {
     let conn = &db.conn;
     if after.events > before.events {
+        if after.events - 1 > i64::MAX as u64 {
+            return Err(Error::History(
+                "the acceptance clock has no event left to assign".into(),
+            ));
+        }
         conn.execute(
             "UPDATE acceptance_clock SET position = MAX(position, ?1) WHERE id = 1",
             [int(after.events - 1)],
@@ -998,12 +1023,28 @@ pub struct StoreHeld<'a> {
     payloads: BTreeMap<String, Vec<u8>>,
 }
 
-fn payload_path(data_dir: &Path, item_id: &str) -> Result<std::path::PathBuf> {
-    let hex = item_id
+fn payload_name(item_id: &str) -> Result<String> {
+    item_id
         .strip_prefix("sha256:")
         .filter(|hex| hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
-        .ok_or_else(|| Error::History(format!("{item_id} names no Payload file")))?;
-    Ok(data_dir.join(format!("payloads/{hex}.json")))
+        .map(|hex| format!("{hex}.json"))
+        .ok_or_else(|| Error::History(format!("{item_id} names no Payload file")))
+}
+
+pub fn held_payload_path(data_dir: &Path, item_id: &str) -> Result<std::path::PathBuf> {
+    Ok(data_dir.join("held/payloads").join(payload_name(item_id)?))
+}
+
+pub fn served_payload_path(data_dir: &Path, item_id: &str) -> Result<std::path::PathBuf> {
+    Ok(data_dir.join("payloads").join(payload_name(item_id)?))
+}
+
+fn read_optional(path: &Path) -> Result<Option<Vec<u8>>> {
+    match std::fs::read(path) {
+        Ok(octets) => Ok(Some(octets)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 impl<'a> StoreHeld<'a> {
@@ -1050,7 +1091,10 @@ impl<'a> StoreHeld<'a> {
             )?;
         }
         for (item_id, octets) in std::mem::take(&mut self.payloads) {
-            let path = payload_path(self.data_dir, &item_id)?;
+            if self.db.is_withdrawn(&item_id)? {
+                continue;
+            }
+            let path = held_payload_path(self.data_dir, &item_id)?;
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -1059,6 +1103,13 @@ impl<'a> StoreHeld<'a> {
             std::fs::rename(&partial, &path)?;
         }
         Ok(())
+    }
+
+    pub(crate) fn discard(&mut self) {
+        self.lists.clear();
+        self.tree_files.clear();
+        self.read.take();
+        self.payloads.clear();
     }
 
     pub fn store(&mut self) -> Result<()> {
@@ -1183,10 +1234,9 @@ impl Held for StoreHeld<'_> {
         if let Some(octets) = self.payloads.get(item_id) {
             return Ok(Some(octets.clone()));
         }
-        match std::fs::read(payload_path(self.data_dir, item_id)?) {
-            Ok(octets) => Ok(Some(octets)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error.into()),
+        match read_optional(&held_payload_path(self.data_dir, item_id)?)? {
+            Some(octets) => Ok(Some(octets)),
+            None => read_optional(&served_payload_path(self.data_dir, item_id)?),
         }
     }
 

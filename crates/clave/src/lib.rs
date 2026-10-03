@@ -17,7 +17,6 @@ pub mod param_change;
 pub mod payload;
 pub mod publication;
 pub mod quota;
-pub mod recovery;
 pub mod registry;
 pub mod scheduler;
 pub mod seal;

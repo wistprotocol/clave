@@ -437,6 +437,65 @@ pub fn open_pull(
     }
 }
 
+const SEALED_RETRIES: usize = 3;
+
+/// A Collection's state is written as a difference from the state loaded, so an Epoch sealed
+/// since then makes it stale.
+fn sealed_since(db: &Db, loaded: &crate::collection::State) -> Result<bool> {
+    Ok(db.last_epoch()?.map(|epoch| epoch.epoch_number) != loaded.height)
+}
+
+pub(crate) fn mirror_admission(
+    db: &Db,
+    state: &crate::collection::State,
+    publisher: &str,
+    at: &str,
+    parameters: &crate::collection::Parameters,
+    sealing: bool,
+) -> Result<()> {
+    let sealed = state.declarations.domains().get(publisher);
+    if let Some(domain) =
+        crate::collection::pull::admission_domain(state, publisher, at, parameters)?
+    {
+        let windows = match (sealing, sealed) {
+            (true, Some(sealed)) => sealed,
+            _ => &domain,
+        };
+        db.mirror_admission(
+            publisher,
+            sealed,
+            &domain,
+            windows,
+            state.floors.get(publisher).copied().unwrap_or_default(),
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn mirror_sealed(
+    db: &Db,
+    state: &crate::collection::State,
+    publishers: &std::collections::BTreeSet<String>,
+    at: &str,
+) -> Result<()> {
+    let at_s = registry::unix(at)?;
+    let schedule = db.parameter_schedule(at_s)?;
+    let parameters = crate::collection::Parameters::new(
+        wist_core::parameters::PARAMS
+            .iter()
+            .filter_map(|spec| {
+                schedule
+                    .value_at(spec.name, at_s)
+                    .map(|value| (spec.name.to_owned(), value))
+            })
+            .collect(),
+    );
+    for publisher in publishers {
+        mirror_admission(db, state, publisher, at, &parameters, true)?;
+    }
+    Ok(())
+}
+
 fn wake_credited(db: &Db, credits: impl IntoIterator<Item = Credit>, now: i64) -> Result<()> {
     for credit in credits.into_iter().filter(|credit| credit.bytes > 0) {
         db.wake_deferred_resumes(&credit.unit, &credit.day, now)?;
@@ -683,27 +742,6 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
         })
     }
 
-    fn admit_declaration(
-        &mut self,
-        key: &ObjectKey,
-        raw: &[u8],
-        value: Value,
-    ) -> Result<admit::Admitted> {
-        let limits = self.limits_at_start()?;
-        let clock = &self.clock;
-        admit::admit_declaration(
-            self.db,
-            self.data_dir,
-            &mut self.run,
-            self.host,
-            clock,
-            key,
-            raw,
-            value,
-            &limits,
-        )
-    }
-
     fn abort(&mut self, key: Option<&ObjectKey>, code: &str, detail: &str) -> Result<()> {
         admit::abort(self.db, &mut self.run, self.host, key, code, detail)
     }
@@ -832,7 +870,7 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
         };
         let mut held = crate::db::StoreHeld::new(db, data_dir, &now);
         let mutation = db.mutation()?;
-        let scope = db.pull_scope(host)?;
+        let mut scope = db.pull_scope(host)?;
         let mut state = db.load_state(db.sealed_state(data_dir)?, &scope)?;
         let mut stored = state.clone();
         let mut pulling = pull::begin(&mut state, self, &mut held, &input)?;
@@ -854,6 +892,18 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
                 db.record_rejection(&settled.publisher, &rejection)?;
             }
         }
+        mirror_admission(db, &state, host, &now, &parameters, false)?;
+        if pulling.report().declaration.outcome == "recovery_chain_head" {
+            let mut rejection = self.rejection("WIST1-E08", None, "");
+            rejection.collection = None;
+            rejection.detail = Some(
+                "the recovery-chain head is served again while it is not current; the pull proceeds under both sources (WIST-1 §5.2)".into(),
+            );
+            self.reject_at(rejection)?;
+        }
+        if pulling.report().declaration.proceeds {
+            admit::consume_declaration(db, &mut self.run, &ObjectKey::Declaration)?;
+        }
         let report = pulling.report();
         self.run.discovered |= report.declaration.discovered;
         self.run.event = Some(report.event);
@@ -863,6 +913,12 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
         let outcome = report.declaration.outcome.clone();
         mutation.commit()?;
         if let Some(code) = stopped {
+            if outcome.starts_with("WIST") && outcome != code {
+                let mut rejection = self.rejection(&outcome, None, "");
+                rejection.collection = None;
+                rejection.detail = Some("the fetched Declaration is refused".into());
+                self.reject_at(rejection)?;
+            }
             self.abort(
                 None,
                 code,
@@ -871,6 +927,7 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
             return Ok(Collections::Stopped);
         }
         stored.clone_from(&state);
+        let mut replaced = 0;
         loop {
             let Some(catalog) = pulling
                 .pull_next(&mut state, self, &mut held, &input)?
@@ -879,27 +936,44 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
                 break;
             };
             let mutation = db.mutation()?;
+            if sealed_since(db, &stored)? {
+                held.discard();
+                replaced += 1;
+                if replaced > SEALED_RETRIES {
+                    return Ok(Collections::Suspended);
+                }
+                scope = db.pull_scope(host)?;
+                state = db.load_state(db.sealed_state(data_dir)?, &scope)?;
+                stored.clone_from(&state);
+                pulling.retry_last(&mut state, &input)?;
+                crate::db::store_changes(db, &stored, &state, &scope, &now)?;
+                self.placed(pulling.report())?;
+                mutation.commit()?;
+                stored.clone_from(&state);
+                continue;
+            }
             crate::db::store_changes(db, &stored, &state, &scope, &now)?;
             held.flush()?;
             self.report_catalog(&catalog)?;
+            self.placed(pulling.report())?;
             mutation.commit()?;
             stored.clone_from(&state);
         }
-        let suspended = pulling.report().suspended;
-        pulling.finish(&mut state, &held, &input)?;
-        let mutation = db.mutation()?;
-        crate::db::store_changes(db, &stored, &state, &scope, &now)?;
-        held.flush()?;
-        mutation.commit()?;
-        Ok(if suspended {
+        Ok(if pulling.finish().suspended {
             Collections::Suspended
         } else {
             Collections::Ended
         })
     }
 
+    /// WIST-3 §3.3, Places.
+    fn placed(&mut self, report: &crate::collection::pull::PullReport) -> Result<()> {
+        self.run.event = Some(report.event);
+        self.run.positions = report.positions;
+        self.db.update_pull_run(&self.run)
+    }
+
     fn run(&mut self) -> Result<()> {
-        crate::recovery::settle(self.db, self.data_dir, &self.now())?;
         if self.run.phase == Phase::Walk && self.discover()? {
             self.run.phase = Phase::Collections;
             self.db.update_pull_run(&self.run)?;
@@ -925,59 +999,17 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
         Ok(())
     }
 
-    /// WIST-2 §5.1 step 0: the pull proceeds only after the Declaration fetch
-    /// succeeds.
+    /// WIST-2 §5.1 step 0.
     fn discover(&mut self) -> Result<bool> {
-        let (db, host) = (self.db, self.host);
         let key = ObjectKey::Declaration;
-        let held = db.pull_object(self.run.run_id, key.kind(), &key.name())?;
-        let first_contact = match &held {
-            Some(object) => checks_flag(object, "first_contact"),
-            None => db.get_publisher(host)?.is_none(),
-        };
-        if held.is_some_and(|object| object.status == Status::Admitted) {
-            return Ok(true);
+        if self
+            .db
+            .pull_object(self.run.run_id, key.kind(), &key.name())?
+            .is_none()
+        {
+            let _ = self.get_declaration(&key, None)?;
         }
-        let checks = serde_json::json!({ "first_contact": first_contact }).to_string();
-        if first_contact {
-            let limits = self.limits_at_start()?;
-            let first = self
-                .get_declaration(&key, Some(&checks))?
-                .and_then(|(raw, value)| {
-                    let publisher = verify::initial_declaration(&value, host, &limits)?;
-                    Ok((raw, value, publisher))
-                });
-            return match first {
-                Ok((raw, value, publisher)) => {
-                    admit::onboard(db, &mut self.run, host, &key, &raw, &value, &publisher)?;
-                    Ok(true)
-                }
-                Err(detail) => {
-                    self.abort(Some(&key), "WIST2-E04", &detail)?;
-                    Ok(false)
-                }
-            };
-        }
-        let admitted = match self.get_declaration(&key, Some(&checks))? {
-            Ok((raw, value)) => self.admit_declaration(&key, &raw, value)?,
-            Err(detail) => admit::Admitted::Refused(detail),
-        };
-        match admitted {
-            admit::Admitted::Proceeds => Ok(true),
-            admit::Admitted::Refused(detail) => {
-                self.abort(
-                    None,
-                    "WIST2-E01",
-                    &format!("the pull stopped at its Declaration: {detail}"),
-                )?;
-                Ok(false)
-            }
-        }
-    }
-
-    fn limits_at_start(&self) -> Result<wist_core::collection::Limits> {
-        let schedule = self.db.parameter_schedule(self.now_unix)?;
-        declaration::limits(&schedule, self.now_unix)
+        Ok(true)
     }
 
     /// The live page is always re-fetched, since the Publisher rewrites it; a
@@ -1308,14 +1340,6 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
         db.clear_walk(host, Walk::Label.as_str())?;
         self.finish(false)
     }
-}
-
-fn checks_flag(object: &PullObject, name: &str) -> bool {
-    object
-        .checks_json
-        .as_deref()
-        .and_then(|checks| serde_json::from_str::<Value>(checks).ok())
-        .is_some_and(|checks| checks[name] == true)
 }
 
 fn failure_detail(object: &PullObject) -> Option<String> {

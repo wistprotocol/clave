@@ -86,6 +86,7 @@ CREATE TABLE IF NOT EXISTS recovery_windows(domain TEXT PRIMARY KEY, declaration
 CREATE TABLE IF NOT EXISTS recovery_settlements(domain TEXT NOT NULL, owner_hash TEXT NOT NULL, PRIMARY KEY(domain, owner_hash));
 CREATE TABLE IF NOT EXISTS sealed_declarations(domain TEXT NOT NULL, seq INTEGER NOT NULL, epoch_number INTEGER NOT NULL, sealed_at TEXT NOT NULL, declaration_json BLOB NOT NULL, PRIMARY KEY(domain, seq));
 CREATE TABLE IF NOT EXISTS pending_identities(domain TEXT PRIMARY KEY, declaration_json BLOB NOT NULL);
+CREATE TABLE IF NOT EXISTS sealed_in_force(domain TEXT PRIMARY KEY, declaration_json BLOB NOT NULL);
 ";
 
 pub(super) fn add_missing_columns(conn: &Connection) -> Result<()> {
@@ -100,6 +101,14 @@ pub(super) fn add_missing_columns(conn: &Connection) -> Result<()> {
         "ALTER TABLE pull_walk ADD COLUMN raw BLOB",
         "ALTER TABLE pull_objects ADD COLUMN unit TEXT",
         "ALTER TABLE pull_objects ADD COLUMN day TEXT",
+        "ALTER TABLE discovered_declarations ADD COLUMN competes_with TEXT",
+        "ALTER TABLE collections ADD COLUMN waiting_deferrals TEXT",
+        "ALTER TABLE collections ADD COLUMN waiting_held TEXT",
+        "ALTER TABLE waiting_urls ADD COLUMN deferrals TEXT",
+        "ALTER TABLE waiting_urls ADD COLUMN held TEXT",
+        "ALTER TABLE payload_duties ADD COLUMN served INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE collections ADD COLUMN accepted_read TEXT",
+        "ALTER TABLE list_items ADD COLUMN read TEXT",
     ] {
         match conn.execute(statement, []) {
             Ok(_) => {}

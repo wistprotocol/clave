@@ -37,17 +37,14 @@ impl Db {
         } else {
             crate::history::declarations::Declarations::default()
         };
-        let pending = self.peek_pending_entries()?.0;
         for (domain, raw) in rows {
             let current: Value = crate::json::parse(&raw)?;
             let mut seq = accepted_declaration_seq(&domain, &current)?;
             if let Some(state) = history.domains().get(&domain) {
                 seq = seq.max(state.highest_accepted_seq());
             }
-            for entry in pending.iter().filter(|entry| {
-                entry.domain == domain && entry.entry_type == "publisher_declaration"
-            }) {
-                seq = seq.max(accepted_declaration_seq(&domain, &entry.entry_json)?);
+            for envelope in self.discovered_declarations(&domain)? {
+                seq = seq.max(accepted_declaration_seq(&domain, &envelope)?);
             }
             exec_retain_declaration_seq(&tx, &domain, seq)?;
         }
@@ -80,7 +77,6 @@ impl Db {
         } else {
             None
         };
-        let pending = self.peek_pending_entries()?.0;
         let at = match self.last_epoch()? {
             Some(head) => crate::registry::unix(&head.sealed_at)?,
             None => 0,
@@ -108,14 +104,12 @@ impl Db {
                 window.owner().envelope().clone()
             } else {
                 let mut candidates = Vec::new();
-                for entry in &pending {
-                    if entry.entry_type == "publisher_declaration"
-                        && entry.domain == domain
-                        && crate::declaration::evaluate(&prior, &entry.entry_json, &limits)
-                            == Ok(crate::declaration::Decision::Recovery)
-                        && !candidates.contains(&entry.entry_json)
+                for envelope in self.discovered_declarations(&domain)? {
+                    if crate::declaration::evaluate(&prior, &envelope, &limits)
+                        == Ok(crate::declaration::Decision::Recovery)
+                        && !candidates.contains(&envelope)
                     {
-                        candidates.push(entry.entry_json.clone());
+                        candidates.push(envelope);
                     }
                 }
                 if candidates.len() != 1 {

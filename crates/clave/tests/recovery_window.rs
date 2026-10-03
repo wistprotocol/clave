@@ -71,8 +71,7 @@ fn pending_owner_migration_rejects_missing_ambiguous_and_invalid_sources_atomica
                 if domain == "b.example.com" && mutation == "invalid" {
                     candidate["publisher"]["contact"] = "altered@example.com".into();
                 }
-                db.insert_pending_entry("publisher_declaration", domain, &candidate, 0)
-                    .unwrap();
+                db.hold_discovered_declaration(domain, &candidate).unwrap();
             }
             if domain == "b.example.com" && matches!(mutation, "ambiguous" | "duplicate") {
                 let mut competitor = owner["publisher"].clone();
@@ -80,13 +79,8 @@ fn pending_owner_migration_rejects_missing_ambiguous_and_invalid_sources_atomica
                     competitor["seq"] = 2.into();
                 }
                 write_declaration(&p, &competitor, &R1_SEED);
-                db.insert_pending_entry(
-                    "publisher_declaration",
-                    domain,
-                    &current_declaration(&p),
-                    0,
-                )
-                .unwrap();
+                db.hold_discovered_declaration(domain, &current_declaration(&p))
+                    .unwrap();
             }
         }
         drop(db);
@@ -182,10 +176,7 @@ fn admission_uses_both_heads_without_joining_a_competing_branch() {
             r.db.highest_accepted_declaration_seq(&r.host).unwrap(),
             Some(6)
         );
-        assert_eq!(
-            r.db.count_pending_entries("publisher_declaration").unwrap(),
-            2
-        );
+        assert_eq!(r.db.count_discovered_declarations(&r.host).unwrap(), 2);
     }
     assert_eq!(
         rejection_codes(&r)
@@ -230,10 +221,7 @@ fn admission_uses_both_heads_without_joining_a_competing_branch() {
         r.db.highest_accepted_declaration_seq(&r.host).unwrap(),
         Some(7)
     );
-    assert_eq!(
-        r.db.count_pending_entries("publisher_declaration").unwrap(),
-        3
-    );
+    assert_eq!(r.db.count_discovered_declarations(&r.host).unwrap(), 3);
     clave::seal::run(&r.db, r.data.path(), &r.sk, start + 7200).unwrap();
     let history = clave::history::declarations::Declarations::reconstruct(
         &r.db,
@@ -281,10 +269,7 @@ fn settled_admission_retains_the_floor_and_current_idempotence_after_migration()
         );
         write_declaration(&r.p, &owner, &R1_SEED);
         ingest(&r, "2026-08-16T14:00:00Z");
-        assert_eq!(
-            r.db.count_pending_entries("publisher_declaration").unwrap(),
-            0
-        );
+        assert_eq!(r.db.count_discovered_declarations(&r.host).unwrap(), 0);
         assert!(!rejection_codes(&r).contains(&"WIST1-E08".into()));
         let mut follower = owner.clone();
         follower["seq"] = 8.into();
@@ -292,10 +277,7 @@ fn settled_admission_retains_the_floor_and_current_idempotence_after_migration()
         write_declaration(&r.p, &follower, &K2_SEED);
         ingest(&r, "2026-08-16T14:00:00Z");
         assert!(rejection_codes(&r).contains(&"WIST1-E08".into()));
-        assert_eq!(
-            r.db.count_pending_entries("publisher_declaration").unwrap(),
-            0
-        );
+        assert_eq!(r.db.count_discovered_declarations(&r.host).unwrap(), 0);
         follower["seq"] = 10.into();
         write_declaration(&r.p, &follower, &K2_SEED);
         ingest(&r, "2026-08-16T14:00:00Z");
@@ -303,10 +285,7 @@ fn settled_admission_retains_the_floor_and_current_idempotence_after_migration()
             r.db.highest_accepted_declaration_seq(&r.host).unwrap(),
             Some(10)
         );
-        assert_eq!(
-            r.db.count_pending_entries("publisher_declaration").unwrap(),
-            1
-        );
+        assert_eq!(r.db.count_discovered_declarations(&r.host).unwrap(), 1);
     }
 }
 
@@ -341,12 +320,8 @@ fn capped_recovery_siblings_preserve_sequences_and_progress_after_restart() {
             r.db.highest_accepted_declaration_seq(&r.host).unwrap(),
             Some(4)
         );
-        let pending = r.db.peek_pending_entries().unwrap().0;
-        assert_eq!(pending.len(), 2);
-        let retained: Vec<_> = pending
-            .iter()
-            .map(|p| (p.rowid, p.entry_json.clone()))
-            .collect();
+        let retained = r.db.discovered_declarations(&r.host).unwrap();
+        assert_eq!(retained.len(), 2);
 
         let size_of = |declaration: &serde_json::Value| {
             wist_core::epoch::epoch_octets(&[serde_json::json!({
@@ -404,15 +379,7 @@ fn capped_recovery_siblings_preserve_sequences_and_progress_after_restart() {
                         })]
                     );
                 }
-                assert_eq!(
-                    r.db.peek_pending_entries()
-                        .unwrap()
-                        .0
-                        .iter()
-                        .map(|p| (p.rowid, p.entry_json.clone()))
-                        .collect::<Vec<_>>(),
-                    retained
-                );
+                assert_eq!(r.db.discovered_declarations(&r.host).unwrap(), retained);
                 assert_eq!(
                     r.db.highest_accepted_declaration_seq(&r.host).unwrap(),
                     Some(4)
@@ -469,7 +436,7 @@ fn capped_recovery_siblings_preserve_sequences_and_progress_after_restart() {
                 Some(4)
             );
             assert_eq!(
-                r.db.peek_pending_entries().unwrap().0.len(),
+                r.db.count_discovered_declarations(&r.host).unwrap() as usize,
                 (first_height + 1 - height) as usize
             );
         }
@@ -512,10 +479,7 @@ fn pending_recovery_followers_remain_eligible_after_partial_sealing() {
     ingest(&r, "2026-08-09T14:00:00Z");
     r.db.set_param("epoch_cap_bytes", 1800).unwrap();
     clave::seal::run(&r.db, r.data.path(), &r.sk, start + 7200).unwrap();
-    assert_eq!(
-        r.db.count_pending_entries("publisher_declaration").unwrap(),
-        1
-    );
+    assert_eq!(r.db.count_discovered_declarations(&r.host).unwrap(), 1);
     let window = r.db.get_recovery_window(&r.host).unwrap().unwrap();
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&window.declaration_json).unwrap()["publisher"]
@@ -537,10 +501,7 @@ fn pending_recovery_followers_remain_eligible_after_partial_sealing() {
         r.db.highest_accepted_declaration_seq(&r.host).unwrap(),
         Some(5)
     );
-    assert_eq!(
-        r.db.count_pending_entries("publisher_declaration").unwrap(),
-        3
-    );
+    assert_eq!(r.db.count_discovered_declarations(&r.host).unwrap(), 3);
     assert!(!rejection_codes(&r).contains(&"WIST1-E08".into()));
     r.db.set_param("epoch_cap_bytes", 16_777_216).unwrap();
     clave::seal::run(&r.db, r.data.path(), &r.sk, start + 10800).unwrap();
@@ -592,10 +553,7 @@ fn floor_migration_authenticates_the_pinned_prefix_before_writing() {
             .unwrap(),
         0
     );
-    assert_eq!(
-        r.db.count_pending_entries("publisher_declaration").unwrap(),
-        1
-    );
+    assert_eq!(r.db.count_discovered_declarations(&r.host).unwrap(), 1);
     conn.execute(
         "UPDATE log_entries SET entry_json = ?1 WHERE leaf_index = 0",
         [corrupted],
@@ -632,10 +590,7 @@ fn failed_recovery_head_write_rolls_back_declaration_floor_and_pending_entry() {
         r.db.highest_accepted_declaration_seq(&r.host).unwrap(),
         Some(1)
     );
-    assert_eq!(
-        r.db.count_pending_entries("publisher_declaration").unwrap(),
-        0
-    );
+    assert_eq!(r.db.count_discovered_declarations(&r.host).unwrap(), 0);
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(
             &r.db.get_publisher_declaration(&r.host).unwrap().unwrap()
@@ -652,8 +607,130 @@ fn failed_recovery_head_write_rolls_back_declaration_floor_and_pending_entry() {
         r.db.highest_accepted_declaration_seq(&r.host).unwrap(),
         Some(2)
     );
-    assert_eq!(
-        r.db.count_pending_entries("publisher_declaration").unwrap(),
-        1
+    assert_eq!(r.db.count_discovered_declarations(&r.host).unwrap(), 1);
+}
+
+fn queued_catalog(r: &Rig, at: &str) -> (Published, (serde_json::Value, serde_json::Value)) {
+    let item = page_item(&r.p, &format!("https://{}/queued", r.host), "queued");
+    let catalog = publish_collection_signed(
+        &r.p,
+        "default",
+        &[(item.0.clone(), Some(item.1.clone()))],
+        at,
+        None,
+        &K2_SEED,
     );
+    (catalog, item)
+}
+
+#[test]
+fn recovery_flow_queues_settles_and_seals_the_survivor() {
+    let (r, start, _) = sealed_recovery();
+    let (catalog, item) = queued_catalog(&r, "2026-08-09T14:00:00Z");
+    let report = ingest(&r, "2026-08-09T14:00:05Z");
+    assert_eq!(report.queued, [format!("default/{}", catalog.catalog_id)]);
+    let report = clave::seal::run(&r.db, r.data.path(), &r.sk, start + 3 * 3600).unwrap();
+    assert_eq!(
+        report.entry_count, 0,
+        "a queued Catalog is held through the window"
+    );
+    let window_end = start + 3600 + 7 * DAY;
+    clave::seal::run(&r.db, r.data.path(), &r.sk, window_end - 3600).unwrap();
+    assert!(stored_entries(&r, 3).is_empty());
+    clave::seal::run(&r.db, r.data.path(), &r.sk, window_end).unwrap();
+    clave::seal::run(&r.db, r.data.path(), &r.sk, window_end + 3600).unwrap();
+    let sealed: Vec<serde_json::Value> = (4..=5)
+        .flat_map(|height| stored_entries(&r, height))
+        .collect();
+    assert!(sealed
+        .iter()
+        .any(|entry| entry["type"] == "publisher_catalog" && entry["body"] == catalog.envelope));
+    assert_eq!(sealed_item_ids(&sealed), [item_id(&item.0)]);
+    let scope = std::collections::BTreeSet::from([r.host.clone()]);
+    let state =
+        r.db.load_state(r.db.sealed_state(r.data.path()).unwrap(), &scope)
+            .unwrap();
+    assert!(state.queues.is_empty());
+    assert!(state
+        .record(&r.host, &format!("https://{}/queued", r.host))
+        .is_some());
+}
+
+#[test]
+fn corrupt_pinned_history_cannot_settle_a_queue() {
+    let (r, start, _) = sealed_recovery();
+    let (catalog, _) = queued_catalog(&r, "2026-08-09T14:00:00Z");
+    ingest(&r, "2026-08-09T14:00:05Z");
+    let connection = rusqlite::Connection::open(r.data.path().join("clave.sqlite")).unwrap();
+    let original: Vec<u8> = connection
+        .query_row(
+            "SELECT entry_json FROM log_entries WHERE leaf_index = 0",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE log_entries SET entry_json = ?1 WHERE leaf_index = 0",
+            [br#"{"type":"label","body":{}}"#.as_slice()],
+        )
+        .unwrap();
+    let deadline = start + 3600 + 7 * DAY;
+    let at = wist_core::timestamp::instant(deadline + 60).unwrap();
+    assert!(clave::ingest::run(&r.db, &r.client, r.data.path(), &r.host, &at).is_err());
+    assert!(clave::seal::run(&r.db, r.data.path(), &r.sk, deadline).is_err());
+    connection
+        .execute(
+            "UPDATE log_entries SET entry_json = ?1 WHERE leaf_index = 0",
+            [original],
+        )
+        .unwrap();
+    let scope = std::collections::BTreeSet::from([r.host.clone()]);
+    let state =
+        r.db.load_state(r.db.sealed_state(r.data.path()).unwrap(), &scope)
+            .unwrap();
+    let queue = &state.queues[&r.host];
+    assert!(queue
+        .queued
+        .values()
+        .any(|queued| queued.catalog_id == catalog.catalog_id));
+}
+
+#[test]
+fn a_rejected_candidate_rolls_back_a_due_settlement() {
+    let (r, start, _) = sealed_recovery();
+    let (catalog, _) = queued_catalog(&r, "2026-08-09T14:00:00Z");
+    ingest(&r, "2026-08-09T14:00:05Z");
+    let fresh = |contact: &str| {
+        let signer = wist_core::crypto::SigningKey::from_seed(&X1_SEED);
+        wist_core::envelope::sign_envelope(
+            &serde_json::json!({"wist_version": "1.0.0", "domain": "fresh.example",
+                "contact": contact, "keys": [key_entry(&X1_SEED, "2026-08-09T00:00:00Z")],
+                "seq": 0}),
+            "publisher",
+            &kid(&X1_SEED),
+            &signer,
+        )
+        .unwrap()
+    };
+    for contact in ["mailto:a@fresh.example", "mailto:b@fresh.example"] {
+        r.db.hold_discovered_declaration("fresh.example", &fresh(contact))
+            .unwrap();
+    }
+    let deadline = start + 3600 + 7 * DAY;
+    assert!(clave::seal::run(&r.db, r.data.path(), &r.sk, deadline).is_err());
+    let scope = std::collections::BTreeSet::from([r.host.clone()]);
+    let state =
+        r.db.load_state(r.db.sealed_state(r.data.path()).unwrap(), &scope)
+            .unwrap();
+    assert!(state.queues[&r.host]
+        .queued
+        .values()
+        .any(|queued| queued.catalog_id == catalog.catalog_id));
+    assert!(r
+        .db
+        .list_rejections(&r.host)
+        .unwrap()
+        .iter()
+        .all(|rejection| rejection.at.as_str() < "2026-08-16"));
 }

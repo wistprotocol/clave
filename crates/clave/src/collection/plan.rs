@@ -59,8 +59,17 @@ impl Inclusion {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Unsealed {
-    Item { publisher: String, url: String },
-    Label { id: String },
+    Catalog {
+        publisher: String,
+        collection: String,
+    },
+    Item {
+        publisher: String,
+        url: String,
+    },
+    Label {
+        id: String,
+    },
 }
 
 pub struct EpochInput<'a> {
@@ -195,6 +204,7 @@ pub struct Left {
 pub struct LeftUnsealed {
     pub publication: Publication,
     pub place: Place,
+    pub ceiling: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -232,6 +242,7 @@ pub struct Planned {
     pub left: Vec<Left>,
     pub deferred: Vec<Deferred>,
     pub held: Vec<HeldBack>,
+    pub held_late: Vec<LeftUnsealed>,
     pub unsealed: Vec<LeftUnsealed>,
     pub rejections: Vec<LabelRejection>,
     pub declarations_failed: Vec<DeclarationFailure>,
@@ -607,6 +618,31 @@ fn waiting_item(
     Ok((list[at].clone(), at))
 }
 
+fn item_read(state: &State, publisher: &str, url: &str) -> Vec<String> {
+    let waiting = &state.urls[&(publisher.to_owned(), url.to_owned())];
+    last_accepted_id(state, publisher, &waiting.collection)
+        .and_then(|catalog_id| state.list(publisher, &waiting.collection, &catalog_id))
+        .and_then(|statuses| {
+            statuses
+                .iter()
+                .find(|status| status.url == url && status.item_id == waiting.item_id)
+        })
+        .map(|status| status.read.clone())
+        .unwrap_or_default()
+}
+
+/// WIST-1 §5.2, Queue.
+fn held_kind(state: &State, publisher: &str, url: &str) -> ItemKind {
+    let waiting = &state.urls[&(publisher.to_owned(), url.to_owned())];
+    state
+        .lists
+        .iter()
+        .filter(|((owner, name, _), _)| owner == publisher && *name == waiting.collection)
+        .flat_map(|(_, statuses)| statuses)
+        .find(|status| status.url == url && status.item_id == waiting.item_id)
+        .map_or(ItemKind::Page, |status| status.kind)
+}
+
 fn set_admission(
     state: &mut State,
     publisher: &str,
@@ -639,6 +675,7 @@ struct Turn<'a, 'b, H: Held> {
     in_force: BTreeMap<String, Publisher>,
     windows: BTreeSet<String>,
     holding: BTreeSet<String>,
+    kept_out: BTreeSet<String>,
     destroyed: BTreeSet<String>,
     deferred_i4: BTreeSet<CollectionKey>,
 }
@@ -646,6 +683,11 @@ struct Turn<'a, 'b, H: Held> {
 impl<H: Held> Turn<'_, '_, H> {
     fn ceiling(&self, eligibility: u64) -> u64 {
         self.input.inclusion.ceiling(eligibility)
+    }
+
+    /// WIST-3 §3.3, Declaration sealing obligation.
+    fn reads_kept_out(&self, read: &[String]) -> bool {
+        read.iter().any(|hash| self.kept_out.contains(hash))
     }
 
     fn unit(&self, publisher: &str) -> String {
@@ -742,13 +784,12 @@ fn run_pass<H: Held>(
         room.domain.insert(unit, left.saturating_sub(1));
     };
     let leave_unsealed = |pass: &mut Pass, publication: Publication, place: Place, eligibility| {
-        if turn.ceiling(eligibility) <= height {
-            return Err(history(
-                "an eligible Entry is left unsealed past its inclusion ceiling",
-            ));
-        }
-        pass.unsealed.push(LeftUnsealed { publication, place });
-        Ok(())
+        pass.unsealed.push(LeftUnsealed {
+            publication,
+            place,
+            ceiling: turn.ceiling(eligibility),
+        });
+        Ok::<(), Error>(())
     };
     let mut waiting: Vec<(PlaceKey, String, String)> = next
         .collections
@@ -808,6 +849,14 @@ fn run_pass<H: Held>(
             deferred_names.insert(key);
             continue;
         }
+        if turn.input.unsealed.contains(&Unsealed::Catalog {
+            publisher: publisher.clone(),
+            collection: name.clone(),
+        }) || turn.reads_kept_out(&accepted.read)
+        {
+            leave_unsealed(&mut pass, publication, accepted.place, accepted.eligibility)?;
+            continue;
+        }
         take(&mut room, &publisher);
         sealed_names.insert(
             key,
@@ -832,8 +881,12 @@ fn run_pass<H: Held>(
             if gone.contains(&(publisher.clone(), url.clone())) || !due {
                 continue;
             }
-            let (item, _) = waiting_item(next, turn.held, lists, &publisher, &url)?;
-            if item_kind(&item) == kind {
+            let held_kind = if turn.windows.contains(&publisher) {
+                held_kind(next, &publisher, &url)
+            } else {
+                item_kind(&waiting_item(next, turn.held, lists, &publisher, &url)?.0)
+            };
+            if held_kind == kind {
                 candidates.push((place_key(place, &publisher), Slot::Url(publisher, url)));
             }
         }
@@ -964,7 +1017,8 @@ fn run_pass<H: Held>(
             if turn.input.unsealed.contains(&Unsealed::Item {
                 publisher: publisher.clone(),
                 url: url.clone(),
-            }) {
+            }) || turn.reads_kept_out(&item_read(next, &publisher, &url))
+            {
                 leave_unsealed(&mut pass, publication, waiting.place, waiting.eligibility)?;
                 continue;
             }
@@ -1228,8 +1282,8 @@ fn settle_due(
             held,
             &publisher,
             &Settling {
-                source: &source,
-                order: &source,
+                source: Some(&source),
+                order: Some(&source),
                 clock: input.sealed_at,
                 parameters: input.parameters,
                 eligibility: input.height,
@@ -1338,6 +1392,13 @@ pub fn plan(state: &State, held: &impl Held, input: &EpochInput<'_>) -> Result<P
         })
         .map(|(publisher, _)| publisher.clone())
         .collect();
+    let kept_out: BTreeSet<String> = next
+        .discovered
+        .values()
+        .flatten()
+        .filter(|found| !sealed_hashes.contains(&found.hash))
+        .map(|found| found.hash.clone())
+        .collect();
     let positive = |name: &str| -> Result<u64> {
         u64::try_from(parameters.value(name)?).map_err(|_| Error::Param(name.into()))
     };
@@ -1353,6 +1414,7 @@ pub fn plan(state: &State, held: &impl Held, input: &EpochInput<'_>) -> Result<P
         in_force,
         windows,
         holding,
+        kept_out,
         destroyed,
         deferred_i4: BTreeSet::new(),
     };
@@ -1604,14 +1666,18 @@ pub fn plan(state: &State, held: &impl Held, input: &EpochInput<'_>) -> Result<P
             }
         }
     };
-    for (holding, eligibility) in &pass.holding {
-        if turn.ceiling(*eligibility) <= height {
-            return Err(Error::Seal(format!(
-                "{} is held past its inclusion ceiling: the Declaration that reduces authority is sealed later than the ceiling allows",
-                holding.publication.publisher()
-            )));
-        }
-    }
+    let held_late: Vec<LeftUnsealed> = pass
+        .holding
+        .iter()
+        .filter(|(holding, eligibility)| {
+            holding.reason == Hold::AuthorityReduction && turn.ceiling(*eligibility) <= height
+        })
+        .map(|(holding, eligibility)| LeftUnsealed {
+            publication: holding.publication.clone(),
+            place: holding.place,
+            ceiling: turn.ceiling(*eligibility),
+        })
+        .collect();
     absorb(&mut next, &judged, height);
     next.height = Some(height);
     for planned in &pass.planned {
@@ -1692,6 +1758,7 @@ pub fn plan(state: &State, held: &impl Held, input: &EpochInput<'_>) -> Result<P
             .filter(|deferred| !matches!(deferred.publication, Publication::Label { .. }))
             .collect(),
         held: pass.holding.into_iter().map(|(held, _)| held).collect(),
+        held_late,
         unsealed: pass.unsealed,
         rejections: pass.rejected,
         declarations_failed: candidates.failed,

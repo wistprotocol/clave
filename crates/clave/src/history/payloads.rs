@@ -83,6 +83,44 @@ impl PayloadSource {
         })
     }
 
+    /// WIST-3 §6.1, §6.2.
+    pub fn reconstruct(
+        db: &crate::db::Db,
+        directory: &Path,
+        head: Option<crate::db::EpochRow>,
+        item_id: &str,
+    ) -> Result<Self> {
+        let mut history = super::History::open(db, directory, head)?;
+        let mut found = None;
+        while let Some(epoch) = history.next_epoch()? {
+            if found.is_some() {
+                continue;
+            }
+            for (index, entry) in epoch.entries().iter().enumerate() {
+                let valid = matches!(
+                    epoch.judgments().get(index),
+                    Some(Some(wist_core::sealing::Judgment::Valid))
+                );
+                let item = &entry["body"]["item"];
+                if entry["type"] == "publisher_item"
+                    && valid
+                    && wist_core::item::item_id(item).ok().as_deref() == Some(item_id)
+                {
+                    found = Some((item.clone(), epoch.epoch_number(), *epoch.size_caps()));
+                    break;
+                }
+            }
+        }
+        if history.replay().withdrawals().is_withdrawn(item_id) {
+            return Err(failure(
+                "a withdrawal sealed for the Item removed its Payload",
+            ));
+        }
+        let (item, epoch_number, size_caps) =
+            found.ok_or_else(|| failure("no Epoch seals a valid Item of that ID"))?;
+        Self::from_item(item, epoch_number, size_caps)
+    }
+
     pub fn item(&self) -> &Value {
         &self.item
     }

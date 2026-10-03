@@ -133,7 +133,7 @@ fn integral_declaration_sequences_preserve_admission_metadata_and_snapshot_heigh
             let raw = serde_json::to_vec(&declaration).unwrap();
             rig.reopen();
             assert_eq!(
-                rig.db.peek_pending_entries().unwrap().0[0].entry_json,
+                rig.db.discovered_declarations(&rig.host).unwrap()[0],
                 declaration
             );
             let height = rig.seal(&at);
@@ -168,12 +168,7 @@ fn integral_declaration_sequences_preserve_admission_metadata_and_snapshot_heigh
                 .unwrap(),
             retained
         );
-        assert_eq!(
-            rig.db
-                .count_pending_entries("publisher_declaration")
-                .unwrap(),
-            0
-        );
+        assert_eq!(rig.db.count_discovered_declarations(&rig.host).unwrap(), 0);
     }
 }
 
@@ -214,7 +209,7 @@ fn integral_pending_recovery_sequences_settle_in_order_and_preserve_the_floor() 
         rig.reopen();
         let deadline = "2026-08-16T13:00:00Z";
         if !sealing_settlement {
-            clave::recovery::settle(&rig.db, rig.data.path(), deadline).unwrap();
+            clave::ingest::run(&rig.db, &rig.client, rig.data.path(), &rig.host, deadline).unwrap();
             rig.reopen();
             assert_eq!(
                 rig.db
@@ -224,14 +219,7 @@ fn integral_pending_recovery_sequences_settle_in_order_and_preserve_the_floor() 
                 serde_json::to_vec(&last).unwrap()
             );
             assert_eq!(
-                rig.db
-                    .peek_pending_entries()
-                    .unwrap()
-                    .0
-                    .into_iter()
-                    .filter(|row| row.entry_type == "publisher_declaration")
-                    .map(|row| row.entry_json)
-                    .collect::<Vec<_>>(),
+                rig.db.discovered_declarations(&rig.host).unwrap(),
                 vec![first.clone(), retained.clone(), last.clone()]
             );
         }
@@ -243,13 +231,8 @@ fn integral_pending_recovery_sequences_settle_in_order_and_preserve_the_floor() 
             Some(6)
         );
         assert!(rig.db.get_recovery_window(&rig.host).unwrap().is_none());
-        assert_eq!(
-            rig.db
-                .count_pending_entries("publisher_declaration")
-                .unwrap(),
-            0
-        );
-        clave::recovery::settle(&rig.db, rig.data.path(), deadline).unwrap();
+        assert_eq!(rig.db.count_discovered_declarations(&rig.host).unwrap(), 0);
+        clave::ingest::run(&rig.db, &rig.client, rig.data.path(), &rig.host, deadline).unwrap();
         let mut rejected = follower.clone();
         rejected["seq"] = json!(6.0);
         rejected["prev_declaration"] = declaration_hash(&last).into();

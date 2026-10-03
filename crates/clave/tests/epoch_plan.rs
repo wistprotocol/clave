@@ -1488,3 +1488,256 @@ fn every_catalog_recovery_history_pulled_over_http_into_the_store_reaches_the_re
         30
     );
 }
+
+const OPERATOR_BOUNDS: [&str; 3] = [
+    "domain_epoch_entries_max",
+    "labeler_epoch_entries_max",
+    "max_inclusion_epochs",
+];
+
+struct SealerRun {
+    store: StoreRun,
+    sk: wist_core::crypto::SigningKey,
+}
+
+impl SealerRun {
+    fn new() -> Self {
+        let store = StoreRun::new();
+        store.db.set_param("epoch_cadence_seconds", 1).unwrap();
+        let sk = clave::keys::load(&store.data.path().join("keys/seed")).unwrap();
+        SealerRun { store, sk }
+    }
+
+    fn load(&self, publishers: &BTreeSet<String>) -> State {
+        let sealed = self.store.db.sealed_state(self.store.data.path()).unwrap();
+        let mut state = self.store.db.load_state(sealed, publishers).unwrap();
+        state.events -= 1;
+        state
+    }
+
+    fn pull(&mut self, history: &History<'_>, event: &Value) -> (u64, u64) {
+        let store = &self.store;
+        let served = serve_pull(history, event);
+        *store.files.lock().unwrap() = served.files.clone();
+        let publisher = event["publisher"].as_str().unwrap();
+        let scope = store.db.pull_scope(publisher).unwrap();
+        let before = self.load(&scope);
+        let mut state = before.clone();
+        let mut held =
+            clave::db::StoreHeld::new(&store.db, store.data.path(), "2026-08-09T00:00:00Z");
+        let mut site = HttpSite {
+            client: &store.client,
+            base: &store.base,
+            meter: served.meter,
+        };
+        let map = parameters(&event["parameters"]);
+        let report = pull(
+            &mut state,
+            &mut site,
+            &mut held,
+            &PullInput {
+                publisher,
+                at: event["at"].as_str().unwrap(),
+                parameters: &map,
+            },
+        )
+        .unwrap();
+        let envelopes = named_labels(history, &event["labels"]);
+        accept_labels(&mut state, &report, publisher, &envelopes).unwrap();
+        held.store().unwrap();
+        store.store(&before, &state, &scope);
+        (before.events, state.events)
+    }
+
+    fn epoch(&mut self, history: &History<'_>, event: &Value, expected: &Value) -> (u64, u64) {
+        let db = &self.store.db;
+        let (_, declarations, updates, unsealed) = epoch_input_parts(history, event);
+        assert!(
+            updates.is_empty() && unsealed.is_empty(),
+            "{}",
+            history.name
+        );
+        for (name, value) in event["parameters"].as_object().unwrap() {
+            if OPERATOR_BOUNDS.contains(&name.as_str()) {
+                db.set_param(name, value.as_i64().unwrap()).unwrap();
+            } else {
+                assert_eq!(
+                    wist_core::parameters::spec(name).unwrap().default,
+                    value.as_i64(),
+                    "{}: {name} is the Log's",
+                    history.name
+                );
+            }
+        }
+        for envelope in &declarations {
+            let domain = envelope["publisher"]["domain"].as_str().unwrap();
+            db.hold_discovered_declaration(domain, envelope).unwrap();
+        }
+        let before = db.last_epoch().unwrap();
+        let clock = || {
+            let events: i64 =
+                rusqlite::Connection::open(self.store.data.path().join("clave.sqlite"))
+                    .unwrap()
+                    .query_row(
+                        "SELECT position FROM acceptance_clock WHERE id = 1",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+            events as u64
+        };
+        let from = clock();
+        let sealed_at = event["sealed_at"].as_str().unwrap();
+        let report = clave::seal::run(
+            db,
+            self.store.data.path(),
+            &self.sk,
+            wist_core::timestamp::log_seconds(sealed_at).unwrap(),
+        )
+        .unwrap_or_else(|error| panic!("{} at {sealed_at}: {error}", history.name));
+        let height = event["height"].as_u64().unwrap();
+        assert_eq!(report.epoch_number, height, "{}", history.name);
+        assert_eq!(
+            before.map_or(0, |epoch| epoch.epoch_number + 1),
+            height,
+            "{}",
+            history.name
+        );
+        assert_eq!(
+            json!(db.epoch_entries(height).unwrap()),
+            expected["entries"],
+            "{} at {sealed_at}: the sealed Entries",
+            history.name
+        );
+        (from, clock())
+    }
+}
+
+fn replay_through_the_sealer(keys: &Value, vector: &Value) {
+    let mut run = Run::new(keys, vector);
+    let mut sealer = SealerRun::new();
+    let mut numbers = BTreeMap::new();
+    let events = vector["events"].as_array().unwrap();
+    let expected = vector["expected"].as_array().unwrap();
+    for (at, (event, expected)) in events.iter().zip(expected).enumerate() {
+        let first = run.state.events;
+        let (from, to) = match event["event"].as_str().unwrap() {
+            "epoch" => {
+                let taken = sealer.epoch(&run.history, event, expected);
+                run.epoch(at, event, expected);
+                taken
+            }
+            _ => {
+                let taken = sealer.pull(&run.history, event);
+                run.pull(at, event, expected);
+                taken
+            }
+        };
+        assert_eq!(
+            to - from,
+            run.state.events - first,
+            "{} event {at}",
+            run.history.name
+        );
+        numbers.extend((from..to).map(|event| (event, first + event - from)));
+        run.show();
+        let publishers = publishers_of(&run.state);
+        let mut stored = sealer.load(&publishers);
+        renumber(&mut stored, &numbers);
+        let name = run.history.name;
+        assert_eq!(
+            state_view(&run.history, &stored, &run.shown),
+            state_view(&run.history, &run.state, &run.shown),
+            "{name} event {at}: the sealed store"
+        );
+        assert_eq!(
+            stored.collections, run.state.collections,
+            "{name} event {at}"
+        );
+        assert_eq!(stored.urls, run.state.urls, "{name} event {at}");
+        assert_eq!(stored.records, run.state.records, "{name} event {at}");
+        assert_eq!(stored.removals, run.state.removals, "{name} event {at}");
+        assert_eq!(stored.discovered, run.state.discovered, "{name} event {at}");
+        assert_eq!(stored.queues, run.state.queues, "{name} event {at}");
+        assert_eq!(stored.labels, run.state.labels, "{name} event {at}");
+        assert_eq!(
+            stored.declarations.domains().keys().collect::<Vec<_>>(),
+            run.state.declarations.domains().keys().collect::<Vec<_>>(),
+            "{name} event {at}"
+        );
+    }
+}
+
+fn replay_named_through_the_sealer(relative: &str, names: &[&str]) {
+    let vector = read_vector(relative);
+    for name in names {
+        replay_through_the_sealer(&vector["keys"], history_named(&vector, name));
+    }
+}
+
+#[test]
+fn catalog_waiting_histories_pulled_over_http_and_sealed_reach_the_expected_state_and_entries() {
+    replay_named_through_the_sealer(
+        "vectors/wist3/catalog-waiting.json",
+        &[
+            "a Catalog accepted at a pull and sealed with its Items in the next Epoch",
+            "a later accepted Catalog takes the place and eligibility Epoch of the waiting one",
+            "a Catalog that fails C4 at its turn stays the last accepted Catalog",
+            "a Catalog that fails C1 at its turn after a Declaration removed its key",
+            "the latest Catalog fails the binding check: Items wait with their places",
+            "a URL whose Item changes while it waits, and a URL that stops waiting and waits again",
+            "capacity order: Catalogs, removed Items, then page Items, by place",
+            "WIST2-E07: a list that drops the URL of a held record",
+            "a Declaration that widens a Scope is sealed with the Item it admits",
+            "an Item that fails I7 and another condition leaves unreported",
+            "a pending head that narrows a Collection",
+            "two Collections whose last accepted Catalogs list one URL",
+        ],
+    );
+}
+
+#[test]
+fn collection_pull_histories_pulled_over_http_and_sealed_reach_the_expected_state_and_entries() {
+    replay_named_through_the_sealer(
+        "vectors/wist2/collection-pull.json",
+        &[
+            "a current Declaration: its Collections in the order it lists them",
+            "a pending head: the current Declaration alone",
+            "an open recovery window: two sources, each read alone",
+            "Payloads at a pull, and the retry of Items refused or not admitted",
+            "a walk that an unavailable tree file interrupts resumes from the files held",
+            "a per-pull limit in objects that interrupts the Items of a Catalog",
+        ],
+    );
+}
+
+#[test]
+fn catalog_recovery_histories_pulled_over_http_and_sealed_reach_the_expected_state_and_entries() {
+    replay_named_through_the_sealer(
+        "vectors/wist1/catalog-recovery.json",
+        &[
+            "the two frozen sources: a recovery rotation discovered, then sealed",
+            "the queue per Collection name and signing key",
+            "settlement: equal instants decided by Catalog ID",
+            "places after settlement: a Catalog queued at the opening keeps the place it had",
+            "a survivor refused at the settlement Epoch by a Declaration of that Epoch",
+            "settlement at a pull between the window's end and the Epoch of settlement",
+            "an idempotent re-serve inside the window retries its Items under the sources that accept it",
+            "a recovery rotation that narrows a Scope: the owner's Catalog is queued",
+            "records sealed under a key an attacker held, and the owner's Catalogs after settlement",
+            "a pull between the discovery and the sealing of a recovery rotation",
+            "frozen sources when a follower is sealed in the owner's Epoch",
+            "the recovery-chain head served again while a competitor is current",
+            "a settlement with nothing queued for a name",
+            "one inner Catalog signed by two keys, both queued",
+            "two Catalogs of one Collection queued between the discovery and the sealing of a recovery rotation",
+            "a queued Catalog and a later one of equal instant under the same key",
+            "a Catalog that waited at the opening and one queued after the discovery share a Catalog ID",
+            "the order of a pull before the window opens, against the waiting Catalog of the same key",
+            "a URL that did not wait at the opening takes the place of the pull that queued the survivor",
+            "a pull that settles is two events, the settlement first",
+            "the order of Collections at a settlement made by a pull",
+            "an Item held inside a window is reported with the window alone",
+        ],
+    );
+}
