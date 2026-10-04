@@ -153,6 +153,30 @@ fn a_repeated_withdrawal_seals_and_keeps_the_first_height() {
 }
 
 #[test]
+fn a_withdrawal_queued_again_under_an_accepted_id_is_dropped_and_keeps_the_first_height() {
+    let (log, _, _, id) = sealed_log();
+    let update_id = withdraw(&log, &id, "2026-08-09T13:30:00Z").unwrap();
+    let (pending, _) = log.db.peek_pending_entries().unwrap();
+    let act = pending[0].entry_json.clone();
+    assert_eq!(log.seal("2026-08-09T14:00:00Z").entry_count, 1);
+
+    log.db
+        .insert_pending_entry("registry_update", "", &act, 0)
+        .unwrap();
+    let report = log.seal("2026-08-09T15:00:00Z");
+    assert_eq!(report.entry_count, 0);
+    assert_eq!(
+        report.dropped,
+        [format!(
+            "payload_withdrawal {} is not sealed: its Registry Update ID {update_id} was accepted at height 1",
+            log.host
+        )]
+    );
+    assert!(log.db.peek_pending_entries().unwrap().0.is_empty());
+    assert_eq!(withdrawn_at(&log, &id), Some(1));
+}
+
+#[test]
 fn a_withdrawal_names_an_item_sealed_below_it_and_never_one_waiting() {
     let log = common::Rig::new();
     let (item, payload) = log.page("a", "waiting body");

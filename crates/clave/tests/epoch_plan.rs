@@ -939,7 +939,7 @@ fn replay_file(relative: &str) -> usize {
 
 #[test]
 fn every_catalog_waiting_history_replays_through_pull_and_plan() {
-    assert_eq!(replay_file("vectors/wist3/catalog-waiting.json"), 42);
+    assert_eq!(replay_file("vectors/wist3/catalog-waiting.json"), 45);
 }
 
 #[test]
@@ -949,7 +949,7 @@ fn every_collection_pull_history_replays_through_pull_and_plan() {
 
 #[test]
 fn every_catalog_recovery_history_replays_through_pull_and_plan() {
-    assert_eq!(replay_file("vectors/wist1/catalog-recovery.json"), 31);
+    assert_eq!(replay_file("vectors/wist1/catalog-recovery.json"), 32);
 }
 
 fn history_named<'a>(vector: &'a Value, name: &str) -> &'a Value {
@@ -1523,7 +1523,7 @@ fn replay_file_through_the_store(relative: &str) -> usize {
 fn every_catalog_waiting_history_pulled_over_http_into_the_store_reaches_the_replayed_state() {
     assert_eq!(
         replay_file_through_the_store("vectors/wist3/catalog-waiting.json"),
-        42
+        45
     );
 }
 
@@ -1539,7 +1539,7 @@ fn every_collection_pull_history_pulled_over_http_into_the_store_reaches_the_rep
 fn every_catalog_recovery_history_pulled_over_http_into_the_store_reaches_the_replayed_state() {
     assert_eq!(
         replay_file_through_the_store("vectors/wist1/catalog-recovery.json"),
-        31
+        32
     );
 }
 
@@ -1899,7 +1899,7 @@ fn replay_file_through_the_sealer(relative: &str) -> (usize, usize) {
 fn every_catalog_waiting_history_pulled_over_http_and_sealed_agrees_with_the_machine() {
     assert_eq!(
         replay_file_through_the_sealer("vectors/wist3/catalog-waiting.json"),
-        (42, 8)
+        (45, 8)
     );
 }
 
@@ -1915,7 +1915,7 @@ fn every_collection_pull_history_pulled_over_http_and_sealed_agrees_with_the_mac
 fn every_catalog_recovery_history_pulled_over_http_and_sealed_agrees_with_the_machine() {
     assert_eq!(
         replay_file_through_the_sealer("vectors/wist1/catalog-recovery.json"),
-        (31, 4)
+        (32, 4)
     );
 }
 
@@ -1942,4 +1942,162 @@ fn a_history_whose_epochs_the_sealer_chooses_otherwise_seals_entries_the_vector_
             assert!(message.contains("the sealed Entries"), "{name}: {message}");
         }
     }
+}
+
+fn owner_label(keys: &Value, subject: &str, asserted_at: &str) -> Value {
+    let hex = keys["owner"]["seed_hex"].as_str().unwrap();
+    let seed: [u8; 32] = (0..32)
+        .map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap())
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+    let inner = json!({
+        "wist_version": "1.0.0",
+        "labeler": "example.com",
+        "subject": subject,
+        "name": "wist:spam",
+        "asserted_at": asserted_at,
+    });
+    wist_core::envelope::sign_envelope(
+        &inner,
+        "label",
+        keys["owner"]["kid"].as_str().unwrap(),
+        &wist_core::crypto::SigningKey::from_seed(&seed),
+    )
+    .unwrap()
+}
+
+fn label_leaf(envelope: &Value) -> [u8; 32] {
+    wist_core::merkle::leaf_hash(&octets(&json!({"type": "label", "body": envelope})))
+}
+
+fn leaving_in_place_order(vector: &Value) -> Value {
+    let disputed = history_named(
+        vector,
+        "a dispute whose subject a Declaration of the candidate Epoch removes from the disputant's authority leaves",
+    );
+    let rotated = history_named(
+        vector,
+        "Labels that leave at one Epoch are reported in the order of their places",
+    );
+    assert_eq!(disputed["declarations"]["G"], rotated["declarations"]["G"]);
+    let first = owner_label(
+        &vector["keys"],
+        "https://watch.example.net/one",
+        "2026-10-01T01:03:00Z",
+    );
+    let second = (0..60)
+        .map(|second| {
+            owner_label(
+                &vector["keys"],
+                "https://watch.example.net/two",
+                &format!("2026-10-01T01:03:{second:02}Z"),
+            )
+        })
+        .find(|second| label_leaf(second) < label_leaf(&first))
+        .unwrap();
+    let mut history = disputed.clone();
+    history["name"] = json!("a dispute and two Labels that leave at one Epoch");
+    history["labels"]["L1"] = first;
+    history["labels"]["L2"] = second;
+    history["declarations"]["K"] = rotated["declarations"]["K"].clone();
+    history["declarations"].as_object_mut().unwrap().remove("U");
+    let events = disputed["events"].as_array().unwrap();
+    let mut pull = events[3].clone();
+    pull["labels"] = json!(["D1", "L1", "L2"]);
+    let mut discovery = events[4].clone();
+    discovery["declaration"] = json!("K");
+    let mut epoch = events[5].clone();
+    epoch["declarations"] = json!(["K"]);
+    history["events"] = json!([
+        events[0].clone(),
+        events[1].clone(),
+        events[2].clone(),
+        pull,
+        discovery,
+        epoch
+    ]);
+    history["expected"] = json!(vec![Value::Null; 6]);
+    history
+}
+
+fn named_ids(history: &Value, names: &[&str]) -> Vec<String> {
+    names
+        .iter()
+        .map(|name| label_id(&history["labels"][*name]))
+        .collect()
+}
+
+#[test]
+fn labels_and_disputes_that_leave_at_one_epoch_are_planned_as_rejections_in_place_order() {
+    let vector = read_vector("vectors/wist3/catalog-waiting.json");
+    let history = leaving_in_place_order(&vector);
+    assert!(label_leaf(&history["labels"]["L2"]) < label_leaf(&history["labels"]["L1"]));
+    let mut run = Run::new(&vector["keys"], &history);
+    run.checked = false;
+    let events = history["events"].as_array().unwrap();
+    let (last, earlier) = events.split_last().unwrap();
+    for (at, event) in earlier.iter().enumerate() {
+        match event["event"].as_str().unwrap() {
+            "epoch" => run.epoch(at, event, &Value::Null),
+            _ => run.pull(at, event, &Value::Null),
+        }
+    }
+    let places: Vec<Place> = named_ids(&history, &["D1", "L1", "L2"])
+        .iter()
+        .map(|id| run.state.labels[id].place)
+        .collect();
+    assert!(places.windows(2).all(|pair| pair[0] < pair[1]));
+    let (map, declarations, updates, _) = epoch_input_parts(&run.history, last);
+    let log_kid = run.history.log_kid.clone();
+    let log_key = run.history.log_key.clone();
+    let key = move |kid: &str| (kid == log_kid).then(|| log_key.clone());
+    let unsealed = BTreeSet::new();
+    let input = EpochInput {
+        height: last["height"].as_u64().unwrap(),
+        sealed_at: last["sealed_at"].as_str().unwrap(),
+        parameters: &map,
+        inclusion: &run.history.inclusion,
+        suffix_list: run.history.suffix_list.as_ref(),
+        declarations: &declarations,
+        updates: &updates,
+        unsealed: &unsealed,
+        log_key: &key,
+    };
+    let planned = plan::plan(&run.state, &run.held, &input).unwrap();
+    let rejected: Vec<String> = planned
+        .rejections
+        .iter()
+        .map(|rejection| rejection.id.clone())
+        .collect();
+    assert_eq!(rejected, named_ids(&history, &["D1", "L1", "L2"]));
+}
+
+#[test]
+fn the_status_endpoint_serves_labels_and_disputes_that_leave_at_one_epoch_in_place_order() {
+    let vector = read_vector("vectors/wist3/catalog-waiting.json");
+    let history = leaving_in_place_order(&vector);
+    let mut run = Run::new(&vector["keys"], &history);
+    run.checked = false;
+    let mut sealer = SealerRun::new(&run.history);
+    for (at, event) in history["events"].as_array().unwrap().iter().enumerate() {
+        if event["event"] == "epoch" {
+            let declarations = epoch_input_parts(&run.history, event).1;
+            let entries = run.epoch_with(at, event, &Value::Null, declarations.clone());
+            sealer.epoch(&run.history, event, &declarations, &entries);
+        } else {
+            sealer.pull(&run.history, event);
+            run.pull(at, event, &Value::Null);
+        }
+    }
+    let wanted = named_ids(&history, &["D1", "L1", "L2"]);
+    let served: Vec<String> = clave::serve::load_status(&sealer.store.db, "example.com")
+        .unwrap()
+        .unwrap()
+        .rejections
+        .into_iter()
+        .filter_map(|rejection| rejection.id)
+        .filter(|id| wanted.contains(id))
+        .collect();
+    assert_eq!(served, wanted);
 }

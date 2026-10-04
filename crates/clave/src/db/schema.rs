@@ -68,7 +68,7 @@ CREATE INDEX IF NOT EXISTS log_entries_epoch ON log_entries(epoch_number);
 CREATE TABLE IF NOT EXISTS log_tiles(level INTEGER NOT NULL, tile_index INTEGER NOT NULL, hashes BLOB NOT NULL, PRIMARY KEY(level, tile_index));
 CREATE TABLE IF NOT EXISTS witnesses(name TEXT PRIMARY KEY, public_key TEXT NOT NULL, base_url TEXT NOT NULL, last_size INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS aggregator_keys(note_key_id TEXT PRIMARY KEY, key_id TEXT NOT NULL, public_key TEXT NOT NULL, added_epoch INTEGER NOT NULL, removed_epoch INTEGER, adding_act BLOB, removing_act BLOB);
-CREATE TABLE IF NOT EXISTS rejections(domain TEXT NOT NULL, code TEXT NOT NULL, at TEXT NOT NULL, id TEXT, detail TEXT, collection TEXT, urls_json TEXT, condition TEXT, change_list TEXT);
+CREATE TABLE IF NOT EXISTS rejections(domain TEXT NOT NULL, code TEXT NOT NULL, at TEXT NOT NULL, id TEXT, detail TEXT, collection TEXT, urls_json TEXT, condition TEXT, change_list TEXT, left_epoch INTEGER);
 CREATE TABLE IF NOT EXISTS params(name TEXT PRIMARY KEY, value INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS param_changes(parameter TEXT NOT NULL, value INTEGER NOT NULL, effective_at TEXT NOT NULL, epoch_number INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS noise_pings(domain TEXT NOT NULL, day TEXT NOT NULL, count INTEGER NOT NULL, PRIMARY KEY(domain, day));
@@ -109,6 +109,7 @@ pub(super) fn add_missing_columns(conn: &Connection) -> Result<()> {
         "ALTER TABLE payload_duties ADD COLUMN served INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE collections ADD COLUMN accepted_read TEXT",
         "ALTER TABLE list_items ADD COLUMN read TEXT",
+        "ALTER TABLE rejections ADD COLUMN left_epoch INTEGER",
     ] {
         match conn.execute(statement, []) {
             Ok(_) => {}

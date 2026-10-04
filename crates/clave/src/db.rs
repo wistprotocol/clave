@@ -1610,7 +1610,7 @@ impl Db {
 
     pub fn list_rejections(&self, domain: &str) -> Result<Vec<StatusRejection>> {
         let mut stmt = self.conn.prepare(
-            "SELECT code, at, id, detail, collection, urls_json, condition, change_list FROM rejections WHERE domain = ?1 ORDER BY rowid DESC",
+            "SELECT r.code, r.at, r.id, r.detail, r.collection, r.urls_json, r.condition, r.change_list FROM rejections r WHERE r.domain = ?1 ORDER BY COALESCE((SELECT MAX(g.rowid) FROM rejections g WHERE g.domain = r.domain AND g.left_epoch = r.left_epoch), r.rowid) DESC, r.rowid ASC",
         )?;
         let rows = stmt
             .query_map([domain], |row| {
@@ -1666,6 +1666,26 @@ impl Db {
 
     /// WIST-2 §7.1, against `schemas/status.schema.json`.
     pub(crate) fn record_rejection(&self, domain: &str, rejection: &StatusRejection) -> Result<()> {
+        self.insert_status_rejection(domain, rejection, None)
+    }
+
+    /// WIST-3 §3.3, Waiting: the Labels and disputes that leave at one Epoch are recorded in the
+    /// order of their places and served in that order.
+    pub(crate) fn record_label_left(
+        &self,
+        domain: &str,
+        rejection: &StatusRejection,
+        epoch_number: u64,
+    ) -> Result<()> {
+        self.insert_status_rejection(domain, rejection, Some(epoch_number))
+    }
+
+    fn insert_status_rejection(
+        &self,
+        domain: &str,
+        rejection: &StatusRejection,
+        left_epoch: Option<u64>,
+    ) -> Result<()> {
         let condition = rejection
             .condition
             .map(serde_json::to_value)
@@ -1683,7 +1703,7 @@ impl Db {
         }
         let urls = (!urls.is_empty()).then_some(urls);
         self.execute(
-            "INSERT INTO rejections(domain, code, at, id, detail, collection, urls_json, condition, change_list) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO rejections(domain, code, at, id, detail, collection, urls_json, condition, change_list, left_epoch) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             rusqlite::params![
                 domain,
                 rejection.code,
@@ -1694,6 +1714,7 @@ impl Db {
                 urls.as_ref().map(serde_json::to_string).transpose()?,
                 condition,
                 rejection.change_list,
+                left_epoch.map(|epoch| epoch as i64),
             ],
         )?;
         Ok(())

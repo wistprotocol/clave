@@ -45,6 +45,7 @@ pub struct Sealed {
     pub withdrawals: WithdrawalReplay,
     pub sealed_items: SealedItems,
     pub sealed_labels: BTreeSet<String>,
+    pub label_subjects: BTreeMap<String, Option<String>>,
 }
 
 impl Sealed {
@@ -55,6 +56,7 @@ impl Sealed {
             withdrawals: state.withdrawals.clone(),
             sealed_items: state.sealed_items.clone(),
             sealed_labels: state.sealed_labels.clone(),
+            label_subjects: state.label_subjects.clone(),
         }
     }
 }
@@ -143,6 +145,10 @@ impl Db {
             withdrawals: replay.withdrawals().clone(),
             sealed_items: self.sealed_items()?,
             sealed_labels,
+            label_subjects: replay
+                .sealed_label_subjects()
+                .map(|(label_id, subject)| (label_id.to_owned(), subject.map(str::to_owned)))
+                .collect(),
         })
     }
 
@@ -298,6 +304,7 @@ impl Db {
             withdrawals: sealed.withdrawals,
             sealed_items: sealed.sealed_items,
             sealed_labels: sealed.sealed_labels,
+            label_subjects: sealed.label_subjects,
             ..State::default()
         };
         for publisher in publishers {

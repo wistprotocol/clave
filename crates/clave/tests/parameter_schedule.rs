@@ -458,3 +458,56 @@ fn a_store_in_the_pre_epoch_block_named_schema_is_refused_with_its_rows_untouche
         head.root
     );
 }
+
+#[test]
+fn a_parameter_change_queued_again_under_an_accepted_id_is_dropped_and_the_later_value_stays_in_force(
+) {
+    let (data, db, sk) = setup();
+    let effective = NOW + 10 * DAY;
+    let first = envelope(&sk, "catalog_refresh_seconds", 3600, effective);
+    queue(&db, &first);
+    assert_eq!(
+        clave::seal::run(&db, data.path(), &sk, NOW)
+            .unwrap()
+            .entry_count,
+        1
+    );
+    queue(
+        &db,
+        &envelope(&sk, "catalog_refresh_seconds", 7200, effective),
+    );
+    assert_eq!(
+        clave::seal::run(&db, data.path(), &sk, NOW + 3600)
+            .unwrap()
+            .entry_count,
+        1
+    );
+
+    queue(&db, &first);
+    let report = clave::seal::run(&db, data.path(), &sk, NOW + 7200).unwrap();
+    assert_eq!(report.entry_count, 0);
+    let update_id = wist_core::registry_updates::update_id(&first).unwrap();
+    assert_eq!(
+        report.dropped,
+        [format!(
+            "parameter_change catalog_refresh_seconds is not sealed: its Registry Update ID {update_id} was accepted at height 0"
+        )]
+    );
+    assert!(db.peek_pending_entries().unwrap().0.is_empty());
+    assert_eq!(
+        db.parameter_schedule(NOW + 7200)
+            .unwrap()
+            .value_at("catalog_refresh_seconds", effective),
+        Some(7200)
+    );
+    let mut history =
+        clave::history::History::open(&db, data.path(), db.last_epoch().unwrap()).unwrap();
+    while history.next_epoch().unwrap().is_some() {}
+    assert_eq!(
+        history
+            .schedule()
+            .unwrap()
+            .value_at("catalog_refresh_seconds", effective),
+        Some(7200)
+    );
+}

@@ -289,6 +289,7 @@ pub struct State {
     pub sealed_items: SealedItems,
     pub labels: BTreeMap<String, WaitingLabel>,
     pub sealed_labels: BTreeSet<String>,
+    pub label_subjects: BTreeMap<String, Option<String>>,
     pub floors: BTreeMap<String, u64>,
 }
 

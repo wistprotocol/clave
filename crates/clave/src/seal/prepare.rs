@@ -232,9 +232,15 @@ pub(super) fn epoch(
     )?);
     let mut tentative = schedule.clone();
     let largest = db.largest_epoch_bytes()?;
+    let accepted_parameters = history
+        .schedule()
+        .map(|schedule| schedule.accepted_updates().clone())
+        .unwrap_or_default();
     for (index, entry) in updates.iter().enumerate() {
         let update = &entry.body["update"];
         if update["action"] == "parameter_change"
+            && !wist_core::registry_updates::update_id(&entry.body)
+                .is_ok_and(|id| accepted_parameters.is_accepted(&id))
             && check_param_change(
                 &mut tentative,
                 update,
@@ -256,14 +262,7 @@ pub(super) fn epoch(
         mut dropped,
         dropped_rowids,
         key_registry,
-    } = enforce_governance(
-        db,
-        history.key_registry(),
-        updates,
-        sealed_unix,
-        epoch_number,
-        0,
-    )?;
+    } = enforce_governance(db, &history, updates, sealed_unix, epoch_number, 0)?;
     for entry in &oversize {
         dropped.push(format!(
             "WIST3-E03 {} Entry over 65 535 octets is not sealed",
@@ -517,7 +516,6 @@ pub(super) fn epoch(
 }
 
 pub(super) struct AcceptedParamChange {
-    pub(super) rowid: i64,
     pub(super) body: Value,
     pub(super) parameter: String,
     pub(super) value: i64,
@@ -548,7 +546,7 @@ pub(super) fn check_param_change(
     epoch_number: u64,
     entry_index: u64,
     largest_epoch: u64,
-) -> std::result::Result<AcceptedParamChange, String> {
+) -> std::result::Result<(), String> {
     let parameter = update["details"]["parameter"]
         .as_str()
         .ok_or("missing details.parameter")?;
@@ -566,15 +564,7 @@ pub(super) fn check_param_change(
         sealed_at_s: sealed_unix,
         effective_at_s: registry::unix(effective_at).map_err(|e| e.to_string())?,
     };
-    registry::accept(schedule, amendment, largest_epoch)
-        .map_err(|e| format!("{parameter}: {e}"))?;
-    Ok(AcceptedParamChange {
-        rowid: 0,
-        body: Value::Null,
-        parameter: parameter.into(),
-        value,
-        effective_at: effective_at.into(),
-    })
+    registry::accept(schedule, amendment, largest_epoch).map_err(|e| format!("{parameter}: {e}"))
 }
 
 pub(crate) fn validate_pending_parameter(
@@ -623,34 +613,41 @@ pub(crate) fn validate_pending_parameter(
     ))
 }
 
+enum Withdrawal {
+    Owned(OwnedWithdrawal),
+    Repeated(String),
+    Other,
+}
+
 /// WIST-4 §5.1: the act must verify under the Log key and name an Item
-/// sealed for the subject at or below this Epoch; a repeated withdrawal
-/// seals and changes nothing.
+/// sealed for the subject at or below this Epoch; a withdrawal of an already
+/// withdrawn Item under another ID seals and changes nothing.
 fn check_withdrawal(
     replay: &mut wist_core::withdrawal::WithdrawalReplay,
     public_key_of: impl Fn(&str) -> Option<wist_core::crypto::PublicKey>,
     body: &Value,
     epoch_number: u64,
     sealed: &wist_core::withdrawal::SealedItems,
-) -> std::result::Result<Option<OwnedWithdrawal>, String> {
+) -> std::result::Result<Withdrawal, String> {
     use wist_core::withdrawal::Disposition;
+    let update_id = || crate::governance::update_id(&body["update"]).map_err(|e| e.to_string());
     match replay.apply(epoch_number, body, public_key_of, sealed) {
         Disposition::Accepted {
             item_id, publisher, ..
-        } => Ok(Some(OwnedWithdrawal {
+        } => Ok(Withdrawal::Owned(OwnedWithdrawal {
             body: body.clone(),
-            update_id: crate::governance::update_id(&body["update"]).map_err(|e| e.to_string())?,
+            update_id: update_id()?,
             item_id,
             domain: publisher,
         })),
-        Disposition::Repeated { .. } => Ok(None),
+        Disposition::Repeated { .. } => Ok(Withdrawal::Repeated(update_id()?)),
         Disposition::Rejected(code) => Err(format!(
             "{code} payload_withdrawal {} is not sealed",
             body["update"]["details"]["delta_id"]
                 .as_str()
                 .unwrap_or("without an Item ID")
         )),
-        Disposition::NotWithdrawal => Ok(None),
+        Disposition::NotWithdrawal => Ok(Withdrawal::Other),
     }
 }
 
@@ -746,21 +743,43 @@ fn key_act_refusal(update: &Value, outcome: &Outcome) -> String {
     let (code, reason) = match outcome {
         Outcome::Ignored { code, reason } => (*code, *reason),
         Outcome::Conflict { reason } => (aggregator_keys::KEY_ACT_CONFLICT_CODE, *reason),
+        Outcome::Repeated {
+            update_id,
+            accepted_height,
+        } => return repeated_act(update, update_id, Some(*accepted_height)),
         Outcome::Accepted { .. } | Outcome::NotKeyAct => ("", "the act is not a key act"),
     };
     format!("{code} {action} {subject} is not sealed: {reason}")
 }
 
+/// WIST-4 §5.1: an occurrence of an accepted ID applies nothing, so it is not sealed again.
+fn repeated_act(update: &Value, update_id: &str, accepted_height: Option<u64>) -> String {
+    let action = update["action"].as_str().unwrap_or("Registry Update");
+    let subject = update["subject"].as_str().unwrap_or("without a subject");
+    match accepted_height {
+        Some(height) => format!(
+            "{action} {subject} is not sealed: its Registry Update ID {update_id} was accepted at height {height}"
+        ),
+        None => format!(
+            "{action} {subject} is not sealed: its Registry Update ID {update_id} is already accepted"
+        ),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn enforce_governance(
     db: &Db,
-    base_keys: &Registry,
+    history: &History<'_>,
     entries: Vec<SealEntry>,
     sealed_unix: i64,
     epoch_number: u64,
     epoch_bytes: u64,
 ) -> Result<GovernanceOutcome> {
+    let base_keys = history.key_registry();
     let mut schedule = db.parameter_schedule(sealed_unix)?;
+    if let Some(read) = history.schedule() {
+        schedule.hold_accepted_updates(read.accepted_updates().clone());
+    }
     let largest = db.largest_epoch_bytes()?.max(epoch_bytes);
     let acts: Vec<Value> = entries
         .iter()
@@ -790,10 +809,14 @@ pub(super) fn enforce_governance(
     for (item_id, domain, height) in db.withdrawal_state()? {
         replay.adopt(&item_id, &domain, height);
     }
+    for accepted in history.replay().registry_updates().entries() {
+        replay.accept_update(&accepted.update_id, accepted.sealing_height);
+    }
     let mut suffix_replay = wist_core::suffix_list::SuffixListReplay::new();
     for (height, identifier) in db.suffix_list_acts()? {
         suffix_replay.adopt(&identifier, height);
     }
+    suffix_replay.hold_accepted_updates(history.suffix_lists().accepted_updates().clone());
     let mut act_position = 0usize;
     for (index, e) in entries.into_iter().enumerate() {
         if e.entry_type != "registry_update" {
@@ -821,32 +844,41 @@ pub(super) fn enforce_governance(
                 }
             }
             Some("parameter_change") => {
-                if aggregator_keys::authenticate(&e.body, &sealing_keys).is_err() {
-                    out.dropped.push(format!(
-                        "WIST4-E11 parameter_change {} is not sealed: no Aggregator key valid at height {epoch_number} signed it",
-                        update["subject"].as_str().unwrap_or("without a subject")
-                    ));
-                    out.dropped_rowids.push(e.rowid);
-                    continue;
-                }
-                match check_param_change(
-                    &mut schedule,
-                    &update,
-                    sealed_unix,
+                use wist_core::parameters::{ActPosition, Disposition};
+                let at = ActPosition {
                     epoch_number,
-                    index as u64,
-                    largest,
-                ) {
-                    Ok(mut change) => {
-                        change.rowid = e.rowid;
-                        change.body = e.body.clone();
-                        out.param_changes.push(change);
+                    entry_index: index as u64,
+                    sealed_at_s: sealed_unix,
+                };
+                match schedule.apply_act(&e.body, at, largest, public_key_of) {
+                    Disposition::Accepted(amendment) => {
+                        out.param_changes.push(AcceptedParamChange {
+                            body: e.body.clone(),
+                            parameter: amendment.parameter,
+                            value: amendment.value,
+                            effective_at: update["effective_at"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .to_owned(),
+                        });
                         out.kept.push(e);
                     }
-                    Err(reason) => {
-                        out.dropped.push(reason);
+                    Disposition::Repeated {
+                        update_id,
+                        accepted_height,
+                    } => {
+                        out.dropped
+                            .push(repeated_act(&update, &update_id, Some(accepted_height)));
                         out.dropped_rowids.push(e.rowid);
                     }
+                    Disposition::Rejected { code, reason } => {
+                        out.dropped.push(format!(
+                            "{code} parameter_change {} is not sealed: {reason}",
+                            update["subject"].as_str().unwrap_or("without a subject")
+                        ));
+                        out.dropped_rowids.push(e.rowid);
+                    }
+                    Disposition::NotParameterChange => out.kept.push(e),
                 }
             }
             Some("payload_withdrawal") => {
@@ -857,11 +889,19 @@ pub(super) fn enforce_governance(
                     epoch_number,
                     &sealed_items,
                 ) {
-                    Ok(Some(withdrawal)) => {
+                    Ok(Withdrawal::Owned(withdrawal)) => {
                         out.withdrawals.push(withdrawal);
                         out.kept.push(e);
                     }
-                    Ok(None) => out.kept.push(e),
+                    Ok(Withdrawal::Repeated(update_id)) => {
+                        let height = history
+                            .replay()
+                            .registry_updates()
+                            .accepted_height(&update_id);
+                        out.dropped.push(repeated_act(&update, &update_id, height));
+                        out.dropped_rowids.push(e.rowid);
+                    }
+                    Ok(Withdrawal::Other) => out.kept.push(e),
                     Err(reason) => {
                         out.dropped.push(reason);
                         out.dropped_rowids.push(e.rowid);
@@ -884,9 +924,13 @@ pub(super) fn enforce_governance(
                         out.suffix_lists.push(identifier);
                         out.kept.push(e);
                     }
-                    Disposition::Accepted { .. }
-                    | Disposition::Repeated { .. }
-                    | Disposition::NotSuffixList => out.kept.push(e),
+                    Disposition::Repeated { .. } => {
+                        let update_id = wist_core::registry_updates::update_id(&e.body)?;
+                        let height = suffix_replay.accepted_updates().accepted_height(&update_id);
+                        out.dropped.push(repeated_act(&update, &update_id, height));
+                        out.dropped_rowids.push(e.rowid);
+                    }
+                    Disposition::Accepted { .. } | Disposition::NotSuffixList => out.kept.push(e),
                     Disposition::Rejected(code) => {
                         out.dropped.push(format!(
                             "{code} suffix_list_update {} is not accepted",

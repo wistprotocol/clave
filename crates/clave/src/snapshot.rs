@@ -1,6 +1,6 @@
 use crate::db::{Db, EpochRow};
 use crate::error::{Error, Result};
-use crate::history::declarations::{Declarations, DeclarationsReplay};
+use crate::history::declarations::Declarations;
 use crate::WIST_VERSION;
 use rusqlite::Connection;
 use serde_json::Value;
@@ -463,10 +463,8 @@ fn read_state(db: &Db, data_dir: &Path, head: EpochRow) -> Result<ReadState> {
         });
     }
     let mut history = crate::history::History::open(db, data_dir, Some(head.clone()))?;
-    let mut declarations = Declarations::default();
-    while let Some(epoch) = history.next_epoch()? {
-        declarations.apply(&epoch)?;
-    }
+    while history.next_epoch()?.is_some() {}
+    let declarations = history.replay().declarations().clone();
     let registry_updates = history.replay().registry_updates().entries();
     let log_entries = db.log_state_entries()?;
     let domains = declarations.domains();

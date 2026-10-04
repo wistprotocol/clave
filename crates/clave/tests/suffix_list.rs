@@ -148,3 +148,54 @@ fn a_pinned_snapshot_governs_from_the_epoch_after_its_seal() {
     );
     assert_eq!(db.suffix_list_acts().unwrap().len(), 2);
 }
+
+fn queued_act(db: &clave::db::Db) -> serde_json::Value {
+    let (pending, _) = db.peek_pending_entries().unwrap();
+    assert_eq!(pending.len(), 1);
+    pending[0].entry_json.clone()
+}
+
+#[test]
+fn a_suffix_list_update_queued_again_under_an_accepted_id_is_dropped_and_the_later_snapshot_stays_in_force(
+) {
+    let data = tempfile::tempdir().unwrap();
+    clave::init::run("log.example", data.path()).unwrap();
+    let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
+    db.set_param("epoch_cadence_seconds", 1).unwrap();
+    let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
+    let file = data.path().join("first.dat");
+    std::fs::write(&file, FIRST).unwrap();
+    let first = clave::suffix_list::pin(&db, data.path(), &sk, &file, SEAL_START - 10).unwrap();
+    let pinning_first = queued_act(&db);
+    let r0 = clave::seal::run(&db, data.path(), &sk, SEAL_START).unwrap();
+    assert_eq!((r0.epoch_number, r0.entry_count), (0, 1));
+    let file = data.path().join("second.dat");
+    std::fs::write(&file, SECOND).unwrap();
+    let second = clave::suffix_list::pin(&db, data.path(), &sk, &file, SEAL_START).unwrap();
+    let r1 = clave::seal::run(&db, data.path(), &sk, SEAL_START + 7200).unwrap();
+    assert_eq!((r1.epoch_number, r1.entry_count), (1, 1));
+
+    db.insert_pending_entry("registry_update", "", &pinning_first, 0)
+        .unwrap();
+    let r2 = clave::seal::run(&db, data.path(), &sk, SEAL_START + 14400).unwrap();
+    assert_eq!((r2.epoch_number, r2.entry_count), (2, 0));
+    let update_id = wist_core::registry_updates::update_id(&pinning_first).unwrap();
+    assert_eq!(
+        r2.dropped,
+        [format!(
+            "suffix_list_update {} is not sealed: its Registry Update ID {update_id} was accepted at height 0",
+            first.identifier
+        )]
+    );
+    assert!(db.peek_pending_entries().unwrap().0.is_empty());
+    assert_eq!(db.suffix_list_acts().unwrap().len(), 2);
+    assert_eq!(
+        db.suffix_list_in_force_at_epoch(3).unwrap(),
+        Some((second.identifier.clone(), 1))
+    );
+    assert!(state_entries(data.path()).contains(&serde_json::json!([
+        "suffix_list",
+        second.identifier,
+        1
+    ])));
+}

@@ -28,7 +28,13 @@ fn rejection(code: &str, at: &str) -> StatusRejection {
 }
 
 /// WIST-2 §7.1.
-fn record_reports(db: &Db, before: &State, planned: &Planned, at: &str) -> Result<()> {
+fn record_reports(
+    db: &Db,
+    before: &State,
+    planned: &Planned,
+    epoch_number: u64,
+    at: &str,
+) -> Result<()> {
     for settled in &planned.settlement {
         let code = match settled.outcome {
             SettledOutcome::Regressed => crate::collection::queue::REGRESSED,
@@ -86,7 +92,7 @@ fn record_reports(db: &Db, before: &State, planned: &Planned, at: &str) -> Resul
                 .into(),
         );
         if let Some(publisher) = publisher {
-            db.record_rejection(&publisher, &row)?;
+            db.record_label_left(&publisher, &row, epoch_number)?;
         }
         db.forget_seen_label(&label.id)?;
     }
@@ -292,7 +298,13 @@ pub(super) fn epoch(
     crate::db::store_changes(db, &prepared.before, &after, &scope, &prepared.sealed_at)?;
     record_sealed_items(db, &prepared)?;
     db.store_waiting_reports(&scope, &prepared.planned.deferred, &prepared.planned.held)?;
-    record_reports(db, &prepared.before, &prepared.planned, &prepared.sealed_at)?;
+    record_reports(
+        db,
+        &prepared.before,
+        &prepared.planned,
+        prepared.epoch_number,
+        &prepared.sealed_at,
+    )?;
     crate::ingest::mirror_sealed(db, &after, &scope, &prepared.sealed_at)?;
     mutation.commit()?;
     crate::publication::recover(db, data_dir)?;

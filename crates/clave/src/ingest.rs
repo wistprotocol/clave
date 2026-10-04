@@ -94,6 +94,14 @@ fn page_declarations(
     let mut pending = std::collections::BTreeSet::new();
     let mut excluded = std::collections::BTreeSet::new();
     while let Some(epoch) = history.next_epoch()? {
+        if epoch.rejected().is_some() {
+            state.seed_head(
+                epoch.epoch_number(),
+                epoch.root(),
+                Some(epoch.sealed_at_s()),
+            );
+            continue;
+        }
         let effects = state.apply(&epoch)?;
         for settlement in &effects.settlements {
             if settlement.domain == host {

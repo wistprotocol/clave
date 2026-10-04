@@ -92,11 +92,20 @@ fn field_rejection_preserves_the_complete_declaration_prefix() {
                     case["name"]
                 );
                 assert_eq!(format!("{state:?}"), before, "{}", case["name"]);
-                assert!(fixture
-                    .restore()
-                    .unwrap_err()
-                    .to_string()
-                    .contains(case["expected"].as_str().unwrap()));
+                assert!(epoch.rejected().is_some(), "{}", case["name"]);
+                let restored = fixture.restore().unwrap();
+                assert_eq!(
+                    format!("{:?}", restored.domains()),
+                    format!("{:?}", state.domains()),
+                    "{}",
+                    case["name"]
+                );
+                assert_eq!(
+                    restored.head(),
+                    Some((epoch.epoch_number(), epoch.root())),
+                    "{}",
+                    case["name"]
+                );
             }
         }
     }
@@ -461,7 +470,13 @@ fn conflicting_groups_and_failed_authors_reject_epochs_atomically() {
                         case["name"]
                     );
                     assert_eq!(format!("{state:?}"), before);
-                    assert!(fixture.restore().is_err());
+                    assert!(epoch.rejected().is_some(), "{}", case["name"]);
+                    let restored = fixture.restore().unwrap();
+                    assert_eq!(
+                        format!("{:?}", restored.domains()),
+                        format!("{:?}", state.domains())
+                    );
+                    assert_eq!(restored.head(), Some((epoch.epoch_number(), epoch.root())));
                 }
             }
         }
@@ -678,7 +693,12 @@ fn authenticated_parameter_schedules_freeze_window_length_at_each_owner() {
             }
         }
         if stopped {
-            assert!(fixture.restore().is_err(), "{}", case["label"]);
+            assert_eq!(
+                format!("{:?}", fixture.restore().unwrap().domains()),
+                format!("{:?}", state.domains()),
+                "{}",
+                case["label"]
+            );
         } else {
             assert_eq!(
                 format!("{:?}", fixture.restore().unwrap()),

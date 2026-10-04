@@ -359,8 +359,10 @@ fn the_state_file_key_tuples_authenticate_from_the_anchor_and_carry_the_accepted
 
     let second = log.signing_key("log2");
     let third = log.signing_key("log3");
+    let mut later_removal = remove_act("log3");
+    later_removal["effective_at"] = json!("2026-12-01T00:00:01Z");
     log.queue(&signed(remove_act("log3"), "log2", &second));
-    log.queue(&signed(remove_act("log3"), "log3", &third));
+    log.queue(&signed(later_removal, "log3", &third));
     let sealed = log.seal(4);
     assert_eq!(
         sealed.entry_count, 2,
@@ -905,6 +907,29 @@ fn a_second_removal_in_one_epoch_is_held_back_only_as_far_as_the_epoch_keeps_a_v
 }
 
 #[test]
+fn a_key_act_queued_again_under_an_accepted_id_is_dropped_as_repeated() {
+    let log = Log::new();
+    log.seal(0);
+    clave::log_key::add(&log.db, log.path(), SEAL_START).unwrap();
+    let (pending, _) = log.db.peek_pending_entries().unwrap();
+    let addition = pending[0].entry_json.clone();
+    assert_eq!(log.seal(1).entry_count, 1);
+
+    log.queue(&addition);
+    let sealed = log.seal(2);
+    assert_eq!(sealed.entry_count, 0);
+    let update_id = wist_core::registry_updates::update_id(&addition).unwrap();
+    assert_eq!(
+        sealed.dropped,
+        [format!(
+            "aggregator_key_add log2 is not sealed: its Registry Update ID {update_id} was accepted at height 1"
+        )]
+    );
+    assert!(log.db.peek_pending_entries().unwrap().0.is_empty());
+    assert_eq!(log.verify_history().unwrap(), 3);
+}
+
+#[test]
 fn a_queued_key_act_seals_after_a_restart_between_queueing_and_sealing() {
     let mut log = Log::new();
     log.seal(0);
@@ -1016,6 +1041,34 @@ fn complete_state(reader: &clave::history::History<'_>, head_at: i64) -> BTreeSe
         .collect()
 }
 
+fn registry_state(reader: &clave::history::History<'_>, at: i64, height: u64) -> BTreeSet<String> {
+    let parameters = clave::registry::parameter_state(reader.schedule().unwrap(), at)
+        .unwrap()
+        .into_iter()
+        .map(|(name, value, effective_at)| {
+            StateEntry::Parameter(ParameterEntry {
+                name,
+                effective_at,
+                value,
+            })
+        });
+    let suffix_list = reader
+        .suffix_lists()
+        .entry_at(height)
+        .map(StateEntry::SuffixList);
+    let updates = reader
+        .replay()
+        .registry_updates()
+        .entries()
+        .into_iter()
+        .map(StateEntry::RegistryUpdate);
+    parameters
+        .chain(suffix_list)
+        .chain(updates)
+        .map(|entry| serde_json::to_value(entry).unwrap().to_string())
+        .collect()
+}
+
 fn state_tuples(entries: &[AggregatorKeyEntry]) -> Vec<Value> {
     entries
         .iter()
@@ -1059,11 +1112,34 @@ fn the_aggregator_key_vector_histories_replay_through_the_history_reader() {
                 expected,
                 "{name} Epoch {height} key registry"
             );
+            assert_eq!(
+                read.rejected().map(<[String]>::to_vec),
+                epoch["rejection"]
+                    .as_str()
+                    .map(|code| vec![code.to_owned()]),
+                "{name} Epoch {height}: {}",
+                epoch["why"]
+            );
+            assert_eq!(
+                registry_state(&reader, read.sealed_at_s(), height),
+                epoch["expected_registry_state"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(Value::to_string)
+                    .collect::<BTreeSet<_>>(),
+                "{name} Epoch {height} registry state: {}",
+                epoch["why"]
+            );
             let rejected: Vec<u64> = epoch["acts"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .filter(|act| act["action"] == "parameter_change" && !act["code"].is_null())
+                .filter(|act| {
+                    epoch["rejection"].is_null()
+                        && act["action"] == "parameter_change"
+                        && !act["code"].is_null()
+                })
                 .map(|act| act["entry_index"].as_u64().unwrap())
                 .collect();
             assert_eq!(
@@ -1233,4 +1309,145 @@ fn a_checkpoint_verifies_only_under_the_keys_the_vector_makes_valid_at_its_heigh
         }
     }
     assert!(cases >= 6, "the vector offers {cases} Checkpoint cases");
+}
+
+struct OwnLog {
+    data: tempfile::TempDir,
+    db: clave::db::Db,
+    leaves: Vec<[u8; 32]>,
+}
+
+impl OwnLog {
+    fn new(genesis: &SigningKey) -> Self {
+        let data = tempfile::tempdir().unwrap();
+        let anchor = json!({
+            "wist_version": "1.0.0",
+            "log_id": LOG_ID,
+            "genesis_key": {"key_id": "genesis", "alg": "Ed25519", "public_key": genesis.public().to_b64u()},
+            "created_at": "2026-08-01T00:00:00Z"
+        });
+        let envelope =
+            wist_core::envelope::sign_envelope(&anchor, "anchor", "genesis", genesis).unwrap();
+        std::fs::write(
+            data.path().join("anchor.json"),
+            wist_core::jcs::canonicalize(&envelope).unwrap(),
+        )
+        .unwrap();
+        let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
+        OwnLog {
+            data,
+            db,
+            leaves: Vec::new(),
+        }
+    }
+
+    fn seal(&mut self, height: u64, entries: &[Value], signers: &[&SigningKey]) {
+        let sealed_at = wist_core::timestamp::instant(SEAL_START + height as i64 * 3600).unwrap();
+        self.db
+            .commit_seal(
+                &SigningKey::from_seed(&[3u8; 32]),
+                LOG_ID,
+                &[],
+                height,
+                &sealed_at,
+                entries,
+                wist_core::epoch::epoch_octets(entries).unwrap(),
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+        self.leaves.extend(entries.iter().map(|entry| {
+            wist_core::merkle::leaf_hash(&wist_core::jcs::canonicalize(entry).unwrap())
+        }));
+        let mut checkpoint = Checkpoint::new(
+            LOG_ID,
+            self.leaves.len() as u64,
+            wist_core::merkle::merkle_root(&self.leaves),
+            height,
+            &sealed_at,
+        )
+        .unwrap();
+        for signer in signers {
+            checkpoint.sign(signer);
+        }
+        self.db
+            .replace_checkpoint_note(height, &checkpoint.encode())
+            .unwrap();
+    }
+}
+
+fn registry_update(update: Value, key_id: &str, key: &SigningKey) -> Value {
+    json!({
+        "type": "registry_update",
+        "body": wist_core::envelope::sign_envelope(&update, "update", key_id, key).unwrap(),
+    })
+}
+
+#[test]
+fn an_epoch_over_the_size_bound_is_rejected_and_applies_its_key_acts_alone() {
+    let genesis = SigningKey::from_seed(&[21u8; 32]);
+    let second = SigningKey::from_seed(&[22u8; 32]);
+    let mut log = OwnLog::new(&genesis);
+    let reduction = registry_update(
+        json!({
+            "wist_version": "1.0.0",
+            "action": "parameter_change",
+            "subject": "epoch_cap_bytes",
+            "details": {"parameter": "epoch_cap_bytes", "value": 65_537},
+            "effective_at": wist_core::timestamp::instant(SEAL_START + 8 * 86_400).unwrap()
+        }),
+        "genesis",
+        &genesis,
+    );
+    log.seal(0, &[reduction], &[&genesis]);
+    let addition = registry_update(
+        json!({
+            "wist_version": "1.0.0",
+            "action": "aggregator_key_add",
+            "subject": "second",
+            "details": {"alg": "Ed25519", "key_id": "second", "public_key": second.public().to_b64u()},
+            "effective_at": "2026-10-01T00:00:00Z"
+        }),
+        "genesis",
+        &genesis,
+    );
+    let mut oversize = vec![addition.clone()];
+    for pad in ["a", "b"] {
+        oversize.push(json!({"type": "label", "body": {"pad": pad.repeat(40_000)}}));
+    }
+    wist_core::epoch::sort_entries(&mut oversize).unwrap();
+    assert!(wist_core::epoch::epoch_octets(&oversize).unwrap() > 65_537);
+    log.seal(1, &oversize, &[&second]);
+    log.seal(2, &[], &[&second]);
+
+    let head = log.db.last_epoch().unwrap();
+    let mut reader = clave::history::History::open(&log.db, log.data.path(), head).unwrap();
+    let first = reader.next_epoch().unwrap().unwrap();
+    assert_eq!(first.rejected(), None);
+    let rejected = reader.next_epoch().unwrap().unwrap();
+    assert_eq!(rejected.rejected(), Some(&["WIST3-E03".to_string()][..]));
+    let addition_id = wist_core::registry_updates::update_id(&addition["body"]).unwrap();
+    assert_eq!(
+        reader
+            .replay()
+            .registry_updates()
+            .accepted_height(&addition_id),
+        Some(1)
+    );
+    let after = reader.next_epoch().unwrap().unwrap();
+    assert_eq!(after.epoch_number(), 2);
+    assert_eq!(after.rejected(), None);
+    assert!(reader.next_epoch().unwrap().is_none());
+    let valid: Vec<String> = reader
+        .key_registry()
+        .valid_at(2)
+        .into_iter()
+        .map(|key| key.key_id)
+        .collect();
+    assert_eq!(valid, ["genesis", "second"]);
+    assert!(reader.replay().labels().next().is_none());
 }

@@ -537,3 +537,107 @@ fn a_queued_label_beyond_the_allowance_at_sealed_at_is_dropped_reported_and_pull
     assert!(resealed.dropped.is_empty(), "{:?}", resealed.dropped);
     assert_eq!(db.sealed_labels().unwrap().len(), 1);
 }
+
+#[test]
+fn a_dispute_whose_label_a_sealed_declaration_takes_out_of_the_disputants_authority_leaves_with_e06(
+) {
+    let (listener, host, client) = reserve_addr();
+    let p = make_publisher(&host);
+    let subject = "https://reduced.example.org/notice";
+    let (label_id, envelope) = sign(
+        &p,
+        "label",
+        label(&host, subject, "wist:spam", "2026-08-09T12:00:00Z"),
+    );
+    write_listed(
+        &p,
+        &host,
+        &[(label_id.clone(), envelope)],
+        "2026-08-09T12:00:00Z",
+    );
+    serve_static(listener, p.dir.path().to_path_buf());
+    let data = tempfile::tempdir().unwrap();
+    clave::init::run(&host, data.path()).unwrap();
+    let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
+    db.set_param("epoch_cadence_seconds", 1).unwrap();
+    clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
+    let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
+    clave::seal::run(&db, data.path(), &sk, SEAL_START).unwrap();
+    assert_eq!(
+        db.sealed_label_subject(&label_id).unwrap().as_deref(),
+        Some(subject)
+    );
+
+    let disputant_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    disputant_listener.set_nonblocking(true).unwrap();
+    let disputant = "disputant.localhost".to_string();
+    let disputant_client = clave::fetch::Client::with_builder(
+        true,
+        reqwest::blocking::Client::builder()
+            .no_proxy()
+            .resolve(&disputant, disputant_listener.local_addr().unwrap()),
+    );
+    let d = make_publisher_with_scope(&disputant, &["reduced.example.org"]);
+    write_label_feed(&d, &disputant, &[], "2026-08-09T13:00:00Z");
+    let (dispute_id, dispute) = sign(
+        &d,
+        "dispute",
+        json!({"wist_version": "1.0.0", "disputant": disputant, "label": label_id, "log": "log.example", "height": 0, "asserted_at": "2026-08-09T13:00:00Z"}),
+    );
+    write_listed(
+        &d,
+        &disputant,
+        &[(dispute_id.clone(), dispute)],
+        "2026-08-09T13:00:00Z",
+    );
+    serve_static(disputant_listener, d.dir.path().to_path_buf());
+    let report = clave::ingest::run(
+        &db,
+        &disputant_client,
+        data.path(),
+        &disputant,
+        "2026-08-09T13:00:00Z",
+    )
+    .unwrap();
+    assert_eq!(report.labels, vec![dispute_id.clone()]);
+
+    let current = common::current_declaration(&d);
+    let mut narrowed = current["publisher"].clone();
+    narrowed.as_object_mut().unwrap().remove("subdomain_scope");
+    narrowed["seq"] = 1.into();
+    narrowed["prev_declaration"] = common::declaration_hash(&current).into();
+    common::write_declaration(&d, &narrowed, &common::K1_SEED);
+    clave::ingest::run(
+        &db,
+        &disputant_client,
+        data.path(),
+        &disputant,
+        "2026-08-09T13:30:00Z",
+    )
+    .unwrap();
+
+    let sealed = clave::seal::run(&db, data.path(), &sk, SEAL_START + 7200).unwrap();
+    let entries = db.epoch_entries(sealed.epoch_number).unwrap();
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry["type"] == "publisher_declaration"
+                && entry["body"]["publisher"]["domain"] == disputant.as_str()
+                && entry["body"]["publisher"]["seq"] == 1),
+        "{entries:?}"
+    );
+    assert!(
+        !entries.iter().any(|entry| entry["type"] == "dispute"),
+        "{entries:?}"
+    );
+    assert!(
+        sealed.dropped.contains(&format!("{dispute_id}: WIST2-E06")),
+        "{:?}",
+        sealed.dropped
+    );
+    assert_eq!(db.count_pending_entries("dispute").unwrap(), 0);
+    assert!(db.sealed_disputes().unwrap().is_empty());
+    assert!(!state_entries(data.path())
+        .iter()
+        .any(|entry| entry[0] == "dispute"));
+}

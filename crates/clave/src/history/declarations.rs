@@ -16,11 +16,8 @@ pub trait DeclarationsReplay: Sized {
 impl DeclarationsReplay for Declarations {
     fn reconstruct(db: &Db, directory: &Path, head: Option<EpochRow>) -> Result<Self> {
         let mut history = History::open(db, directory, head)?;
-        let mut state = Self::default();
-        while let Some(epoch) = history.next_epoch()? {
-            state.apply(&epoch)?;
-        }
-        Ok(state)
+        while history.next_epoch()?.is_some() {}
+        Ok(history.replay().declarations().clone())
     }
 
     fn apply(&mut self, verified: &VerifiedEpoch) -> Result<Effects> {

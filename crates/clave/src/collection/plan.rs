@@ -427,7 +427,8 @@ pub struct Judged {
 }
 
 /// Resumed from the tuples of the Publishers the Epoch's Entries and transitions touch: no
-/// other Publisher's state enters a judgment of WIST-3 §3.3.
+/// other Publisher's state enters a judgment of WIST-3 §3.3. Every sealed Item and Label ID is
+/// handed over, so a withdrawal or dispute reads what a full replay reads.
 pub fn judge(state: &State, input: &EpochInput<'_>, entries: &[Value]) -> Result<Judged> {
     let parameters = input.parameters.sealing()?;
     let publishers = judged_publishers(state, entries, changed_domains(state, input, entries));
@@ -445,6 +446,13 @@ pub fn judge(state: &State, input: &EpochInput<'_>, entries: &[Value]) -> Result
             &tuples(state, &publishers),
         )?,
     };
+    replay.hold_walk_floor(None);
+    for sealed in state.sealed_items.sealed() {
+        replay.hold_sealed_item(sealed.item_id, sealed.publisher, sealed.kind, sealed.height);
+    }
+    for (label_id, subject) in &state.label_subjects {
+        replay.hold_sealed_label(label_id, subject.as_deref());
+    }
     let outcome = replay.epoch(&Epoch {
         height: input.height,
         root: CANDIDATE_ROOT,
@@ -490,6 +498,10 @@ fn absorb(next: &mut State, judged: &Judged, height: u64) {
     let replay = &judged.replay;
     next.declarations = replay.declarations().clone();
     next.withdrawals = replay.withdrawals().clone();
+    next.label_subjects = replay
+        .sealed_label_subjects()
+        .map(|(label_id, subject)| (label_id.to_owned(), subject.map(str::to_owned)))
+        .collect();
     for (publisher, name, latest) in replay.latest_catalogs() {
         if !judged.publishers.contains(publisher) {
             continue;
@@ -1442,7 +1454,7 @@ pub fn plan(state: &State, held: &impl Held, input: &EpochInput<'_>) -> Result<P
     let mut gone: BTreeSet<CollectionKey> = BTreeSet::new();
     let mut left: Vec<(TurnKey, Left)> = Vec::new();
     let mut replaced: BTreeMap<CollectionKey, (String, String)> = BTreeMap::new();
-    let mut rejections: Vec<LabelRejection> = Vec::new();
+    let mut rejections: Vec<((PlaceKey, String), LabelRejection)> = Vec::new();
     let (pass, entries, judged, records_removed) = loop {
         let pass = run_pass(&mut next, &turn, &mut lists, &mut gone)?;
         left.extend(pass.dropped.iter().cloned());
@@ -1672,11 +1684,17 @@ pub fn plan(state: &State, held: &impl Held, input: &EpochInput<'_>) -> Result<P
                         .first()
                         .map(|failure| failure.code)
                         .ok_or_else(|| history("a Label ignored without a failure"))?;
-                    next.labels.remove(id);
-                    rejections.push(LabelRejection {
-                        id: id.clone(),
-                        code,
-                    });
+                    let label = next
+                        .labels
+                        .remove(id)
+                        .ok_or_else(|| history("a planned Label that is not waiting"))?;
+                    rejections.push((
+                        (place_key(label.place, &label.publisher), id.clone()),
+                        LabelRejection {
+                            id: id.clone(),
+                            code,
+                        },
+                    ));
                 }
             }
         }
@@ -1762,6 +1780,7 @@ pub fn plan(state: &State, held: &impl Held, input: &EpochInput<'_>) -> Result<P
         }
     }
     left.sort_by(|a, b| a.0.cmp(&b.0));
+    rejections.sort_by(|a, b| a.0.cmp(&b.0));
     let sealed = pass
         .planned
         .iter()
@@ -1786,7 +1805,10 @@ pub fn plan(state: &State, held: &impl Held, input: &EpochInput<'_>) -> Result<P
         held: pass.holding.into_iter().map(|(held, _)| held).collect(),
         held_late,
         unsealed: pass.unsealed,
-        rejections,
+        rejections: rejections
+            .into_iter()
+            .map(|(_, rejection)| rejection)
+            .collect(),
         declarations_failed: candidates.failed,
         declarations_left: candidates.left,
         updates_refused,
