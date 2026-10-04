@@ -949,7 +949,7 @@ fn every_collection_pull_history_replays_through_pull_and_plan() {
 
 #[test]
 fn every_catalog_recovery_history_replays_through_pull_and_plan() {
-    assert_eq!(replay_file("vectors/wist1/catalog-recovery.json"), 30);
+    assert_eq!(replay_file("vectors/wist1/catalog-recovery.json"), 31);
 }
 
 fn history_named<'a>(vector: &'a Value, name: &str) -> &'a Value {
@@ -1527,7 +1527,7 @@ fn every_collection_pull_history_pulled_over_http_into_the_store_reaches_the_rep
 fn every_catalog_recovery_history_pulled_over_http_into_the_store_reaches_the_replayed_state() {
     assert_eq!(
         replay_file_through_the_store("vectors/wist1/catalog-recovery.json"),
-        30
+        31
     );
 }
 
@@ -1903,7 +1903,7 @@ fn every_collection_pull_history_pulled_over_http_and_sealed_agrees_with_the_mac
 fn every_catalog_recovery_history_pulled_over_http_and_sealed_agrees_with_the_machine() {
     assert_eq!(
         replay_file_through_the_sealer("vectors/wist1/catalog-recovery.json"),
-        (30, 4)
+        (31, 4)
     );
 }
 
