@@ -884,7 +884,9 @@ pub(super) fn enforce_governance(
                         out.suffix_lists.push(identifier);
                         out.kept.push(e);
                     }
-                    Disposition::Accepted { .. } | Disposition::NotSuffixList => out.kept.push(e),
+                    Disposition::Accepted { .. }
+                    | Disposition::Repeated { .. }
+                    | Disposition::NotSuffixList => out.kept.push(e),
                     Disposition::Rejected(code) => {
                         out.dropped.push(format!(
                             "{code} suffix_list_update {} is not accepted",
@@ -1064,15 +1066,32 @@ pub(super) fn storage_order(peeked: Vec<PendingEntryRow>) -> Result<Vec<SealEntr
 mod tests {
     use crate::WIST_VERSION;
 
-    #[test]
-    fn domain_cap_counts_per_registrable_domain() {
+    fn waiting_labels(labelers: &[(&str, bool)]) -> State {
         use crate::collection::state::{LabelKind, Place, WaitingLabel};
         let mut state = State::default();
         let signer = SigningKey::from_seed(&[3; 32]);
-        for (index, labeler) in ["a.example.com", "b.example.com", "alice.github.io"]
-            .into_iter()
-            .enumerate()
-        {
+        let key = wist_core::objects::PublisherKey::new(&signer.public().to_b64u(), 0, None);
+        let head_s = wist_core::timestamp::log_seconds("2026-08-09T00:00:00Z").unwrap();
+        for (index, (labeler, declared)) in labelers.iter().copied().enumerate() {
+            let declaration = serde_json::json!({"wist_version": WIST_VERSION,
+                "domain": labeler, "seq": 0, "keys": [key]});
+            if declared {
+                state
+                    .declarations
+                    .adopt(
+                        labeler,
+                        sign_envelope(&declaration, "publisher", &key.kid, &signer).unwrap(),
+                        wist_core::declarations::Position {
+                            epoch_number: 0,
+                            entry_index: index,
+                        },
+                        head_s,
+                        0,
+                        None,
+                        None,
+                    )
+                    .unwrap();
+            }
             let inner = serde_json::json!({"wist_version": WIST_VERSION, "labeler": labeler,
                 "subject": "https://subject.example/", "name": "wist:spam",
                 "asserted_at": "2026-08-09T00:00:00Z"});
@@ -1081,31 +1100,88 @@ mod tests {
                 WaitingLabel {
                     kind: LabelKind::Label,
                     publisher: labeler.into(),
-                    envelope: sign_envelope(&inner, "label", "labeler-key", &signer).unwrap(),
+                    envelope: sign_envelope(&inner, "label", &key.kid, &signer).unwrap(),
                     place: Place::url(0, 0, index as u64),
-                    eligibility: 0,
+                    eligibility: 1,
                 },
             );
         }
+        state.declarations.seed_head(0, "root", Some(head_s));
+        state.height = Some(0);
+        state.events = 1;
+        state
+    }
+
+    fn label_input<'a>(
+        parameters: &'a Parameters,
+        inclusion: &'a Inclusion,
+        unsealed: &'a BTreeSet<Unsealed>,
+        suffix_list: Option<&'a wist_core::suffix_list::SuffixList>,
+    ) -> EpochInput<'a> {
+        EpochInput {
+            height: 1,
+            sealed_at: "2026-08-09T01:00:00Z",
+            parameters,
+            inclusion,
+            suffix_list,
+            declarations: &[],
+            updates: &[],
+            unsealed,
+            log_key: &|_| None,
+        }
+    }
+
+    #[test]
+    fn a_label_whose_labeler_has_no_declaration_in_force_leaves_with_the_binding_code() {
+        let state = waiting_labels(&[("a.example.com", true), ("b.example.com", false)]);
+        let undeclared = state
+            .labels
+            .iter()
+            .find(|(_, label)| label.publisher == "b.example.com")
+            .map(|(id, _)| id.clone())
+            .unwrap();
+        let parameters = Parameters::new(Default::default());
+        let inclusion = Inclusion::constant(24);
+        let unsealed = BTreeSet::new();
+        let planned = plan::plan(
+            &state,
+            &crate::collection::MemoryHeld::default(),
+            &label_input(&parameters, &inclusion, &unsealed, None),
+        )
+        .unwrap();
+        assert_eq!(planned.entries.len(), 1);
+        assert_eq!(
+            planned.entries[0]["body"]["label"]["labeler"],
+            "a.example.com"
+        );
+        assert_eq!(
+            planned.rejections,
+            [plan::LabelRejection {
+                id: undeclared,
+                code: "WIST1-E02",
+            }]
+        );
+        assert!(planned.state.labels.is_empty());
+    }
+
+    #[test]
+    fn domain_cap_counts_per_registrable_domain() {
+        let state = waiting_labels(&[
+            ("a.example.com", true),
+            ("b.example.com", true),
+            ("alice.github.io", true),
+        ]);
         let mut parameters = Parameters::new(Default::default());
         parameters.set("domain_epoch_entries_max", 1);
         parameters.set("labeler_epoch_entries_max", 1);
         let list = wist_core::suffix_list::SuffixList::parse(b"com\ngithub.io\n").unwrap();
+        let inclusion = Inclusion::constant(24);
+        let unsealed = BTreeSet::new();
         let sealed = |suffix_list| {
             let planned = plan::plan(
                 &state,
                 &crate::collection::MemoryHeld::default(),
-                &EpochInput {
-                    height: 0,
-                    sealed_at: "2026-08-09T01:00:00Z",
-                    parameters: &parameters,
-                    inclusion: &Inclusion::constant(24),
-                    suffix_list,
-                    declarations: &[],
-                    updates: &[],
-                    unsealed: &BTreeSet::new(),
-                    log_key: &|_| None,
-                },
+                &label_input(&parameters, &inclusion, &unsealed, suffix_list),
             )
             .unwrap();
             let mut labelers: Vec<String> = planned

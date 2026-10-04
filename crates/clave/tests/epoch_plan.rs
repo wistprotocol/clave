@@ -1056,7 +1056,19 @@ fn a_label_of_a_labeler_whose_recovery_window_is_open_waits_with_its_eligibility
     let envelope = &history["declarations"]["G"];
     let label = &history["labels"]["L1"];
     let sealed_at_s = wist_core::timestamp::log_seconds("2026-10-01T00:00:00Z").unwrap();
-    let event = &history["events"][3];
+    let events = history["events"].as_array().unwrap();
+    let pulled = events
+        .iter()
+        .position(|event| {
+            event["labels"]
+                .as_array()
+                .is_some_and(|labels| labels.contains(&json!("L1")))
+        })
+        .unwrap();
+    let event = events[pulled..]
+        .iter()
+        .find(|event| event["event"] == "epoch")
+        .unwrap();
     let (map, _, _, unsealed) = epoch_input_parts(&History::read(&vector["keys"], history), event);
     let key = |_: &str| None;
     let inclusion = Inclusion::constant(4);

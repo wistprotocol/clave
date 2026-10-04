@@ -4,10 +4,11 @@ mod common;
 use common::spec_dir;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::path::Path;
 use wist_core::checkpoint::{self, AggregatorKey, Checkpoint};
 use wist_core::crypto::{PublicKey, SigningKey};
-use wist_core::objects::{AggregatorKeyEntry, StateEntry};
+use wist_core::objects::{AggregatorKeyEntry, ParameterEntry, StateEntry};
 
 const SEAL_START: i64 = 1_786_276_800;
 const LOG_ID: &str = "log.example.test";
@@ -432,6 +433,67 @@ fn the_state_file_key_tuples_authenticate_from_the_anchor_and_carry_the_accepted
             .map(|key| key.key_id.clone())
             .collect::<Vec<_>>(),
         vec!["log1".to_string(), "log2".to_string()]
+    );
+}
+
+#[test]
+fn the_state_file_carries_one_registry_update_tuple_per_accepted_act_at_its_sealing_height() {
+    let log = Log::new();
+    log.seal(0);
+    clave::log_key::add(&log.db, log.path(), SEAL_START).unwrap();
+    log.seal(1);
+    clave::param_change::run(
+        &log.db,
+        &log.genesis(),
+        "feed_window",
+        500,
+        None,
+        SEAL_START + 3600,
+    )
+    .unwrap();
+    log.seal(2);
+    let list = log.path().join("list.dat");
+    std::fs::write(&list, "com\n").unwrap();
+    clave::suffix_list::pin(
+        &log.db,
+        log.path(),
+        &log.genesis(),
+        &list,
+        SEAL_START + 2 * 3600,
+    )
+    .unwrap();
+    let sealed = log.seal(3);
+    assert_eq!(sealed.entry_count, 1, "{:?}", sealed.dropped);
+
+    let mut expected = Vec::new();
+    for height in 1..=3 {
+        for entry in log.db.epoch_entries(height).unwrap() {
+            expected.push((
+                wist_core::registry_updates::update_id(&entry["body"]).unwrap(),
+                height,
+            ));
+        }
+    }
+    assert_eq!(expected.len(), 3);
+    let state = log.state("2026-08-09");
+    let entries: Vec<StateEntry> =
+        serde_json::from_value(state["state"]["entries"].clone()).unwrap();
+    let mut carried: Vec<(String, u64)> = entries
+        .iter()
+        .filter_map(|entry| match entry {
+            StateEntry::RegistryUpdate(entry) => {
+                Some((entry.update_id.clone(), entry.sealing_height))
+            }
+            _ => None,
+        })
+        .collect();
+    carried.sort_by_key(|(_, height)| *height);
+    assert_eq!(carried, expected);
+    let manifest = log.document(&format!("{}/manifest.json", log.snapshot("2026-08-09")));
+    let values: Vec<Value> = state["state"]["entries"].as_array().unwrap().clone();
+    assert_eq!(
+        manifest["manifest"]["state"]["state_digest"],
+        wist_core::snapshot::state_digest(&values).unwrap()
     );
 }
 
@@ -927,6 +989,33 @@ fn replay_vector_history(history: &Value) -> (tempfile::TempDir, clave::db::Db, 
     (data, db, epochs)
 }
 
+fn complete_state(reader: &clave::history::History<'_>, head_at: i64) -> BTreeSet<String> {
+    let keys = reader
+        .key_entries()
+        .into_iter()
+        .map(StateEntry::AggregatorKey);
+    let parameters = clave::registry::parameter_state(reader.schedule().unwrap(), head_at)
+        .unwrap()
+        .into_iter()
+        .map(|(name, value, effective_at)| {
+            StateEntry::Parameter(ParameterEntry {
+                name,
+                effective_at,
+                value,
+            })
+        });
+    let updates = reader
+        .replay()
+        .registry_updates()
+        .entries()
+        .into_iter()
+        .map(StateEntry::RegistryUpdate);
+    keys.chain(parameters)
+        .chain(updates)
+        .map(|entry| serde_json::to_value(entry).unwrap().to_string())
+        .collect()
+}
+
 fn state_tuples(entries: &[AggregatorKeyEntry]) -> Vec<Value> {
     entries
         .iter()
@@ -946,6 +1035,7 @@ fn the_aggregator_key_vector_histories_replay_through_the_history_reader() {
         let head = db.last_epoch().unwrap();
         let mut reader = clave::history::History::open(&db, data.path(), head).unwrap();
         let verified_head = history["verified_head"].as_u64().unwrap();
+        let mut head_at = None;
         for epoch in &epochs {
             let height = epoch["epoch_number"].as_u64().unwrap();
             let applied = epoch["applied"].as_bool().unwrap();
@@ -961,6 +1051,7 @@ fn the_aggregator_key_vector_histories_replay_through_the_history_reader() {
                 .unwrap_or_else(|error| panic!("{name} Epoch {height}: {error}"))
                 .unwrap_or_else(|| panic!("{name} Epoch {height} is missing"));
             assert_eq!(read.epoch_number(), height, "{name}");
+            head_at = Some(read.sealed_at_s());
             let expected: Vec<Value> =
                 serde_json::from_value(epoch["expected_state"].clone()).unwrap();
             assert_eq!(
@@ -1004,15 +1095,15 @@ fn the_aggregator_key_vector_histories_replay_through_the_history_reader() {
             assert_eq!(valid, expected, "{name} keys valid at height {height}");
         }
         if let Some(state) = history.get("snapshot_state") {
+            assert_eq!(state["epoch_number"].as_u64(), reader.height(), "{name}");
+            let held = complete_state(&reader, head_at.unwrap());
             for case in state["cases"].as_array().unwrap() {
-                let stated: Vec<Value> = case["entries"]
+                let stated: BTreeSet<String> = case["entries"]
                     .as_array()
                     .unwrap()
                     .iter()
-                    .filter(|tuple| tuple[0] == "aggregator_key")
-                    .cloned()
+                    .map(|tuple| tuple.to_string())
                     .collect();
-                let held = state_tuples(&reader.key_entries());
                 let label = case["name"].as_str().unwrap();
                 if case["verifies"].as_bool().unwrap() {
                     assert_eq!(held, stated, "{name}: {label}");
@@ -1022,6 +1113,56 @@ fn the_aggregator_key_vector_histories_replay_through_the_history_reader() {
             }
         }
     }
+}
+
+#[test]
+fn the_snapshot_key_vector_states_a_replay_leaves_are_the_history_readers_state() {
+    let vector: Value = serde_json::from_slice(
+        &std::fs::read(spec_dir().join("vectors/wist3/snapshot-keys.json")).unwrap(),
+    )
+    .unwrap();
+    let (data, db, _) = replay_vector_history(&vector["history"]);
+    let tie = &vector["removal_tie_break"];
+    let mut replayed = 0;
+    for case in vector["cases"].as_array().unwrap() {
+        let label = case["name"].as_str().unwrap();
+        let head = db.epoch_at(case["epoch_number"].as_u64().unwrap()).unwrap();
+        let mut reader = clave::history::History::open(&db, data.path(), head).unwrap();
+        let mut head_at = None;
+        while let Some(epoch) = reader.next_epoch().unwrap() {
+            head_at = Some(epoch.sealed_at_s());
+        }
+        let held = complete_state(&reader, head_at.unwrap());
+        let digest = wist_core::snapshot::state_digest(
+            &held
+                .iter()
+                .map(|tuple| serde_json::from_str(tuple).unwrap())
+                .collect::<Vec<Value>>(),
+        )
+        .unwrap();
+        let stated: BTreeSet<String> = case["state"]["state"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tuple| tuple.to_string())
+            .collect();
+        if case["name"] == tie["alternate_case"] {
+            assert_ne!(held, stated, "{label}");
+            assert_eq!(digest, tie["accepted_state_digest"], "{label}");
+            assert_eq!(
+                case["state_digest"], tie["alternate_state_digest"],
+                "{label}"
+            );
+        } else if case["expected"] == "accept" {
+            assert_eq!(held, stated, "{label}");
+            assert_eq!(digest, case["state_digest"], "{label}");
+            replayed += 1;
+        }
+    }
+    assert!(
+        replayed >= 7,
+        "the vector offers {replayed} accepted states"
+    );
 }
 
 #[test]

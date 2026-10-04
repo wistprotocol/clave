@@ -5,7 +5,6 @@ use crate::db::{Db, EpochRow};
 use crate::error::{Error, Result};
 use crate::registry;
 use serde_json::Value;
-use std::collections::BTreeSet;
 use std::path::Path;
 use wist_core::aggregator_keys::Registry;
 use wist_core::checkpoint::{self, AggregatorKey, Checkpoint};
@@ -15,6 +14,7 @@ use wist_core::objects::{
 };
 use wist_core::parameters::{Amendment, Schedule};
 use wist_core::sealing::{Epoch, Judgment, Outcome, Removed, Replay};
+use wist_core::suffix_list::{Disposition, HeldFile, SuffixListReplay};
 
 pub struct LogAnchor {
     pub log_id: String,
@@ -130,16 +130,6 @@ impl VerifiedEpoch {
     }
 }
 
-pub fn sealing_parameters(schedule: &Schedule, at: i64) -> Result<wist_core::sealing::Parameters> {
-    Ok(wist_core::sealing::Parameters::new(
-        wist_core::parameters::PARAMS.iter().filter_map(|spec| {
-            schedule
-                .value_at(spec.name, at)
-                .map(|value| (spec.name, value))
-        }),
-    )?)
-}
-
 pub struct History<'a> {
     db: &'a Db,
     head: Option<EpochRow>,
@@ -152,7 +142,7 @@ pub struct History<'a> {
     schedule: Option<Schedule>,
     failed: bool,
     replay: Replay,
-    labels: BTreeSet<String>,
+    suffix_lists: SuffixListReplay,
 }
 
 impl<'a> History<'a> {
@@ -175,7 +165,7 @@ impl<'a> History<'a> {
             schedule: None,
             failed: false,
             replay: Replay::new(),
-            labels: BTreeSet::new(),
+            suffix_lists: SuffixListReplay::new(),
         })
     }
 
@@ -274,39 +264,39 @@ impl<'a> History<'a> {
         // registry — under the keys valid at N−1 (§3.4) — before the
         // Checkpoint's signature is verified under the keys valid at N.
         let mut registry = self.registry.clone();
-        registry.apply_epoch(
-            height,
-            entries
-                .iter()
-                .filter(|entry| entry["type"] == "registry_update")
-                .map(|entry| &entry["body"]),
-        );
+        let acts: Vec<&Value> = entries
+            .iter()
+            .filter(|entry| entry["type"] == "registry_update")
+            .map(|entry| &entry["body"])
+            .collect();
+        let key_outcomes = registry.apply_epoch(height, acts.iter().copied());
         let keys = registry.valid_at(height);
         checkpoint::verify(&checkpoint, &self.log_id, &keys, &[])
             .map_err(|e| failure(&e.to_string()))?;
 
         let mut rejected_parameters = Vec::new();
+        let mut accepted_acts: Vec<&Value> = key_outcomes
+            .iter()
+            .zip(&acts)
+            .filter(|(outcome, _)| outcome.is_accepted())
+            .map(|(_, act)| *act)
+            .collect();
         for (index, entry) in entries.iter().enumerate() {
             if entry["type"] != "registry_update"
                 || entry["body"]["update"]["action"] != "parameter_change"
             {
                 continue;
             }
-            if !accept_parameter(&keys, &mut schedule, entry, height, index, at, largest) {
+            if accept_parameter(&keys, &mut schedule, entry, height, index, at, largest) {
+                accepted_acts.push(&entry["body"]);
+            } else {
                 rejected_parameters.push(index);
             }
         }
         if largest > schedule.epoch_size_bounds(at).0 {
             return Err(failure("Epoch exceeds the accepted size schedule"));
         }
-        for entry in entries.iter().filter(|entry| entry["type"] == "label") {
-            if let Ok(id) = wist_core::label::label_id(&entry["body"]["label"]) {
-                if !self.labels.insert(id) {
-                    return Err(failure("a Label ID is carried by a lower label Entry"));
-                }
-            }
-        }
-        let parameters = sealing_parameters(&schedule, at)?;
+        let parameters = wist_core::sealing::Parameters::from_schedule(&schedule, at)?;
         let suffix_list = crate::suffix_list::in_force_at_epoch(self.db, height)?;
         let log_key = |key_id: &str| {
             keys.iter()
@@ -332,6 +322,24 @@ impl<'a> History<'a> {
                 records_removed,
             } => (None, entries, records_removed),
         };
+        if rejected.is_none() {
+            let db = self.db;
+            for act in &acts {
+                let disposition = self.suffix_lists.apply(height, act, log_key, |identifier| {
+                    db.suffix_list_bytes(identifier)
+                        .ok()
+                        .flatten()
+                        .map_or(HeldFile::Absent, HeldFile::Bytes)
+                });
+                if matches!(disposition, Disposition::Accepted { .. }) {
+                    accepted_acts.push(act);
+                }
+            }
+            for act in accepted_acts {
+                let update_id = wist_core::registry_updates::update_id(act)?;
+                self.replay.accept_registry_update(&update_id, height);
+            }
+        }
         self.next_height = height
             .checked_add(1)
             .ok_or_else(|| failure("Epoch height overflow"))?;

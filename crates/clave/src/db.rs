@@ -1571,26 +1571,7 @@ impl Db {
 
     pub fn parameter_state(&self, at: &str) -> Result<Vec<(String, i64, String)>> {
         let at = crate::registry::unix(at)?;
-        let schedule = self.parameter_schedule(at)?;
-        let mut latest = std::collections::BTreeMap::new();
-        for amendment in schedule.accepted().iter().filter(|a| a.sealed_at_s <= at) {
-            latest.insert(
-                (amendment.parameter.clone(), amendment.effective_at_s),
-                amendment.value,
-            );
-        }
-        latest
-            .into_iter()
-            .map(|((name, effective_at), value)| {
-                Ok((
-                    name,
-                    value,
-                    jiff::Timestamp::from_second(effective_at)
-                        .map_err(|e| Error::ParamChange(e.to_string()))?
-                        .to_string(),
-                ))
-            })
-            .collect()
+        crate::registry::parameter_state(&self.parameter_schedule(at)?, at)
     }
 
     pub fn list_publishers(&self) -> Result<Vec<PublisherListRow>> {

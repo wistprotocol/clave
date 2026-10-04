@@ -18,7 +18,6 @@ use wist_core::suffix_list::{registrable_domain, SuffixList};
 
 const CANDIDATE_ROOT: &str = "candidate";
 const NOT_ADMITTED: &str = "WIST2-E03";
-const LABEL_REJECTED: &str = "WIST2-E06";
 const CONTRACT_FAILED: &str = "WIST4-E04";
 const ITEM_OVER_BOUND: &str = "WIST1-E04";
 const ENTRY_OVER_BOUND: &str = "WIST3-E03";
@@ -676,11 +675,8 @@ struct Turn<'a, 'b, H: Held> {
     input: &'a EpochInput<'b>,
     held: &'a H,
     caps: item::SizeCaps,
-    sealed_at_s: i64,
     capacity: u64,
     labeler_cap: u64,
-    url_cap_bytes: i64,
-    clock_skew_seconds: i64,
     in_force: BTreeMap<String, Publisher>,
     windows: BTreeSet<String>,
     holding: BTreeSet<String>,
@@ -712,27 +708,6 @@ impl<H: Held> Turn<'_, '_, H> {
             }
         }
     }
-
-    /// WIST-3 §3.3: the WIST-2 §3.3 checks that read the candidate Epoch's map and clock.
-    fn label_refusal(&self, kind: LabelKind, envelope: &Value) -> Option<&'static str> {
-        let inner = &envelope[kind.as_str()];
-        if kind == LabelKind::Label {
-            let octets =
-                wist_core::jcs::canonicalize(&inner["subject"]).map_or(usize::MAX, |o| o.len());
-            if i64::try_from(octets).map_or(true, |octets| octets > self.url_cap_bytes) {
-                return Some(LABEL_REJECTED);
-            }
-        }
-        let asserted_at = inner["asserted_at"].as_str().unwrap_or_default();
-        match wist_core::publisher_time::within_clock_bound(
-            asserted_at,
-            self.sealed_at_s,
-            self.clock_skew_seconds,
-        ) {
-            Some(true) => None,
-            _ => Some(LABEL_REJECTED),
-        }
-    }
 }
 
 struct PlannedEntry {
@@ -749,7 +724,6 @@ struct Pass {
     holding: Vec<(HeldBack, u64)>,
     dropped: Vec<(TurnKey, Left)>,
     unsealed: Vec<LeftUnsealed>,
-    rejected: Vec<LabelRejection>,
 }
 
 #[derive(Default)]
@@ -963,10 +937,6 @@ fn run_pass<H: Held>(
                         .contains(&Unsealed::Label { id: id.clone() })
                     {
                         leave_unsealed(&mut pass, publication, label.place, label.eligibility)?;
-                        continue;
-                    }
-                    if let Some(code) = turn.label_refusal(label.kind, &label.envelope) {
-                        pass.rejected.push(LabelRejection { id, code });
                         continue;
                     }
                     take(&mut room, &label.publisher);
@@ -1459,11 +1429,8 @@ pub fn plan(state: &State, held: &impl Held, input: &EpochInput<'_>) -> Result<P
         input,
         held,
         caps: parameters.size_caps()?,
-        sealed_at_s: wist_core::timestamp::log_seconds(input.sealed_at)?,
         capacity: positive("domain_epoch_entries_max")?,
         labeler_cap: positive("labeler_epoch_entries_max")?,
-        url_cap_bytes: parameters.value("url_cap_bytes")?,
-        clock_skew_seconds: parameters.value("clock_skew_seconds")?,
         in_force,
         windows,
         holding,
@@ -1475,6 +1442,7 @@ pub fn plan(state: &State, held: &impl Held, input: &EpochInput<'_>) -> Result<P
     let mut gone: BTreeSet<CollectionKey> = BTreeSet::new();
     let mut left: Vec<(TurnKey, Left)> = Vec::new();
     let mut replaced: BTreeMap<CollectionKey, (String, String)> = BTreeMap::new();
+    let mut rejections: Vec<LabelRejection> = Vec::new();
     let (pass, entries, judged, records_removed) = loop {
         let pass = run_pass(&mut next, &turn, &mut lists, &mut gone)?;
         left.extend(pass.dropped.iter().cloned());
@@ -1699,8 +1667,16 @@ pub fn plan(state: &State, held: &impl Held, input: &EpochInput<'_>) -> Result<P
                         )));
                     }
                 }
-                Publication::Label { .. } => {
-                    return Err(history("a Label is ignored by the judgment"));
+                Publication::Label { id, .. } => {
+                    let code = failed
+                        .first()
+                        .map(|failure| failure.code)
+                        .ok_or_else(|| history("a Label ignored without a failure"))?;
+                    next.labels.remove(id);
+                    rejections.push(LabelRejection {
+                        id: id.clone(),
+                        code,
+                    });
                 }
             }
         }
@@ -1785,9 +1761,6 @@ pub fn plan(state: &State, held: &impl Held, input: &EpochInput<'_>) -> Result<P
             next.sealed_labels.insert(id.clone());
         }
     }
-    for rejection in &pass.rejected {
-        next.labels.remove(&rejection.id);
-    }
     left.sort_by(|a, b| a.0.cmp(&b.0));
     let sealed = pass
         .planned
@@ -1813,7 +1786,7 @@ pub fn plan(state: &State, held: &impl Held, input: &EpochInput<'_>) -> Result<P
         held: pass.holding.into_iter().map(|(held, _)| held).collect(),
         held_late,
         unsealed: pass.unsealed,
-        rejections: pass.rejected,
+        rejections,
         declarations_failed: candidates.failed,
         declarations_left: candidates.left,
         updates_refused,

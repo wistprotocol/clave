@@ -14,8 +14,9 @@ use wist_core::label::{self, LabelerRow, SealedLabelCount};
 use wist_core::materialization::{self, ContentTuple, LinkRow};
 use wist_core::objects::{
     AggregatorKeyEntry, DeclarationEntry, DisputeEntry, LabelEntry, ParameterEntry, Payload,
-    PendingDeclarationEntry, RecoveryWindowEntry, SnapshotFile, SnapshotIndex, SnapshotIndexEntry,
-    SnapshotManifest, SnapshotState, SnapshotStateFile, StateEntry, SuffixListEntry,
+    PendingDeclarationEntry, RecoveryWindowEntry, RegistryUpdateEntry, SnapshotFile, SnapshotIndex,
+    SnapshotIndexEntry, SnapshotManifest, SnapshotState, SnapshotStateFile, StateEntry,
+    SuffixListEntry,
 };
 use wist_core::sealing::Records;
 use wist_core::snapshot::{content_digest, shard_of, shard_path, state_digest, TIER_FILES};
@@ -438,6 +439,7 @@ struct ReadState {
     records: Vec<Materialized>,
     parameters: Vec<(String, i64, String)>,
     suffix_list: Option<(String, u64)>,
+    registry_updates: Vec<RegistryUpdateEntry>,
     labels: Vec<LabelEntry>,
     disputes: Vec<DisputeEntry>,
     labelers: Vec<LabelerRow>,
@@ -460,7 +462,12 @@ fn read_state(db: &Db, data_dir: &Path, head: EpochRow) -> Result<ReadState> {
             removing_act: None,
         });
     }
-    let declarations = Declarations::reconstruct(db, data_dir, Some(head.clone()))?;
+    let mut history = crate::history::History::open(db, data_dir, Some(head.clone()))?;
+    let mut declarations = Declarations::default();
+    while let Some(epoch) = history.next_epoch()? {
+        declarations.apply(&epoch)?;
+    }
+    let registry_updates = history.replay().registry_updates().entries();
     let log_entries = db.log_state_entries()?;
     let domains = declarations.domains();
     let records = materialize(&log_entries, |host| domains.contains_key(host))?;
@@ -470,6 +477,7 @@ fn read_state(db: &Db, data_dir: &Path, head: EpochRow) -> Result<ReadState> {
         records,
         parameters: db.parameter_state(&head.sealed_at)?,
         suffix_list: db.suffix_list_at_epoch(head.epoch_number)?,
+        registry_updates,
         labels,
         disputes,
         labelers,
@@ -505,6 +513,12 @@ fn build_state(read: &ReadState) -> Result<(SnapshotState, String)> {
             sealing_height: *sealing_height,
         }));
     }
+    entries.extend(
+        read.registry_updates
+            .iter()
+            .cloned()
+            .map(StateEntry::RegistryUpdate),
+    );
     entries.extend(read.labels.iter().cloned().map(StateEntry::Label));
     entries.extend(read.disputes.iter().cloned().map(StateEntry::Dispute));
     for (domain, state) in domains {

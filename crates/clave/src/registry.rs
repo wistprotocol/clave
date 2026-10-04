@@ -39,6 +39,33 @@ pub(crate) fn accept(
         .map_err(|e| Error::ParamChange(format!("WIST4-E03 {e}")))
 }
 
+/// WIST-3 §7: one `parameter` tuple per amendment sealed by `at_s` that no later amendment with
+/// its `effective_at` supersedes.
+pub fn parameter_state(
+    schedule: &wist_core::parameters::Schedule,
+    at_s: i64,
+) -> Result<Vec<(String, i64, String)>> {
+    let mut latest = std::collections::BTreeMap::new();
+    for amendment in schedule.accepted().iter().filter(|a| a.sealed_at_s <= at_s) {
+        latest.insert(
+            (amendment.parameter.clone(), amendment.effective_at_s),
+            amendment.value,
+        );
+    }
+    latest
+        .into_iter()
+        .map(|((name, effective_at), value)| {
+            Ok((
+                name,
+                value,
+                jiff::Timestamp::from_second(effective_at)
+                    .map_err(|e| Error::ParamChange(e.to_string()))?
+                    .to_string(),
+            ))
+        })
+        .collect()
+}
+
 pub(crate) fn epoch_cap(schedule: &wist_core::parameters::Schedule, at: i64) -> i64 {
     schedule.epoch_size_bounds(at).0 as i64
 }
