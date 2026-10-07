@@ -1,6 +1,6 @@
 # clave
 
-The publication formats target [WIST specification revision `0127b0f2e5420e167a15d3f7afae6ed81030e158`](https://github.com/wistprotocol/spec/tree/0127b0f2e5420e167a15d3f7afae6ed81030e158). Object version `1.0.0` alone does not identify a compatible draft.
+The publication format — Declarations, Collections, Catalogs, Items and Payloads — targets [WIST specification revision `f4acfefbe7d3cdb8e82ed34053377159d8782890`](https://github.com/wistprotocol/spec/tree/f4acfefbe7d3cdb8e82ed34053377159d8782890). Object version `1.0.0` alone does not identify a compatible draft.
 
 WIST Protocol aggregator. Clave pulls each Publisher's Declaration, the
 Catalogs of its Collections with their Items and Payloads, and its Label
@@ -409,8 +409,8 @@ Reconciliation without a running producer also removes unfinished
 Witness; `--remove <name>` drops one and no argument lists them. The
 verifier key is the signed-note string `<name>+<hex key ID>+<base64 key>`
 of the Ed25519 cosignature/v1 type, and the store keeps the tree size each
-Witness last cosigned. Default: no Witness, and a Log with none behaves
-exactly as before.
+Witness last cosigned. Default: no Witness, and a seal then submits
+nothing.
 
 After the archive write, each seal submits the head Checkpoint to every
 configured Witness through [tlog-witness]'s `add-checkpoint`: the body is
@@ -712,11 +712,10 @@ history containing an Epoch that exceeded its accepted schedule. Snapshot
 parameter tuples include pending amendments and omit superseded
 equal-effective-time values.
 
-A store written before the Log became one tree keys its Blocks by a
-per-Block hash and holds no leaf data; opening it fails with that reason
-rather than half-migrating it. A store written before this rename still
-names its table and columns after `block` and is refused the same way.
-Start a new data directory.
+A store that keys its Blocks by a per-Block hash and holds no leaf data
+fails to open with that reason rather than being half-migrated, as does
+one that names its table and columns after `block`. Start a new data
+directory.
 
 Schedule validation uses the protocol's Registry defaults. Direct local
 parameter overrides, including the accelerated `--cadence` setting, do not
@@ -734,9 +733,14 @@ replacement of both trusted inputs.
 The reader parses each Checkpoint as a signed note, checks that it states
 the Epoch the store records, checks sequential `epoch_number`s,
 non-shrinking tree sizes,
-strictly increasing whole-second timestamps on the cadence grid, canonical
-Entry order and each Entry's JCS leaf data, and recomputes the root the
-Checkpoint states from the retained leaves and the stored tree hashes.
+strictly increasing whole-second timestamps on the cadence grid and each
+Entry's JCS leaf data, and recomputes the root the Checkpoint states from
+the retained leaves and the stored tree hashes. An Epoch core's sealing
+replay rejects whole — Entries out of form or canonical order among its
+conditions — or one over the smallest `epoch_cap_bytes` in force at its
+`sealed_at` or at any accepted later `effective_at` (`WIST3-E03`) stays in
+the Log and applies its key acts alone; `VerifiedEpoch::rejected` carries
+its codes and the reader continues (WIST-3 §3.3).
 
 It then replays the Epoch's Aggregator key acts — authenticated under the
 keys valid at the height below it — and verifies the Checkpoint's signature
