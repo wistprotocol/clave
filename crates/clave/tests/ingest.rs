@@ -935,3 +935,94 @@ fn unused_excluded_keys_survive_ingest_reopen_and_sealing_without_blocking_usabl
     assert_eq!(entries[0]["body"], signed);
     assert_eq!(common::sealed_item_ids(&entries), [common::item_id(&item)]);
 }
+
+#[test]
+fn an_established_publisher_is_admitted_at_first_contact_and_its_seq_becomes_the_floor() {
+    let (listener, host, client) = reserve_addr();
+    let p = make_publisher(&host);
+    let seed = common::current_declaration(&p)["publisher"].clone();
+    let mut unseen = seed.clone();
+    unseen["seq"] = 1.into();
+    unseen["prev_declaration"] = common::declaration_hash(&common::current_declaration(&p)).into();
+    unseen["contact"] = "mailto:unseen@example.com".into();
+    common::write_declaration(&p, &unseen, &common::K1_SEED);
+    let unseen = common::current_declaration(&p);
+    let mut established = seed.clone();
+    established["seq"] = 2.into();
+    established["prev_declaration"] = common::declaration_hash(&unseen).into();
+    common::write_declaration(&p, &established, &common::K1_SEED);
+    let established = common::current_declaration(&p);
+    let page = common::page_item(&p, &format!("https://{host}/a"), "first contact");
+    let catalog = common::publish_collection(
+        &p,
+        "default",
+        &with_payloads(std::slice::from_ref(&page)),
+        "2026-08-09T12:00:00Z",
+        None,
+    );
+    serve_static(listener, p.dir.path().to_path_buf());
+    let (data, db) = open_store(&host);
+    let stored = |db: &clave::db::Db| -> serde_json::Value {
+        serde_json::from_slice(&db.get_publisher_declaration(&host).unwrap().unwrap()).unwrap()
+    };
+
+    let report = common::pull_at(&db, &client, data.path(), &host, "2026-08-09T12:00:05Z");
+    assert_eq!(report.ended, None);
+    assert_eq!(report.noise, None);
+    assert_eq!(report.accepted, [format!("default/{}", catalog.catalog_id)]);
+    assert_eq!(admitted_ids(&report), [common::item_id(&page.0)]);
+    assert_eq!(stored(&db), established);
+    assert_eq!(db.highest_accepted_declaration_seq(&host).unwrap(), Some(2));
+    assert!(db.get_pending_identity(&host).unwrap().is_none());
+    assert!(db.get_recovery_window(&host).unwrap().is_none());
+
+    let mut forged = seed.clone();
+    forged["seq"] = 1.into();
+    forged["prev_declaration"] = common::declaration_hash(&established).into();
+    common::write_declaration(&p, &forged, &common::K1_SEED);
+    let report = common::pull_at(&db, &client, data.path(), &host, "2026-08-09T12:10:00Z");
+    assert_eq!(report.ended.as_deref(), Some("WIST2-E01"));
+    assert_eq!(report.noise, None);
+    let codes: Vec<String> = db
+        .list_rejections(&host)
+        .unwrap()
+        .into_iter()
+        .map(|rejection| rejection.code)
+        .collect();
+    assert_eq!(codes, ["WIST2-E01", "WIST1-E08"]);
+    assert_eq!(stored(&db), established);
+
+    let key = clave::keys::load(&data.path().join("keys/seed")).unwrap();
+    let sealed_at = wist_core::timestamp::log_seconds("2026-08-09T13:00:00Z").unwrap();
+    let height = clave::seal::run(&db, data.path(), &key, sealed_at)
+        .unwrap()
+        .epoch_number;
+    let history = clave::history::declarations::Declarations::reconstruct(
+        &db,
+        data.path(),
+        db.last_epoch().unwrap(),
+    )
+    .unwrap();
+    let domain = &history.domains()[&host];
+    assert_eq!(domain.current().envelope(), &established);
+    assert_eq!(domain.highest_accepted_seq(), 2);
+    assert_eq!(domain.first().epoch_number, height);
+    assert!(domain.window().is_none() && domain.pending().is_none());
+
+    let mut rotated = seed;
+    rotated["seq"] = 3.into();
+    rotated["prev_declaration"] = common::declaration_hash(&established).into();
+    rotated["keys"] = serde_json::json!([
+        common::key_entry(&common::K1_SEED, "2026-08-09T00:00:00Z"),
+        common::key_entry(&common::K2_SEED, "2026-08-09T00:00:00Z"),
+    ]);
+    common::write_declaration(&p, &rotated, &common::K1_SEED);
+    let rotated = common::current_declaration(&p);
+    let report = common::pull_at(&db, &client, data.path(), &host, "2026-08-09T14:00:00Z");
+    assert_eq!(report.ended, None);
+    assert_eq!(report.noise, None);
+    assert_eq!(stored(&db), rotated);
+    assert_eq!(db.highest_accepted_declaration_seq(&host).unwrap(), Some(3));
+    assert!(db.get_pending_identity(&host).unwrap().is_none());
+    assert!(db.get_recovery_window(&host).unwrap().is_none());
+}

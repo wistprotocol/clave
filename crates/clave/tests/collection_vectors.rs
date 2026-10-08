@@ -278,7 +278,7 @@ fn a_pull_reads_the_sources_the_publisher_state_gives_once_the_fetched_declarati
         assert_eq!(view, wanted, "{name}");
         assert_declaration_stop(&report, name);
     }
-    assert_eq!(cases.len(), 26);
+    assert_eq!(cases.len(), 32);
 }
 
 #[test]
