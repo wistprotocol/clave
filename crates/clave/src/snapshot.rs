@@ -289,12 +289,9 @@ fn build_label_tables(
     })
 }
 
-/// WIST-2 §3.3, WIST-3 §7: the Labels and disputes current at
-/// `head_sealed_at`, and labeler statistics over every sealed Label.
-fn label_state(
-    db: &Db,
-    head_sealed_at: &str,
-) -> Result<(Vec<LabelEntry>, Vec<DisputeEntry>, Vec<LabelerRow>)> {
+/// WIST-2 §3.3, WIST-3 §7: the current Labels and disputes, and labeler
+/// statistics over every sealed Label.
+fn label_state(db: &Db) -> Result<(Vec<LabelEntry>, Vec<DisputeEntry>, Vec<LabelerRow>)> {
     let sealed = db.sealed_labels()?;
     let mut by_triple: BTreeMap<(String, String, String), Vec<&label::SealedLabel>> =
         BTreeMap::new();
@@ -311,7 +308,7 @@ fn label_state(
     let labels: Vec<LabelEntry> = by_triple
         .values()
         .filter_map(|group| label::current_label(group.iter().copied()))
-        .filter_map(|current| label::label_tuple(current, head_sealed_at))
+        .map(label::label_tuple)
         .collect();
     let disputes_sealed = db.sealed_disputes()?;
     let mut by_pair: BTreeMap<(String, String), Vec<&label::SealedDispute>> = BTreeMap::new();
@@ -449,7 +446,7 @@ struct ReadState {
 }
 
 fn read_state(db: &Db, data_dir: &Path, head: EpochRow) -> Result<ReadState> {
-    let (labels, disputes, labelers) = label_state(db, &head.sealed_at)?;
+    let (labels, disputes, labelers) = label_state(db)?;
     let mut key_entries = db.aggregator_key_entries()?;
     if key_entries.is_empty() {
         let anchor = crate::history::anchor(data_dir)?;
@@ -1075,7 +1072,7 @@ fn build_staged(
         let shard_labels: Vec<LabelEntry> = read
             .labels
             .iter()
-            .filter(|l| in_shard(&l.labeler))
+            .filter(|l| in_shard(&l.labeler) && label::applies_at(l, &read.head.sealed_at))
             .cloned()
             .collect();
         let shard_disputes: Vec<DisputeEntry> = read

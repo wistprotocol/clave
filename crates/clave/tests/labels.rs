@@ -46,6 +46,25 @@ fn write_listed_with_next(
 }
 
 fn state_entries(data: &std::path::Path) -> Vec<Value> {
+    snapshot_contents(data).0
+}
+
+fn parquet_rows(path: &std::path::Path) -> Vec<Vec<String>> {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    let reader = SerializedFileReader::new(fs::File::open(path).unwrap()).unwrap();
+    reader
+        .get_row_iter(None)
+        .unwrap()
+        .map(|row| {
+            row.unwrap()
+                .get_column_iter()
+                .map(|(_, value)| format!("{value}").trim_matches('"').to_owned())
+                .collect()
+        })
+        .collect()
+}
+
+fn snapshot_contents(data: &std::path::Path) -> (Vec<Value>, Vec<Vec<String>>) {
     let read = |path: &std::path::Path| -> Value {
         serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
     };
@@ -76,10 +95,12 @@ fn state_entries(data: &std::path::Path) -> Vec<Value> {
         .parent()
         .unwrap()
         .join(manifest["manifest"]["state"]["path"].as_str().unwrap());
-    read(&state_path)["state"]["entries"]
+    let entries = read(&state_path)["state"]["entries"]
         .as_array()
         .unwrap()
-        .clone()
+        .clone();
+    let labels = parquet_rows(&manifest_path.parent().unwrap().join("tier1/labels.parquet"));
+    (entries, labels)
 }
 
 fn label(labeler: &str, subject: &str, name: &str, asserted_at: &str) -> Value {
@@ -217,7 +238,7 @@ fn labels_and_disputes_are_pulled_sealed_and_carried() {
         db.sealed_label_subject(&id).unwrap().as_deref(),
         Some(subject)
     );
-    let entries = state_entries(data.path());
+    let (entries, label_rows) = snapshot_contents(data.path());
     assert!(entries.contains(&json!([
         "label",
         host,
@@ -225,11 +246,24 @@ fn labels_and_disputes_are_pulled_sealed_and_carried() {
         "wist:spam",
         500_000,
         "2026-08-09T12:00:00Z",
+        false,
         null,
         null,
         id,
         0
     ])));
+    assert_eq!(
+        label_rows,
+        vec![vec![
+            host.clone(),
+            subject.to_string(),
+            "wist:spam".to_string(),
+            "500000".to_string(),
+            "2026-08-09T12:00:00Z".to_string(),
+            "null".to_string(),
+            "null".to_string(),
+        ]]
+    );
 
     let again =
         clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:30:00Z").unwrap();
@@ -325,8 +359,29 @@ fn labels_and_disputes_are_pulled_sealed_and_carried() {
             "dispute"
         ]
     );
-    let entries = state_entries(data.path());
-    assert!(!entries.iter().any(|e| e[0] == "label"), "{entries:?}");
+    let (entries, label_rows) = snapshot_contents(data.path());
+    let label_tuples: Vec<&Value> = entries.iter().filter(|e| e[0] == "label").collect();
+    assert_eq!(
+        label_tuples,
+        [&json!([
+            "label",
+            host,
+            subject,
+            "wist:spam",
+            null,
+            "2026-08-09T14:00:00Z",
+            true,
+            null,
+            null,
+            retraction.0,
+            1
+        ])],
+        "WIST-3 §7: a retracted current Label keeps its state tuple"
+    );
+    assert!(
+        label_rows.is_empty(),
+        "WIST-3 §7: tier1/labels.parquet omits a retracted current Label: {label_rows:?}"
+    );
     assert!(entries.contains(&json!([
         "dispute",
         id,
@@ -337,6 +392,99 @@ fn labels_and_disputes_are_pulled_sealed_and_carried() {
     ])));
     assert_eq!(db.sealed_labels().unwrap().len(), 2);
     assert_eq!(db.sealed_disputes().unwrap().len(), 1);
+}
+
+#[test]
+fn an_expired_current_label_keeps_its_state_tuple_and_has_no_labels_table_row() {
+    let (listener, host, client) = reserve_addr();
+    let p = make_publisher(&host);
+    write_label_feed(&p, &host, &[], "2026-08-09T12:00:00Z");
+    let expired_subject = "https://reduced.example.org/expired";
+    let live_subject = "https://reduced.example.org/live";
+    let mut expired = label(&host, expired_subject, "wist:spam", "2026-08-09T12:00:00Z");
+    expired["expires_at"] = "2026-08-09T14:00:00Z".into();
+    let (expired_id, expired_envelope) = sign(&p, "label", expired);
+    let mut live = label(&host, live_subject, "wist:spam", "2026-08-09T12:00:00Z");
+    live["expires_at"] = "2026-08-09T14:00:01Z".into();
+    let (live_id, live_envelope) = sign(&p, "label", live);
+    write_listed(
+        &p,
+        &host,
+        &[
+            (expired_id.clone(), expired_envelope),
+            (live_id.clone(), live_envelope),
+        ],
+        "2026-08-09T12:00:00Z",
+    );
+    serve_static(listener, p.dir.path().to_path_buf());
+
+    let data = tempfile::tempdir().unwrap();
+    clave::init::run(&host, data.path()).unwrap();
+    let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
+    db.set_param("epoch_cadence_seconds", 1).unwrap();
+    let report =
+        clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
+    assert_eq!(report.labels.len(), 2, "rejected {:?}", report.rejected);
+    let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
+    let r0 = clave::seal::run(&db, data.path(), &sk, SEAL_START).unwrap();
+    assert_eq!(r0.epoch_number, 0);
+    assert_eq!(db.sealed_labels().unwrap().len(), 2);
+    let (_, label_rows) = snapshot_contents(data.path());
+    assert_eq!(
+        label_rows
+            .iter()
+            .map(|row| row[1].as_str())
+            .collect::<Vec<_>>(),
+        [expired_subject, live_subject],
+        "neither Label has expired at the first Epoch's sealed_at"
+    );
+
+    let r1 = clave::seal::run(&db, data.path(), &sk, SEAL_START + 7200).unwrap();
+    assert_eq!(r1.epoch_number, 1);
+
+    let (entries, label_rows) = snapshot_contents(data.path());
+    assert!(
+        entries.contains(&json!([
+            "label",
+            host,
+            expired_subject,
+            "wist:spam",
+            null,
+            "2026-08-09T12:00:00Z",
+            false,
+            "2026-08-09T14:00:00Z",
+            null,
+            expired_id,
+            0
+        ])),
+        "WIST-3 §7: a current Label expired at sealed_at keeps its state tuple: {entries:?}"
+    );
+    assert!(entries.contains(&json!([
+        "label",
+        host,
+        live_subject,
+        "wist:spam",
+        null,
+        "2026-08-09T12:00:00Z",
+        false,
+        "2026-08-09T14:00:01Z",
+        null,
+        live_id,
+        0
+    ])));
+    assert_eq!(
+        label_rows,
+        vec![vec![
+            host.clone(),
+            live_subject.to_string(),
+            "wist:spam".to_string(),
+            "null".to_string(),
+            "2026-08-09T12:00:00Z".to_string(),
+            "2026-08-09T14:00:01Z".to_string(),
+            "null".to_string(),
+        ]],
+        "an expires_at equal to sealed_at is expired; one after it is not"
+    );
 }
 
 fn is_e06_for(db: &clave::db::Db, host: &str, id: &str) -> bool {
