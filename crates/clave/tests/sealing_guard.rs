@@ -172,6 +172,52 @@ fn a_store_restored_one_epoch_behind_its_published_directory_is_refused_and_chan
 }
 
 #[test]
+fn serve_started_below_the_published_height_exits_with_the_refusal_status_and_a_sentence() {
+    let mut log = Log::new();
+    log.seal(0);
+    let backup = log.back_up();
+    log.seal(1);
+    log.restore(&backup);
+    let before = log.published();
+    log.db = None;
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_clave"))
+        .args([
+            "serve",
+            "--data",
+            log.path().to_str().unwrap(),
+            "--bind",
+            "127.0.0.1:0",
+            "--no-seal",
+        ])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(clave::error::PUBLISHED_AHEAD_EXIT_STATUS),
+        "{stderr}"
+    );
+    assert_ne!(clave::error::PUBLISHED_AHEAD_EXIT_STATUS, 1);
+    assert!(!stderr.contains("PublishedAhead {"), "{stderr}");
+    for expected in [
+        "Epoch 1 is published at",
+        &log.archive(1).display().to_string(),
+        "whose head is Epoch 0",
+        "README, Restored stores and published heights",
+    ] {
+        assert!(
+            stderr.contains(expected),
+            "{expected:?} absent from {stderr}"
+        );
+    }
+    log.db = Some(clave::db::Db::open(&log.store_path()).unwrap());
+    assert_eq!(log.published(), before);
+    assert_eq!(log.head_epoch(), Some(0));
+}
+
+#[test]
 fn a_store_restored_at_its_published_height_seals() {
     let mut log = Log::new();
     log.seal(0);

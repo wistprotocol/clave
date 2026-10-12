@@ -56,8 +56,22 @@ fn published_ahead(holder: &str, published: u64, store_head: Option<u64>) -> Str
     format!(
         "a Checkpoint of Epoch {published} is published at {holder} that the store, whose head is {head}, does not hold; \
          signing another Checkpoint at or below Epoch {published} would equivocate (WIST-3 §5), so nothing is sealed or published. \
-         Restore a backup whose head is at or above Epoch {published}, or end this Log and start a successor Log (WIST-3 §3.4); never seal below the published height"
+         Restore a backup whose head is at or above Epoch {published}, or end this Log and start a successor Log (WIST-3 §3.4); never seal below the published height. \
+         Both recoveries: README, Restored stores and published heights"
     )
+}
+
+/// Exit status of a process ending on `Error::PublishedAhead`, distinct from the
+/// status of every other failure so a service manager can decline to restart it.
+pub const PUBLISHED_AHEAD_EXIT_STATUS: i32 = 3;
+
+impl Error {
+    pub fn exit_status(&self) -> i32 {
+        match self {
+            Error::PublishedAhead { .. } => PUBLISHED_AHEAD_EXIT_STATUS,
+            _ => 1,
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

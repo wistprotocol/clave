@@ -231,7 +231,14 @@ fn produce_snapshot(
     Ok(())
 }
 
-fn main() -> Result<(), clave::Error> {
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("clave: {error}");
+        std::process::exit(error.exit_status());
+    }
+}
+
+fn run() -> Result<(), clave::Error> {
     let cli = Cli::parse();
     match cli.command {
         Command::Init {

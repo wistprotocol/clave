@@ -271,7 +271,10 @@ file named above the head refuses by its name alone. A file at or below
 the head that is missing, torn or unparseable is repaired from the store,
 as described above. Signatures are not checked: a restored store may
 predate the key that signed a later Checkpoint. `serve` therefore does
-not start, with or without `--no-seal`, while the refusal holds.
+not start, with or without `--no-seal`, while the refusal holds: the
+process prints the refusal and exits with status 3, which no other
+failure uses, so a service manager can leave the unit failed instead of
+restarting it (systemd: `RestartPreventExitStatus=3`).
 
 Before sealing, each listed Mirror's `<base URL>checkpoint` is fetched,
 bounded at 65 536 octets. A `404` passes, as does a Checkpoint of this
@@ -289,8 +292,8 @@ confirmed, so a Mirror listed later is consulted at the next seal. A
 refused seal confirms no Mirror. No flag, environment variable or
 setting overrides either refusal.
 
-The refusal names the published height and the file or Mirror URL that
-holds it. To recover:
+The refusal names the published height, the store's head, the file or
+Mirror URL that holds the height, and this section. To recover:
 
 1. Restore a backup whose head is at or above the published height.
 2. When no such backup exists, end the Log and start a successor Log
