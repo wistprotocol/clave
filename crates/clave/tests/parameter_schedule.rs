@@ -70,6 +70,7 @@ fn historical_size_vectors_replay_identically_after_reopening() {
         let data = tempfile::tempdir().unwrap();
         let path = data.path().join("clave.sqlite");
         let mut db = Db::open(&path).unwrap();
+        let mut previous = Vec::new();
         for (height, b) in case["epochs"].as_array().unwrap().iter().enumerate() {
             let expected = &case["expected"][height];
             let at = b["sealed_at_s"].as_i64().unwrap();
@@ -99,18 +100,10 @@ fn historical_size_vectors_replay_identically_after_reopening() {
                 &changes,
                 b["jcs_bytes"].as_u64().unwrap(),
             );
-            let replay = db.parameter_schedule(0);
+            let replay = db.parameter_schedule(0).unwrap();
             if !expected["epoch_valid"].as_bool().unwrap() {
-                assert!(
-                    replay.err().unwrap().to_string().contains("WIST3-E03"),
-                    "{}",
-                    case["label"]
-                );
-                drop(db);
-                assert!(Db::open(&path).is_err(), "{}", case["label"]);
-                break;
+                assert_eq!(replay.accepted(), previous, "{}", case["label"]);
             }
-            let replay = replay.unwrap();
             let rejected: Vec<_> = (0..amendments.len())
                 .filter(|&i| {
                     !replay
@@ -142,8 +135,11 @@ fn historical_size_vectors_replay_identically_after_reopening() {
             );
             assert_eq!(
                 db.largest_epoch_bytes().unwrap(),
-                expected["largest_bytes"].as_u64().unwrap()
+                expected["largest_bytes"].as_u64().unwrap(),
+                "{}",
+                case["label"]
             );
+            previous = before;
         }
     }
 }

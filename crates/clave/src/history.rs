@@ -316,7 +316,8 @@ impl<'a> History<'a> {
         };
         // WIST-4 §5: an Epoch over the smallest cap at its `sealed_at` and every accepted later
         // `effective_at` is rejected whole (WIST-3 §3.3, Rejected Epochs).
-        let outcome = if summary.octets > candidate.epoch_size_bounds(at).0 {
+        let size_rejected = summary.octets > candidate.epoch_size_bounds(at).0;
+        let outcome = if size_rejected {
             self.replay
                 .reject_epoch(&epoch, vec![EPOCH_SIZE_REJECTED.to_owned()])
         } else {
@@ -357,7 +358,9 @@ impl<'a> History<'a> {
             .checked_add(1)
             .ok_or_else(|| failure("Epoch height overflow"))?;
         self.prior_at = Some(at);
-        self.largest = largest;
+        if !size_rejected {
+            self.largest = largest;
+        }
         let recovery_window_days = schedule.value_at("recovery_window_days", at).unwrap();
         let declaration_activation_epochs = schedule
             .value_at("declaration_activation_epochs", at)

@@ -1549,17 +1549,20 @@ impl Db {
     }
 
     pub fn largest_epoch_bytes(&self) -> Result<u64> {
-        Ok(self.conn.query_row(
-            "SELECT COALESCE(MAX(epoch_bytes), 0) FROM epochs",
-            [],
-            |row| row.get(0),
-        )?)
+        Ok(self.replay_parameters(0)?.1)
     }
 
     pub fn parameter_schedule(
         &self,
         first_epoch_s: i64,
     ) -> Result<wist_core::parameters::Schedule> {
+        Ok(self.replay_parameters(first_epoch_s)?.0)
+    }
+
+    fn replay_parameters(
+        &self,
+        first_epoch_s: i64,
+    ) -> Result<(wist_core::parameters::Schedule, u64)> {
         let mut stmt = self.conn.prepare(
             "SELECT epoch_number, sealed_at, epoch_bytes FROM epochs ORDER BY epoch_number",
         )?;
@@ -1595,8 +1598,9 @@ impl Db {
         let mut changes = changes.into_iter().peekable();
         let mut largest = 0;
         for (height, sealed_at, bytes) in epochs {
-            largest = largest.max(bytes);
+            let tentative = largest.max(bytes);
             let at = crate::registry::unix(&sealed_at)?;
+            let mut candidate = schedule.clone();
             while changes.peek().is_some_and(|c| c.2 == height) {
                 let (parameter, value, epoch_number, entry_index, effective_at) =
                     changes.next().unwrap();
@@ -1608,12 +1612,13 @@ impl Db {
                     sealed_at_s: at,
                     effective_at_s: crate::registry::unix(&effective_at)?,
                 };
-                let _ = crate::registry::accept(&mut schedule, amendment, largest);
+                let _ = crate::registry::accept(&mut candidate, amendment, tentative);
             }
-            if largest > schedule.epoch_size_bounds(at).0 {
-                return Err(Error::Seal(format!(
-                    "WIST3-E03 Epoch {height} exceeds the accepted size schedule"
-                )));
+            // WIST-4 §5: an Epoch rejected for its size (WIST3-E03) applies none of its
+            // parameter candidates and its size never enters the running maximum.
+            if bytes <= candidate.epoch_size_bounds(at).0 {
+                schedule = candidate;
+                largest = tentative;
             }
         }
         if changes.next().is_some() {
@@ -1621,7 +1626,7 @@ impl Db {
                 "parameter history names a missing Epoch".into(),
             ));
         }
-        Ok(schedule)
+        Ok((schedule, largest))
     }
 
     pub fn latest_param_change(&self, name: &str, at: &str) -> Result<Option<i64>> {
