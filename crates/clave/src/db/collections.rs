@@ -1060,10 +1060,18 @@ pub(crate) fn store_changes(
     }
     for (publisher, floor) in in_scope(&before.floors, &after.floors, publishers, |k| k) {
         match floor {
-            None => conn.execute(
-                "DELETE FROM discovery_floors WHERE domain = ?1",
-                [publisher],
-            )?,
+            None => {
+                if !after.declarations.domains().contains_key(publisher) {
+                    conn.execute(
+                        "DELETE FROM declaration_floors WHERE domain = ?1",
+                        [publisher],
+                    )?;
+                }
+                conn.execute(
+                    "DELETE FROM discovery_floors WHERE domain = ?1",
+                    [publisher],
+                )?
+            }
             Some(seq) => conn.execute(
                 "INSERT OR REPLACE INTO discovery_floors(domain, seq) VALUES (?1, ?2)",
                 (publisher, int(*seq)),

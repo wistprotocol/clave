@@ -41,12 +41,17 @@ impl Db {
             crate::history::declarations::Declarations::default()
         };
         for (domain, raw) in rows {
+            let sealed = history.domains().get(&domain);
+            let discovered = self.discovered_declarations(&domain)?;
+            if sealed.is_none() && discovered.is_empty() {
+                continue;
+            }
             let current: Value = crate::json::parse(&raw)?;
             let mut seq = accepted_declaration_seq(&domain, &current)?;
-            if let Some(state) = history.domains().get(&domain) {
+            if let Some(state) = sealed {
                 seq = seq.max(state.highest_accepted_seq());
             }
-            for envelope in self.discovered_declarations(&domain)? {
+            for envelope in discovered {
                 seq = seq.max(accepted_declaration_seq(&domain, &envelope)?);
             }
             exec_retain_declaration_seq(&tx, &domain, seq)?;
