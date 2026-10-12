@@ -528,7 +528,7 @@ impl Db {
         if at.get(..10) != Some(day) {
             return Ok(0);
         }
-        let budget = crate::registry::effective(self, "ingest_budget_bytes_day", &at)?;
+        let budget = crate::registry::operator_value(self, "ingest_budget_bytes_day", &at)?;
         if budget - self.ingest_bytes(unit, day)? < crate::fetch::OBJECT_CAP_BYTES as i64 {
             return Ok(0);
         }

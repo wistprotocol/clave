@@ -1604,7 +1604,6 @@ struct SealerRun {
 impl SealerRun {
     fn new(history: &History<'_>) -> Self {
         let store = StoreRun::new();
-        store.db.set_param("epoch_cadence_seconds", 1).unwrap();
         let sk = clave::keys::load(&store.data.path().join("keys/seed")).unwrap();
         let mut run = SealerRun {
             store,

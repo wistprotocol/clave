@@ -31,7 +31,6 @@ fn snapshot_index(data: &Path) -> bool {
 fn log(data: &Path) -> (Db, wist_core::crypto::SigningKey) {
     clave::init::run("127.0.0.1:0", data).unwrap();
     let db = Db::open(&data.join("clave.sqlite")).unwrap();
-    db.set_param("epoch_cadence_seconds", 1).unwrap();
     let sk = clave::keys::load(&data.join("keys/seed")).unwrap();
     (db, sk)
 }

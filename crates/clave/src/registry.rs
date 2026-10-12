@@ -1,17 +1,52 @@
 use crate::error::{Error, Result};
 pub use wist_core::parameters::{spec, ParamSpec, PARAMS};
 
+pub const OPERATOR_VALUES: [&str; 7] = [
+    "epoch_cap_bytes",
+    "domain_epoch_entries_max",
+    "labeler_epoch_entries_max",
+    "max_inclusion_epochs",
+    "quota_base",
+    "ingest_budget_bytes_day",
+    "baseline_poll_seconds",
+];
+
 pub fn effective(db: &crate::db::Db, name: &str, at: &str) -> Result<i64> {
+    let at = unix(at)?;
+    db.parameter_schedule(at)?
+        .value_at(name, at)
+        .ok_or_else(|| Error::Param(name.to_string()))
+}
+
+pub fn operator_value(db: &crate::db::Db, name: &str, at: &str) -> Result<i64> {
     if let Some(v) = db.latest_param_change(name, at)? {
         return Ok(v);
     }
     match db.param(name) {
         Ok(v) => Ok(v),
-        Err(Error::Param(_)) => spec(name)
-            .and_then(|s| s.default)
-            .ok_or_else(|| Error::Param(name.to_string())),
+        Err(Error::Param(_)) => effective(db, name, at),
         Err(e) => Err(e),
     }
+}
+
+// WIST-3 §3.1: Epoch 0 seals on the Registry default grid; a later Epoch on the cadence in force
+// at the previous Epoch's `sealed_at`, genesis amendments included.
+pub fn sealing_grid(db: &crate::db::Db) -> Result<(Option<i64>, i64)> {
+    let previous = db
+        .last_epoch()?
+        .map(|epoch| unix(&epoch.sealed_at))
+        .transpose()?;
+    let cadence = match previous {
+        Some(at) => db
+            .parameter_schedule(at)?
+            .value_at("epoch_cadence_seconds", at),
+        None => spec("epoch_cadence_seconds").and_then(|s| s.default),
+    }
+    .ok_or_else(|| Error::Param("epoch_cadence_seconds".into()))?;
+    if cadence <= 0 {
+        return Err(Error::Seal("epoch_cadence_seconds must be positive".into()));
+    }
+    Ok((previous, cadence))
 }
 
 pub fn validate(name: &str, value: i64, lookup: impl Fn(&str) -> i64) -> Result<()> {
@@ -199,16 +234,50 @@ mod tests {
     }
 
     #[test]
-    fn effective_prefers_change_then_param_row_then_default() {
+    fn effective_reads_the_log_schedule_and_ignores_operator_values() {
         let tmp = tempfile::tempdir().unwrap();
         let db = crate::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
         assert_eq!(
-            effective(&db, "feed_window", "2026-01-01T00:00:00Z").unwrap(),
+            effective(&db, "quota_base", "2026-01-01T00:00:00Z").unwrap(),
             1000
         );
-        db.set_param("feed_window", 700).unwrap();
+        db.set_param("quota_base", 700).unwrap();
         assert_eq!(
-            effective(&db, "feed_window", "2026-01-01T00:00:00Z").unwrap(),
+            effective(&db, "quota_base", "2026-01-01T00:00:00Z").unwrap(),
+            1000
+        );
+        crate::db::tests::seal_epoch(
+            &db,
+            0,
+            "2026-01-01T00:00:00Z",
+            &[crate::db::ParamChangeRow {
+                entry_index: 0,
+                parameter: "quota_base",
+                value: 500,
+                effective_at: "2026-01-10T00:00:00Z",
+            }],
+        );
+        assert_eq!(
+            effective(&db, "quota_base", "2026-01-09T00:00:00Z").unwrap(),
+            1000
+        );
+        assert_eq!(
+            effective(&db, "quota_base", "2026-01-10T00:00:00Z").unwrap(),
+            500
+        );
+    }
+
+    #[test]
+    fn operator_value_prefers_change_then_operator_row_then_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+        assert_eq!(
+            operator_value(&db, "quota_base", "2026-01-01T00:00:00Z").unwrap(),
+            1000
+        );
+        db.set_param("quota_base", 700).unwrap();
+        assert_eq!(
+            operator_value(&db, "quota_base", "2026-01-01T00:00:00Z").unwrap(),
             700
         );
         crate::db::tests::seal_epoch(
@@ -217,18 +286,45 @@ mod tests {
             "2026-01-01T00:00:00Z",
             &[crate::db::ParamChangeRow {
                 entry_index: 0,
-                parameter: "feed_window",
+                parameter: "quota_base",
                 value: 500,
                 effective_at: "2026-01-10T00:00:00Z",
             }],
         );
         assert_eq!(
-            effective(&db, "feed_window", "2026-01-09T00:00:00Z").unwrap(),
+            operator_value(&db, "quota_base", "2026-01-09T00:00:00Z").unwrap(),
             700
         );
         assert_eq!(
-            effective(&db, "feed_window", "2026-01-10T00:00:00Z").unwrap(),
+            operator_value(&db, "quota_base", "2026-01-10T00:00:00Z").unwrap(),
             500
+        );
+    }
+
+    #[test]
+    fn sealing_grid_is_the_default_before_epoch_0_and_the_cadence_in_force_after() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+        db.record_genesis_amendment(&crate::db::GenesisAmendment::at_genesis(
+            "epoch_cadence_seconds",
+            900,
+        ))
+        .unwrap();
+        assert_eq!(sealing_grid(&db).unwrap(), (None, 3600));
+        crate::db::tests::seal_epoch(
+            &db,
+            0,
+            "2026-01-01T00:00:00Z",
+            &[crate::db::ParamChangeRow {
+                entry_index: 0,
+                parameter: "epoch_cadence_seconds",
+                value: 900,
+                effective_at: "2026-01-01T00:00:00Z",
+            }],
+        );
+        assert_eq!(
+            sealing_grid(&db).unwrap(),
+            (Some(unix("2026-01-01T00:00:00Z").unwrap()), 900)
         );
     }
 

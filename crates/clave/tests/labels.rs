@@ -201,7 +201,6 @@ fn labels_and_disputes_are_pulled_sealed_and_carried() {
     let data = tempfile::tempdir().unwrap();
     clave::init::run(&host, data.path()).unwrap();
     let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
-    db.set_param("epoch_cadence_seconds", 1).unwrap();
     let report =
         clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
     assert_eq!(report.labels, vec![id.clone()]);
@@ -421,7 +420,6 @@ fn an_expired_current_label_keeps_its_state_tuple_and_has_no_labels_table_row() 
     let data = tempfile::tempdir().unwrap();
     clave::init::run(&host, data.path()).unwrap();
     let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
-    db.set_param("epoch_cadence_seconds", 1).unwrap();
     let report =
         clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
     assert_eq!(report.labels.len(), 2, "rejected {:?}", report.rejected);
@@ -556,7 +554,6 @@ fn a_dispute_asserted_beyond_the_attempt_clock_allowance_is_rejected_and_pulled_
     let data = tempfile::tempdir().unwrap();
     clave::init::run(&host, data.path()).unwrap();
     let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
-    db.set_param("epoch_cadence_seconds", 1).unwrap();
     clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
     clave::seal::run(&db, data.path(), &sk, SEAL_START).unwrap();
@@ -707,7 +704,6 @@ fn a_dispute_whose_label_a_sealed_declaration_takes_out_of_the_disputants_author
     let data = tempfile::tempdir().unwrap();
     clave::init::run(&host, data.path()).unwrap();
     let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
-    db.set_param("epoch_cadence_seconds", 1).unwrap();
     clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
     clave::seal::run(&db, data.path(), &sk, SEAL_START).unwrap();

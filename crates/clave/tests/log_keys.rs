@@ -23,7 +23,6 @@ impl Log {
         let data = tempfile::tempdir().unwrap();
         clave::init::run(LOG_ID, data.path()).unwrap();
         let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
-        db.set_param("epoch_cadence_seconds", 3600).unwrap();
         Log { data, db }
     }
 

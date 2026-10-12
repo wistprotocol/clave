@@ -21,7 +21,6 @@ fn rig(p_for: fn(&str) -> TestPub) -> Rig {
     let data = tempfile::tempdir().unwrap();
     clave::init::run(&host, data.path()).unwrap();
     let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
-    db.set_param("epoch_cadence_seconds", 1).unwrap();
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
     Rig {
         host,
@@ -752,7 +751,6 @@ fn cadence_rounding_cannot_reopen_a_settled_admission_window() {
     const T0: i64 = 1_786_276_800;
     let r = rig(make_publisher_with_recovery);
     let at = |seconds| jiff::Timestamp::from_second(seconds).unwrap().to_string();
-    r.db.set_param("epoch_cadence_seconds", 3600).unwrap();
     ingest(&r, &at(T0));
     let effective = T0 + 30 * DAY;
     let update = wist_core::envelope::sign_envelope(&serde_json::json!({

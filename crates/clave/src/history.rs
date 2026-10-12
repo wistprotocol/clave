@@ -241,11 +241,16 @@ impl<'a> History<'a> {
             .sealed_at_s()
             .map_err(|e| failure(&e.to_string()))?;
         let mut schedule = self.schedule.clone().unwrap_or_else(|| Schedule::new(at));
-        let cadence = schedule
-            .value_at("epoch_cadence_seconds", self.prior_at.unwrap_or(at))
-            .unwrap();
-        checkpoint::check_sequence(self.previous.as_ref(), &checkpoint, cadence)
-            .map_err(|e| failure(&e.to_string()))?;
+        match (&self.previous, self.prior_at) {
+            (Some(previous), Some(prior_at)) => {
+                let cadence = schedule
+                    .value_at("epoch_cadence_seconds", prior_at)
+                    .unwrap();
+                checkpoint::check_sequence(Some(previous), &checkpoint, cadence)
+            }
+            _ => checkpoint::check_genesis(&checkpoint),
+        }
+        .map_err(|e| failure(&e.to_string()))?;
 
         let previous_size = self.db.size_before(height)?;
         let entries = self.db.epoch_entries(height)?;

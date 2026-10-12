@@ -11,7 +11,10 @@ Payloads of sealed Items, and periodic Snapshots over HTTP for Consumer
 sync.
 
 Subcommands: `init` (generate the log's genesis key and local store, and
-print the signed-note verifier key a Witness is configured with),
+print the signed-note verifier key a Witness is configured with; each
+`--parameter <name>=<value>`, and `--cadence <seconds>` when it differs
+from the default 3600, records a genesis amendment, see
+[Genesis amendments](#genesis-amendments)),
 `serve` (HTTP ingest + read endpoints; seals an Epoch at every cadence
 grid instant and produces Snapshots unless `--no-seal`, under the store
 instance name `--instance <name>` gives it), `seal` (append the next
@@ -30,7 +33,8 @@ sealed head for cold-start sync, see [Snapshot production](#snapshot-production)
 WIST-4 §5: bounds and combination rules checked, `effective_at` held past
 the grace period, applied to the live parameter set once its Epoch seals
 and the effective instant passes; a change whose grace window lapses
-while queued is dropped from the Epoch and reported by `seal`),
+while queued is dropped from the Epoch and reported by `seal`; before
+Epoch 0 seals it records a genesis amendment instead),
 `withdraw --domain <Publisher> --item-id <Item ID>` (queue a
 `payload_withdrawal`, WIST-4 §5.1 and WIST-3 §6.2, naming a sealed Item:
 at sealing the act replays through core's withdrawal engine under the Log
@@ -195,8 +199,8 @@ its height (WIST-3 §3.4, §5, see
 restates the previous size and root.
 
 `serve` seals at every instant of the cadence grid in force at the last
-Epoch's `sealed_at` (at the current time before the first Epoch), an
-empty Epoch when nothing is eligible. An instant is sealed within its
+Epoch's `sealed_at` (the Registry default 3600-second grid before the
+first Epoch, WIST-3 §3.1), an empty Epoch when nothing is eligible. An instant is sealed within its
 grace of `min(60, cadence / 2)` seconds after it, with `sealed_at` equal
 to the instant however many attempts it took: while the instant is
 unsealed and its grace lasts, a failed seal is retried every 5 seconds,
@@ -717,9 +721,37 @@ fails to open with that reason rather than being half-migrated, as does
 one that names its table and columns after `block`. Start a new data
 directory.
 
-Schedule validation uses the protocol's Registry defaults. Direct local
-parameter overrides, including the accelerated `--cadence` setting, do not
-amend that schedule and must not be used to assert protocol conformance.
+Every Registry parameter a Consumer verifies, the cadence included, is
+read from the Log's accepted schedule over the Registry defaults. The
+store's local operator values apply only to `epoch_cap_bytes`,
+`domain_epoch_entries_max`, `labeler_epoch_entries_max` and
+`max_inclusion_epochs`, where they can only tighten what one Epoch
+carries, and to `quota_base`, `ingest_budget_bytes_day` and
+`baseline_poll_seconds`; any other Registry identifier is refused as a
+local value.
+
+### Genesis amendments
+
+A Log whose Anchor names no predecessor sets its initial parameter values
+with genesis amendments (WIST-4 §5): `parameter_change` Registry Updates
+sealed in Epoch 0 whose `effective_at` need only reach Epoch 0's own
+`sealed_at`. `init --parameter <name>=<value>` (repeatable) and
+`init --cadence <seconds>` record them, each checked against the
+Registry bounds and combination rules; an invalid value or a repeated
+name is refused before anything is written. `param-change` before Epoch 0
+seals records one too, replacing a recorded amendment of the same
+parameter and instant: without `--effective-at` it is in force from
+Epoch 0's `sealed_at`, with it from the instant given. When Epoch 0
+seals, each recorded amendment becomes a signed `parameter_change` in
+that Epoch, validated through the schedule like any other; one whose
+instant precedes Epoch 0's `sealed_at` is dropped with WIST4-E03 and
+reported. The recorded amendments are cleared when Epoch 0 commits.
+
+Epoch 0 seals on the grid of the cadence in force before genesis, the
+Registry default 3600 seconds (WIST-3 §3.1). A genesis cadence amendment
+is in force at Epoch 0's `sealed_at` and governs Epoch 1 onward, so a Log
+initialized with `--cadence 900` seals Epoch 0 on the hour and Epoch 1
+900 seconds later.
 
 ## Authenticated history
 

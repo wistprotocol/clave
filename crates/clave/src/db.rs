@@ -138,6 +138,23 @@ impl Drop for Mutation<'_> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenesisAmendment {
+    pub parameter: String,
+    pub value: i64,
+    pub effective_at: Option<String>,
+}
+
+impl GenesisAmendment {
+    pub fn at_genesis(parameter: &str, value: i64) -> Self {
+        Self {
+            parameter: parameter.to_owned(),
+            value,
+            effective_at: None,
+        }
+    }
+}
+
 pub struct PublisherRow {
     pub key_id: String,
     pub public_key: String,
@@ -382,11 +399,57 @@ impl Db {
     }
 
     pub fn set_param(&self, name: &str, value: i64) -> Result<()> {
+        if crate::registry::spec(name).is_some()
+            && !crate::registry::OPERATOR_VALUES.contains(&name)
+        {
+            return Err(Error::ParamChange(format!(
+                "{name} is a Registry parameter the Log sets; amend it with a parameter_change, before Epoch 0 seals as a genesis amendment"
+            )));
+        }
         self.execute(
             "INSERT INTO params(name, value) VALUES (?1, ?2) ON CONFLICT(name) DO UPDATE SET value = excluded.value",
             (name, value),
         )?;
         Ok(())
+    }
+
+    pub fn genesis_amendments(&self) -> Result<Vec<GenesisAmendment>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT parameter, value, effective_at FROM genesis_params ORDER BY parameter, effective_at",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(GenesisAmendment {
+                    parameter: row.get(0)?,
+                    value: row.get(1)?,
+                    effective_at: row.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn record_genesis_amendment(&self, amendment: &GenesisAmendment) -> Result<()> {
+        self.write(|conn| {
+            if conn.query_row("SELECT EXISTS(SELECT 1 FROM epochs)", [], |row| row.get(0))? {
+                return Err(Error::ParamChange(
+                    "Epoch 0 is sealed; a genesis amendment is no longer possible".into(),
+                ));
+            }
+            conn.execute(
+                "DELETE FROM genesis_params WHERE parameter = ?1 AND effective_at IS ?2",
+                (&amendment.parameter, &amendment.effective_at),
+            )?;
+            conn.execute(
+                "INSERT INTO genesis_params(parameter, value, effective_at) VALUES (?1, ?2, ?3)",
+                (
+                    &amendment.parameter,
+                    amendment.value,
+                    &amendment.effective_at,
+                ),
+            )?;
+            Ok(())
+        })
     }
 
     pub fn get_publisher(&self, domain: &str) -> Result<Option<PublisherRow>> {
@@ -1112,6 +1175,9 @@ impl Db {
                     d.declaration_json,
                 ),
             )?;
+        }
+        if epoch_number == 0 {
+            tx.execute("DELETE FROM genesis_params", [])?;
         }
         for c in param_changes {
             tx.execute(
@@ -1966,10 +2032,31 @@ pub(crate) mod tests {
     fn set_param_then_param_roundtrips() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
-        db.set_param("epoch_cadence_seconds", 3600).unwrap();
-        assert_eq!(db.param("epoch_cadence_seconds").unwrap(), 3600);
-        db.set_param("epoch_cadence_seconds", 60).unwrap();
-        assert_eq!(db.param("epoch_cadence_seconds").unwrap(), 60);
+        db.set_param("snapshot_shard_count", 4).unwrap();
+        assert_eq!(db.param("snapshot_shard_count").unwrap(), 4);
+        db.set_param("quota_base", 60).unwrap();
+        assert_eq!(db.param("quota_base").unwrap(), 60);
+    }
+
+    #[test]
+    fn set_param_refuses_a_registry_parameter_only_the_log_sets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+        for name in ["epoch_cadence_seconds", "feed_window", "param_grace_days"] {
+            assert!(db.set_param(name, 60).is_err(), "{name}");
+            assert!(db.param(name).is_err(), "{name}");
+        }
+    }
+
+    #[test]
+    fn sealing_epoch_0_clears_the_genesis_amendments() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+        let amendment = GenesisAmendment::at_genesis("feed_window", 500);
+        db.record_genesis_amendment(&amendment).unwrap();
+        seal_epoch(&db, 0, "2026-01-01T00:00:00Z", &[]);
+        assert!(db.genesis_amendments().unwrap().is_empty());
+        assert!(db.record_genesis_amendment(&amendment).is_err());
     }
 
     #[test]

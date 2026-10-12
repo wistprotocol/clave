@@ -35,7 +35,6 @@ fn rig(urls: &[&str]) -> Rig {
     let data = tempfile::tempdir().unwrap();
     clave::init::run(&host, data.path()).unwrap();
     let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
-    db.set_param("epoch_cadence_seconds", 1).unwrap();
     clave::ingest::run(&db, &client, data.path(), &host, &ts(NOW)).unwrap();
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
     Rig {

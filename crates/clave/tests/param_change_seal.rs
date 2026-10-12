@@ -23,16 +23,28 @@ fn read_entries(db: &clave::db::Db, number: u64) -> Vec<serde_json::Value> {
     db.epoch_entries(number).unwrap()
 }
 
+fn queued(report: clave::param_change::ParamChangeReport) -> String {
+    match report {
+        clave::param_change::ParamChangeReport::Queued { effective_at, .. } => effective_at,
+        clave::param_change::ParamChangeReport::Genesis { .. } => {
+            panic!("recorded as a genesis amendment")
+        }
+    }
+}
+
 #[test]
 fn seal_includes_valid_parameter_change_and_applies_it_at_effective_at() {
     let (data, db, sk) = setup();
-    let report = clave::param_change::run(&db, &sk, "feed_window", 500, None, NOW).unwrap();
+    clave::seal::run(&db, data.path(), &sk, NOW).unwrap();
+    let effective_at =
+        queued(clave::param_change::run(&db, &sk, "feed_window", 500, None, NOW + 60).unwrap());
 
-    let seal = clave::seal::run(&db, data.path(), &sk, NOW).unwrap();
+    let seal = clave::seal::run(&db, data.path(), &sk, NOW + 3600).unwrap();
+    assert_eq!(seal.epoch_number, 1);
     assert_eq!(seal.entry_count, 1);
     assert!(seal.dropped.is_empty());
 
-    let entries = read_entries(&db, 0);
+    let entries = read_entries(&db, 1);
     let entry = &entries[0];
     assert_eq!(entry["type"], "registry_update");
     wist_core::envelope::verify_envelope(&entry["body"], "update", &sk.public()).unwrap();
@@ -47,7 +59,7 @@ fn seal_includes_valid_parameter_change_and_applies_it_at_effective_at() {
         1000
     );
     assert_eq!(
-        clave::registry::effective(&db, "feed_window", &report.effective_at).unwrap(),
+        clave::registry::effective(&db, "feed_window", &effective_at).unwrap(),
         500
     );
 }
@@ -55,20 +67,39 @@ fn seal_includes_valid_parameter_change_and_applies_it_at_effective_at() {
 #[test]
 fn seal_drops_and_reports_parameter_change_gone_stale_in_queue() {
     let (data, db, sk) = setup();
-    let effective_at = ts(NOW + 7 * DAY);
-    clave::param_change::run(&db, &sk, "feed_window", 500, Some(&effective_at), NOW).unwrap();
+    clave::seal::run(&db, data.path(), &sk, NOW).unwrap();
+    let queued_at = NOW + 3600;
+    let effective_at = ts(queued_at + 7 * DAY);
+    clave::param_change::run(&db, &sk, "feed_window", 500, Some(&effective_at), queued_at).unwrap();
 
-    let seal = clave::seal::run(&db, data.path(), &sk, NOW + 3600).unwrap();
+    let seal = clave::seal::run(&db, data.path(), &sk, queued_at + 3600).unwrap();
+    assert_eq!(seal.epoch_number, 1);
     assert_eq!(seal.entry_count, 0);
     assert_eq!(seal.dropped.len(), 1);
     assert!(seal.dropped[0].contains("feed_window"));
 
-    assert!(read_entries(&db, 0).is_empty());
+    assert!(read_entries(&db, 1).is_empty());
     let (pending, _) = db.peek_pending_entries().unwrap();
     assert!(pending.is_empty());
     assert_eq!(
         clave::registry::effective(&db, "feed_window", &effective_at).unwrap(),
         1000
+    );
+}
+
+#[test]
+fn an_epoch_0_parameter_change_sealed_late_is_valid_under_the_genesis_exemption() {
+    let (data, db, sk) = setup();
+    let effective_at = ts(NOW + 7 * DAY);
+    clave::param_change::run(&db, &sk, "feed_window", 500, Some(&effective_at), NOW).unwrap();
+
+    let seal = clave::seal::run(&db, data.path(), &sk, NOW + 3600).unwrap();
+    assert_eq!(seal.epoch_number, 0);
+    assert_eq!(seal.entry_count, 1);
+    assert!(seal.dropped.is_empty());
+    assert_eq!(
+        clave::registry::effective(&db, "feed_window", &effective_at).unwrap(),
+        500
     );
 }
 

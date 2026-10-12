@@ -1,5 +1,5 @@
 use crate::db::{Db, Fence, SEALER_LEASE_SECONDS};
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::fetch::Client;
 use std::collections::HashSet;
 use std::io::Write;
@@ -37,19 +37,6 @@ pub fn next_seal(last_sealed_unix: Option<i64>, cadence: i64, now_unix: i64) -> 
     }
     let floor = last_sealed_unix.map_or(instant, |last| last.max(instant));
     Decision::SleepUntil((floor.div_euclid(cadence) + 1) * cadence)
-}
-
-fn grid(db: &Db, now_unix: i64) -> Result<(Option<i64>, i64)> {
-    let last = db
-        .last_epoch()?
-        .map(|epoch| crate::registry::unix(&epoch.sealed_at))
-        .transpose()?;
-    let at = crate::registry::instant(last.unwrap_or(now_unix))?;
-    let cadence = crate::registry::effective(db, "epoch_cadence_seconds", &at)?;
-    if cadence <= 0 {
-        return Err(Error::Seal("epoch_cadence_seconds must be positive".into()));
-    }
-    Ok((last, cadence))
 }
 
 fn seal_at(
@@ -120,7 +107,7 @@ fn pass(
         return Ok((now_unix + LEASE_RENEWAL_SECONDS, attempt));
     };
     finish_publications(db_path, data_dir, owner, token)?;
-    let (last, cadence) = grid(&db, now_unix)?;
+    let (last, cadence) = crate::registry::sealing_grid(&db)?;
     match next_seal(last, cadence, now_unix) {
         Decision::SleepUntil(instant) => {
             Ok((instant.min(now_unix + LEASE_RENEWAL_SECONDS), attempt))
@@ -224,6 +211,7 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::Error;
 
     const HOUR: i64 = 3600;
     const T: i64 = 1_786_276_800;
@@ -233,7 +221,6 @@ mod tests {
         crate::init::run("127.0.0.1:0", data).unwrap();
         let db_path = data.join("clave.sqlite");
         let db = Db::open(&db_path).unwrap();
-        db.set_param("epoch_cadence_seconds", HOUR).unwrap();
         (db_path, db)
     }
 

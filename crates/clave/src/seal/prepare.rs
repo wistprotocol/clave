@@ -38,24 +38,12 @@ pub(super) struct PreparedEpoch {
 }
 
 fn sealing_slot(db: &Db, now_unix: i64) -> Result<(u64, i64, String)> {
-    let now_at = jiff::Timestamp::from_second(now_unix)
-        .map_err(|_| Error::Seal("now out of range".into()))?
-        .to_string();
-    let prev = db.last_epoch()?;
-    let cadence = registry::effective(
-        db,
-        "epoch_cadence_seconds",
-        prev.as_ref()
-            .map_or(now_at.as_str(), |p| p.sealed_at.as_str()),
-    )?;
-    if cadence <= 0 {
-        return Err(Error::Seal("epoch_cadence_seconds must be positive".into()));
-    }
+    let (_, cadence) = registry::sealing_grid(db)?;
     let sealed_unix = now_unix.div_euclid(cadence) * cadence;
     let sealed_at = jiff::Timestamp::from_second(sealed_unix)
         .map_err(|_| Error::Seal("sealed_at out of range".into()))?
         .to_string();
-    let epoch_number = match &prev {
+    let epoch_number = match db.last_epoch()? {
         Some(p) => {
             if sealed_at.as_str() <= p.sealed_at.as_str() {
                 return Err(Error::Seal("cadence slot already sealed".into()));
@@ -65,6 +53,27 @@ fn sealing_slot(db: &Db, now_unix: i64) -> Result<(u64, i64, String)> {
         None => 0,
     };
     Ok((epoch_number, sealed_unix, sealed_at))
+}
+
+// WIST-4 §5: a genesis amendment may be in force from Epoch 0's own `sealed_at`.
+fn queue_genesis_amendments(db: &Db, sk: &SigningKey, sealed_at: &str) -> Result<()> {
+    let key_id = db.signing_key_id(&sk.public())?;
+    for amendment in db.genesis_amendments()? {
+        let update = serde_json::json!({
+            "wist_version": crate::WIST_VERSION,
+            "action": "parameter_change",
+            "subject": amendment.parameter,
+            "details": {"parameter": amendment.parameter, "value": amendment.value},
+            "effective_at": amendment.effective_at.as_deref().unwrap_or(sealed_at),
+        });
+        db.insert_pending_entry(
+            "registry_update",
+            "",
+            &sign_envelope(&update, "update", &key_id, sk)?,
+            0,
+        )?;
+    }
+    Ok(())
 }
 
 /// WIST-4 §5: the Log's map, which a replaying Consumer reads; an operator value of a bound
@@ -86,7 +95,7 @@ fn sealing_parameters(db: &Db, sealed_unix: i64, sealed_at: &str) -> Result<Para
         "labeler_epoch_entries_max",
         "max_inclusion_epochs",
     ] {
-        let local = registry::effective(db, name, sealed_at)?;
+        let local = registry::operator_value(db, name, sealed_at)?;
         let logged = parameters.value(name)?;
         parameters.set(name, logged.min(local));
     }
@@ -190,6 +199,9 @@ pub(super) fn epoch(
     now_unix: i64,
 ) -> Result<PreparedEpoch> {
     let (epoch_number, sealed_unix, sealed_at) = sealing_slot(db, now_unix)?;
+    if epoch_number == 0 {
+        queue_genesis_amendments(db, sk, &sealed_at)?;
+    }
     let mut history = History::open(db, data_dir, db.last_epoch()?)?;
     while history.next_epoch()?.is_some() {}
     let sealed = db.sealed_from(&history)?;
@@ -225,7 +237,7 @@ pub(super) fn epoch(
     .into_iter()
     .partition(|entry| entry.canonical.len() as u64 <= tiles::ENTRY_MAX_BYTES);
     let schedule = db.parameter_schedule(sealed_unix)?;
-    let mut cap = registry::epoch_cap(&schedule, sealed_unix).min(registry::effective(
+    let mut cap = registry::epoch_cap(&schedule, sealed_unix).min(registry::operator_value(
         db,
         "epoch_cap_bytes",
         &sealed_at,

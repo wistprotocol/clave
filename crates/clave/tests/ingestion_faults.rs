@@ -242,6 +242,7 @@ fn a_lapsed_task_of_a_running_dispatchers_own_partition_is_returned_and_pulled_e
     let f = fixture(false);
     let db = clave::db::Db::open(&f.data.path().join("clave.sqlite")).unwrap();
     let sk = clave::keys::load(&f.data.path().join("keys/seed")).unwrap();
+    clave::seal::run(&db, f.data.path(), &sk, unix_now() - 3600).unwrap();
     clave::param_change::run(&db, &sk, "feed_window", 500, None, unix_now()).unwrap();
     spawn_server(
         f.data.path(),

@@ -74,7 +74,6 @@ fn verify_static_log(data: &Path, log_id: &str, key: &AggregatorKey) -> Vec<Chec
 fn sealed_log(host: &str, client: &clave::fetch::Client, data: &Path) -> clave::db::Db {
     clave::init::run(host, data).unwrap();
     let db = clave::db::Db::open(&data.join("clave.sqlite")).unwrap();
-    db.set_param("epoch_cadence_seconds", 1).unwrap();
     clave::ingest::run(&db, client, data, host, "2026-08-09T12:00:00Z").unwrap();
     db
 }

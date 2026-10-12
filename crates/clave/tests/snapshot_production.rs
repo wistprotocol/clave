@@ -39,7 +39,6 @@ impl Log {
         let data = tempfile::tempdir().unwrap();
         clave::init::run(&host, data.path()).unwrap();
         let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
-        db.set_param("epoch_cadence_seconds", 1).unwrap();
         clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T12:00:00Z").unwrap();
         let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
         Log {

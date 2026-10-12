@@ -342,8 +342,11 @@ struct DispatchBounds {
 impl DispatchBounds {
     fn under_pressure(&self, db: &Db, now: i64) -> Result<bool> {
         let (entries, bytes) = db.sealing_backlog()?;
-        let cap =
-            crate::registry::effective(db, "epoch_cap_bytes", &crate::registry::instant(now)?)?;
+        let cap = crate::registry::operator_value(
+            db,
+            "epoch_cap_bytes",
+            &crate::registry::instant(now)?,
+        )?;
         let limit = (cap.max(0) as u64).saturating_mul(u64::from(self.backlog_epochs));
         Ok(bytes >= limit || entries >= self.backlog_entries)
     }

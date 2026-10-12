@@ -36,7 +36,6 @@ fn a_pinned_snapshot_governs_from_the_epoch_after_its_seal() {
     let data = tempfile::tempdir().unwrap();
     clave::init::run("log.example", data.path()).unwrap();
     let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
-    db.set_param("epoch_cadence_seconds", 1).unwrap();
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
     let file = data.path().join("first.dat");
     std::fs::write(&file, FIRST).unwrap();
@@ -161,7 +160,6 @@ fn a_suffix_list_update_queued_again_under_an_accepted_id_is_dropped_and_the_lat
     let data = tempfile::tempdir().unwrap();
     clave::init::run("log.example", data.path()).unwrap();
     let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
-    db.set_param("epoch_cadence_seconds", 1).unwrap();
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
     let file = data.path().join("first.dat");
     std::fs::write(&file, FIRST).unwrap();

@@ -372,7 +372,7 @@ fn next_due(
 }
 
 fn baseline_interval(db: &Db, now: i64) -> Result<i64> {
-    crate::registry::effective(db, "baseline_poll_seconds", &crate::registry::instant(now)?)
+    crate::registry::operator_value(db, "baseline_poll_seconds", &crate::registry::instant(now)?)
 }
 
 fn retry_delay(before: i64) -> Option<i64> {
@@ -662,7 +662,7 @@ impl Db {
         let at = crate::registry::instant(now)?;
         let day = at.get(..10).unwrap_or(&at);
         let unit = crate::suffix_list::unit_at(self, domain, &at)?;
-        let budget = crate::registry::effective(self, "ingest_budget_bytes_day", &at)?;
+        let budget = crate::registry::operator_value(self, "ingest_budget_bytes_day", &at)?;
         if self.ingest_bytes(&unit, day)? < budget {
             return Ok(now);
         }

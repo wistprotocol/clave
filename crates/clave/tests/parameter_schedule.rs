@@ -150,7 +150,12 @@ fn historical_size_vectors_replay_identically_after_reopening() {
 
 #[test]
 fn prospective_vectors_filter_rejected_history_and_preserve_every_future_map() {
-    for case in fixture()["prospective_cases"].as_array().unwrap() {
+    for case in fixture()["prospective_cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|case| case["successor"] != true)
+    {
         let data = tempfile::tempdir().unwrap();
         let path = data.path().join("clave.sqlite");
         let db = Db::open(&path).unwrap();
@@ -222,6 +227,7 @@ fn prospective_vectors_filter_rejected_history_and_preserve_every_future_map() {
 #[test]
 fn queued_conflicts_use_canonical_entry_order_for_admission_and_sealing() {
     let (data, db, sk) = setup();
+    clave::seal::run(&db, data.path(), &sk, NOW - 3600).unwrap();
     let mut candidates = [
         envelope(&sk, "payload_window_days", 540, NOW + 10 * DAY),
         envelope(&sk, "mirror_retention_days", 30, NOW + 10 * DAY),
@@ -259,7 +265,8 @@ fn queued_conflicts_use_canonical_entry_order_for_admission_and_sealing() {
     assert_eq!(report.entry_count, 1);
     assert_eq!(report.dropped.len(), 1);
     assert!(report.dropped[0].contains("WIST4-E03"));
-    assert_eq!(db.epoch_entries(0).unwrap()[0]["body"], candidates[0]);
+    assert_eq!(report.epoch_number, 1);
+    assert_eq!(db.epoch_entries(1).unwrap()[0]["body"], candidates[0]);
 }
 
 #[test]

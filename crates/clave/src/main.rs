@@ -18,8 +18,19 @@ enum Command {
         log_id: String,
         #[arg(long)]
         data: PathBuf,
-        #[arg(long, default_value_t = 3600)]
+        #[arg(
+            long,
+            default_value_t = 3600,
+            help = "epoch_cadence_seconds from Epoch 1 on; a value other than 3600 is sealed in Epoch 0 as a genesis amendment"
+        )]
         cadence: i64,
+        #[arg(
+            long = "parameter",
+            value_name = "NAME=VALUE",
+            value_parser = parse_parameter,
+            help = "A Registry parameter value sealed in Epoch 0 as a genesis amendment, in force from Epoch 0's sealed_at; repeatable"
+        )]
+        parameters: Vec<(String, i64)>,
         /// A Public Suffix List file to pin in Epoch 0, so quota, ingest
         /// budget and Epoch capacity are keyed per Registrable Domain from
         /// the first Epoch on; without one every Canonical Host is its own
@@ -168,6 +179,16 @@ enum LogKeyCommand {
     },
 }
 
+fn parse_parameter(given: &str) -> Result<(String, i64), String> {
+    let (name, value) = given
+        .split_once('=')
+        .ok_or_else(|| format!("expected NAME=VALUE, got {given:?}"))?;
+    let value = value
+        .parse()
+        .map_err(|_| format!("{name}: {value:?} is not an integer"))?;
+    Ok((name.to_owned(), value))
+}
+
 fn produce_snapshot(
     db_path: &std::path::Path,
     data: &std::path::Path,
@@ -217,12 +238,23 @@ fn main() -> Result<(), clave::Error> {
             log_id,
             data,
             cadence,
+            mut parameters,
             suffix_list,
         } => {
-            let verifier_key = clave::init::run(&log_id, &data)?;
+            let default_cadence = clave::registry::spec("epoch_cadence_seconds")
+                .and_then(|spec| spec.default)
+                .unwrap_or(cadence);
+            if cadence != default_cadence {
+                parameters.push(("epoch_cadence_seconds".to_owned(), cadence));
+            }
+            let verifier_key = clave::init::run_with(&log_id, &data, &parameters)?;
             let db = clave::db::Db::open(&data.join("clave.sqlite"))?;
             println!("checkpoint verifier key: {verifier_key}");
-            db.set_param("epoch_cadence_seconds", cadence)?;
+            for (parameter, value) in &parameters {
+                println!(
+                    "genesis amendment {parameter} = {value}: sealed in Epoch 0, in force from its sealed_at"
+                );
+            }
             match suffix_list {
                 Some(file) => {
                     let sk = clave::keys::load(&data.join("keys/seed"))?;
@@ -378,10 +410,22 @@ fn main() -> Result<(), clave::Error> {
                 effective_at.as_deref(),
                 now_unix,
             )?;
-            println!(
-                "queued parameter change {} = {value}, effective {} ({})",
-                parameter, report.effective_at, report.update_id
-            );
+            match report {
+                clave::param_change::ParamChangeReport::Queued {
+                    update_id,
+                    effective_at,
+                } => println!(
+                    "queued parameter change {parameter} = {value}, effective {effective_at} ({update_id})"
+                ),
+                clave::param_change::ParamChangeReport::Genesis { effective_at: None } => println!(
+                    "recorded genesis amendment {parameter} = {value}: it seals in Epoch 0, effective at that Epoch's sealed_at"
+                ),
+                clave::param_change::ParamChangeReport::Genesis {
+                    effective_at: Some(effective_at),
+                } => println!(
+                    "recorded genesis amendment {parameter} = {value}: it seals in Epoch 0, effective {effective_at}"
+                ),
+            }
         }
         Command::Withdraw {
             data,

@@ -242,7 +242,6 @@ fn an_empty_first_epoch_states_the_empty_tree_and_serves_no_tile() {
     let data = tempfile::tempdir().unwrap();
     clave::init::run("example-log.test", data.path()).unwrap();
     let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
-    db.set_param("epoch_cadence_seconds", 1).unwrap();
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
     clave::seal::run(&db, data.path(), &sk, 1_800_000_000).unwrap();
     let head = head_checkpoint(data.path());
@@ -545,7 +544,6 @@ fn a_pull_and_a_seal_racing_on_one_collection_keep_the_sealed_catalog() {
     clave::init::run(&host, data.path()).unwrap();
     let path = data.path().join("clave.sqlite");
     let db = clave::db::Db::open(&path).unwrap();
-    db.set_param("epoch_cadence_seconds", 1).unwrap();
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
     let a = page_item(&p, &format!("https://{host}/a"), "alpha");
     let one = publish_collection(
@@ -650,7 +648,6 @@ fn a_sealed_log_replays_through_core_with_every_entry_valid_and_the_records_of_t
     let data = tempfile::tempdir().unwrap();
     clave::init::run(&host, data.path()).unwrap();
     let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
-    db.set_param("epoch_cadence_seconds", 1).unwrap();
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
     let r = Rig {
         p,

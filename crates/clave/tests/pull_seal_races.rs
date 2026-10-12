@@ -66,11 +66,14 @@ struct Store {
 }
 
 fn store(host: &str) -> Store {
+    store_with(host, &[])
+}
+
+fn store_with(host: &str, genesis: &[(String, i64)]) -> Store {
     let data = tempfile::tempdir().unwrap();
-    clave::init::run(host, data.path()).unwrap();
+    clave::init::run_with(host, data.path(), genesis).unwrap();
     let path = data.path().join("clave.sqlite");
     let db = clave::db::Db::open(&path).unwrap();
-    db.set_param("epoch_cadence_seconds", 1).unwrap();
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
     Store { data, path, db, sk }
 }
@@ -134,7 +137,7 @@ fn a_pull_retried_after_a_settlement_reads_the_current_declaration_alone() {
     let p = make_publisher_with_recovery(&host);
     let hooks = Hooks::default();
     serve_hooked(listener, p.dir.path().to_path_buf(), hooks.clone());
-    let s = store(&host);
+    let s = store_with(&host, &[("epoch_cadence_seconds".into(), 1)]);
     let ingest = |now: &str| clave::ingest::run(&s.db, &client, s.data.path(), &host, now).unwrap();
     ingest("2026-08-09T12:00:00Z");
     clave::seal::run(&s.db, s.data.path(), &s.sk, ts("2026-08-09T12:00:00Z")).unwrap();

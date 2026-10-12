@@ -182,7 +182,6 @@ fn a_fetch_after_a_suffix_list_update_is_debited_to_the_unit_in_force_at_it() {
     let site = site(&p, listener, "2026-08-09T12:00:00Z");
     let data = tempfile::tempdir().unwrap();
     let db = open_log("log.example", data.path());
-    db.set_param("epoch_cadence_seconds", 1).unwrap();
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
     for (octets, seal) in [
         (WITHOUT_SUBDOMAIN, SEAL_START),

@@ -7,7 +7,7 @@ use crate::registry;
 /// UTC day is `quota_base` in force at the instant, the same for every
 /// Registrable Domain.
 pub fn quota_q(db: &Db, at: &str) -> Result<i64> {
-    registry::effective(db, "quota_base", at)
+    registry::operator_value(db, "quota_base", at)
 }
 
 /// WIST-4 §3.1: the Registrable Domain under the snapshot in force at `at`,

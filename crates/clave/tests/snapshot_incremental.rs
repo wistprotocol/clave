@@ -94,7 +94,6 @@ impl Log {
         let data = tempfile::tempdir().unwrap();
         clave::init::run(PRIMARY, data.path()).unwrap();
         let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
-        db.set_param("epoch_cadence_seconds", 1).unwrap();
         db.set_param("snapshot_shard_count", shard_count as i64)
             .unwrap();
         let log = Log {
