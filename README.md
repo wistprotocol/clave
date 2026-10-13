@@ -49,13 +49,16 @@ with `WIST2-E03`), `suffix-list` (pin a Public Suffix List file, WIST-4
 `suffix_list_update` seals in the next Epoch and is in force from the
 Epoch after it; `init --suffix-list <file>` pins one for Epoch 0, and
 without a pinned snapshot every Canonical Host is its own accounting
-unit), `mirror` (maintain the signed `/log/mirrors.json`), `log-key`
-(rotate the Log's own Aggregator keys, see
+unit), `bound` (set or clear a local bound on what one Epoch carries,
+see [Parameter schedules and Epoch sizes](#parameter-schedules-and-epoch-sizes)),
+`mirror` (maintain the signed `/log/mirrors.json`), `log-key` (rotate
+the Log's own Aggregator keys, see
 [Aggregator key rotation](#aggregator-key-rotation)).
 
-`serve` additionally enforces the flat `quota_base` ping quota (429 +
-Retry-After; only WIST2-E02/E04 pings count as noise), accounted per
-Registrable Domain under the snapshot in force at the Ping and reported
+`serve` additionally enforces the flat ping quota, the `quota_base` in
+force in the Log's schedule (429 + Retry-After; only WIST2-E02/E04 pings
+count as noise), accounted per Registrable Domain under the snapshot in
+force at the Ping and reported
 as the shared remainder at every host's status endpoint, and re-pulls
 every known publisher `baseline_poll_seconds` after its last pull
 without a Ping, as [Concurrency](#concurrency) describes. The seal's
@@ -724,14 +727,21 @@ fails to open with that reason rather than being half-migrated, as does
 one that names its table and columns after `block`. Start a new data
 directory.
 
-Every Registry parameter a Consumer verifies, the cadence included, is
-read from the Log's accepted schedule over the Registry defaults. The
-store's local operator values apply only to `epoch_cap_bytes`,
-`domain_epoch_entries_max`, `labeler_epoch_entries_max` and
-`max_inclusion_epochs`, where they can only tighten what one Epoch
-carries, and to `quota_base`, `ingest_budget_bytes_day` and
-`baseline_poll_seconds`; any other Registry identifier is refused as a
-local value.
+Every Registry parameter, the cadence, `quota_base`,
+`ingest_budget_bytes_day` and `baseline_poll_seconds` included, is read
+from the Log's accepted schedule over the Registry defaults; set one with
+a genesis amendment before Epoch 0 seals or with `param-change` after.
+Only `epoch_cap_bytes`, `domain_epoch_entries_max`,
+`labeler_epoch_entries_max` and `max_inclusion_epochs` also take a local
+bound, set with `bound --parameter <name> --value <n>` and removed with
+`bound --parameter <name> --clear`: the seal and `serve`'s back-pressure
+apply the smaller of it and the Log's value, so a local bound tightens
+what one Epoch carries and never loosens it. `bound` refuses any other
+parameter and a value below the Registry floor; an `epoch_cap_bytes`
+below 65 537 could leave a conforming Entry unsealable. A tight local
+bound can still defer Entries past their inclusion ceiling
+(`max_inclusion_epochs`), which `seal` reports; keeping the bounds wide
+enough for the queued load is the operator's duty.
 
 ### Genesis amendments
 

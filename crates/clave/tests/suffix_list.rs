@@ -54,8 +54,13 @@ fn a_pinned_snapshot_governs_from_the_epoch_after_its_seal() {
         "a.example.com"
     );
 
+    clave::param_change::record_genesis(
+        &db,
+        &clave::db::GenesisAmendment::at_genesis("quota_base", 2),
+    )
+    .unwrap();
     let r0 = clave::seal::run(&db, data.path(), &sk, SEAL_START).unwrap();
-    assert_eq!((r0.epoch_number, r0.entry_count), (0, 1));
+    assert_eq!((r0.epoch_number, r0.entry_count), (0, 2));
     assert!(r0.dropped.is_empty(), "{:?}", r0.dropped);
     assert_eq!(
         db.suffix_list_acts().unwrap(),
@@ -83,7 +88,6 @@ fn a_pinned_snapshot_governs_from_the_epoch_after_its_seal() {
         0
     ])));
 
-    db.set_param("quota_base", 2).unwrap();
     db.bump_noise_ping("example.com", &after[..10]).unwrap();
     let remaining = |host: &str| clave::quota::quota_remaining(&db, host, &after).unwrap();
     assert_eq!(remaining("a.example.com"), 1);
@@ -165,8 +169,13 @@ fn a_suffix_list_update_queued_again_under_an_accepted_id_is_dropped_and_the_lat
     std::fs::write(&file, FIRST).unwrap();
     let first = clave::suffix_list::pin(&db, data.path(), &sk, &file, SEAL_START - 10).unwrap();
     let pinning_first = queued_act(&db);
+    clave::param_change::record_genesis(
+        &db,
+        &clave::db::GenesisAmendment::at_genesis("quota_base", 2),
+    )
+    .unwrap();
     let r0 = clave::seal::run(&db, data.path(), &sk, SEAL_START).unwrap();
-    assert_eq!((r0.epoch_number, r0.entry_count), (0, 1));
+    assert_eq!((r0.epoch_number, r0.entry_count), (0, 2));
     let file = data.path().join("second.dat");
     std::fs::write(&file, SECOND).unwrap();
     let second = clave::suffix_list::pin(&db, data.path(), &sk, &file, SEAL_START).unwrap();

@@ -909,7 +909,7 @@ fn claim_all(db: &Db) -> Vec<crate::db::PullTask> {
 
 fn defer_resume(db: &Db, task: &crate::db::PullTask, unit: &str) {
     let (day, domain) = (&NOW[..10], task.domain.as_str());
-    let budget = registry::operator_value(db, "ingest_budget_bytes_day", NOW).unwrap();
+    let budget = registry::effective(db, "ingest_budget_bytes_day", NOW).unwrap();
     let spent = (budget - db.ingest_bytes(unit, day).unwrap()).max(0);
     db.add_ingest_bytes(unit, day, spent).unwrap();
     db.complete_pull(
@@ -951,7 +951,7 @@ fn a_credit_to_a_meter_row_wakes_the_resumptions_of_its_registrable_domain_that_
 
     let (day, budget) = (
         &NOW[..10],
-        registry::operator_value(db, "ingest_budget_bytes_day", NOW).unwrap(),
+        registry::effective(db, "ingest_budget_bytes_day", NOW).unwrap(),
     );
     let run = start_run(db, a, NOW);
     let remainder = budget - db.ingest_bytes(&unit, day).unwrap();

@@ -184,6 +184,8 @@ fn downstream_failures_and_budget_suspension_preserve_the_observation() {
             .unwrap();
         }
         let db = Db::open(&path).unwrap();
+        let day = &NOW[..10];
+        let mut charged = 0;
         if failure == "budget" {
             let size = std::fs::metadata(
                 publisher
@@ -197,8 +199,9 @@ fn downstream_failures_and_budget_suspension_preserve_the_observation() {
                 .values()
                 .map(|octets| octets.len() as i64)
                 .sum::<i64>();
-            db.set_param("ingest_budget_bytes_day", size + collection)
-                .unwrap();
+            charged = clave::registry::effective(&db, "ingest_budget_bytes_day", NOW).unwrap()
+                - (size + collection);
+            db.add_ingest_bytes(&host, day, charged).unwrap();
         }
         let report = clave::ingest::run(&db, &client, data.path(), &host, NOW).unwrap();
         let admitted: &[String] = match failure {
@@ -212,8 +215,7 @@ fn downstream_failures_and_budget_suspension_preserve_the_observation() {
             Some(NOW.parse::<jiff::Timestamp>().unwrap().as_second()),
             "{failure}"
         );
-        db.set_param("ingest_budget_bytes_day", 100_000_000)
-            .unwrap();
+        db.add_ingest_bytes(&host, day, -charged).unwrap();
         drop(db);
         write_label_feed(&publisher, &host, &[], EARLIER);
         let db = Db::open(&path).unwrap();

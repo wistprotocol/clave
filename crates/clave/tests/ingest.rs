@@ -142,10 +142,14 @@ fn a_label_feed_regressed_at_wist2_e05_keeps_the_baseline_schedule() {
 
     let tmp = tempfile::tempdir().unwrap();
     clave::init::run(&host, tmp.path()).unwrap();
+    let baseline = 3600;
+    common::seal_genesis_amendments(
+        tmp.path(),
+        &[("baseline_poll_seconds", baseline)],
+        started_at - 86_400,
+    );
     let db = clave::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
     let all = clave::db::PARTITIONS as usize;
-    let baseline = 3600;
-    db.set_param("baseline_poll_seconds", baseline).unwrap();
     let pull = |started_at: i64| {
         db.schedule_ping(&host, started_at, 4).unwrap();
         let task = db
@@ -499,9 +503,15 @@ fn the_budget_suspends_a_tree_walk_and_a_later_day_resumes_it_from_the_held_file
         .unwrap()
         .len() as i64;
     let root = &published.tree[&published.envelope["catalog"]["tree"].as_str().unwrap()[7..]];
-    db.set_param("ingest_budget_bytes_day", catalog + root.len() as i64 + 10)
-        .unwrap();
-    let first = common::pull_at(&db, &client, data.path(), &host, "2026-08-09T12:00:05Z");
+    let first_at = "2026-08-09T12:00:05Z";
+    let budget = clave::registry::effective(&db, "ingest_budget_bytes_day", first_at).unwrap();
+    db.add_ingest_bytes(
+        &clave::suffix_list::unit_at(&db, &host, first_at).unwrap(),
+        &first_at[..10],
+        budget - (catalog + root.len() as i64 + 10),
+    )
+    .unwrap();
+    let first = common::pull_at(&db, &client, data.path(), &host, first_at);
     assert!(first.suspended && first.items.is_empty() && first.accepted.is_empty());
     assert_eq!(first.noise, None, "a suspended pull is not noise");
     let walked: Vec<String> = requests
@@ -517,7 +527,6 @@ fn the_budget_suspends_a_tree_walk_and_a_later_day_resumes_it_from_the_held_file
         "the root file is read whole and the next one interrupted"
     );
 
-    db.set_param("ingest_budget_bytes_day", 1 << 30).unwrap();
     requests.lock().unwrap().clear();
     let second = common::pull_at(&db, &client, data.path(), &host, "2026-08-10T00:00:05Z");
     assert!(!second.suspended);

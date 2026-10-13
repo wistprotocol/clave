@@ -399,9 +399,7 @@ impl Db {
     }
 
     pub fn set_param(&self, name: &str, value: i64) -> Result<()> {
-        if crate::registry::spec(name).is_some()
-            && !crate::registry::OPERATOR_VALUES.contains(&name)
-        {
+        if crate::registry::spec(name).is_some() && !crate::registry::LOCAL_BOUNDS.contains(&name) {
             return Err(Error::ParamChange(format!(
                 "{name} is a Registry parameter the Log sets; amend it with a parameter_change, before Epoch 0 seals as a genesis amendment"
             )));
@@ -411,6 +409,10 @@ impl Db {
             (name, value),
         )?;
         Ok(())
+    }
+
+    pub fn clear_param(&self, name: &str) -> Result<bool> {
+        Ok(self.execute("DELETE FROM params WHERE name = ?1", [name])? > 0)
     }
 
     pub fn genesis_amendments(&self) -> Result<Vec<GenesisAmendment>> {
@@ -1629,17 +1631,6 @@ impl Db {
         Ok((schedule, largest))
     }
 
-    pub fn latest_param_change(&self, name: &str, at: &str) -> Result<Option<i64>> {
-        let at = crate::registry::unix(at)?;
-        let schedule = self.parameter_schedule(at)?;
-        Ok(schedule
-            .accepted()
-            .iter()
-            .filter(|a| a.parameter == name && a.effective_at_s <= at)
-            .max_by_key(|a| (a.effective_at_s, a.epoch_number, a.entry_index))
-            .map(|a| a.value))
-    }
-
     pub fn parameter_state(&self, at: &str) -> Result<Vec<(String, i64, String)>> {
         let at = crate::registry::unix(at)?;
         crate::registry::parameter_state(&self.parameter_schedule(at)?, at)
@@ -2039,15 +2030,34 @@ pub(crate) mod tests {
         let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
         db.set_param("snapshot_shard_count", 4).unwrap();
         assert_eq!(db.param("snapshot_shard_count").unwrap(), 4);
-        db.set_param("quota_base", 60).unwrap();
-        assert_eq!(db.param("quota_base").unwrap(), 60);
+        db.set_param("epoch_cap_bytes", 1 << 20).unwrap();
+        assert_eq!(db.param("epoch_cap_bytes").unwrap(), 1 << 20);
+    }
+
+    #[test]
+    fn clear_param_removes_the_row_and_reports_whether_one_existed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+        db.set_param("epoch_cap_bytes", 1 << 20).unwrap();
+        db.set_param("max_inclusion_epochs", 2).unwrap();
+        assert!(db.clear_param("epoch_cap_bytes").unwrap());
+        assert!(matches!(db.param("epoch_cap_bytes"), Err(Error::Param(_))));
+        assert!(!db.clear_param("epoch_cap_bytes").unwrap());
+        assert_eq!(db.param("max_inclusion_epochs").unwrap(), 2);
     }
 
     #[test]
     fn set_param_refuses_a_registry_parameter_only_the_log_sets() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
-        for name in ["epoch_cadence_seconds", "feed_window", "param_grace_days"] {
+        for name in [
+            "epoch_cadence_seconds",
+            "feed_window",
+            "param_grace_days",
+            "quota_base",
+            "ingest_budget_bytes_day",
+            "baseline_poll_seconds",
+        ] {
             assert!(db.set_param(name, 60).is_err(), "{name}");
             assert!(db.param(name).is_err(), "{name}");
         }
@@ -2087,14 +2097,12 @@ pub(crate) mod tests {
             }],
         );
         assert_eq!(
-            db.latest_param_change("feed_window", "2026-01-09T23:59:59Z")
-                .unwrap(),
-            None
+            crate::registry::effective(&db, "feed_window", "2026-01-09T23:59:59Z").unwrap(),
+            1000
         );
         assert_eq!(
-            db.latest_param_change("feed_window", "2026-01-10T00:00:00Z")
-                .unwrap(),
-            Some(500)
+            crate::registry::effective(&db, "feed_window", "2026-01-10T00:00:00Z").unwrap(),
+            500
         );
         seal_epoch(
             &db,
@@ -2108,14 +2116,12 @@ pub(crate) mod tests {
             }],
         );
         assert_eq!(
-            db.latest_param_change("feed_window", "2026-01-15T00:00:00Z")
-                .unwrap(),
-            Some(500)
+            crate::registry::effective(&db, "feed_window", "2026-01-15T00:00:00Z").unwrap(),
+            500
         );
         assert_eq!(
-            db.latest_param_change("feed_window", "2026-01-25T00:00:00Z")
-                .unwrap(),
-            Some(800)
+            crate::registry::effective(&db, "feed_window", "2026-01-25T00:00:00Z").unwrap(),
+            800
         );
     }
 

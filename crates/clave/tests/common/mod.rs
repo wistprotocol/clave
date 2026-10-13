@@ -35,6 +35,26 @@ pub fn seal_fixture_epoch(
     row
 }
 
+pub fn seal_genesis_amendments(
+    data_dir: &std::path::Path,
+    amendments: &[(&str, i64)],
+    now_unix: i64,
+) -> clave::seal::SealReport {
+    let db = clave::db::Db::open(&data_dir.join("clave.sqlite")).unwrap();
+    let sk = clave::keys::load(&data_dir.join("keys/seed")).unwrap();
+    for (parameter, value) in amendments {
+        clave::param_change::record_genesis(
+            &db,
+            &clave::db::GenesisAmendment::at_genesis(parameter, *value),
+        )
+        .unwrap();
+    }
+    let report = clave::seal::run(&db, data_dir, &sk, now_unix).unwrap();
+    assert_eq!(report.epoch_number, 0);
+    assert!(report.dropped.is_empty(), "{:?}", report.dropped);
+    report
+}
+
 pub fn seal_vector_epochs(
     db: &clave::db::Db,
     data_dir: &std::path::Path,

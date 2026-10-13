@@ -78,7 +78,7 @@ fn queue_genesis_amendments(db: &Db, sk: &SigningKey, sealed_at: &str) -> Result
 
 /// WIST-4 §5: the Log's map, which a replaying Consumer reads; an operator value of a bound
 /// on what one Epoch carries may only tighten it.
-fn sealing_parameters(db: &Db, sealed_unix: i64, sealed_at: &str) -> Result<Parameters> {
+fn sealing_parameters(db: &Db, sealed_unix: i64) -> Result<Parameters> {
     let schedule = db.parameter_schedule(sealed_unix)?;
     let mut parameters = Parameters::new(
         registry::PARAMS
@@ -95,9 +95,10 @@ fn sealing_parameters(db: &Db, sealed_unix: i64, sealed_at: &str) -> Result<Para
         "labeler_epoch_entries_max",
         "max_inclusion_epochs",
     ] {
-        let local = registry::operator_value(db, name, sealed_at)?;
-        let logged = parameters.value(name)?;
-        parameters.set(name, logged.min(local));
+        if let Some(local) = registry::local_bound(db, name)? {
+            let logged = parameters.value(name)?;
+            parameters.set(name, logged.min(local));
+        }
     }
     let domain = parameters.value("domain_epoch_entries_max")?;
     let labeler = parameters.value("labeler_epoch_entries_max")?;
@@ -224,7 +225,7 @@ pub(super) fn epoch(
         }
     }
     let state = db.load_state(sealed, &scope)?;
-    let parameters = sealing_parameters(db, sealed_unix, &sealed_at)?;
+    let parameters = sealing_parameters(db, sealed_unix)?;
     let payload_window_days = parameters.value("payload_window_days")?;
 
     let (pending, _) = db.peek_pending_entries()?;
@@ -236,36 +237,6 @@ pub(super) fn epoch(
     )?
     .into_iter()
     .partition(|entry| entry.canonical.len() as u64 <= tiles::ENTRY_MAX_BYTES);
-    let schedule = db.parameter_schedule(sealed_unix)?;
-    let mut cap = registry::epoch_cap(&schedule, sealed_unix).min(registry::operator_value(
-        db,
-        "epoch_cap_bytes",
-        &sealed_at,
-    )?);
-    let mut tentative = schedule.clone();
-    let largest = db.largest_epoch_bytes()?;
-    let accepted_parameters = history
-        .schedule()
-        .map(|schedule| schedule.accepted_updates().clone())
-        .unwrap_or_default();
-    for (index, entry) in updates.iter().enumerate() {
-        let update = &entry.body["update"];
-        if update["action"] == "parameter_change"
-            && !wist_core::registry_updates::update_id(&entry.body)
-                .is_ok_and(|id| accepted_parameters.is_accepted(&id))
-            && check_param_change(
-                &mut tentative,
-                update,
-                sealed_unix,
-                epoch_number,
-                index as u64,
-                largest,
-            )
-            .is_ok()
-        {
-            cap = cap.min(registry::epoch_cap(&tentative, sealed_unix));
-        }
-    }
     let GovernanceOutcome {
         kept,
         param_changes,
@@ -274,7 +245,15 @@ pub(super) fn epoch(
         mut dropped,
         dropped_rowids,
         key_registry,
+        schedule: amended,
     } = enforce_governance(db, &history, updates, sealed_unix, epoch_number, 0)?;
+    // WIST-4 §5: the Epoch seals under the smallest cap of the maps left after its own
+    // candidates are processed; a candidate raising the cap does not widen the Epoch sealing
+    // it, which a Consumer bounds from the verified prefix alone (WIST-3 §6).
+    let logged_cap = registry::epoch_cap(&db.parameter_schedule(sealed_unix)?, sealed_unix)
+        .min(registry::epoch_cap(&amended, sealed_unix));
+    let cap = registry::local_bound(db, "epoch_cap_bytes")?
+        .map_or(logged_cap, |local| logged_cap.min(local));
     for entry in &oversize {
         dropped.push(format!(
             "WIST3-E03 {} Entry over 65 535 octets is not sealed",
@@ -549,6 +528,7 @@ pub(super) struct GovernanceOutcome {
     pub(super) dropped: Vec<String>,
     pub(super) dropped_rowids: Vec<i64>,
     pub(super) key_registry: Registry,
+    pub(super) schedule: wist_core::parameters::Schedule,
 }
 
 pub(super) fn check_param_change(
@@ -815,6 +795,7 @@ pub(super) fn enforce_governance(
         dropped: Vec::new(),
         dropped_rowids: Vec::new(),
         key_registry,
+        schedule: schedule.clone(),
     };
     let sealed_items = crate::governance::sealed_items(db)?;
     let mut replay = wist_core::withdrawal::WithdrawalReplay::new();
@@ -955,6 +936,7 @@ pub(super) fn enforce_governance(
             _ => out.kept.push(e),
         }
     }
+    out.schedule = schedule;
     Ok(out)
 }
 

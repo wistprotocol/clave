@@ -190,3 +190,125 @@ fn admission_rejects_invalid_combinations_without_queueing() {
         assert!(db.peek_pending_entries().unwrap().0.is_empty(), "{name}");
     }
 }
+
+fn corrupt_queued_signature(data: &std::path::Path, parameter: &str) {
+    let conn = rusqlite::Connection::open(data.join("clave.sqlite")).unwrap();
+    let rows: Vec<(i64, Vec<u8>)> = conn
+        .prepare(
+            "SELECT rowid, entry_json FROM pending_entries WHERE entry_type = 'registry_update'",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let mut corrupted = 0;
+    for (rowid, json) in rows {
+        let mut body: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        if body["update"]["details"]["parameter"] != parameter {
+            continue;
+        }
+        body["sig"]["value"] = wist_core::crypto::b64u_encode(&[0u8; 64]).into();
+        conn.execute(
+            "UPDATE pending_entries SET entry_json = ?2 WHERE rowid = ?1",
+            rusqlite::params![rowid, serde_json::to_vec(&body).unwrap()],
+        )
+        .unwrap();
+        corrupted += 1;
+    }
+    assert_eq!(corrupted, 1);
+}
+
+const REDUCED_CAP: u64 = 65_537;
+
+fn publish_items_over_the_reduced_cap(r: &common::Rig) {
+    let items: Vec<_> = (0..40)
+        .map(|n| {
+            let (item, payload) = r.page(&format!("{n:04}/{}", "p".repeat(1900)), "body");
+            (item, Some(payload))
+        })
+        .collect();
+    r.publish(&items, "2026-08-09T12:00:00Z", None);
+    r.pull("2026-08-09T12:00:05Z");
+}
+
+fn carries_cap_change(entries: &[serde_json::Value]) -> bool {
+    entries
+        .iter()
+        .any(|entry| entry["body"]["update"]["details"]["parameter"] == "epoch_cap_bytes")
+}
+
+fn seal_beside_a_queued_cap_reduction(
+    corrupt: bool,
+) -> (common::Rig, clave::seal::SealReport, Vec<serde_json::Value>) {
+    let r = common::Rig::new();
+    let genesis = r.seal("2026-08-09T11:00:00Z");
+    assert_eq!(genesis.epoch_number, 0);
+    assert!(r.db.largest_epoch_bytes().unwrap() <= REDUCED_CAP);
+    let queued_at = wist_core::timestamp::log_seconds("2026-08-09T11:00:10Z").unwrap();
+    clave::param_change::run(
+        &r.db,
+        &r.sk,
+        "epoch_cap_bytes",
+        REDUCED_CAP as i64,
+        Some(&ts(queued_at + 10 * DAY)),
+        queued_at,
+    )
+    .unwrap();
+    if corrupt {
+        corrupt_queued_signature(r.data.path(), "epoch_cap_bytes");
+    }
+    publish_items_over_the_reduced_cap(&r);
+    let seal = r.seal("2026-08-09T13:00:00Z");
+    assert_eq!(seal.epoch_number, 1);
+    let entries = r.entries(1);
+    (r, seal, entries)
+}
+
+#[test]
+fn a_queued_cap_reduction_whose_signature_fails_at_sealing_does_not_tighten_that_epochs_cap() {
+    let (r, seal, entries) = seal_beside_a_queued_cap_reduction(true);
+    assert_eq!(seal.dropped.len(), 1, "{:?}", seal.dropped);
+    assert!(
+        seal.dropped[0].contains("epoch_cap_bytes"),
+        "{:?}",
+        seal.dropped
+    );
+    assert!(!carries_cap_change(&entries));
+    assert!(wist_core::epoch::epoch_octets(&entries).unwrap() > REDUCED_CAP);
+    assert!(r.state().urls.is_empty(), "every queued Item seals");
+    assert!(r.db.peek_pending_entries().unwrap().0.is_empty());
+}
+
+#[test]
+fn a_valid_queued_cap_reduction_bounds_the_epoch_that_seals_it() {
+    let (r, seal, entries) = seal_beside_a_queued_cap_reduction(false);
+    assert!(seal.dropped.is_empty(), "{:?}", seal.dropped);
+    assert!(carries_cap_change(&entries));
+    assert!(wist_core::epoch::epoch_octets(&entries).unwrap() <= REDUCED_CAP);
+    assert!(
+        !r.state().urls.is_empty(),
+        "the reduced cap keeps Items out"
+    );
+}
+
+#[test]
+fn a_genesis_cap_reduction_bounds_the_contents_of_epoch_0() {
+    let r = common::Rig::new();
+    clave::param_change::record_genesis(
+        &r.db,
+        &clave::db::GenesisAmendment::at_genesis("epoch_cap_bytes", REDUCED_CAP as i64),
+    )
+    .unwrap();
+    publish_items_over_the_reduced_cap(&r);
+    let seal = r.seal("2026-08-09T13:00:00Z");
+    assert_eq!(seal.epoch_number, 0);
+    assert!(seal.dropped.is_empty(), "{:?}", seal.dropped);
+    let entries = r.entries(0);
+    assert!(carries_cap_change(&entries));
+    assert!(wist_core::epoch::epoch_octets(&entries).unwrap() <= REDUCED_CAP);
+    assert!(
+        !r.state().urls.is_empty(),
+        "the reduced cap keeps Items out"
+    );
+}

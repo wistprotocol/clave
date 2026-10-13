@@ -103,8 +103,9 @@ fn a_fetch_after_midnight_utc_is_metered_on_the_new_day() {
     let data = tempfile::tempdir().unwrap();
     let db = open_log(&host, data.path());
     let spent_before = site.walked + file_len(&p, &site.first);
-    db.set_param("ingest_budget_bytes_day", spent_before)
-        .unwrap();
+    let charged =
+        clave::registry::effective(&db, "ingest_budget_bytes_day", before).unwrap() - spent_before;
+    db.add_ingest_bytes(&host, &before[..10], charged).unwrap();
 
     let report = pull_across(&db, &client, data.path(), &host, &site, before, after);
     assert_eq!(report.items.len(), 2, "{report:?}");
@@ -114,7 +115,7 @@ fn a_fetch_after_midnight_utc_is_metered_on_the_new_day() {
     );
     assert_eq!(
         db.ingest_bytes(&host, &before[..10]).unwrap(),
-        spent_before,
+        charged + spent_before,
         "the requests issued before midnight stay debited to that day"
     );
     assert_eq!(
@@ -136,8 +137,8 @@ fn a_fetch_after_a_budget_change_is_metered_under_the_budget_in_force_at_it() {
     let db = open_log(&host, data.path());
     let sk = clave::keys::load(&data.path().join("keys/seed")).unwrap();
     let spent_before = site.walked + file_len(&p, &site.first);
-    db.set_param("ingest_budget_bytes_day", spent_before)
-        .unwrap();
+    let floor = 1_048_576;
+    clave::param_change::run(&db, &sk, "ingest_budget_bytes_day", floor, None, sealed_at).unwrap();
     clave::param_change::run(
         &db,
         &sk,
@@ -148,6 +149,12 @@ fn a_fetch_after_a_budget_change_is_metered_under_the_budget_in_force_at_it() {
     )
     .unwrap();
     clave::seal::run(&db, data.path(), &sk, sealed_at).unwrap();
+    assert_eq!(
+        clave::registry::effective(&db, "ingest_budget_bytes_day", &before).unwrap(),
+        floor
+    );
+    let charged = floor - spent_before;
+    db.add_ingest_bytes(&host, &before[..10], charged).unwrap();
 
     let report = pull_across(&db, &client, data.path(), &host, &site, &before, &after);
     assert_eq!(report.items.len(), 2, "{report:?}");
@@ -157,7 +164,7 @@ fn a_fetch_after_a_budget_change_is_metered_under_the_budget_in_force_at_it() {
     );
     assert_eq!(
         db.ingest_bytes(&host, &before[..10]).unwrap(),
-        spent_before + file_len(&p, &site.second)
+        charged + spent_before + file_len(&p, &site.second)
     );
 }
 

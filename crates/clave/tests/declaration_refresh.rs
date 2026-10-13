@@ -299,6 +299,7 @@ fn every_declaration_refresh_case_replays_over_loopback() {
             )
             .unwrap();
         }
+        let mut charged = 0;
         for (pull, expected) in case["pulls"]
             .as_array()
             .unwrap()
@@ -307,13 +308,15 @@ fn every_declaration_refresh_case_replays_over_loopback() {
         {
             let budget = serve_pull(served.path(), pull);
             let day = &clock[..10];
-            let spent = db.ingest_bytes(&host, day).unwrap();
-            let budget = if budget < 0 { 1 << 30 } else { spent + budget };
-            db.set_param("ingest_budget_bytes_day", budget.max(1))
-                .unwrap();
-            if budget == 0 {
-                db.add_ingest_bytes(&host, day, 1).unwrap();
-            }
+            let charge = if budget < 0 {
+                -charged
+            } else {
+                clave::registry::effective(&db, "ingest_budget_bytes_day", clock).unwrap()
+                    - budget
+                    - db.ingest_bytes(&host, day).unwrap()
+            };
+            db.add_ingest_bytes(&host, day, charge).unwrap();
+            charged += charge;
             requests.lock().unwrap().clear();
             let report = clave::ingest::run(&db, &client, data.path(), &host, clock).unwrap();
             let requests = requests.lock().unwrap().clone();

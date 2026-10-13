@@ -384,7 +384,6 @@ fn every_label_feed_case_decides_over_loopback_whether_the_label_feed_is_pulled(
         let data = tempfile::tempdir().unwrap();
         clave::init::run(&host, data.path()).unwrap();
         let db = clave::db::Db::open(&data.path().join("clave.sqlite")).unwrap();
-        db.set_param("ingest_budget_bytes_day", 1 << 30).unwrap();
         let onboarded = clave::ingest::run(&db, &client, data.path(), &host, CLOCK).unwrap();
         assert_eq!(
             onboarded.accepted.len(),
@@ -443,12 +442,13 @@ fn every_label_feed_case_decides_over_loopback_whether_the_label_feed_is_pulled(
             .len() as i64;
         let day = &CLOCK[..10];
         let spent = db.ingest_bytes(&host, day).unwrap();
+        let logged = clave::registry::effective(&db, "ingest_budget_bytes_day", CLOCK).unwrap();
         let budget = match case["budget_remaining"].as_i64().unwrap() {
             0 => spent + spent_by_collections,
             1 => spent + spent_by_collections + live_len,
-            _ => 1 << 30,
+            _ => logged,
         };
-        db.set_param("ingest_budget_bytes_day", budget).unwrap();
+        db.add_ingest_bytes(&host, day, logged - budget).unwrap();
         requests.lock().unwrap().clear();
         let report =
             clave::ingest::run(&db, &client, data.path(), &host, "2026-08-09T14:00:30Z").unwrap();

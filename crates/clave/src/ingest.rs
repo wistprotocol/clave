@@ -556,7 +556,7 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
         Ok(Meter {
             unit: crate::suffix_list::unit_at(self.db, self.host, &at)?,
             day: at.get(..10).unwrap_or(&at).to_string(),
-            budget: registry::operator_value(self.db, "ingest_budget_bytes_day", &at)?,
+            budget: registry::effective(self.db, "ingest_budget_bytes_day", &at)?,
             caps: ObjectCaps::from_schedule(&self.db.parameter_schedule(unix)?, unix),
         })
     }

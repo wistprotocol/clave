@@ -260,19 +260,36 @@ fn status_reports_last_pull_and_quota_after_ingest() {
 
 #[test]
 fn ingest_ping_over_quota_gets_429_with_retry_after() {
+    let (listener, host, client) = reserve_addr();
+    let empty = tempfile::tempdir().unwrap();
+    serve_static(listener, empty.path().to_path_buf());
+
     let tmp = tempfile::tempdir().unwrap();
-    clave::init::run("127.0.0.1:0", tmp.path()).unwrap();
-    {
-        let db = clave::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
-        db.set_param("quota_base", 0).unwrap();
-    }
-    let addr = spawn_server(tmp.path());
+    clave::init::run(&host, tmp.path()).unwrap();
+    common::seal_genesis_amendments(tmp.path(), &[("quota_base", 1)], unix_now() - 86_400);
+    let addr = spawn_server_with_client(tmp.path(), client);
     let c = reqwest::blocking::Client::new();
-    let r = c
-        .post(format!("{addr}/ingest"))
-        .json(&serde_json::json!({"host": "127.0.0.1"}))
-        .send()
-        .unwrap();
+    let ping = || {
+        c.post(format!("{addr}/ingest"))
+            .json(&serde_json::json!({"host": host}))
+            .send()
+            .unwrap()
+    };
+    assert_eq!(ping().status(), 202);
+    let db = store(tmp.path());
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while db
+        .noise_ping_count(&host, &jiff::Timestamp::now().to_string()[..10])
+        .unwrap()
+        == 0
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the first-contact failure was never counted as a noise ping"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let r = ping();
     assert_eq!(r.status(), 429);
     let retry_after: i64 = r
         .headers()
@@ -325,6 +342,7 @@ fn noise_ping_decrements_quota() {
 fn status_reports_real_quota_remaining() {
     let tmp = tempfile::tempdir().unwrap();
     clave::init::run("127.0.0.1:0", tmp.path()).unwrap();
+    common::seal_genesis_amendments(tmp.path(), &[("quota_base", 50)], unix_now() - 86_400);
     {
         let db = clave::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
         let publisher = common::make_publisher("example.com");
@@ -337,7 +355,6 @@ fn status_reports_real_quota_remaining() {
             &doc,
         )
         .unwrap();
-        db.set_param("quota_base", 50).unwrap();
         let day = &jiff::Timestamp::now().to_string()[..10];
         db.bump_noise_ping("example.com", day).unwrap();
         db.bump_noise_ping("example.com", day).unwrap();
@@ -560,6 +577,11 @@ fn unix_now() -> i64 {
 fn a_ping_moves_a_scheduled_pull_earlier_never_later_and_takes_no_new_slot() {
     let tmp = tempfile::tempdir().unwrap();
     clave::init::run("127.0.0.1:0", tmp.path()).unwrap();
+    common::seal_genesis_amendments(
+        tmp.path(),
+        &[("baseline_poll_seconds", 3600)],
+        unix_now() - 86_400,
+    );
     let domain = "example.com";
     let baseline_due = {
         let db = clave::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
@@ -573,7 +595,6 @@ fn a_ping_moves_a_scheduled_pull_earlier_never_later_and_takes_no_new_slot() {
             &doc,
         )
         .unwrap();
-        db.set_param("baseline_poll_seconds", 3600).unwrap();
         let now = unix_now();
         let task = db
             .claim_pulls(
@@ -903,9 +924,13 @@ fn a_pull_in_flight_at_restart_is_dispatched_once_and_rescheduled_one_baseline_l
 
     let tmp = tempfile::tempdir().unwrap();
     clave::init::run("127.0.0.1:0", tmp.path()).unwrap();
+    common::seal_genesis_amendments(
+        tmp.path(),
+        &[("baseline_poll_seconds", 3600)],
+        unix_now() - 86_400,
+    );
     {
         let db = clave::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
-        db.set_param("baseline_poll_seconds", 3600).unwrap();
         let crashed_at = unix_now() - clave::db::PARTITION_LEASE_SECONDS;
         db.schedule_ping(&host, crashed_at, 4).unwrap();
         let claimed = db

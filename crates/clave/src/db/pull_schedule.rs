@@ -372,7 +372,7 @@ fn next_due(
 }
 
 fn baseline_interval(db: &Db, now: i64) -> Result<i64> {
-    crate::registry::operator_value(db, "baseline_poll_seconds", &crate::registry::instant(now)?)
+    crate::registry::effective(db, "baseline_poll_seconds", &crate::registry::instant(now)?)
 }
 
 fn retry_delay(before: i64) -> Option<i64> {
@@ -662,7 +662,7 @@ impl Db {
         let at = crate::registry::instant(now)?;
         let day = at.get(..10).unwrap_or(&at);
         let unit = crate::suffix_list::unit_at(self, domain, &at)?;
-        let budget = crate::registry::operator_value(self, "ingest_budget_bytes_day", &at)?;
+        let budget = crate::registry::effective(self, "ingest_budget_bytes_day", &at)?;
         if self.ingest_bytes(&unit, day)? < budget {
             return Ok(now);
         }
@@ -748,6 +748,21 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
         (tmp, db)
+    }
+
+    fn seal_baseline(db: &Db, seconds: i64) {
+        let genesis = ts(1_700_000_000);
+        crate::db::tests::seal_epoch(
+            db,
+            0,
+            &genesis,
+            &[crate::db::ParamChangeRow {
+                entry_index: 0,
+                parameter: "baseline_poll_seconds",
+                value: seconds,
+                effective_at: &genesis,
+            }],
+        );
     }
 
     fn due(domain: &str, due_at: i64, reason: Reason, attempts: i64) -> DuePull {
@@ -924,7 +939,7 @@ mod tests {
         db.set_publisher_pulled("suspended.example", &ts(now - 60))
             .unwrap();
         db.set_walk_suspended("suspended.example", true).unwrap();
-        db.set_param("baseline_poll_seconds", 3600).unwrap();
+        seal_baseline(&db, 3600);
         db.conn
             .execute_batch("DROP TABLE pull_schedule; DROP TABLE pull_tasks;")
             .unwrap();
@@ -1072,7 +1087,7 @@ mod tests {
     #[test]
     fn a_successful_pull_is_next_due_one_baseline_interval_after_it_started() {
         let (_tmp, db) = open_db();
-        db.set_param("baseline_poll_seconds", 3600).unwrap();
+        seal_baseline(&db, 3600);
         db.insert_publisher("a.example", b"{}", "k", "p").unwrap();
         let task = db
             .claim_pulls(NOW, 1, "me", ALL, &[], &mut false, true)
@@ -1147,9 +1162,9 @@ mod tests {
     #[test]
     fn a_walk_suspended_on_a_spent_budget_resumes_at_the_next_utc_day() {
         let (_tmp, db) = open_db();
-        db.set_param("ingest_budget_bytes_day", 10).unwrap();
         db.insert_publisher("a.example", b"{}", "k", "p").unwrap();
-        db.add_ingest_bytes("a.example", &ts(NOW)[..10], 10)
+        let budget = crate::registry::effective(&db, "ingest_budget_bytes_day", &ts(NOW)).unwrap();
+        db.add_ingest_bytes("a.example", &ts(NOW)[..10], budget)
             .unwrap();
         let task = db
             .claim_pulls(NOW, 1, "me", ALL, &[], &mut false, true)
@@ -1198,7 +1213,7 @@ mod tests {
     #[test]
     fn a_pull_ended_at_wist2_e01_is_retried_at_one_four_sixteen_and_sixty_four_minutes() {
         let (_tmp, db) = open_db();
-        db.set_param("baseline_poll_seconds", 86_400).unwrap();
+        seal_baseline(&db, 86_400);
         db.insert_publisher("a.example", b"{}", "k", "p").unwrap();
         let now = back_off_four_times(&db, PullOutcome::StoppedAtDeclaration);
         let task = db
@@ -1224,7 +1239,7 @@ mod tests {
     #[test]
     fn internal_failures_back_off_past_a_shorter_baseline_and_reset_on_success() {
         let (_tmp, db) = open_db();
-        db.set_param("baseline_poll_seconds", 600).unwrap();
+        seal_baseline(&db, 600);
         db.insert_publisher("a.example", b"{}", "k", "p").unwrap();
         let now = back_off_four_times(&db, PullOutcome::Failed);
         let task = db
@@ -1249,7 +1264,7 @@ mod tests {
     #[test]
     fn a_successful_pull_clears_the_retry_count_of_the_pulls_that_ended_at_wist2_e01() {
         let (_tmp, db) = open_db();
-        db.set_param("baseline_poll_seconds", 3600).unwrap();
+        seal_baseline(&db, 3600);
         db.insert_publisher("a.example", b"{}", "k", "p").unwrap();
         let complete = |now: i64, outcome: PullOutcome| {
             let task = db
@@ -1282,7 +1297,7 @@ mod tests {
     #[test]
     fn a_pull_ended_at_e04_e05_or_wist1_e02_keeps_the_baseline_schedule() {
         let (_tmp, db) = open_db();
-        db.set_param("baseline_poll_seconds", 3600).unwrap();
+        seal_baseline(&db, 3600);
         db.insert_publisher("a.example", b"{}", "k", "p").unwrap();
         let task = db
             .claim_pulls(NOW, 1, "me", ALL, &[], &mut false, true)

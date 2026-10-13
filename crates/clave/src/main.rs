@@ -110,6 +110,16 @@ enum Command {
         #[arg(long = "effective-at")]
         effective_at: Option<String>,
     },
+    Bound {
+        #[arg(long)]
+        data: PathBuf,
+        #[arg(long)]
+        parameter: String,
+        #[arg(long, conflicts_with = "clear", required_unless_present = "clear")]
+        value: Option<i64>,
+        #[arg(long)]
+        clear: bool,
+    },
     Withdraw {
         #[arg(long)]
         data: PathBuf,
@@ -432,6 +442,43 @@ fn run() -> Result<(), clave::Error> {
                 } => println!(
                     "recorded genesis amendment {parameter} = {value}: it seals in Epoch 0, effective {effective_at}"
                 ),
+            }
+        }
+        Command::Bound {
+            data,
+            parameter,
+            value,
+            ..
+        } => {
+            if !clave::registry::LOCAL_BOUNDS.contains(&parameter.as_str()) {
+                return Err(clave::Error::ParamChange(format!(
+                    "{parameter} takes no local bound; local bounds exist for {}",
+                    clave::registry::LOCAL_BOUNDS.join(", ")
+                )));
+            }
+            let db = clave::db::Db::open(&data.join("clave.sqlite"))?;
+            match value {
+                Some(value) => {
+                    if let Some(floor) = clave::registry::spec(&parameter).and_then(|spec| spec.min)
+                    {
+                        if value < floor {
+                            return Err(clave::Error::ParamChange(format!(
+                                "{parameter} = {value} is below its Registry floor {floor}"
+                            )));
+                        }
+                    }
+                    db.set_param(&parameter, value)?;
+                    println!(
+                        "local bound {parameter} = {value}; the Log's value applies where it is smaller"
+                    );
+                }
+                None => {
+                    if db.clear_param(&parameter)? {
+                        println!("cleared local bound {parameter}; the Log's value applies");
+                    } else {
+                        println!("no local bound {parameter} was set; the Log's value applies");
+                    }
+                }
             }
         }
         Command::Withdraw {

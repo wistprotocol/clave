@@ -7,7 +7,7 @@ use crate::registry;
 /// UTC day is `quota_base` in force at the instant, the same for every
 /// Registrable Domain.
 pub fn quota_q(db: &Db, at: &str) -> Result<i64> {
-    registry::operator_value(db, "quota_base", at)
+    registry::effective(db, "quota_base", at)
 }
 
 /// WIST-4 §3.1: the Registrable Domain under the snapshot in force at `at`,
@@ -29,6 +29,20 @@ mod tests {
         (tmp, db)
     }
 
+    fn seal_quota_base(db: &Db, value: i64) {
+        crate::db::tests::seal_epoch(
+            db,
+            0,
+            "2026-08-01T00:00:00Z",
+            &[crate::db::ParamChangeRow {
+                entry_index: 0,
+                parameter: "quota_base",
+                value,
+                effective_at: "2026-08-01T00:00:00Z",
+            }],
+        );
+    }
+
     #[test]
     fn quota_q_is_the_registry_default() {
         let (_tmp, db) = open_db();
@@ -38,14 +52,14 @@ mod tests {
     #[test]
     fn quota_q_follows_quota_base() {
         let (_tmp, db) = open_db();
-        db.set_param("quota_base", 10).unwrap();
+        seal_quota_base(&db, 10);
         assert_eq!(quota_q(&db, "2026-08-15T00:00:00Z").unwrap(), 10);
     }
 
     #[test]
     fn quota_remaining_subtracts_the_day_s_noise_pings() {
         let (_tmp, db) = open_db();
-        db.set_param("quota_base", 2).unwrap();
+        seal_quota_base(&db, 2);
         for _ in 0..3 {
             db.bump_noise_ping("example.com", "2026-08-15").unwrap();
         }
