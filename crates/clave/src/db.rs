@@ -586,7 +586,7 @@ impl Db {
 
     pub fn sealed_declarations(&self, domain: &str) -> Result<Vec<SealedDeclarationEntry>> {
         let mut stmt = self.conn.prepare(
-            "SELECT seq, epoch_number, sealed_at, declaration_json FROM sealed_declarations WHERE domain = ?1 ORDER BY seq ASC",
+            "SELECT d.seq, d.epoch_number, d.sealed_at, d.declaration_json FROM sealed_declarations d JOIN epochs b ON b.epoch_number = d.epoch_number WHERE d.domain = ?1 AND b.rejected = 0 ORDER BY d.seq ASC",
         )?;
         let rows = stmt
             .query_map([domain], |row| {
@@ -1292,7 +1292,7 @@ impl Db {
         Ok(self
             .conn
             .query_row(
-                "SELECT subject FROM labels WHERE label_id = ?1",
+                "SELECT l.subject FROM labels l JOIN epochs b ON b.epoch_number = l.epoch_number WHERE l.label_id = ?1 AND b.rejected = 0",
                 [label_id],
                 |row| row.get(0),
             )
@@ -1320,7 +1320,7 @@ impl Db {
 
     pub fn sealed_labels(&self) -> Result<Vec<wist_core::label::SealedLabel>> {
         let mut stmt = self.conn.prepare(
-            "SELECT label_id, labeler, subject, name, value, asserted_at, retracted, expires_at, delta, epoch_number, entry_index FROM labels ORDER BY epoch_number, entry_index",
+            "SELECT l.label_id, l.labeler, l.subject, l.name, l.value, l.asserted_at, l.retracted, l.expires_at, l.delta, l.epoch_number, l.entry_index FROM labels l JOIN epochs b ON b.epoch_number = l.epoch_number WHERE b.rejected = 0 ORDER BY l.epoch_number, l.entry_index",
         )?;
         let rows = stmt
             .query_map([], |row| {
@@ -1347,7 +1347,7 @@ impl Db {
 
     pub fn sealed_disputes(&self) -> Result<Vec<wist_core::label::SealedDispute>> {
         let mut stmt = self.conn.prepare(
-            "SELECT dispute_id, label_id, disputant, reason, asserted_at, epoch_number, entry_index FROM disputes ORDER BY epoch_number, entry_index",
+            "SELECT d.dispute_id, d.label_id, d.disputant, d.reason, d.asserted_at, d.epoch_number, d.entry_index FROM disputes d JOIN epochs b ON b.epoch_number = d.epoch_number WHERE b.rejected = 0 ORDER BY d.epoch_number, d.entry_index",
         )?;
         let rows = stmt
             .query_map([], |row| {
@@ -1439,11 +1439,25 @@ impl Db {
         if marked.is_none_or(|marked| marked == rejected) {
             return Ok(());
         }
-        self.execute(
-            "UPDATE epochs SET rejected = ?2 WHERE epoch_number = ?1 AND rejected != ?2",
-            (epoch_number as i64, rejected),
-        )?;
-        Ok(())
+        self.write(|conn| {
+            conn.execute(
+                "UPDATE epochs SET rejected = ?2 WHERE epoch_number = ?1 AND rejected != ?2",
+                (epoch_number as i64, rejected),
+            )?;
+            // WIST-3 §3.3, Rejected Epochs: no withdrawal of a rejected Epoch applies.
+            if rejected {
+                conn.execute(
+                    "DELETE FROM pending_removals WHERE item_id IN (SELECT item_id FROM withdrawals WHERE epoch_number = ?1)",
+                    [epoch_number as i64],
+                )?;
+            } else {
+                conn.execute(
+                    "INSERT OR IGNORE INTO pending_removals(item_id, domain) SELECT item_id, domain FROM withdrawals WHERE epoch_number = ?1",
+                    [epoch_number as i64],
+                )?;
+            }
+            Ok(())
+        })
     }
 
     pub fn suffix_list_in_force_at(&self, at: &str) -> Result<Option<(String, u64)>> {

@@ -1,10 +1,12 @@
 mod common;
 
-use clave::db::{ParamChangeRow, WithdrawalRow};
+use clave::db::{
+    ParamChangeRow, SealedDeclarationRow, SealedDisputeRow, SealedLabelRow, WithdrawalRow,
+};
 use clave::history::History;
 use serde_json::{json, Value};
 use wist_core::crypto::SigningKey;
-use wist_core::objects::{ParameterEntry, StateEntry};
+use wist_core::objects::{Dispute, Label, ParameterEntry, StateEntry};
 
 const T0: i64 = 1_786_276_800;
 const DAY: i64 = 86_400;
@@ -58,11 +60,111 @@ fn seal_with(
     sk: &SigningKey,
     height: u64,
     at: i64,
-    mut entries: Vec<Value>,
+    entries: Vec<Value>,
     changes: &[ParamChangeRow],
     withdrawals: &[WithdrawalRow],
     suffix_lists: &[String],
 ) -> u64 {
+    seal_publications(
+        db,
+        sk,
+        height,
+        at,
+        entries,
+        changes,
+        withdrawals,
+        suffix_lists,
+        &Publications::none(),
+    )
+}
+
+struct Publications {
+    label: Option<(&'static str, Label)>,
+    dispute: Option<(&'static str, Dispute)>,
+    declaration: Option<u64>,
+}
+
+impl Publications {
+    fn none() -> Self {
+        Self {
+            label: None,
+            dispute: None,
+            declaration: None,
+        }
+    }
+
+    fn of(label_id: &'static str, dispute_id: &'static str, seq: u64) -> Self {
+        Self {
+            label: Some((
+                label_id,
+                Label {
+                    wist_version: "1.0.0".into(),
+                    labeler: LABELER.into(),
+                    subject: format!("https://site.example.test/{seq}"),
+                    name: "spam".into(),
+                    value: None,
+                    asserted_at: ts(T0 - DAY),
+                    retracted: None,
+                    expires_at: None,
+                    delta: None,
+                },
+            )),
+            dispute: Some((
+                dispute_id,
+                Dispute {
+                    wist_version: "1.0.0".into(),
+                    disputant: "site.example.test".into(),
+                    label: label_id.into(),
+                    log: LOG_ID.into(),
+                    height: 0,
+                    reason: None,
+                    asserted_at: ts(T0 - DAY),
+                },
+            )),
+            declaration: Some(seq),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn seal_publications(
+    db: &clave::db::Db,
+    sk: &SigningKey,
+    height: u64,
+    at: i64,
+    mut entries: Vec<Value>,
+    changes: &[ParamChangeRow],
+    withdrawals: &[WithdrawalRow],
+    suffix_lists: &[String],
+    publications: &Publications,
+) -> u64 {
+    let labels: Vec<SealedLabelRow> = publications
+        .label
+        .iter()
+        .map(|(label_id, label)| SealedLabelRow {
+            label_id,
+            entry_index: 0,
+            label,
+        })
+        .collect();
+    let disputes: Vec<SealedDisputeRow> = publications
+        .dispute
+        .iter()
+        .map(|(dispute_id, dispute)| SealedDisputeRow {
+            dispute_id,
+            entry_index: 1,
+            dispute,
+        })
+        .collect();
+    let declarations: Vec<SealedDeclarationRow> = publications
+        .declaration
+        .iter()
+        .map(|seq| SealedDeclarationRow {
+            domain: DECLARING_DOMAIN,
+            seq: *seq,
+            declaration_json: b"{}",
+        })
+        .collect();
     wist_core::epoch::sort_entries(&mut entries).unwrap();
     let octets = wist_core::epoch::epoch_octets(&entries).unwrap();
     db.commit_seal(
@@ -76,9 +178,9 @@ fn seal_with(
         changes,
         withdrawals,
         suffix_lists,
-        &[],
-        &[],
-        &[],
+        &labels,
+        &disputes,
+        &declarations,
     )
     .unwrap();
     octets
@@ -195,6 +297,20 @@ const ITEM_ID: &str = "sha256:7a1f0c5e3b9d2e4f6a8c0b1d3e5f7a9c2b4d6e8f0a1c3e5b7d
 const WITHDRAWN_DOMAIN: &str = "publisher.example.test";
 const WITHDRAWAL_ID: &str =
     "sha256:0b1d3e5f7a9c2b4d6e8f0a1c3e5b7d9f1a3c5e7b9d0f7a1f0c5e3b9d2e4f6a8c";
+const OTHER_ITEM_ID: &str =
+    "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+const OTHER_WITHDRAWAL_ID: &str =
+    "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+const LABELER: &str = "labeler.example.test";
+const DECLARING_DOMAIN: &str = "declarer.example.test";
+const ACCEPTED_LABEL_ID: &str =
+    "sha256:3333333333333333333333333333333333333333333333333333333333333333";
+const ACCEPTED_DISPUTE_ID: &str =
+    "sha256:4444444444444444444444444444444444444444444444444444444444444444";
+const REJECTED_LABEL_ID: &str =
+    "sha256:5555555555555555555555555555555555555555555555555555555555555555";
+const REJECTED_DISPUTE_ID: &str =
+    "sha256:6666666666666666666666666666666666666666666666666666666666666666";
 
 fn suffix_list_act(sk: &SigningKey, identifier: &str, bytes: usize) -> Value {
     let update = json!({
@@ -234,7 +350,7 @@ impl RejectedStore {
         let identifier = wist_core::suffix_list::identifier(SUFFIX_LIST);
         db.store_suffix_list(&identifier, SUFFIX_LIST).unwrap();
         let cap_effective = ts(T0);
-        seal(
+        seal_publications(
             &db,
             &sk,
             0,
@@ -246,8 +362,11 @@ impl RejectedStore {
                 value: 65_537,
                 effective_at: &cap_effective,
             }],
+            &[],
+            &[],
+            &Publications::of(ACCEPTED_LABEL_ID, ACCEPTED_DISPUTE_ID, 1),
         );
-        let octets1 = seal_with(
+        let octets1 = seal_publications(
             &db,
             &sk,
             1,
@@ -260,6 +379,7 @@ impl RejectedStore {
             &[],
             &[withdrawal()],
             std::slice::from_ref(&identifier),
+            &Publications::of(REJECTED_LABEL_ID, REJECTED_DISPUTE_ID, 2),
         );
         assert!(octets1 > 65_537);
         let window_effective = ts(T0 + 8 * DAY);
@@ -498,4 +618,130 @@ fn a_snapshot_that_is_the_first_pass_over_a_rejected_epoch_marks_it_and_builds()
     assert!(clave::suffix_list::in_force_at_epoch(&store.db, 2)
         .unwrap()
         .is_none());
+}
+
+#[test]
+fn the_label_readers_exclude_a_rejected_epochs_labels_and_keep_an_accepted_epochs() {
+    let store = RejectedStore::build();
+    let db = &store.db;
+    assert_eq!(db.sealed_labels().unwrap().len(), 2);
+    assert!(db
+        .sealed_label_subject(REJECTED_LABEL_ID)
+        .unwrap()
+        .is_some());
+
+    store.read_all();
+    let labels: Vec<(String, u64)> = db
+        .sealed_labels()
+        .unwrap()
+        .into_iter()
+        .map(|sealed| (sealed.label_id, sealed.height))
+        .collect();
+    assert_eq!(labels, vec![(ACCEPTED_LABEL_ID.to_owned(), 0)]);
+    assert_eq!(
+        db.sealed_label_subject(ACCEPTED_LABEL_ID)
+            .unwrap()
+            .as_deref(),
+        Some("https://site.example.test/1")
+    );
+    assert_eq!(db.sealed_label_subject(REJECTED_LABEL_ID).unwrap(), None);
+}
+
+#[test]
+fn the_dispute_reader_excludes_a_rejected_epochs_disputes_and_keeps_an_accepted_epochs() {
+    let store = RejectedStore::build();
+    let db = &store.db;
+    assert_eq!(db.sealed_disputes().unwrap().len(), 2);
+
+    store.read_all();
+    let disputes: Vec<(String, u64)> = db
+        .sealed_disputes()
+        .unwrap()
+        .into_iter()
+        .map(|sealed| (sealed.dispute_id, sealed.height))
+        .collect();
+    assert_eq!(disputes, vec![(ACCEPTED_DISPUTE_ID.to_owned(), 0)]);
+}
+
+#[test]
+fn the_sealed_declaration_reader_excludes_a_rejected_epochs_declaration_and_keeps_an_accepted_epochs(
+) {
+    let store = RejectedStore::build();
+    let db = &store.db;
+    assert_eq!(db.sealed_declarations(DECLARING_DOMAIN).unwrap().len(), 2);
+
+    store.read_all();
+    let declarations: Vec<(u64, u64)> = db
+        .sealed_declarations(DECLARING_DOMAIN)
+        .unwrap()
+        .into_iter()
+        .map(|sealed| (sealed.seq, sealed.epoch_number))
+        .collect();
+    assert_eq!(declarations, vec![(1, 0)]);
+}
+
+#[test]
+fn the_sealed_id_set_keeps_a_rejected_epochs_label_and_dispute_ids_seen_so_none_is_sealed_twice() {
+    let store = RejectedStore::build();
+    let sealed = store.db.sealed_state(store.data.path()).unwrap();
+    assert_eq!(store.markers(), vec![(0, 0), (1, 1), (2, 0)]);
+    let expected: std::collections::BTreeSet<String> = [
+        ACCEPTED_LABEL_ID,
+        ACCEPTED_DISPUTE_ID,
+        REJECTED_LABEL_ID,
+        REJECTED_DISPUTE_ID,
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    assert_eq!(sealed.sealed_labels, expected);
+}
+
+#[test]
+fn marking_an_epoch_rejected_drops_its_queued_removal_and_keeps_an_accepted_epochs() {
+    let store = RejectedStore::build();
+    let db = &store.db;
+    seal_with(
+        db,
+        &store.sk,
+        3,
+        T0 + 10_800,
+        vec![],
+        &[],
+        &[WithdrawalRow {
+            update_id: OTHER_WITHDRAWAL_ID,
+            item_id: OTHER_ITEM_ID,
+            domain: WITHDRAWN_DOMAIN,
+        }],
+        &[],
+    );
+    assert_eq!(
+        db.pending_removals().unwrap(),
+        vec![
+            (OTHER_ITEM_ID.to_owned(), WITHDRAWN_DOMAIN.to_owned()),
+            (ITEM_ID.to_owned(), WITHDRAWN_DOMAIN.to_owned()),
+        ]
+    );
+
+    let judgments = store.read_all();
+    assert_eq!(judgments[1], Some(vec!["WIST3-E03".to_owned()]));
+    assert_eq!(judgments[3], None);
+    assert_eq!(
+        db.pending_removals().unwrap(),
+        vec![(OTHER_ITEM_ID.to_owned(), WITHDRAWN_DOMAIN.to_owned())]
+    );
+}
+
+#[test]
+fn clearing_a_rejected_marker_queues_the_epochs_withdrawal_again() {
+    let store = RejectedStore::build();
+    let db = &store.db;
+    db.record_epoch_judgment(1, true).unwrap();
+    assert!(db.pending_removals().unwrap().is_empty());
+
+    db.record_epoch_judgment(1, false).unwrap();
+    assert_eq!(
+        db.pending_removals().unwrap(),
+        vec![(ITEM_ID.to_owned(), WITHDRAWN_DOMAIN.to_owned())]
+    );
 }
