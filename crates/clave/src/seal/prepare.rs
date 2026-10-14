@@ -995,9 +995,11 @@ pub(super) fn fit_to_cap(
             Ok((declaration, entry))
         })
         .collect::<Result<Vec<_>>>()?;
+    // WIST-4 §5: the Epoch is bounded by the maps its own amendments leave, so an
+    // accepted `parameter_change` is never packed out by the load it bounds.
     entries.sort_by(|(a_declaration, a), (b_declaration, b)| {
-        entry_type_rank(&a.entry_type)
-            .cmp(&entry_type_rank(&b.entry_type))
+        packing_rank(a)
+            .cmp(&packing_rank(b))
             .then_with(|| a_declaration.cmp(b_declaration))
             .then_with(|| a.leaf.cmp(&b.leaf))
     });
@@ -1061,6 +1063,12 @@ impl SealEntry {
     pub(super) fn octets(&self) -> u64 {
         self.canonical.len() as u64 + 2
     }
+}
+
+fn packing_rank(entry: &SealEntry) -> (usize, usize) {
+    let amendment = entry.entry_type == "registry_update"
+        && entry.body["update"]["action"] == "parameter_change";
+    (entry_type_rank(&entry.entry_type), usize::from(!amendment))
 }
 
 pub(super) fn entry_type_rank(entry_type: &str) -> usize {
@@ -1240,6 +1248,59 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn packing_keeps_an_accepted_cap_reduction_ahead_of_the_registry_updates_it_bounds() {
+        let sk = SigningKey::from_seed(&[42; 32]);
+        let row = |rowid, update: Value| PendingEntryRow {
+            rowid,
+            entry_type: "registry_update".into(),
+            domain: String::new(),
+            entry_json: sign_envelope(&update, "update", crate::keys::GENESIS_KEY_ID, &sk).unwrap(),
+            turn_epoch: None,
+        };
+        let reduction = row(
+            1,
+            serde_json::json!({"wist_version": WIST_VERSION,
+                "action": "parameter_change", "subject": "epoch_cap_bytes",
+                "details": {"parameter": "epoch_cap_bytes", "value": 65_537},
+                "effective_at": "2026-09-17T00:00:00Z"}),
+        );
+        let reduction_leaf = storage_order(vec![row(1, reduction.entry_json.clone())])
+            .unwrap()
+            .remove(0)
+            .leaf;
+        let mut flood = Vec::new();
+        let mut n = 0u64;
+        while flood.len() < 8 {
+            n += 1;
+            let update = serde_json::json!({"wist_version": WIST_VERSION,
+                "action": "payload_withdrawal", "subject": "example.com",
+                "details": {"delta_id": format!("sha256:{n:064x}"), "reason": "takedown"},
+                "effective_at": "2026-09-17T00:00:00Z"});
+            let candidate = row(2 + n as i64, update);
+            let leaf = storage_order(vec![row(0, candidate.entry_json.clone())])
+                .unwrap()
+                .remove(0)
+                .leaf;
+            if leaf < reduction_leaf {
+                flood.push(candidate);
+            }
+        }
+        let mut pending = vec![reduction];
+        pending.extend(flood);
+        let all = storage_order(pending).unwrap();
+        let reduction_octets = all[0].octets();
+        let flood_octets = all[1].octets();
+        assert!(flood_octets <= reduction_octets);
+        let cap = reduction_octets + flood_octets;
+        let (fit, deferred) =
+            fit_to_cap(all, cap as i64, &HashSet::new(), &HashMap::new()).unwrap();
+        assert_eq!(deferred, 7);
+        assert_eq!(fit.len(), 2);
+        assert!(fit.iter().any(|entry| entry.rowid == 1));
+        assert!(fit.iter().map(SealEntry::octets).sum::<u64>() <= cap);
+    }
 
     #[test]
     fn packing_counts_each_entry_as_its_jcs_octets_plus_a_length_prefix() {

@@ -715,6 +715,8 @@ largest representable window and an unsealable opening near the range end.
 
 Caps cover the largest Epoch through each amendment's own height, counted
 in entry-bundle octets. Pending reductions constrain packing immediately;
+an accepted `parameter_change` is packed ahead of every other Entry, so
+the amendment that bounds an Epoch seals in it whenever it fits at all;
 deferred Entries remain queued. SQLite stores actual Epoch sizes and
 canonical Entry positions with the sealed changes. Restart replays the
 accepted schedule using each historical size maximum, and rejects a
