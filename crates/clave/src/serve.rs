@@ -508,7 +508,7 @@ pub fn run_with_options(
     let owner: Arc<str> = options.instance.as_str().into();
     let db = Db::open(&db_path)?;
     db.reclaim_instance_leases(&owner, jiff::Timestamp::now().as_second())?;
-    crate::publication::recover(&db, &data_dir)?;
+    crate::publication::recover_at_start(&db, &data_dir)?;
     drop(db);
     let state = AppState {
         db_path,

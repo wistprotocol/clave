@@ -695,6 +695,7 @@ fn a_pass_interrupted_between_documents_is_finished_by_the_next_publication_repa
     )
     .unwrap();
     std::fs::write(log.path().join("snapshots/index.json"), &stale_index).unwrap();
+    clave::snapshot::forget_resigning(&log.db).unwrap();
     clave::publication::recover(&log.db, log.path()).unwrap();
     let remaining = log.public_key("log2");
     for (path, inner) in [
@@ -733,6 +734,7 @@ fn a_pass_interrupted_between_documents_is_finished_by_the_next_publication_repa
         .unwrap(),
     )
     .unwrap();
+    clave::snapshot::forget_resigning(&log.db).unwrap();
     clave::publication::recover(&log.db, log.path()).unwrap();
     assert_eq!(
         std::fs::read(

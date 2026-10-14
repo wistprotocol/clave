@@ -859,6 +859,10 @@ fn served_name(data_dir: &Path, path: &Path) -> String {
 /// comes first, then the manifest that carries its `sha256` and `bytes`,
 /// then the index and the Mirror list; each document is judged alone, so
 /// an interrupted pass is finished by the next one.
+pub fn forget_resigning(db: &Db) -> Result<()> {
+    db.clear_param(RESIGNED_AT_KEY_ACT).map(|_| ())
+}
+
 pub fn resign_unsealed(db: &Db, data_dir: &Path) -> Result<Vec<String>> {
     let head = crate::keys::head_height(db)?;
     let registry = db.aggregator_key_entries()?;
@@ -872,7 +876,19 @@ pub fn resign_unsealed(db: &Db, data_dir: &Path) -> Result<Vec<String>> {
         })
         .map(|entry| entry.key_id.clone())
         .collect();
-
+    // WIST-3 §3.4: a served document falls off the head only when a key act seals, so the
+    // documents are scanned once per key act, not once per seal.
+    let last_key_act = registry
+        .iter()
+        .map(|entry| entry.added_height.max(entry.removed_height.unwrap_or(0)))
+        .max()
+        .unwrap_or(0)
+        .min(head);
+    let last_key_act = i64::try_from(last_key_act)
+        .map_err(|_| Error::Snapshot("key act height out of range".into()))?;
+    if db.param(RESIGNED_AT_KEY_ACT).ok() == Some(last_key_act) {
+        return Ok(Vec::new());
+    }
     let mut signer: Option<(String, SigningKey)> = None;
     let mut rewritten = Vec::new();
     for directory in snapshot_directories(data_dir) {
@@ -923,6 +939,7 @@ pub fn resign_unsealed(db: &Db, data_dir: &Path) -> Result<Vec<String>> {
         crate::publication::write_durable(&path, &bytes)?;
         rewritten.push(served_name(data_dir, &path));
     }
+    db.set_param(RESIGNED_AT_KEY_ACT, last_key_act)?;
     Ok(rewritten)
 }
 
@@ -1307,6 +1324,7 @@ fn clear_directory(path: &Path) -> Result<()> {
 }
 
 pub const STAGING_DIRECTORY: &str = "snapshot-build";
+const RESIGNED_AT_KEY_ACT: &str = "resigned_at_key_act";
 const PRODUCER_LOCK: &str = "snapshot-build.lock";
 const SWAP_LOCK: &str = "snapshot-swap.lock";
 

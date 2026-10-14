@@ -338,9 +338,20 @@ fn serve_duty_payloads(db: &Db, data_dir: &Path) -> Result<()> {
 /// signed are re-signed before a Checkpoint at that head is served to
 /// verify them against.
 pub fn recover(db: &Db, data_dir: &Path) -> Result<Vec<u64>> {
+    repair(db, data_dir, false)
+}
+
+pub fn recover_at_start(db: &Db, data_dir: &Path) -> Result<Vec<u64>> {
+    repair(db, data_dir, true)
+}
+
+fn repair(db: &Db, data_dir: &Path, every_document: bool) -> Result<Vec<u64>> {
     db.check_fence()?;
     guard_published(db, data_dir)?;
     crate::snapshot::reconcile(db, data_dir)?;
+    if every_document {
+        crate::snapshot::forget_resigning(db)?;
+    }
     crate::snapshot::resign_unsealed(db, data_dir)?;
     let mut republished = finish_committed(db, data_dir)?;
     if let Some((epoch_number, note)) = db.head_publication()? {
