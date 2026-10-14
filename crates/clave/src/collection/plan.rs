@@ -570,9 +570,15 @@ fn absorb(next: &mut State, judged: &Judged, height: u64) {
 
 type ListKey = (String, String, String);
 
+struct HeldList {
+    list: Vec<Value>,
+    positions: BTreeMap<String, usize>,
+    tree: wist_core::publisher_item::ListTree,
+}
+
 #[derive(Default)]
 struct Lists {
-    held: BTreeMap<ListKey, (Vec<Value>, BTreeMap<String, usize>)>,
+    held: BTreeMap<ListKey, HeldList>,
 }
 
 impl Lists {
@@ -583,7 +589,7 @@ impl Lists {
         name: &str,
         catalog_id: &str,
         catalog: Option<&Value>,
-    ) -> Result<&(Vec<Value>, BTreeMap<String, usize>)> {
+    ) -> Result<&HeldList> {
         let key = (publisher.to_owned(), name.to_owned(), catalog_id.to_owned());
         if !self.held.contains_key(&key) {
             let list = match held.list(publisher, name, catalog_id)? {
@@ -603,12 +609,20 @@ impl Lists {
                     "no list is held for Catalog {catalog_id} of {publisher} {name}"
                 ))
             })?;
-            let index = list
+            let positions = list
                 .iter()
                 .enumerate()
                 .filter_map(|(at, item)| item["url"].as_str().map(|url| (url.to_owned(), at)))
                 .collect();
-            self.held.insert(key.clone(), (list, index));
+            let tree = wist_core::publisher_item::ListTree::of(&list)?;
+            self.held.insert(
+                key.clone(),
+                HeldList {
+                    list,
+                    positions,
+                    tree,
+                },
+            );
         }
         Ok(&self.held[&key])
     }
@@ -631,11 +645,12 @@ fn waiting_item(
     let waiting = &state.urls[&(publisher.to_owned(), url.to_owned())];
     let catalog_id = last_accepted_id(state, publisher, &waiting.collection)
         .ok_or_else(|| history(format!("{url} waits with no last accepted Catalog")))?;
-    let (list, index) = lists.get(held, publisher, &waiting.collection, &catalog_id, None)?;
-    let at = *index
+    let held = lists.get(held, publisher, &waiting.collection, &catalog_id, None)?;
+    let at = *held
+        .positions
         .get(url)
         .ok_or_else(|| history(format!("{url} waits with no Item in its list")))?;
-    Ok((list[at].clone(), at))
+    Ok((held.list[at].clone(), at))
 }
 
 fn item_read(state: &State, publisher: &str, url: &str) -> Vec<String> {
@@ -1063,12 +1078,13 @@ fn run_pass<H: Held>(
                 latest.ok_or_else(|| history(format!("{url} waits with no latest Catalog")))?;
             let inner = &latest_envelope["catalog"];
             let catalog: wist_core::objects::Catalog = serde_json::from_value(inner.clone())?;
-            let (list, positions) =
-                lists.get(turn.held, &publisher, &name, &latest_id, Some(inner))?;
-            let at = *positions
+            let list = lists.get(turn.held, &publisher, &name, &latest_id, Some(inner))?;
+            let at = *list
+                .positions
                 .get(&url)
                 .ok_or_else(|| history(format!("the latest Catalog does not list {url}")))?;
-            let body = wist_core::publisher_item::build(list, at as u64, &catalog)?;
+            let body =
+                wist_core::publisher_item::build_with(&list.tree, &list.list, at as u64, &catalog)?;
             let entry = json!({"type": "publisher_item", "body": body});
             if over_entry_bound(&entry)? {
                 set_admission(
@@ -1849,7 +1865,7 @@ fn base_leaves(
     let inner = &latest.envelope["catalog"];
     let catalog: wist_core::objects::Catalog = serde_json::from_value(inner.clone())?;
     let mut lists = Lists::default();
-    let (list, positions) = lists.get(held, publisher, name, &latest.catalog_id, Some(inner))?;
+    let list = lists.get(held, publisher, name, &latest.catalog_id, Some(inner))?;
     let mut leaving = Vec::new();
     let mut bodies = Vec::new();
     for ((owner, url), waiting) in &next.urls {
@@ -1863,10 +1879,11 @@ fn base_leaves(
         }) else {
             continue;
         };
-        let Some(at) = positions.get(url) else {
+        let Some(at) = list.positions.get(url) else {
             continue;
         };
-        let body = wist_core::publisher_item::build(list, *at as u64, &catalog)?;
+        let body =
+            wist_core::publisher_item::build_with(&list.tree, &list.list, *at as u64, &catalog)?;
         bodies.push(json!({"type": "publisher_item", "body": body}));
         leaving.push((
             url.clone(),
