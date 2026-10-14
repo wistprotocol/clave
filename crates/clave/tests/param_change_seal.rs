@@ -133,6 +133,7 @@ fn seal_reads_cadence_in_force_at_previous_epoch_sealed_at() {
         ts((NOW + 7 * DAY + 3600).div_euclid(3500) * 3500),
         "the following Epoch uses the new 3500-second grid"
     );
+    common::assert_resumes_as_replayed(&db, data.path());
 }
 
 #[test]

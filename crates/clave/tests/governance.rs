@@ -173,6 +173,7 @@ fn a_withdrawal_queued_again_under_an_accepted_id_is_dropped_and_keeps_the_first
     );
     assert!(log.db.peek_pending_entries().unwrap().0.is_empty());
     assert_eq!(withdrawn_at(&log, &id), Some(1));
+    common::assert_resumes_as_replayed(&log.db, log.data.path());
 }
 
 #[test]

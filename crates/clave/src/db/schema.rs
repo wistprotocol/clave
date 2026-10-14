@@ -89,6 +89,8 @@ CREATE TABLE IF NOT EXISTS recovery_settlements(domain TEXT NOT NULL, owner_hash
 CREATE TABLE IF NOT EXISTS sealed_declarations(domain TEXT NOT NULL, seq INTEGER NOT NULL, epoch_number INTEGER NOT NULL, sealed_at TEXT NOT NULL, declaration_json BLOB NOT NULL, PRIMARY KEY(domain, seq));
 CREATE TABLE IF NOT EXISTS pending_identities(domain TEXT PRIMARY KEY, declaration_json BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS sealed_in_force(domain TEXT PRIMARY KEY, declaration_json BLOB NOT NULL);
+CREATE TABLE IF NOT EXISTS derived_state(epoch_number INTEGER PRIMARY KEY, root TEXT NOT NULL, declarations_json BLOB NOT NULL);
+CREATE TABLE IF NOT EXISTS accepted_updates(update_id TEXT PRIMARY KEY, epoch_number INTEGER NOT NULL);
 ";
 
 fn relax_publisher_columns(conn: &Connection) -> Result<()> {

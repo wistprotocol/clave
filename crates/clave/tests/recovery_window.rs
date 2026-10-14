@@ -668,37 +668,33 @@ fn recovery_flow_queues_settles_and_seals_the_survivor() {
 }
 
 #[test]
-fn corrupt_pinned_history_cannot_settle_a_queue() {
-    let (r, start, _) = sealed_recovery();
+fn corrupt_stored_entries_fail_the_full_replay_and_leave_the_derived_state() {
+    let (r, _, _) = sealed_recovery();
     let (catalog, _) = queued_catalog(&r, "2026-08-09T14:00:00Z");
     ingest(&r, "2026-08-09T14:00:05Z");
+    assert!(clave::history::History::resume(&r.db, r.data.path()).is_ok());
     let connection = rusqlite::Connection::open(r.data.path().join("clave.sqlite")).unwrap();
-    let original: Vec<u8> = connection
-        .query_row(
-            "SELECT entry_json FROM log_entries WHERE leaf_index = 0",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
     connection
         .execute(
             "UPDATE log_entries SET entry_json = ?1 WHERE leaf_index = 0",
             [br#"{"type":"label","body":{}}"#.as_slice()],
         )
         .unwrap();
-    let deadline = start + 3600 + 7 * DAY;
-    let at = wist_core::timestamp::instant(deadline + 60).unwrap();
-    assert!(clave::ingest::run(&r.db, &r.client, r.data.path(), &r.host, &at).is_err());
-    assert!(clave::seal::run(&r.db, r.data.path(), &r.sk, deadline).is_err());
-    connection
-        .execute(
-            "UPDATE log_entries SET entry_json = ?1 WHERE leaf_index = 0",
-            [original],
-        )
-        .unwrap();
+    let mut replayed =
+        clave::history::History::open(&r.db, r.data.path(), r.db.last_epoch().unwrap()).unwrap();
+    let mut outcome = Ok(());
+    while outcome.is_ok() {
+        match replayed.next_epoch() {
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(error) => outcome = Err(error),
+        }
+    }
+    assert!(outcome.is_err(), "the full replay accepts a corrupt Entry");
+    let resumed = clave::history::History::resume(&r.db, r.data.path()).unwrap();
     let scope = std::collections::BTreeSet::from([r.host.clone()]);
     let state =
-        r.db.load_state(r.db.sealed_state(r.data.path()).unwrap(), &scope)
+        r.db.load_state(r.db.sealed_from(&resumed).unwrap(), &scope)
             .unwrap();
     let queue = &state.queues[&r.host];
     assert!(queue

@@ -344,6 +344,7 @@ fn labels_and_disputes_are_pulled_sealed_and_carried() {
 
     let r1 = clave::seal::run(&db, data.path(), &sk, SEAL_START + 7200).unwrap();
     assert_eq!((r1.epoch_number, r1.entry_count), (1, 4));
+    common::assert_resumes_as_replayed(&db, data.path());
     let sealed_entries = db.epoch_entries(1).unwrap();
     let types: Vec<&str> = sealed_entries
         .iter()
@@ -784,4 +785,5 @@ fn a_dispute_whose_label_a_sealed_declaration_takes_out_of_the_disputants_author
     assert!(!state_entries(data.path())
         .iter()
         .any(|entry| entry[0] == "dispute"));
+    common::assert_resumes_as_replayed(&db, data.path());
 }

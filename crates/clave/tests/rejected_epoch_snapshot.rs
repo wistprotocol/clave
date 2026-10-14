@@ -225,6 +225,7 @@ fn an_epoch_rejected_for_conflicting_declarations_still_builds_its_snapshot() {
         [None, Some(vec!["WIST1-E08".to_owned()]), None],
         "the conflicting Declarations reject Epoch 1"
     );
+    common::assert_resumes_as_replayed(&store.db, store.data.path());
 
     let (entries, _) = store.snapshot();
     assert!(declaration_tuples(&entries).is_empty());

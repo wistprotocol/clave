@@ -199,18 +199,10 @@ fn declaration_ref(db: &Db, host: &str) -> Result<verify::DeclarationRef> {
 
 /// The schedule's height is read before the schedule, so a seal that lands
 /// between them makes admission recheck the allowance rather than miss it.
-fn issue_refs(
-    db: &Db,
-    data_dir: &Path,
-    host: &str,
-    clock: jiff::Timestamp,
-) -> Result<verify::IssuedRefs> {
+fn issue_refs(db: &Db, host: &str, clock: jiff::Timestamp) -> Result<verify::IssuedRefs> {
     let schedule_at = db.last_epoch()?.map(|epoch| epoch.epoch_number);
     let at = clock.as_nanosecond().div_euclid(1_000_000_000) as i64;
-    let mut history = crate::history::History::open(db, data_dir, db.last_epoch()?)?;
-    while history.next_epoch()?.is_some() {}
-    let initial = wist_core::parameters::Schedule::new(at);
-    let schedule = history.schedule().unwrap_or(&initial);
+    let schedule = db.parameter_schedule(at)?;
     let clock_skew_seconds = schedule
         .value_at("clock_skew_seconds", at)
         .ok_or_else(|| crate::error::Error::Param("clock_skew_seconds".into()))?;
@@ -1244,7 +1236,7 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
     }
 
     fn process_labels(&mut self) -> Result<()> {
-        let (db, host, data_dir) = (self.db, self.host, self.data_dir);
+        let (db, host) = (self.db, self.host);
         let Some(mut declaration) = label_declaration(db, host)? else {
             return self.finish(false);
         };
@@ -1293,7 +1285,7 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
             {
                 Some(stored) => verify::IssuedRefs::from_json(&stored)?,
                 None => {
-                    let refs = issue_refs(db, data_dir, host, (self.clock)())?;
+                    let refs = issue_refs(db, host, (self.clock)())?;
                     db.set_pull_object_refs(self.run.run_id, "label", &slot, &refs.to_json()?)?;
                     refs
                 }

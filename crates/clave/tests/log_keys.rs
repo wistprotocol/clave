@@ -221,6 +221,7 @@ fn removing_the_genesis_key_leaves_every_later_document_verifiable_under_the_rem
     clave::log_key::remove(&log.db, log.path(), "log1", SEAL_START + 3600).unwrap();
     let sealed = log.seal(2);
     assert!(sealed.dropped.is_empty(), "{:?}", sealed.dropped);
+    common::assert_resumes_as_replayed(&log.db, log.path());
     assert_eq!(
         log.keys()
             .iter()

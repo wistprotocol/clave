@@ -8,8 +8,9 @@ use std::path::Path;
 use wist_core::aggregator_keys::Registry;
 use wist_core::checkpoint::{self, AggregatorKey, Checkpoint};
 use wist_core::crypto::PublicKey;
-use wist_core::objects::{AggregatorKeyEntry, GenesisKey, LogAnchorEnvelope};
+use wist_core::objects::{AggregatorKeyEntry, GenesisKey, LogAnchorEnvelope, StateEntry};
 use wist_core::parameters::{ActPosition, Disposition, Schedule};
+use wist_core::registry_updates::AcceptedUpdates;
 use wist_core::sealing::{Epoch, Judgment, Outcome, Removed, Replay};
 use wist_core::suffix_list::{self, HeldFile, SuffixListReplay};
 
@@ -22,6 +23,10 @@ pub struct LogAnchor {
 /// WIST-3 §3.4: `anchor.json` is self-signed under the genesis key it
 /// declares.
 pub fn anchor(directory: &Path) -> Result<LogAnchor> {
+    Ok(read_anchor(directory)?.0)
+}
+
+fn read_anchor(directory: &Path) -> Result<(LogAnchor, wist_core::objects::Anchor)> {
     let doc: Value = crate::json::parse(&std::fs::read(directory.join("anchor.json"))?)?;
     let parsed: LogAnchorEnvelope = serde_json::from_value(doc.clone())?;
     let genesis = &parsed.anchor.genesis_key;
@@ -40,11 +45,14 @@ pub fn anchor(directory: &Path) -> Result<LogAnchor> {
     }
     let key = PublicKey::from_b64u(&genesis.public_key)?;
     wist_core::envelope::verify_envelope(&doc, "anchor", &key)?;
-    Ok(LogAnchor {
-        log_id: parsed.anchor.log_id.clone(),
-        key,
-        key_id: genesis.key_id.clone(),
-    })
+    Ok((
+        LogAnchor {
+            log_id: parsed.anchor.log_id.clone(),
+            key,
+            key_id: genesis.key_id.clone(),
+        },
+        parsed.anchor,
+    ))
 }
 
 #[derive(Debug)]
@@ -167,6 +175,72 @@ impl<'a> History<'a> {
         })
     }
 
+    pub fn resume(db: &'a Db, directory: &Path) -> Result<Self> {
+        let Some(head) = db.last_epoch()? else {
+            return Self::open(db, directory, None);
+        };
+        let Some(declarations) = db.derived_declarations(&head)? else {
+            let mut history = Self::open(db, directory, Some(head))?;
+            while history.next_epoch()?.is_some() {}
+            return Ok(history);
+        };
+        let (anchor, parsed) = read_anchor(directory)?;
+        let note = db
+            .checkpoint_note(head.epoch_number)?
+            .ok_or_else(|| failure("the store is missing an Epoch's Checkpoint"))?;
+        let checkpoint = Checkpoint::parse(&note).map_err(|e| failure(&e.to_string()))?;
+        let at = checkpoint
+            .sealed_at_s()
+            .map_err(|e| failure(&e.to_string()))?;
+        let mut entries = db.log_state_entries()?;
+        entries.extend(
+            db.accepted_updates()?
+                .into_iter()
+                .map(StateEntry::RegistryUpdate),
+        );
+        let accepted = AcceptedUpdates::from_state(&entries)?;
+        let mut replay =
+            Replay::resumed(head.epoch_number, &head.sealed_at, declarations, &entries)?;
+        replay.hold_walk_floor(None);
+        for sealed in db.sealed_items()?.sealed() {
+            replay.hold_sealed_item(sealed.item_id, sealed.publisher, sealed.kind, sealed.height);
+        }
+        for sealed in db.sealed_labels()? {
+            replay.hold_sealed_label(&sealed.label_id, Some(&sealed.label.subject));
+        }
+        let key_entries = db.aggregator_key_entries()?;
+        let mut registry = if key_entries.is_empty() {
+            Registry::from_genesis(&anchor.log_id, &parsed.genesis_key)?
+        } else {
+            Registry::from_state_tuples(&parsed, head.epoch_number, &key_entries)?
+        };
+        registry.hold_accepted_updates(accepted.clone());
+        let mut schedule = db.parameter_schedule(at)?;
+        schedule.hold_accepted_updates(accepted.clone());
+        let mut suffix_lists = SuffixListReplay::new();
+        for (height, identifier) in db.suffix_list_acts()? {
+            suffix_lists.adopt(&identifier, height);
+        }
+        suffix_lists.hold_accepted_updates(accepted);
+        Ok(Self {
+            db,
+            next_height: head
+                .epoch_number
+                .checked_add(1)
+                .ok_or_else(|| failure("Epoch height overflow"))?,
+            head: Some(head),
+            registry,
+            log_id: anchor.log_id,
+            previous: Some(checkpoint),
+            prior_at: Some(at),
+            largest: db.largest_epoch_bytes()?,
+            schedule: Some(schedule),
+            failed: false,
+            replay,
+            suffix_lists,
+        })
+    }
+
     pub fn extend(&mut self, head: EpochRow) {
         self.head = Some(head);
     }
@@ -181,6 +255,14 @@ impl<'a> History<'a> {
 
     pub fn height(&self) -> Option<u64> {
         self.next_height.checked_sub(1)
+    }
+
+    pub fn previous(&self) -> Option<&Checkpoint> {
+        self.previous.as_ref()
+    }
+
+    pub fn largest_epoch_bytes(&self) -> u64 {
+        self.largest
     }
 
     pub fn replay(&self) -> &Replay {
@@ -217,6 +299,7 @@ impl<'a> History<'a> {
         if height > head.epoch_number {
             return Ok(None);
         }
+        let at_head = height == head.epoch_number;
         let row = self
             .db
             .epoch_at(height)?
@@ -339,7 +422,6 @@ impl<'a> History<'a> {
                 records_removed,
             } => (None, entries, records_removed),
         };
-        self.db.record_epoch_judgment(height, rejected.is_some())?;
         let mut accepted_acts = key_acts;
         if rejected.is_none() {
             schedule = candidate;
@@ -380,6 +462,19 @@ impl<'a> History<'a> {
         self.schedule = Some(schedule);
         self.previous = Some(checkpoint);
         self.registry = registry;
+        if at_head && self.db.derived_state_due(&row)? {
+            // The judgment and the derived state it leaves commit in one transaction.
+            let tx = self.db.mutation()?;
+            self.db.record_epoch_judgment(height, rejected.is_some())?;
+            self.db.record_derived_state(
+                &row,
+                self.replay.declarations(),
+                &self.replay.registry_updates().entries(),
+            )?;
+            tx.commit()?;
+        } else {
+            self.db.record_epoch_judgment(height, rejected.is_some())?;
+        }
         Ok(Some(VerifiedEpoch {
             epoch_number: height,
             tree_size: row.tree_size,

@@ -204,8 +204,7 @@ pub(super) fn epoch<'a>(
     if epoch_number == 0 {
         queue_genesis_amendments(db, sk, &sealed_at)?;
     }
-    let mut history = History::open(db, data_dir, db.last_epoch()?)?;
-    while history.next_epoch()?.is_some() {}
+    let history = History::resume(db, data_dir)?;
     let sealed = db.sealed_from(&history)?;
     for (domain, state) in sealed.declarations.domains() {
         let Some(window) = state.window() else {

@@ -274,6 +274,7 @@ fn grace_changes_are_read_from_the_accepted_sealing_prefix() {
     let rejected = clave::seal::run(&db, data.path(), &sk, NOW + DAY).unwrap();
     assert_eq!(rejected.entry_count, 0);
     assert!(rejected.dropped[0].contains("grace"));
+    common::assert_resumes_as_replayed(&db, data.path());
     clave::param_change::run(
         &db,
         &sk,
@@ -489,6 +490,7 @@ fn a_parameter_change_queued_again_under_an_accepted_id_is_dropped_and_the_later
     queue(&db, &first);
     let report = clave::seal::run(&db, data.path(), &sk, NOW + 7200).unwrap();
     assert_eq!(report.entry_count, 0);
+    common::assert_resumes_as_replayed(&db, data.path());
     let update_id = wist_core::registry_updates::update_id(&first).unwrap();
     assert_eq!(
         report.dropped,

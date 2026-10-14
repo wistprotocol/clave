@@ -127,8 +127,7 @@ fn condition_str(discard: &Discard) -> Result<String> {
 
 impl Db {
     pub fn sealed_state(&self, data_dir: &Path) -> Result<Sealed> {
-        let mut history = crate::history::History::open(self, data_dir, self.last_epoch()?)?;
-        while history.next_epoch()?.is_some() {}
+        let history = crate::history::History::resume(self, data_dir)?;
         self.sealed_from(&history)
     }
 

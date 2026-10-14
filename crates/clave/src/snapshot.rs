@@ -459,8 +459,12 @@ fn read_state(db: &Db, data_dir: &Path, head: EpochRow) -> Result<ReadState> {
             removing_act: None,
         });
     }
-    let mut history = crate::history::History::open(db, data_dir, Some(head.clone()))?;
-    while history.next_epoch()?.is_some() {}
+    let history = crate::history::History::resume(db, data_dir)?;
+    if history.height() != Some(head.epoch_number) {
+        return Err(Error::Snapshot(
+            "the resumed history is not at the sealed head".into(),
+        ));
+    }
     let declarations = history.replay().declarations().clone();
     let registry_updates = history.replay().registry_updates().entries();
     let log_entries = db.log_state_entries()?;

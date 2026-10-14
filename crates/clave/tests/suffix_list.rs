@@ -1,3 +1,5 @@
+mod common;
+
 use wist_core::envelope::sign_envelope;
 
 const SEAL_START: i64 = 1_786_276_800;
@@ -150,6 +152,7 @@ fn a_pinned_snapshot_governs_from_the_epoch_after_its_seal() {
         r3.dropped
     );
     assert_eq!(db.suffix_list_acts().unwrap().len(), 2);
+    common::assert_resumes_as_replayed(&db, data.path());
 }
 
 fn queued_act(db: &clave::db::Db) -> serde_json::Value {
@@ -186,6 +189,7 @@ fn a_suffix_list_update_queued_again_under_an_accepted_id_is_dropped_and_the_lat
         .unwrap();
     let r2 = clave::seal::run(&db, data.path(), &sk, SEAL_START + 14400).unwrap();
     assert_eq!((r2.epoch_number, r2.entry_count), (2, 0));
+    common::assert_resumes_as_replayed(&db, data.path());
     let update_id = wist_core::registry_updates::update_id(&pinning_first).unwrap();
     assert_eq!(
         r2.dropped,

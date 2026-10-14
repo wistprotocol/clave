@@ -990,3 +990,93 @@ pub fn assert_valid(schema_name: &str, value: &serde_json::Value) {
     let errors = schema_errors(&schema(schema_name), value, "");
     assert!(errors.is_empty(), "{schema_name}: {errors:?}\n{value}");
 }
+
+pub fn assert_resumes_as_replayed(db: &clave::db::Db, data_dir: &std::path::Path) {
+    let head = db.last_epoch().unwrap().expect("a sealed head");
+    let mut replayed = clave::history::History::open(db, data_dir, Some(head.clone())).unwrap();
+    while replayed.next_epoch().unwrap().is_some() {}
+    assert!(db.derived_declarations(&head).unwrap().is_some());
+    let resumed = clave::history::History::resume(db, data_dir).unwrap();
+    assert_eq!(resumed.height(), replayed.height());
+    let (a, b) = (replayed.replay(), resumed.replay());
+    assert_eq!(
+        serde_json::to_value(a.declarations()).unwrap(),
+        serde_json::to_value(b.declarations()).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(a.state_entries()).unwrap(),
+        serde_json::to_value(b.state_entries()).unwrap()
+    );
+    let subjects = |replay: &wist_core::sealing::Replay| {
+        let mut subjects: Vec<(String, Option<String>)> = replay
+            .sealed_label_subjects()
+            .map(|(id, subject)| (id.to_owned(), subject.map(str::to_owned)))
+            .collect();
+        subjects.sort();
+        subjects
+    };
+    assert_eq!(subjects(a), subjects(b));
+    let items = |replay: &wist_core::sealing::Replay| {
+        let mut items: Vec<String> = replay
+            .sealed_items()
+            .sealed()
+            .map(|item| {
+                format!(
+                    "{} {} {:?} {}",
+                    item.item_id, item.publisher, item.kind, item.height
+                )
+            })
+            .collect();
+        items.sort();
+        items
+    };
+    assert_eq!(items(a), items(b));
+    assert_eq!(
+        a.registry_updates().entries(),
+        b.registry_updates().entries()
+    );
+    assert_eq!(
+        format!("{:?}", replayed.key_entries()),
+        format!("{:?}", resumed.key_entries())
+    );
+    let at = wist_core::timestamp::log_seconds(&head.sealed_at).unwrap();
+    let (x, y) = (replayed.schedule().unwrap(), resumed.schedule().unwrap());
+    assert_eq!(
+        clave::registry::parameter_state(x, at).unwrap(),
+        clave::registry::parameter_state(y, at).unwrap()
+    );
+    assert_eq!(x.accepted(), y.accepted());
+    assert_eq!(x.first_epoch_s(), y.first_epoch_s());
+    assert_eq!(
+        replayed.largest_epoch_bytes(),
+        resumed.largest_epoch_bytes()
+    );
+    assert_eq!(
+        replayed.previous().map(|checkpoint| checkpoint.encode()),
+        resumed.previous().map(|checkpoint| checkpoint.encode())
+    );
+    assert_eq!(
+        replayed.suffix_lists().accepted(),
+        resumed.suffix_lists().accepted()
+    );
+    let held = b.registry_updates();
+    for updates in [
+        x.accepted_updates(),
+        replayed.suffix_lists().accepted_updates(),
+        replayed.key_registry().accepted_updates(),
+    ] {
+        for entry in updates.entries() {
+            assert_eq!(
+                held.accepted_height(&entry.update_id),
+                Some(entry.sealing_height)
+            );
+        }
+    }
+    for updates in [
+        y.accepted_updates(),
+        resumed.suffix_lists().accepted_updates(),
+        resumed.key_registry().accepted_updates(),
+    ] {
+        assert_eq!(updates, held);
+    }
+}

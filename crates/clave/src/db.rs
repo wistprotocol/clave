@@ -1467,6 +1467,76 @@ impl Db {
         })
     }
 
+    pub fn derived_declarations(
+        &self,
+        head: &EpochRow,
+    ) -> Result<Option<wist_core::declarations::Declarations>> {
+        let stored: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT declarations_json FROM derived_state WHERE epoch_number = ?1 AND root = ?2",
+                (head.epoch_number as i64, &head.root),
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(stored
+            .map(|json| serde_json::from_slice(&json))
+            .transpose()?)
+    }
+
+    pub fn accepted_updates(&self) -> Result<Vec<wist_core::objects::RegistryUpdateEntry>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT update_id, epoch_number FROM accepted_updates ORDER BY update_id")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(wist_core::objects::RegistryUpdateEntry {
+                    update_id: row.get(0)?,
+                    sealing_height: row.get::<_, i64>(1)?.max(0) as u64,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub(crate) fn derived_state_due(&self, epoch: &EpochRow) -> Result<bool> {
+        let head = self.last_epoch()?;
+        if head
+            .is_none_or(|head| head.epoch_number != epoch.epoch_number || head.root != epoch.root)
+        {
+            return Ok(false);
+        }
+        Ok(!self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM derived_state WHERE epoch_number = ?1 AND root = ?2)",
+            (epoch.epoch_number as i64, &epoch.root),
+            |row| row.get::<_, bool>(0),
+        )?)
+    }
+
+    pub(crate) fn record_derived_state(
+        &self,
+        epoch: &EpochRow,
+        declarations: &wist_core::declarations::Declarations,
+        updates: &[wist_core::objects::RegistryUpdateEntry],
+    ) -> Result<()> {
+        let json = serde_json::to_vec(declarations)?;
+        self.write(|conn| {
+            conn.execute("DELETE FROM derived_state", [])?;
+            conn.execute(
+                "INSERT INTO derived_state(epoch_number, root, declarations_json) VALUES (?1, ?2, ?3)",
+                (epoch.epoch_number as i64, &epoch.root, json),
+            )?;
+            conn.execute("DELETE FROM accepted_updates", [])?;
+            let mut insert = conn.prepare(
+                "INSERT INTO accepted_updates(update_id, epoch_number) VALUES (?1, ?2)",
+            )?;
+            for update in updates {
+                insert.execute((&update.update_id, update.sealing_height as i64))?;
+            }
+            Ok(())
+        })
+    }
+
     pub fn epoch_judged(&self, epoch_number: u64) -> Result<bool> {
         Ok(self
             .conn
