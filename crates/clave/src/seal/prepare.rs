@@ -14,7 +14,8 @@ use wist_core::epoch::ENTRY_TYPES as ENTRY_TYPE_ORDER;
 use wist_core::objects::AggregatorKeyEntry;
 use wist_core::{jcs, merkle, tiles};
 
-pub(super) struct PreparedEpoch {
+pub(super) struct PreparedEpoch<'a> {
+    pub(super) history: History<'a>,
     pub(super) log_id: String,
     /// WIST-3 §3.4, §5: every key signs the Checkpoint; the first signs the
     /// Snapshot documents.
@@ -193,12 +194,12 @@ fn entry_octets(entry: &Value) -> Result<u64> {
 }
 
 /// WIST-3 §3.3, Waiting.
-pub(super) fn epoch(
-    db: &Db,
+pub(super) fn epoch<'a>(
+    db: &'a Db,
     data_dir: &Path,
     sk: &SigningKey,
     now_unix: i64,
-) -> Result<PreparedEpoch> {
+) -> Result<PreparedEpoch<'a>> {
     let (epoch_number, sealed_unix, sealed_at) = sealing_slot(db, now_unix)?;
     if epoch_number == 0 {
         queue_genesis_amendments(db, sk, &sealed_at)?;
@@ -487,6 +488,7 @@ pub(super) fn epoch(
     }));
     Ok(PreparedEpoch {
         log_id: history.log_id().to_owned(),
+        history,
         signers,
         key_entries: key_registry.entries(),
         entries,

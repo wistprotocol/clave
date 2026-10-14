@@ -254,3 +254,14 @@ fn a_removal_applied_under_a_running_producer_leaves_its_build_intact() {
         break;
     }
 }
+
+#[test]
+fn a_seal_judges_its_own_epoch_and_applies_its_withdrawal_before_it_returns() {
+    let (site, log, id) = withdrawn_log();
+    assert!(payload_path(&log, &id).exists());
+    seal(&log, "2026-08-09T14:00:00Z").unwrap();
+    let head = head_epoch(&log);
+    assert!(log.db.epoch_judged(head).unwrap());
+    assert_eq!(withdrawal_height(&log, &id), Some(head));
+    assert_removed(&log, &site, &id, "after the seal");
+}

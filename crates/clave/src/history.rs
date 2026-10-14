@@ -167,6 +167,10 @@ impl<'a> History<'a> {
         })
     }
 
+    pub fn extend(&mut self, head: EpochRow) {
+        self.head = Some(head);
+    }
+
     pub fn schedule(&self) -> Option<&Schedule> {
         self.schedule.as_ref()
     }

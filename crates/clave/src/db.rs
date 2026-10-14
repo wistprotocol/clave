@@ -1173,10 +1173,10 @@ impl Db {
             ),
         )?;
         for d in declarations {
-            exec_retain_declaration_seq(&tx, d.domain, d.seq)?;
             tx.execute(
                 "INSERT INTO sealed_declarations(domain, seq, epoch_number, sealed_at, declaration_json) VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT(domain, seq) DO NOTHING",
+                 ON CONFLICT(domain, seq) DO UPDATE SET epoch_number = excluded.epoch_number, sealed_at = excluded.sealed_at, declaration_json = excluded.declaration_json
+                 WHERE (SELECT rejected = 1 OR judged = 0 FROM epochs WHERE epoch_number = sealed_declarations.epoch_number)",
                 (
                     d.domain,
                     d.seq as i64,
@@ -1196,18 +1196,12 @@ impl Db {
             )?;
         }
         for w in withdrawals {
-            let first = tx.execute(
+            tx.execute(
                 "INSERT INTO withdrawals(item_id, domain, update_id, epoch_number, sealed_at) VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(item_id) DO UPDATE SET domain = excluded.domain, update_id = excluded.update_id, epoch_number = excluded.epoch_number, sealed_at = excluded.sealed_at
-                 WHERE (SELECT rejected FROM epochs WHERE epoch_number = withdrawals.epoch_number) = 1",
+                 WHERE (SELECT rejected = 1 OR judged = 0 FROM epochs WHERE epoch_number = withdrawals.epoch_number)",
                 (w.item_id, w.domain, w.update_id, epoch_number as i64, sealed_at),
-            )? == 1;
-            if first {
-                tx.execute(
-                    "INSERT OR IGNORE INTO pending_removals(item_id, domain) VALUES (?1, ?2)",
-                    (w.item_id, w.domain),
-                )?;
-            }
+            )?;
         }
         for identifier in suffix_lists {
             tx.execute(
@@ -1218,7 +1212,9 @@ impl Db {
         for row in labels {
             let label = row.label;
             tx.execute(
-                "INSERT OR IGNORE INTO labels(label_id, labeler, subject, name, value, asserted_at, retracted, expires_at, delta, epoch_number, entry_index) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                "INSERT INTO labels(label_id, labeler, subject, name, value, asserted_at, retracted, expires_at, delta, epoch_number, entry_index) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                 ON CONFLICT(label_id) DO UPDATE SET labeler = excluded.labeler, subject = excluded.subject, name = excluded.name, value = excluded.value, asserted_at = excluded.asserted_at, retracted = excluded.retracted, expires_at = excluded.expires_at, delta = excluded.delta, epoch_number = excluded.epoch_number, entry_index = excluded.entry_index
+                 WHERE (SELECT rejected = 1 OR judged = 0 FROM epochs WHERE epoch_number = labels.epoch_number)",
                 rusqlite::params![
                     row.label_id,
                     label.labeler,
@@ -1233,15 +1229,13 @@ impl Db {
                     row.entry_index as i64,
                 ],
             )?;
-            tx.execute(
-                "INSERT OR IGNORE INTO seen_labels(id, domain) VALUES (?1, ?2)",
-                (row.label_id, &label.labeler),
-            )?;
         }
         for row in disputes {
             let dispute = row.dispute;
             tx.execute(
-                "INSERT OR IGNORE INTO disputes(dispute_id, label_id, disputant, reason, asserted_at, epoch_number, entry_index) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO disputes(dispute_id, label_id, disputant, reason, asserted_at, epoch_number, entry_index) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(dispute_id) DO UPDATE SET label_id = excluded.label_id, disputant = excluded.disputant, reason = excluded.reason, asserted_at = excluded.asserted_at, epoch_number = excluded.epoch_number, entry_index = excluded.entry_index
+                 WHERE (SELECT rejected = 1 OR judged = 0 FROM epochs WHERE epoch_number = disputes.epoch_number)",
                 rusqlite::params![
                     row.dispute_id,
                     dispute.label,
@@ -1252,17 +1246,13 @@ impl Db {
                     row.entry_index as i64,
                 ],
             )?;
-            tx.execute(
-                "INSERT OR IGNORE INTO seen_labels(id, domain) VALUES (?1, ?2)",
-                (row.dispute_id, &dispute.disputant),
-            )?;
         }
         tx.commit()?;
         Ok(epoch)
     }
 
-    /// WIST-2 §3.3: a Label ID or Dispute ID the Log sealed or holds
-    /// accepted for sealing is seen.
+    /// WIST-2 §5.5: a Label ID or Dispute ID the Log sealed in an accepted
+    /// Epoch or holds accepted for sealing is seen.
     pub fn is_label_seen_for(&self, id: &str, domain: &str) -> Result<bool> {
         Ok(self
             .conn
@@ -1428,36 +1418,65 @@ impl Db {
     }
 
     pub fn record_epoch_judgment(&self, epoch_number: u64, rejected: bool) -> Result<()> {
-        let marked: Option<bool> = self
+        let marked: Option<(bool, bool)> = self
             .conn
             .query_row(
-                "SELECT rejected FROM epochs WHERE epoch_number = ?1",
+                "SELECT judged, rejected FROM epochs WHERE epoch_number = ?1",
                 [epoch_number as i64],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        if marked.is_none_or(|marked| marked == rejected) {
+        if marked.is_none_or(|(judged, marked)| judged && marked == rejected) {
             return Ok(());
         }
         self.write(|conn| {
             conn.execute(
-                "UPDATE epochs SET rejected = ?2 WHERE epoch_number = ?1 AND rejected != ?2",
+                "UPDATE epochs SET judged = 1, rejected = ?2 WHERE epoch_number = ?1",
                 (epoch_number as i64, rejected),
             )?;
-            // WIST-3 §3.3, Rejected Epochs: no withdrawal of a rejected Epoch applies.
+            // WIST-3 §3.3, Rejected Epochs; WIST-3 §3.2 and WIST-2 §5.5 for the seen IDs.
             if rejected {
                 conn.execute(
                     "DELETE FROM pending_removals WHERE item_id IN (SELECT item_id FROM withdrawals WHERE epoch_number = ?1)",
                     [epoch_number as i64],
                 )?;
-            } else {
                 conn.execute(
-                    "INSERT OR IGNORE INTO pending_removals(item_id, domain) SELECT item_id, domain FROM withdrawals WHERE epoch_number = ?1",
+                    "DELETE FROM seen_labels WHERE id IN (SELECT label_id FROM labels WHERE epoch_number = ?1 UNION SELECT dispute_id FROM disputes WHERE epoch_number = ?1)",
                     [epoch_number as i64],
                 )?;
+                return Ok(());
+            }
+            conn.execute(
+                "INSERT OR IGNORE INTO pending_removals(item_id, domain) SELECT item_id, domain FROM withdrawals WHERE epoch_number = ?1",
+                [epoch_number as i64],
+            )?;
+            conn.execute(
+                "INSERT OR IGNORE INTO seen_labels(id, domain) SELECT label_id, labeler FROM labels WHERE epoch_number = ?1 UNION ALL SELECT dispute_id, disputant FROM disputes WHERE epoch_number = ?1",
+                [epoch_number as i64],
+            )?;
+            let declarations = conn
+                .prepare("SELECT domain, seq FROM sealed_declarations WHERE epoch_number = ?1")?
+                .query_map([epoch_number as i64], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?.max(0) as u64))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for (domain, seq) in declarations {
+                exec_retain_declaration_seq(conn, &domain, seq)?;
             }
             Ok(())
         })
+    }
+
+    pub fn epoch_judged(&self, epoch_number: u64) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT judged FROM epochs WHERE epoch_number = ?1",
+                [epoch_number as i64],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(false))
     }
 
     pub fn suffix_list_in_force_at(&self, at: &str) -> Result<Option<(String, u64)>> {
@@ -2187,6 +2206,25 @@ pub(crate) mod tests {
             )
             .unwrap();
         }
+    }
+
+    #[test]
+    fn opening_a_store_without_the_judgment_column_marks_its_epochs_judged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("clave.sqlite");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE epochs(epoch_number INTEGER PRIMARY KEY, tree_size INTEGER NOT NULL, root TEXT NOT NULL, sealed_at TEXT NOT NULL, note TEXT NOT NULL, published INTEGER NOT NULL DEFAULT 0, epoch_bytes INTEGER, rejected INTEGER NOT NULL DEFAULT 0);
+             INSERT INTO epochs(epoch_number, tree_size, root, sealed_at, note, published, epoch_bytes, rejected) VALUES (0, 0, 'root', '2026-08-09T00:00:00Z', 'note', 1, 0, 0);
+             PRAGMA user_version = 3;",
+        )
+        .unwrap();
+        drop(conn);
+        let db = Db::open(&path).unwrap();
+        assert!(db.epoch_judged(0).unwrap());
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        assert!(db.epoch_judged(0).unwrap());
     }
 
     #[test]

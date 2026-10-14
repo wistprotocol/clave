@@ -136,7 +136,7 @@ impl Db {
         let replay = history.replay();
         let sealed_labels = self
             .conn
-            .prepare("SELECT label_id FROM labels UNION SELECT dispute_id FROM disputes")?
+            .prepare("SELECT l.label_id FROM labels l JOIN epochs b ON b.epoch_number = l.epoch_number WHERE b.rejected = 0 UNION SELECT d.dispute_id FROM disputes d JOIN epochs b ON b.epoch_number = d.epoch_number WHERE b.rejected = 0")?
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<BTreeSet<_>>>()?;
         Ok(Sealed {

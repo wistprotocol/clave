@@ -496,6 +496,7 @@ fn a_withdrawal_of_a_rejected_epoch_withdraws_nothing_until_an_accepted_epoch_se
         &[withdrawal()],
         &[],
     );
+    store.read_all();
     assert_eq!(
         db.withdrawal_state().unwrap(),
         vec![(ITEM_ID.to_owned(), WITHDRAWN_DOMAIN.to_owned(), 3)]
@@ -522,6 +523,7 @@ fn a_withdrawal_sealed_again_after_an_accepted_one_keeps_the_earliest_height_and
         &[withdrawal()],
         &[],
     );
+    store.read_all();
     db.clear_pending_removals(&[ITEM_ID.to_owned()]).unwrap();
     seal_with(
         db,
@@ -533,6 +535,7 @@ fn a_withdrawal_sealed_again_after_an_accepted_one_keeps_the_earliest_height_and
         &[withdrawal()],
         &[],
     );
+    store.read_all();
     assert_eq!(
         db.withdrawal_state().unwrap(),
         vec![(ITEM_ID.to_owned(), WITHDRAWN_DOMAIN.to_owned(), 3)]
@@ -681,11 +684,39 @@ fn the_sealed_declaration_reader_excludes_a_rejected_epochs_declaration_and_keep
 }
 
 #[test]
-fn the_sealed_id_set_keeps_a_rejected_epochs_label_and_dispute_ids_seen_so_none_is_sealed_twice() {
+fn the_sealed_id_set_and_the_seen_ids_exclude_a_rejected_epochs_labels_until_an_accepted_epoch_seals_them(
+) {
     let store = RejectedStore::build();
-    let sealed = store.db.sealed_state(store.data.path()).unwrap();
+    let db = &store.db;
+    let sealed = db.sealed_state(store.data.path()).unwrap();
     assert_eq!(store.markers(), vec![(0, 0), (1, 1), (2, 0)]);
-    let expected: std::collections::BTreeSet<String> = [
+    let accepted: std::collections::BTreeSet<String> = [ACCEPTED_LABEL_ID, ACCEPTED_DISPUTE_ID]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(sealed.sealed_labels, accepted);
+    assert!(db.is_label_seen_for(ACCEPTED_LABEL_ID, LABELER).unwrap());
+    assert!(db
+        .is_label_seen_for(ACCEPTED_DISPUTE_ID, "site.example.test")
+        .unwrap());
+    assert!(!db.is_label_seen_for(REJECTED_LABEL_ID, LABELER).unwrap());
+    assert!(!db
+        .is_label_seen_for(REJECTED_DISPUTE_ID, "site.example.test")
+        .unwrap());
+
+    seal_publications(
+        db,
+        &store.sk,
+        3,
+        T0 + 10_800,
+        vec![],
+        &[],
+        &[],
+        &[],
+        &Publications::of(REJECTED_LABEL_ID, REJECTED_DISPUTE_ID, 2),
+    );
+    let sealed = db.sealed_state(store.data.path()).unwrap();
+    let all: std::collections::BTreeSet<String> = [
         ACCEPTED_LABEL_ID,
         ACCEPTED_DISPUTE_ID,
         REJECTED_LABEL_ID,
@@ -694,7 +725,37 @@ fn the_sealed_id_set_keeps_a_rejected_epochs_label_and_dispute_ids_seen_so_none_
     .into_iter()
     .map(str::to_owned)
     .collect();
-    assert_eq!(sealed.sealed_labels, expected);
+    assert_eq!(sealed.sealed_labels, all);
+    assert!(db.is_label_seen_for(REJECTED_LABEL_ID, LABELER).unwrap());
+    assert!(db
+        .is_label_seen_for(REJECTED_DISPUTE_ID, "site.example.test")
+        .unwrap());
+    let labels: Vec<(String, u64)> = db
+        .sealed_labels()
+        .unwrap()
+        .into_iter()
+        .map(|sealed| (sealed.label_id, sealed.height))
+        .collect();
+    assert_eq!(
+        labels,
+        vec![
+            (ACCEPTED_LABEL_ID.to_owned(), 0),
+            (REJECTED_LABEL_ID.to_owned(), 3)
+        ]
+    );
+    let disputes: Vec<(String, u64)> = db
+        .sealed_disputes()
+        .unwrap()
+        .into_iter()
+        .map(|sealed| (sealed.dispute_id, sealed.height))
+        .collect();
+    assert_eq!(
+        disputes,
+        vec![
+            (ACCEPTED_DISPUTE_ID.to_owned(), 0),
+            (REJECTED_DISPUTE_ID.to_owned(), 3)
+        ]
+    );
 }
 
 #[test]
@@ -715,6 +776,9 @@ fn marking_an_epoch_rejected_drops_its_queued_removal_and_keeps_an_accepted_epoc
         }],
         &[],
     );
+    assert!(db.pending_removals().unwrap().is_empty());
+    db.record_epoch_judgment(1, false).unwrap();
+    db.record_epoch_judgment(3, false).unwrap();
     assert_eq!(
         db.pending_removals().unwrap(),
         vec![
@@ -744,4 +808,170 @@ fn clearing_a_rejected_marker_queues_the_epochs_withdrawal_again() {
         db.pending_removals().unwrap(),
         vec![(ITEM_ID.to_owned(), WITHDRAWN_DOMAIN.to_owned())]
     );
+}
+
+#[test]
+fn a_withdrawal_queues_no_removal_until_its_epoch_is_judged_accepted() {
+    let store = RejectedStore::build();
+    let db = &store.db;
+    assert!(!db.epoch_judged(1).unwrap());
+    assert!(db.pending_removals().unwrap().is_empty());
+    seal_with(
+        db,
+        &store.sk,
+        3,
+        T0 + 10_800,
+        vec![],
+        &[],
+        &[WithdrawalRow {
+            update_id: OTHER_WITHDRAWAL_ID,
+            item_id: OTHER_ITEM_ID,
+            domain: WITHDRAWN_DOMAIN,
+        }],
+        &[],
+    );
+    assert!(!db.epoch_judged(3).unwrap());
+    assert!(db.pending_removals().unwrap().is_empty());
+
+    db.record_epoch_judgment(3, false).unwrap();
+    assert!(db.epoch_judged(3).unwrap());
+    assert_eq!(
+        db.pending_removals().unwrap(),
+        vec![(OTHER_ITEM_ID.to_owned(), WITHDRAWN_DOMAIN.to_owned())]
+    );
+    db.record_epoch_judgment(1, true).unwrap();
+    assert!(db.epoch_judged(1).unwrap());
+    assert_eq!(
+        db.pending_removals().unwrap(),
+        vec![(OTHER_ITEM_ID.to_owned(), WITHDRAWN_DOMAIN.to_owned())]
+    );
+}
+
+#[test]
+fn a_withdrawal_sealed_in_an_unjudged_rejected_epoch_and_again_in_an_accepted_one_applies_at_the_later_height(
+) {
+    let store = RejectedStore::build();
+    let db = &store.db;
+    seal_with(
+        db,
+        &store.sk,
+        3,
+        T0 + 10_800,
+        vec![],
+        &[],
+        &[withdrawal()],
+        &[],
+    );
+    let judgments = store.read_all();
+    assert_eq!(judgments[1], Some(vec!["WIST3-E03".to_owned()]));
+    assert_eq!(judgments[3], None);
+    assert_eq!(
+        db.withdrawal_state().unwrap(),
+        vec![(ITEM_ID.to_owned(), WITHDRAWN_DOMAIN.to_owned(), 3)]
+    );
+    assert_eq!(
+        db.pending_removals().unwrap(),
+        vec![(ITEM_ID.to_owned(), WITHDRAWN_DOMAIN.to_owned())]
+    );
+}
+
+#[test]
+fn a_declaration_sealed_in_an_unjudged_rejected_epoch_and_again_in_an_accepted_one_is_listed_at_the_later_height(
+) {
+    let store = RejectedStore::build();
+    let db = &store.db;
+    seal_publications(
+        db,
+        &store.sk,
+        3,
+        T0 + 10_800,
+        vec![],
+        &[],
+        &[],
+        &[],
+        &Publications::of(REJECTED_LABEL_ID, REJECTED_DISPUTE_ID, 2),
+    );
+    store.read_all();
+    let declarations: Vec<(u64, u64)> = db
+        .sealed_declarations(DECLARING_DOMAIN)
+        .unwrap()
+        .into_iter()
+        .map(|sealed| (sealed.seq, sealed.epoch_number))
+        .collect();
+    assert_eq!(declarations, vec![(1, 0), (2, 3)]);
+}
+
+#[test]
+fn a_rejected_epochs_declaration_raises_no_floor_and_an_accepted_epochs_does() {
+    let store = RejectedStore::build();
+    let db = &store.db;
+    assert_eq!(
+        db.highest_accepted_declaration_seq(DECLARING_DOMAIN)
+            .unwrap(),
+        None
+    );
+    store.read_all();
+    assert_eq!(
+        db.highest_accepted_declaration_seq(DECLARING_DOMAIN)
+            .unwrap(),
+        Some(1)
+    );
+
+    seal_publications(
+        db,
+        &store.sk,
+        3,
+        T0 + 10_800,
+        vec![],
+        &[],
+        &[],
+        &[],
+        &Publications::of(REJECTED_LABEL_ID, REJECTED_DISPUTE_ID, 2),
+    );
+    assert_eq!(
+        db.highest_accepted_declaration_seq(DECLARING_DOMAIN)
+            .unwrap(),
+        Some(1)
+    );
+    store.read_all();
+    assert_eq!(
+        db.highest_accepted_declaration_seq(DECLARING_DOMAIN)
+            .unwrap(),
+        Some(2)
+    );
+}
+
+#[test]
+fn the_payload_items_needed_keep_an_item_withdrawn_only_by_a_rejected_epoch() {
+    let store = RejectedStore::build();
+    let db = &store.db;
+    seal_with(
+        db,
+        &store.sk,
+        3,
+        T0 + 10_800,
+        vec![],
+        &[],
+        &[WithdrawalRow {
+            update_id: OTHER_WITHDRAWAL_ID,
+            item_id: OTHER_ITEM_ID,
+            domain: WITHDRAWN_DOMAIN,
+        }],
+        &[],
+    );
+    store.read_all();
+    let conn = rusqlite::Connection::open(store.data.path().join("clave.sqlite")).unwrap();
+    for (url, item_id) in [
+        ("https://publisher.example.test/a", ITEM_ID),
+        ("https://publisher.example.test/b", OTHER_ITEM_ID),
+    ] {
+        conn.execute(
+            "INSERT INTO records(publisher, url, item, item_id, collection, catalog_id, generated_at, sealing_height) VALUES (?1, ?2, x'7b7d', ?3, 'default', 'sha256:00', ?4, 0)",
+            (WITHDRAWN_DOMAIN, url, item_id, ts(T0)),
+        )
+        .unwrap();
+    }
+    let needed = db.payload_items_needed().unwrap();
+    assert!(needed.contains(ITEM_ID));
+    assert!(!needed.contains(OTHER_ITEM_ID));
 }

@@ -123,7 +123,7 @@ fn declaration_domain(before: &State, hash: &str) -> Option<String> {
 }
 
 /// WIST-3 §6.1, §6.2.
-fn record_sealed_items(db: &Db, prepared: &PreparedEpoch) -> Result<()> {
+fn record_sealed_items(db: &Db, prepared: &PreparedEpoch<'_>) -> Result<()> {
     let sealed_at_s = wist_core::timestamp::log_seconds(&prepared.sealed_at)?;
     let until = crate::registry::instant(
         sealed_at_s.saturating_add(prepared.payload_window_days.saturating_mul(DAY_SECONDS)),
@@ -175,7 +175,7 @@ pub(super) fn epoch(
     data_dir: &Path,
     client: &crate::fetch::Client,
     mutation: Mutation<'_>,
-    prepared: PreparedEpoch,
+    mut prepared: PreparedEpoch<'_>,
 ) -> Result<SealReport> {
     let param_changes: Vec<ParamChangeRow> = prepared
         .accepted_changes
@@ -276,6 +276,18 @@ pub(super) fn epoch(
         &dispute_rows,
         &declaration_rows,
     )?;
+    prepared.history.extend(sealed.clone());
+    let verified = prepared
+        .history
+        .next_epoch()?
+        .ok_or_else(|| Error::Seal("the sealed Epoch is missing from its history".into()))?;
+    if let Some(codes) = verified.rejected() {
+        tracing::warn!(
+            epoch = prepared.epoch_number,
+            ?codes,
+            "the sealed Epoch is rejected: it stays in the Log and applies its key acts alone"
+        );
+    }
     let mut after = prepared.planned.state.clone();
     after.declarations.seed_head(
         prepared.epoch_number,

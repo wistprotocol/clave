@@ -516,7 +516,7 @@ impl Db {
             .transpose()
     }
 
-    pub(crate) fn payload_items_needed(&self) -> Result<BTreeSet<String>> {
+    pub fn payload_items_needed(&self) -> Result<BTreeSet<String>> {
         let mut needed: BTreeSet<String> = BTreeSet::new();
         for (publisher, name, catalog_id) in self.kept_catalogs()? {
             let mut statement = self.conn.prepare_cached(
@@ -543,7 +543,7 @@ impl Db {
         }
         for item_id in self
             .conn
-            .prepare("SELECT item_id FROM withdrawals")?
+            .prepare("SELECT w.item_id FROM withdrawals w JOIN epochs b ON b.epoch_number = w.epoch_number WHERE b.rejected = 0")?
             .query_map([], |row| row.get::<_, String>(0))?
         {
             needed.remove(&item_id?);
