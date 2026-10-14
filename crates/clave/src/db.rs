@@ -1197,7 +1197,9 @@ impl Db {
         }
         for w in withdrawals {
             let first = tx.execute(
-                "INSERT OR IGNORE INTO withdrawals(item_id, domain, update_id, epoch_number, sealed_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO withdrawals(item_id, domain, update_id, epoch_number, sealed_at) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(item_id) DO UPDATE SET domain = excluded.domain, update_id = excluded.update_id, epoch_number = excluded.epoch_number, sealed_at = excluded.sealed_at
+                 WHERE (SELECT rejected FROM epochs WHERE epoch_number = withdrawals.epoch_number) = 1",
                 (w.item_id, w.domain, w.update_id, epoch_number as i64, sealed_at),
             )? == 1;
             if first {
@@ -1403,7 +1405,7 @@ impl Db {
     pub fn suffix_list_acts(&self) -> Result<Vec<(u64, String)>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT epoch_number, sha256 FROM suffix_list_acts ORDER BY rowid")?;
+            .prepare("SELECT a.epoch_number, a.sha256 FROM suffix_list_acts a JOIN epochs b ON b.epoch_number = a.epoch_number WHERE b.rejected = 0 ORDER BY a.rowid")?;
         let rows = stmt
             .query_map([], |row| {
                 Ok((row.get::<_, i64>(0)?.max(0) as u64, row.get(1)?))
@@ -1425,9 +1427,28 @@ impl Db {
             .optional()?)
     }
 
+    pub fn record_epoch_judgment(&self, epoch_number: u64, rejected: bool) -> Result<()> {
+        let marked: Option<bool> = self
+            .conn
+            .query_row(
+                "SELECT rejected FROM epochs WHERE epoch_number = ?1",
+                [epoch_number as i64],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if marked.is_none_or(|marked| marked == rejected) {
+            return Ok(());
+        }
+        self.execute(
+            "UPDATE epochs SET rejected = ?2 WHERE epoch_number = ?1 AND rejected != ?2",
+            (epoch_number as i64, rejected),
+        )?;
+        Ok(())
+    }
+
     pub fn suffix_list_in_force_at(&self, at: &str) -> Result<Option<(String, u64)>> {
         self.suffix_list_row(
-            "SELECT a.sha256, a.epoch_number FROM suffix_list_acts a JOIN epochs b ON b.epoch_number = a.epoch_number WHERE b.sealed_at <= ?1 ORDER BY a.rowid DESC LIMIT 1",
+            "SELECT a.sha256, a.epoch_number FROM suffix_list_acts a JOIN epochs b ON b.epoch_number = a.epoch_number WHERE b.sealed_at <= ?1 AND b.rejected = 0 ORDER BY a.rowid DESC LIMIT 1",
             at,
         )
     }
@@ -1437,7 +1458,7 @@ impl Db {
         epoch_number: u64,
     ) -> Result<Option<(String, u64)>> {
         self.suffix_list_row(
-            "SELECT sha256, epoch_number FROM suffix_list_acts WHERE epoch_number < ?1 ORDER BY rowid DESC LIMIT 1",
+            "SELECT a.sha256, a.epoch_number FROM suffix_list_acts a JOIN epochs b ON b.epoch_number = a.epoch_number WHERE a.epoch_number < ?1 AND b.rejected = 0 ORDER BY a.rowid DESC LIMIT 1",
             epoch_number as i64,
         )
     }
@@ -1445,7 +1466,7 @@ impl Db {
     /// WIST-3 §7: the most recent act sealed at or below the Snapshot's Epoch.
     pub fn suffix_list_at_epoch(&self, epoch_number: u64) -> Result<Option<(String, u64)>> {
         self.suffix_list_row(
-            "SELECT sha256, epoch_number FROM suffix_list_acts WHERE epoch_number <= ?1 ORDER BY rowid DESC LIMIT 1",
+            "SELECT a.sha256, a.epoch_number FROM suffix_list_acts a JOIN epochs b ON b.epoch_number = a.epoch_number WHERE a.epoch_number <= ?1 AND b.rejected = 0 ORDER BY a.rowid DESC LIMIT 1",
             epoch_number as i64,
         )
     }
@@ -1455,7 +1476,7 @@ impl Db {
     pub fn withdrawal_state(&self) -> Result<Vec<WithdrawalState>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT item_id, domain, epoch_number FROM withdrawals ORDER BY item_id")?;
+            .prepare("SELECT w.item_id, w.domain, w.epoch_number FROM withdrawals w JOIN epochs b ON b.epoch_number = w.epoch_number WHERE b.rejected = 0 ORDER BY w.item_id")?;
         let rows = stmt
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1464,7 +1485,7 @@ impl Db {
 
     pub fn is_withdrawn(&self, item_id: &str) -> Result<bool> {
         Ok(self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM withdrawals WHERE item_id = ?1)",
+            "SELECT EXISTS(SELECT 1 FROM withdrawals w JOIN epochs b ON b.epoch_number = w.epoch_number WHERE w.item_id = ?1 AND b.rejected = 0)",
             [item_id],
             |row| row.get(0),
         )?)
@@ -1574,7 +1595,7 @@ impl Db {
         first_epoch_s: i64,
     ) -> Result<(wist_core::parameters::Schedule, u64)> {
         let mut stmt = self.conn.prepare(
-            "SELECT epoch_number, sealed_at, epoch_bytes FROM epochs ORDER BY epoch_number",
+            "SELECT epoch_number, sealed_at, epoch_bytes, rejected FROM epochs ORDER BY epoch_number",
         )?;
         let epochs = stmt
             .query_map([], |row| {
@@ -1582,6 +1603,7 @@ impl Db {
                     row.get::<_, u64>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, u64>(2)?,
+                    row.get::<_, bool>(3)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1607,7 +1629,7 @@ impl Db {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let mut changes = changes.into_iter().peekable();
         let mut largest = 0;
-        for (height, sealed_at, bytes) in epochs {
+        for (height, sealed_at, bytes, rejected) in epochs {
             let tentative = largest.max(bytes);
             let at = crate::registry::unix(&sealed_at)?;
             let mut candidate = schedule.clone();
@@ -1625,10 +1647,13 @@ impl Db {
                 let _ = crate::registry::accept(&mut candidate, amendment, tentative);
             }
             // WIST-4 §5: an Epoch rejected for its size (WIST3-E03) applies none of its
-            // parameter candidates and its size never enters the running maximum.
+            // parameter candidates and its size never enters the running maximum; an Epoch
+            // rejected on another ground (WIST-3 §3.3) applies no candidate but counts its size.
             if bytes <= candidate.epoch_size_bounds(at).0 {
-                schedule = candidate;
                 largest = tentative;
+                if !rejected {
+                    schedule = candidate;
+                }
             }
         }
         if changes.next().is_some() {

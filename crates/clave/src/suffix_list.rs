@@ -56,7 +56,7 @@ pub fn pin(
 
 static PARSED: Mutex<Vec<(String, Arc<SuffixList>)>> = Mutex::new(Vec::new());
 
-fn load(db: &Db, identifier: &str) -> Result<Arc<SuffixList>> {
+pub(crate) fn load(db: &Db, identifier: &str) -> Result<Arc<SuffixList>> {
     let mut parsed = PARSED
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());

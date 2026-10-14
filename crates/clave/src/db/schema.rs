@@ -63,7 +63,7 @@ const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS publishers(domain TEXT PRIMARY KEY, declaration_json BLOB, key_id TEXT, public_key TEXT, state TEXT NOT NULL DEFAULT 'new', last_pull_at TEXT);
 CREATE TABLE IF NOT EXISTS declaration_floors(domain TEXT PRIMARY KEY, seq INTEGER NOT NULL CHECK(typeof(seq) = 'integer' AND seq BETWEEN 0 AND 9007199254740991));
 CREATE TABLE IF NOT EXISTS pending_entries(rowid INTEGER PRIMARY KEY AUTOINCREMENT, entry_type TEXT NOT NULL, domain TEXT NOT NULL, entry_json BLOB NOT NULL, chain_pos INTEGER NOT NULL, turn_epoch INTEGER, acceptance_order INTEGER, label_id TEXT UNIQUE, place_event INTEGER, place_position INTEGER, place_index INTEGER, eligibility INTEGER);
-CREATE TABLE IF NOT EXISTS epochs(epoch_number INTEGER PRIMARY KEY, tree_size INTEGER NOT NULL, root TEXT NOT NULL, sealed_at TEXT NOT NULL, note TEXT NOT NULL, published INTEGER NOT NULL DEFAULT 0, epoch_bytes INTEGER);
+CREATE TABLE IF NOT EXISTS epochs(epoch_number INTEGER PRIMARY KEY, tree_size INTEGER NOT NULL, root TEXT NOT NULL, sealed_at TEXT NOT NULL, note TEXT NOT NULL, published INTEGER NOT NULL DEFAULT 0, epoch_bytes INTEGER, rejected INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS log_entries(leaf_index INTEGER PRIMARY KEY, epoch_number INTEGER NOT NULL, entry_json BLOB NOT NULL);
 CREATE INDEX IF NOT EXISTS log_entries_epoch ON log_entries(epoch_number);
 CREATE TABLE IF NOT EXISTS log_tiles(level INTEGER NOT NULL, tile_index INTEGER NOT NULL, hashes BLOB NOT NULL, PRIMARY KEY(level, tile_index));
@@ -130,6 +130,7 @@ pub(super) fn add_missing_columns(conn: &Connection) -> Result<()> {
         "ALTER TABLE collections ADD COLUMN accepted_read TEXT",
         "ALTER TABLE list_items ADD COLUMN read TEXT",
         "ALTER TABLE rejections ADD COLUMN left_epoch INTEGER",
+        "ALTER TABLE epochs ADD COLUMN rejected INTEGER NOT NULL DEFAULT 0",
     ] {
         match conn.execute(statement, []) {
             Ok(_) => {}

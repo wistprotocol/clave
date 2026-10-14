@@ -299,7 +299,11 @@ impl<'a> History<'a> {
             }
         }
         let parameters = wist_core::sealing::Parameters::from_schedule(&schedule, at)?;
-        let suffix_list = crate::suffix_list::in_force_at_epoch(self.db, height)?;
+        let suffix_list = self
+            .suffix_lists
+            .in_force_at_epoch(height)
+            .map(|(identifier, _)| crate::suffix_list::load(self.db, identifier))
+            .transpose()?;
         let log_key = |key_id: &str| {
             keys.iter()
                 .find(|key| key.key_id == key_id)
@@ -331,6 +335,7 @@ impl<'a> History<'a> {
                 records_removed,
             } => (None, entries, records_removed),
         };
+        self.db.record_epoch_judgment(height, rejected.is_some())?;
         let mut accepted_acts = key_acts;
         if rejected.is_none() {
             schedule = candidate;
