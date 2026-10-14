@@ -23,7 +23,7 @@ impl Db {
             rusqlite::TransactionBehavior::Immediate,
         )?;
         let rows = tx
-            .prepare("SELECT domain, declaration_json FROM publishers WHERE domain NOT IN (SELECT domain FROM declaration_floors) ORDER BY domain")?
+            .prepare("SELECT domain, declaration_json FROM publishers WHERE declaration_json IS NOT NULL AND domain NOT IN (SELECT domain FROM declaration_floors) ORDER BY domain")?
             .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         if rows.is_empty() {
@@ -44,6 +44,7 @@ impl Db {
             let sealed = history.domains().get(&domain);
             let discovered = self.discovered_declarations(&domain)?;
             if sealed.is_none() && discovered.is_empty() {
+                self.clear_admission(&domain)?;
                 continue;
             }
             let current: Value = crate::json::parse(&raw)?;

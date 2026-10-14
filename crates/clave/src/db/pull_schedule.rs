@@ -627,7 +627,7 @@ impl Db {
             "INSERT INTO pull_load(domain, score, updated_at) VALUES (?1, ?2, ?3) ON CONFLICT(domain) DO UPDATE SET score = (score + excluded.score) / 2, updated_at = excluded.updated_at",
             (&task.domain, cost, now),
         )?;
-        if self.get_publisher(&task.domain)?.is_none() {
+        if !self.publisher_known(&task.domain)? {
             return tx.commit();
         }
         let interval = baseline_interval(self, now)?;

@@ -110,6 +110,20 @@ impl Store {
         self.db.highest_accepted_declaration_seq(domain).unwrap()
     }
 
+    fn status_collections(&self, domain: &str) -> Vec<String> {
+        let status = clave::serve::load_status(&self.db, domain)
+            .unwrap()
+            .unwrap();
+        let status = serde_json::to_value(status).unwrap();
+        assert_eq!(status["state"], "active");
+        status["collections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|collection| collection["name"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
     fn sealed_domains(&self) -> Vec<String> {
         clave::history::declarations::Declarations::reconstruct(
             &self.db,
@@ -125,7 +139,7 @@ impl Store {
 }
 
 #[test]
-fn a_domain_returning_to_first_contact_at_sealing_keeps_no_declaration_floor() {
+fn a_domain_returning_to_first_contact_at_sealing_holds_no_floor_and_no_declaration() {
     let departing = site("a.localhost");
     let keeping = site("b.localhost");
     let mut store = Store::genesis_with_collections_max_32_then_16();
@@ -137,6 +151,12 @@ fn a_domain_returning_to_first_contact_at_sealing_keeps_no_declaration_floor() {
     );
     store.pull(&departing, ADMITTED_AT);
     assert_eq!(store.floor("a.localhost"), Some(5));
+    assert_eq!(
+        store.status_collections("a.localhost"),
+        (0..20)
+            .map(|index| format!("c{index:02}"))
+            .collect::<Vec<_>>()
+    );
     assert_eq!(
         store
             .db
@@ -163,10 +183,23 @@ fn a_domain_returning_to_first_contact_at_sealing_keeps_no_declaration_floor() {
     assert_eq!(store.sealed_domains(), ["b.localhost"]);
     assert_eq!(store.floor("a.localhost"), None);
     assert_eq!(store.floor("b.localhost"), Some(3));
+    assert_eq!(
+        store.db.get_publisher_declaration("a.localhost").unwrap(),
+        None
+    );
+    assert!(store.db.get_publisher("a.localhost").unwrap().is_none());
+    assert!(store.db.publisher_known("a.localhost").unwrap());
+    assert!(store.status_collections("a.localhost").is_empty());
+    assert_eq!(store.status_collections("b.localhost"), ["c00"]);
 
     store.reopen();
     assert_eq!(store.floor("a.localhost"), None);
     assert_eq!(store.floor("b.localhost"), Some(3));
+    assert_eq!(
+        store.db.get_publisher_declaration("a.localhost").unwrap(),
+        None
+    );
+    assert!(store.status_collections("a.localhost").is_empty());
 
     write_declaration(
         &departing.publisher,
@@ -181,6 +214,12 @@ fn a_domain_returning_to_first_contact_at_sealing_keeps_no_declaration_floor() {
         Some(serde_json::to_vec(&fresh).unwrap())
     );
     assert_eq!(store.floor("a.localhost"), Some(0));
+    assert_eq!(
+        store.status_collections("a.localhost"),
+        (0..16)
+            .map(|index| format!("c{index:02}"))
+            .collect::<Vec<_>>()
+    );
 
     store.reopen();
     assert_eq!(store.floor("a.localhost"), Some(0));

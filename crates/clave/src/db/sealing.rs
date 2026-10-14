@@ -161,11 +161,14 @@ impl Db {
             "SELECT prior_declaration_json FROM recovery_windows WHERE domain = ?1",
             "SELECT owner_declaration_json FROM recovery_windows WHERE domain = ?1",
         ] {
-            let octets: Option<Vec<u8>> = self
+            let octets: Option<Option<Vec<u8>>> = self
                 .conn
                 .query_row(sql, [domain], |row| row.get(0))
                 .optional()?;
-            let Some(envelope) = octets.and_then(|octets| crate::json::parse(&octets).ok()) else {
+            let Some(envelope) = octets
+                .flatten()
+                .and_then(|octets| crate::json::parse(&octets).ok())
+            else {
                 continue;
             };
             if let Ok(publisher) = crate::declaration::publisher_of(&envelope) {
@@ -586,7 +589,7 @@ impl Db {
         let publisher = crate::declaration::publisher_of(current).map_err(Error::History)?;
         let key = &publisher.keys[0];
         let octets = envelope_octets(current)?;
-        let stored: Option<Vec<u8>> = self
+        let stored: Option<Option<Vec<u8>>> = self
             .conn
             .query_row(
                 "SELECT declaration_json FROM publishers WHERE domain = ?1",
@@ -594,6 +597,8 @@ impl Db {
                 |row| row.get(0),
             )
             .optional()?;
+        let known = stored.is_some();
+        let stored = stored.flatten();
         let unchanged = stored
             .as_deref()
             .and_then(|octets| crate::json::parse(octets).ok())
@@ -602,7 +607,7 @@ impl Db {
         if unchanged {
             return self.mirror_windows(domain, sealed, admission, windows, floor);
         }
-        if stored.is_some() {
+        if known {
             self.conn.execute(
                 "UPDATE publishers SET declaration_json = ?2, key_id = ?3, public_key = ?4 WHERE domain = ?1",
                 (domain, &octets, &key.kid, &key.x),
@@ -611,6 +616,20 @@ impl Db {
             super::exec_insert_publisher(&self.conn, domain, &octets, &key.kid, &key.x)?;
         }
         self.mirror_windows(domain, sealed, admission, windows, floor)
+    }
+
+    /// WIST-1 §5.2: a domain at first contact holds no Declaration, so the
+    /// row keeps only its pull and status state.
+    pub(crate) fn clear_admission(&self, domain: &str) -> Result<()> {
+        for sql in [
+            "UPDATE publishers SET declaration_json = NULL, key_id = NULL, public_key = NULL WHERE domain = ?1",
+            "DELETE FROM sealed_in_force WHERE domain = ?1",
+            "DELETE FROM pending_identities WHERE domain = ?1",
+            "DELETE FROM recovery_windows WHERE domain = ?1",
+        ] {
+            self.conn.execute(sql, [domain])?;
+        }
+        Ok(())
     }
 
     fn mirror_windows(

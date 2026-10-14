@@ -181,7 +181,7 @@ pub struct EpochRow {
 
 pub struct PublisherListRow {
     pub domain: String,
-    pub declaration_json: Vec<u8>,
+    pub declaration_json: Option<Vec<u8>>,
 }
 
 pub struct PendingEntryRow {
@@ -457,7 +457,7 @@ impl Db {
     pub fn get_publisher(&self, domain: &str) -> Result<Option<PublisherRow>> {
         self.conn
             .query_row(
-                "SELECT key_id, public_key FROM publishers WHERE domain = ?1",
+                "SELECT key_id, public_key FROM publishers WHERE domain = ?1 AND key_id IS NOT NULL",
                 [domain],
                 |row| {
                     Ok(PublisherRow {
@@ -470,11 +470,19 @@ impl Db {
             .map_err(Error::Db)
     }
 
+    pub fn publisher_known(&self, domain: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM publishers WHERE domain = ?1)",
+            [domain],
+            |row| row.get(0),
+        )?)
+    }
+
     pub fn get_publisher_scope(&self, domain: &str) -> Result<Option<Vec<String>>> {
         let blob: Option<Vec<u8>> = self
             .conn
             .query_row(
-                "SELECT declaration_json FROM publishers WHERE domain = ?1",
+                "SELECT declaration_json FROM publishers WHERE domain = ?1 AND declaration_json IS NOT NULL",
                 [domain],
                 |row| row.get(0),
             )
@@ -604,7 +612,7 @@ impl Db {
     pub fn get_publisher_declaration(&self, domain: &str) -> Result<Option<Vec<u8>>> {
         self.conn
             .query_row(
-                "SELECT declaration_json FROM publishers WHERE domain = ?1",
+                "SELECT declaration_json FROM publishers WHERE domain = ?1 AND declaration_json IS NOT NULL",
                 [domain],
                 |row| row.get(0),
             )
@@ -2123,6 +2131,63 @@ pub(crate) mod tests {
             crate::registry::effective(&db, "feed_window", "2026-01-25T00:00:00Z").unwrap(),
             800
         );
+    }
+
+    fn store_with_required_publisher_columns(path: &Path, floor: bool) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE publishers(domain TEXT PRIMARY KEY, declaration_json BLOB NOT NULL, key_id TEXT NOT NULL, public_key TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'new', last_pull_at TEXT);
+             INSERT INTO publishers(domain, declaration_json, key_id, public_key, state, last_pull_at) VALUES ('example.com', X'7B7D', 'k1', 'pk', 'active', '2026-08-09T00:00:00Z');
+             PRAGMA user_version = 3;",
+        )
+        .unwrap();
+        if floor {
+            conn.execute_batch(
+                "CREATE TABLE declaration_floors(domain TEXT PRIMARY KEY, seq INTEGER NOT NULL);
+                 INSERT INTO declaration_floors(domain, seq) VALUES ('example.com', 0);",
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn opening_a_store_clears_the_declaration_of_a_domain_at_first_contact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("clave.sqlite");
+        store_with_required_publisher_columns(&path, false);
+        let db = Db::open(&path).unwrap();
+        assert!(db.get_publisher("example.com").unwrap().is_none());
+        assert_eq!(db.get_publisher_declaration("example.com").unwrap(), None);
+        assert!(db.publisher_known("example.com").unwrap());
+        assert_eq!(
+            db.highest_accepted_declaration_seq("example.com").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn opening_a_store_whose_publisher_columns_are_required_relaxes_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("clave.sqlite");
+        store_with_required_publisher_columns(&path, true);
+        let db = Db::open(&path).unwrap();
+        assert_eq!(
+            db.get_publisher("example.com").unwrap().unwrap().key_id,
+            "k1"
+        );
+        assert_eq!(
+            db.get_publisher_declaration("example.com").unwrap(),
+            Some(b"{}".to_vec())
+        );
+        db.clear_admission("example.com").unwrap();
+        assert!(db.get_publisher("example.com").unwrap().is_none());
+        assert_eq!(db.get_publisher_declaration("example.com").unwrap(), None);
+        assert!(db.publisher_known("example.com").unwrap());
+        let row = db.get_publisher_status("example.com").unwrap().unwrap();
+        assert_eq!(row.last_pull_at.as_deref(), Some("2026-08-09T00:00:00Z"));
+        assert!(matches!(row.state, PublisherState::Active));
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.get_publisher_declaration("example.com").unwrap(), None);
     }
 
     #[test]

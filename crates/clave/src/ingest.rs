@@ -462,22 +462,22 @@ pub(crate) fn mirror_admission(
     sealing: bool,
 ) -> Result<()> {
     let sealed = state.declarations.domains().get(publisher);
-    if let Some(domain) =
-        crate::collection::pull::admission_domain(state, publisher, at, parameters)?
-    {
-        let windows = match (sealing, sealed) {
-            (true, Some(sealed)) => sealed,
-            _ => &domain,
-        };
-        db.mirror_admission(
-            publisher,
-            sealed,
-            &domain,
-            windows,
-            state.floors.get(publisher).copied().unwrap_or_default(),
-        )?;
+    match crate::collection::pull::admission_domain(state, publisher, at, parameters)? {
+        Some(domain) => {
+            let windows = match (sealing, sealed) {
+                (true, Some(sealed)) => sealed,
+                _ => &domain,
+            };
+            db.mirror_admission(
+                publisher,
+                sealed,
+                &domain,
+                windows,
+                state.floors.get(publisher).copied().unwrap_or_default(),
+            )
+        }
+        None => db.clear_admission(publisher),
     }
-    Ok(())
 }
 
 pub(crate) fn mirror_sealed(
