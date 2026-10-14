@@ -1466,7 +1466,7 @@ pub fn produce_with(
         return Ok(Outcome::Unsealed);
     };
     let served = served_directory(data_dir, &snapshot_date_of(&head), head.epoch_number);
-    if served_manifest(&served).is_some() {
+    if mode == Mode::Incremental && served_manifest(&served).is_some() {
         return Ok(Outcome::Current {
             epoch_number: head.epoch_number,
         });
@@ -1532,11 +1532,16 @@ pub fn produce_with(
         });
     }
     let target = served_directory(data_dir, &snapshot_date, built);
+    let replaced = staging(data_dir).join(format!("{built}.replaced"));
     if target.exists() {
-        remove_tree(&staged)?;
-        return Ok(Outcome::Current {
-            epoch_number: built,
-        });
+        if mode == Mode::Incremental {
+            remove_tree(&staged)?;
+            return Ok(Outcome::Current {
+                epoch_number: built,
+            });
+        }
+        remove_tree(&replaced)?;
+        std::fs::rename(&target, &replaced)?;
     }
     // Under the swap lock and after the superseding check: a withdrawal seal
     // either abandons this build or runs after it and removes its shard.
@@ -1547,6 +1552,7 @@ pub fn produce_with(
     std::fs::rename(&staged, &target)?;
     sync_directory(&date_root)?;
     sync_directory(&served_root)?;
+    remove_tree(&replaced)?;
     sync_directory(&staging(data_dir))?;
     observe(Phase::Swapped)?;
 

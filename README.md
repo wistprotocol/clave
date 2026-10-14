@@ -319,17 +319,16 @@ starting `clave`.
 
 A seal publishes the Checkpoint only; the Snapshot at the sealed head is
 produced afterwards by `seal` (unless `--no-snapshot`), by `clave snapshot
---data <dir>` (`--rebuild` rebuilds every shard instead of reusing
-unchanged ones), or by `serve`'s producer task, which runs at start, after each
+--data <dir>` (`--rebuild` rebuilds every shard and replaces a served
+Snapshot of the head with the result), or by `serve`'s producer task, which runs at start, after each
 successful seal and every 60 seconds, and retries at once when a
 withdrawal supersedes its build. `--no-seal` instances never produce. One
 producer runs per data directory at a time, holding an exclusive lock on
 `snapshot-build.lock`; a second one fails naming it. Production prints one
 of `snapshot built at epoch N for <date> in M ms, K of S shards rebuilt`,
 `snapshot current at
-epoch N` (a Snapshot of the head Epoch is already served; with or
-without `--rebuild`, nothing is built, and regenerating a served
-Snapshot means sealing a new Epoch), `snapshot
+epoch N` (a Snapshot of the head Epoch is already served and nothing is
+built; `--rebuild` builds and swaps it in anyway), `snapshot
 superseded by a withdrawal at epoch H` or `snapshot not built: no Epoch
 sealed`. A built Snapshot is followed by `snapshot bytes written N`
 (bytes the build wrote into the staging directory: rebuilt tier files,

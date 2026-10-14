@@ -86,7 +86,7 @@ enum Command {
     Snapshot {
         #[arg(long)]
         data: PathBuf,
-        /// Rebuild every shard instead of reusing unchanged ones.
+        /// Rebuild every shard and replace the served Snapshot at the head.
         #[arg(long)]
         rebuild: bool,
     },

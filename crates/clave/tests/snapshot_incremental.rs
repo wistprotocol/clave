@@ -561,22 +561,6 @@ fn a_cache_entry_with_a_same_length_corrupted_file_is_not_reused() {
 }
 
 #[test]
-fn a_full_rebuild_at_a_served_head_builds_nothing() {
-    let log = built_log(2);
-    let served = common::tree_bytes(&log.path().join("snapshots"));
-    let entries: Vec<Vec<u64>> = (0..2).map(|shard| log.entry_inodes(shard)).collect();
-    let head = log.db.last_epoch().unwrap().unwrap().epoch_number;
-    assert_eq!(
-        log.produce(Mode::Full),
-        Outcome::Current { epoch_number: head }
-    );
-    for (shard, before) in entries.iter().enumerate() {
-        assert_eq!(&log.entry_inodes(shard as u64), before);
-    }
-    assert_eq!(common::tree_bytes(&log.path().join("snapshots")), served);
-}
-
-#[test]
 fn a_full_rebuild_of_a_new_empty_epoch_rebuilds_every_shard_and_matches() {
     let mut log = built_log(2);
     log.seal();
@@ -642,4 +626,35 @@ fn an_empty_epoch_build_reads_no_payloads_and_writes_only_state_and_manifest() {
             payload_bytes_read: 0,
         }
     );
+}
+
+#[test]
+fn a_rebuild_at_the_served_head_replaces_the_snapshot_with_an_identical_one() {
+    let log = built_log(2);
+    let before = log.capture();
+    let served_files = || {
+        let mut files = common::tree_bytes(&log.path().join("snapshots"));
+        files.remove(Path::new("index.json"));
+        files
+    };
+    let served_before = served_files();
+    let inodes_before: Vec<Vec<u64>> = (0..2).map(|shard| log.served_inodes(shard)).collect();
+    assert!(matches!(
+        log.produce(Mode::Incremental),
+        Outcome::Current { .. }
+    ));
+    assert_eq!(log.produce_built(Mode::Full), log.shard_count);
+    let after = log.capture();
+    assert_same_snapshot(&before, &after);
+    assert_eq!(served_files(), served_before);
+    for shard in 0..2 {
+        assert_ne!(log.served_inodes(shard), inodes_before[shard as usize]);
+        assert_eq!(log.served_inodes(shard), log.entry_inodes(shard));
+    }
+    assert!(
+        std::fs::read_dir(log.path().join(clave::snapshot::STAGING_DIRECTORY))
+            .map(|entries| entries.count() == 0)
+            .unwrap_or(true)
+    );
+    assert_eq!(common::listed_snapshots(log.path()).len(), 1);
 }
