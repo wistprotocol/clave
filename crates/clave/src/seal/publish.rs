@@ -281,6 +281,7 @@ pub(super) fn epoch(
         .history
         .next_epoch()?
         .ok_or_else(|| Error::Seal("the sealed Epoch is missing from its history".into()))?;
+    let rejected = verified.rejected().is_some();
     if let Some(codes) = verified.rejected() {
         tracing::warn!(
             epoch = prepared.epoch_number,
@@ -288,7 +289,12 @@ pub(super) fn epoch(
             "the sealed Epoch is rejected: it stays in the Log and applies its key acts alone"
         );
     }
-    let mut after = prepared.planned.state.clone();
+    // WIST-3 §3.3, Rejected Epochs: no Catalog or Item of a rejected Epoch changes state.
+    let mut after = if rejected {
+        prepared.before.clone()
+    } else {
+        prepared.planned.state.clone()
+    };
     after.declarations.seed_head(
         prepared.epoch_number,
         &sealed.root,
@@ -308,7 +314,9 @@ pub(super) fn epoch(
         .chain(after.discovered.keys().cloned())
         .collect();
     crate::db::store_changes(db, &prepared.before, &after, &scope, &prepared.sealed_at)?;
-    record_sealed_items(db, &prepared)?;
+    if !rejected {
+        record_sealed_items(db, &prepared)?;
+    }
     db.store_waiting_reports(&scope, &prepared.planned.deferred, &prepared.planned.held)?;
     record_reports(
         db,

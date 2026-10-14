@@ -1,5 +1,8 @@
 #![forbid(unsafe_code)]
 
+#[cfg(test)]
+extern crate self as clave;
+
 pub mod collection;
 pub mod db;
 pub mod declaration;
