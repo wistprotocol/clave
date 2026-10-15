@@ -1160,6 +1160,7 @@ pub struct StoreHeld<'a> {
     tree_files: BTreeMap<String, Vec<u8>>,
     read: std::cell::RefCell<BTreeSet<String>>,
     payloads: BTreeMap<String, Vec<u8>>,
+    written: Vec<String>,
 }
 
 fn payload_name(item_id: &str) -> Result<String> {
@@ -1196,12 +1197,32 @@ impl<'a> StoreHeld<'a> {
             tree_files: BTreeMap::new(),
             read: std::cell::RefCell::default(),
             payloads: BTreeMap::new(),
+            written: Vec::new(),
         }
     }
 
-    /// Payload files are written before the enclosing transaction commits: a rollback leaves a
-    /// file no row names, never a row without its file.
+    // Payload files precede the rows naming them; retention removes a file no row came to name.
+    pub fn flush_files(&mut self) -> Result<()> {
+        let mut directories = BTreeSet::new();
+        for (item_id, octets) in std::mem::take(&mut self.payloads) {
+            if self.db.is_withdrawn(&item_id)? {
+                continue;
+            }
+            let path = held_payload_path(self.data_dir, &item_id)?;
+            crate::publication::write_synced(&path, &octets)?;
+            if let Some(parent) = path.parent() {
+                directories.insert(parent.to_path_buf());
+            }
+            self.written.push(item_id);
+        }
+        for directory in directories {
+            crate::publication::sync_directory(&directory)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn flush(&mut self) -> Result<()> {
+        self.flush_files()?;
         let conn = &self.db.conn;
         for ((publisher, name, catalog_id), (size, root, items)) in std::mem::take(&mut self.lists)
         {
@@ -1229,17 +1250,10 @@ impl<'a> StoreHeld<'a> {
                 (&hex, &self.at),
             )?;
         }
-        for (item_id, octets) in std::mem::take(&mut self.payloads) {
+        for item_id in std::mem::take(&mut self.written) {
             if self.db.is_withdrawn(&item_id)? {
-                continue;
+                crate::db::remove_file(&held_payload_path(self.data_dir, &item_id)?)?;
             }
-            let path = held_payload_path(self.data_dir, &item_id)?;
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let partial = path.with_extension("json.partial");
-            std::fs::write(&partial, &octets)?;
-            std::fs::rename(&partial, &path)?;
         }
         Ok(())
     }
@@ -1249,9 +1263,11 @@ impl<'a> StoreHeld<'a> {
         self.tree_files.clear();
         self.read.take();
         self.payloads.clear();
+        self.written.clear();
     }
 
     pub fn store(&mut self) -> Result<()> {
+        self.flush_files()?;
         let mutation = self.db.mutation()?;
         self.flush()?;
         mutation.commit()

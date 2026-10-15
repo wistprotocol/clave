@@ -1035,3 +1035,46 @@ fn an_established_publisher_is_admitted_at_first_contact_and_its_seq_becomes_the
     assert!(db.get_pending_identity(&host).unwrap().is_none());
     assert!(db.get_recovery_window(&host).unwrap().is_none());
 }
+
+#[test]
+fn flushing_held_files_writes_the_payloads_before_any_row_and_as_write_durable_writes_them() {
+    use clave::collection::Held;
+    let tmp = tempfile::tempdir().unwrap();
+    clave::init::run("localhost", tmp.path()).unwrap();
+    let db = clave::db::Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+    let item_id = format!("sha256:{}", "ab".repeat(32));
+    let octets = br#"{"extract":"held body"}"#;
+    let mut held = clave::db::StoreHeld::new(&db, tmp.path(), "2026-08-09T12:00:00Z");
+    held.hold_payload(&item_id, octets).unwrap();
+    held.hold_list(
+        "localhost",
+        "default",
+        "sha256:catalog",
+        &serde_json::json!({"size": 1, "root": "sha256:root"}),
+        &[serde_json::json!({"url": "https://localhost/a"})],
+    )
+    .unwrap();
+    held.hold_tree_file("cd".repeat(32).as_str(), b"tree")
+        .unwrap();
+
+    held.flush_files().unwrap();
+    let path = clave::db::held_payload_path(tmp.path(), &item_id).unwrap();
+    let durable = tmp.path().join("durable.json");
+    clave::publication::write_durable(&durable, octets).unwrap();
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        std::fs::read(&durable).unwrap()
+    );
+    let conn = rusqlite::Connection::open(tmp.path().join("clave.sqlite")).unwrap();
+    let rows = |table: &str| -> i64 {
+        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+    };
+    assert_eq!((rows("held_lists"), rows("tree_files")), (0, 0));
+
+    held.store().unwrap();
+    assert_eq!((rows("held_lists"), rows("tree_files")), (1, 1));
+    assert_eq!(std::fs::read(&path).unwrap(), octets);
+}

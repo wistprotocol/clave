@@ -935,6 +935,7 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
             else {
                 break;
             };
+            held.flush_files()?;
             let mutation = db.mutation()?;
             if sealed_since(db, &stored)? {
                 held.discard();

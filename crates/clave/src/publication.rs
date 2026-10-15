@@ -10,6 +10,11 @@ use wist_core::tiles::{self, TILE_WIDTH};
 
 /// The path holds either the previous content or all of the new one.
 pub fn write_durable(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_synced(path, bytes)?;
+    sync_directory(path.parent().unwrap_or_else(|| Path::new(".")))
+}
+
+pub fn write_synced(path: &Path, bytes: &[u8]) -> Result<()> {
     let directory = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(directory)?;
     let name = path
@@ -22,6 +27,10 @@ pub fn write_durable(path: &Path, bytes: &[u8]) -> Result<()> {
     output.sync_all()?;
     drop(output);
     std::fs::rename(&temporary, path)?;
+    Ok(())
+}
+
+pub fn sync_directory(directory: &Path) -> Result<()> {
     std::fs::File::open(directory)?.sync_all()?;
     Ok(())
 }
