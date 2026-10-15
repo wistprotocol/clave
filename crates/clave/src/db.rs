@@ -369,7 +369,7 @@ impl Db {
     /// background pass) takes its own.
     pub fn connect(path: &Path) -> Result<Db> {
         let conn = Connection::open(path)?;
-        conn.busy_timeout(std::time::Duration::from_millis(5000))?;
+        conn.busy_timeout(std::time::Duration::from_millis(60_000))?;
         let _mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "secure_delete", "ON")?;
@@ -2139,7 +2139,7 @@ pub(crate) mod tests {
             .conn
             .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(timeout, 5000);
+        assert_eq!(timeout, 60_000);
     }
 
     #[test]
