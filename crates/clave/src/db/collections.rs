@@ -131,24 +131,64 @@ impl Db {
         self.sealed_from(&history)
     }
 
+    pub fn sealed_state_for_pull(&self, data_dir: &Path) -> Result<Sealed> {
+        let head = self.last_epoch()?;
+        let declarations = match &head {
+            None => Declarations::default(),
+            Some(head) => match self.derived_declarations(head)? {
+                Some(declarations) => declarations,
+                None => {
+                    let history = crate::history::History::resume(self, data_dir)?;
+                    return self.sealed_with(&history, SealedItems::new());
+                }
+            },
+        };
+        let mut entries = self.withdrawal_entries()?;
+        entries.extend(self.accepted_update_entries()?);
+        Ok(Sealed {
+            height: head.map(|head| head.epoch_number),
+            declarations,
+            withdrawals: WithdrawalReplay::from_state(&entries)?,
+            sealed_items: SealedItems::new(),
+            sealed_labels: self.sealed_label_ids()?,
+            label_subjects: self
+                .sealed_labels()?
+                .into_iter()
+                .map(|sealed| (sealed.label_id, Some(sealed.label.subject)))
+                .collect(),
+        })
+    }
+
     pub fn sealed_from(&self, history: &crate::history::History<'_>) -> Result<Sealed> {
+        self.sealed_with(history, self.sealed_items()?)
+    }
+
+    fn sealed_with(
+        &self,
+        history: &crate::history::History<'_>,
+        sealed_items: SealedItems,
+    ) -> Result<Sealed> {
         let replay = history.replay();
-        let sealed_labels = self
-            .conn
-            .prepare("SELECT l.label_id FROM labels l JOIN epochs b ON b.epoch_number = l.epoch_number WHERE b.rejected = 0 UNION SELECT d.dispute_id FROM disputes d JOIN epochs b ON b.epoch_number = d.epoch_number WHERE b.rejected = 0")?
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+        let sealed_labels = self.sealed_label_ids()?;
         Ok(Sealed {
             height: history.height(),
             declarations: replay.declarations().clone(),
             withdrawals: replay.withdrawals().clone(),
-            sealed_items: self.sealed_items()?,
+            sealed_items,
             sealed_labels,
             label_subjects: replay
                 .sealed_label_subjects()
                 .map(|(label_id, subject)| (label_id.to_owned(), subject.map(str::to_owned)))
                 .collect(),
         })
+    }
+
+    fn sealed_label_ids(&self) -> Result<BTreeSet<String>> {
+        Ok(self
+            .conn
+            .prepare("SELECT l.label_id FROM labels l JOIN epochs b ON b.epoch_number = l.epoch_number WHERE b.rejected = 0 UNION SELECT d.dispute_id FROM disputes d JOIN epochs b ON b.epoch_number = d.epoch_number WHERE b.rejected = 0")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<BTreeSet<_>>>()?)
     }
 
     pub fn sealed_items(&self) -> Result<SealedItems> {
@@ -233,14 +273,30 @@ impl Db {
         })? {
             entries.push(StateEntry::Removal(row?));
         }
-        for (item_id, publisher, sealing_height) in self.withdrawal_state()? {
-            entries.push(StateEntry::Withdrawal(WithdrawalEntry {
-                item_id,
-                publisher,
-                sealing_height,
-            }));
-        }
+        entries.extend(self.withdrawal_entries()?);
         Ok(entries)
+    }
+
+    fn withdrawal_entries(&self) -> Result<Vec<StateEntry>> {
+        Ok(self
+            .withdrawal_state()?
+            .into_iter()
+            .map(|(item_id, publisher, sealing_height)| {
+                StateEntry::Withdrawal(WithdrawalEntry {
+                    item_id,
+                    publisher,
+                    sealing_height,
+                })
+            })
+            .collect())
+    }
+
+    pub fn accepted_update_entries(&self) -> Result<Vec<StateEntry>> {
+        Ok(self
+            .accepted_updates()?
+            .into_iter()
+            .map(StateEntry::RegistryUpdate)
+            .collect())
     }
 
     pub fn record_sealed_item(
@@ -264,7 +320,7 @@ impl Db {
     pub fn pull_scope(&self, publisher: &str) -> Result<BTreeSet<String>> {
         let mut scope: BTreeSet<String> = self
             .conn
-            .prepare("SELECT publisher FROM catalog_queues")?
+            .prepare("SELECT q.publisher FROM catalog_queues q WHERE q.end_s IS NULL AND NOT EXISTS (SELECT 1 FROM discovered_declarations d WHERE d.domain = q.publisher AND d.hash = q.owner)")?
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<_>>()?;
         scope.insert(publisher.to_owned());

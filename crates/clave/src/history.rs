@@ -8,7 +8,7 @@ use std::path::Path;
 use wist_core::aggregator_keys::Registry;
 use wist_core::checkpoint::{self, AggregatorKey, Checkpoint};
 use wist_core::crypto::PublicKey;
-use wist_core::objects::{AggregatorKeyEntry, GenesisKey, LogAnchorEnvelope, StateEntry};
+use wist_core::objects::{AggregatorKeyEntry, GenesisKey, LogAnchorEnvelope};
 use wist_core::parameters::{ActPosition, Disposition, Schedule};
 use wist_core::registry_updates::AcceptedUpdates;
 use wist_core::sealing::{Epoch, Judgment, Outcome, Removed, Replay};
@@ -193,11 +193,7 @@ impl<'a> History<'a> {
             .sealed_at_s()
             .map_err(|e| failure(&e.to_string()))?;
         let mut entries = db.log_state_entries()?;
-        entries.extend(
-            db.accepted_updates()?
-                .into_iter()
-                .map(StateEntry::RegistryUpdate),
-        );
+        entries.extend(db.accepted_update_entries()?);
         let accepted = AcceptedUpdates::from_state(&entries)?;
         let mut replay =
             Replay::resumed(head.epoch_number, &head.sealed_at, declarations, &entries)?;

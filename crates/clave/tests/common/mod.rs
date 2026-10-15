@@ -1079,4 +1079,49 @@ pub fn assert_resumes_as_replayed(db: &clave::db::Db, data_dir: &std::path::Path
     ] {
         assert_eq!(updates, held);
     }
+    assert_pull_state_equals_resumed(db, data_dir);
+}
+
+pub fn assert_pull_state_equals_resumed(db: &clave::db::Db, data_dir: &std::path::Path) {
+    let pulled = db.sealed_state_for_pull(data_dir).unwrap();
+    let resumed = clave::history::History::resume(db, data_dir).unwrap();
+    let mut sealed = db.sealed_from(&resumed).unwrap();
+    sealed.sealed_items = wist_core::withdrawal::SealedItems::new();
+    assert_eq!(pulled.height, sealed.height);
+    assert_eq!(
+        serde_json::to_value(&pulled.declarations).unwrap(),
+        serde_json::to_value(&sealed.declarations).unwrap()
+    );
+    let mut item_ids: Vec<String> = pulled
+        .withdrawals
+        .entries()
+        .into_iter()
+        .chain(sealed.withdrawals.entries())
+        .map(|entry| entry.item_id)
+        .collect();
+    item_ids.extend(
+        db.sealed_items()
+            .unwrap()
+            .sealed()
+            .map(|item| item.item_id.to_owned()),
+    );
+    for item_id in &item_ids {
+        assert_eq!(
+            pulled.withdrawals.is_withdrawn(item_id),
+            sealed.withdrawals.is_withdrawn(item_id),
+            "{item_id}"
+        );
+        assert_eq!(
+            pulled.withdrawals.withdrawn_height(item_id),
+            sealed.withdrawals.withdrawn_height(item_id),
+            "{item_id}"
+        );
+    }
+    assert_eq!(
+        pulled.withdrawals.accepted_updates(),
+        sealed.withdrawals.accepted_updates()
+    );
+    assert_eq!(pulled.sealed_items.sealed().count(), 0);
+    assert_eq!(pulled.sealed_labels, sealed.sealed_labels);
+    assert_eq!(pulled.label_subjects, sealed.label_subjects);
 }
