@@ -399,6 +399,13 @@ impl Db {
         Ok(kept)
     }
 
+    pub(crate) fn discard_unmarked_list_rows(&self) -> Result<usize> {
+        Ok(self.conn.execute(
+            "DELETE FROM list_items WHERE NOT EXISTS (SELECT 1 FROM lists l WHERE l.publisher = list_items.publisher AND l.name = list_items.name AND l.catalog_id = list_items.catalog_id) AND publisher NOT IN (SELECT domain FROM pull_runs WHERE ended IS NULL)",
+            [],
+        )?)
+    }
+
     /// WIST-2 §5.3: the lists of the latest, last accepted and queued Catalogs, and of the
     /// Catalog fetched last, which a refusal for a dropped record leaves held.
     pub(crate) fn discard_unkept_lists(&self) -> Result<usize> {
@@ -533,6 +540,7 @@ impl Db {
         for sql in [
             "SELECT item_id FROM records",
             "SELECT item_id FROM waiting_urls",
+            "SELECT item_id FROM list_items WHERE publisher IN (SELECT domain FROM pull_runs WHERE ended IS NULL)",
         ] {
             needed.extend(
                 self.conn

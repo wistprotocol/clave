@@ -1,3 +1,4 @@
+use crate::collection::state::{ListItem, ListKey};
 use crate::db::{Credit, Db, NewRun, Phase, PullObject, PullRun, Settled, Status, WalkPage};
 use crate::error::Result;
 use crate::fetch::Client;
@@ -12,6 +13,8 @@ use crate::registry;
 mod admit;
 mod feed;
 mod fetch_stage;
+#[cfg(test)]
+mod prewrite_tests;
 mod site;
 #[cfg(test)]
 pub(crate) mod stage_tests;
@@ -438,6 +441,53 @@ pub fn open_pull(
 }
 
 const SEALED_RETRIES: usize = 3;
+
+pub(crate) const LIST_ROWS_PER_TRANSACTION: usize = 1_000;
+
+type Prewritten = std::collections::BTreeMap<ListKey, Vec<ListItem>>;
+
+// A new list's rows stay invisible until the Catalog's transaction marks them; retention keeps
+// them, and the held Payload files they name, while the pull is in flight.
+pub(crate) fn prewrite_new_lists(
+    db: &Db,
+    stored: &crate::collection::State,
+    state: &crate::collection::State,
+    prewritten: &mut Prewritten,
+) -> Result<()> {
+    for (key, list) in &state.lists {
+        if stored.lists.contains_key(key) || prewritten.get(key) == Some(list) {
+            continue;
+        }
+        db.prewrite_list(key, list, LIST_ROWS_PER_TRANSACTION)?;
+        prewritten.insert(key.clone(), list.clone());
+    }
+    Ok(())
+}
+
+pub(crate) fn adopt_prewritten(
+    stored: &mut crate::collection::State,
+    state: &crate::collection::State,
+    prewritten: &Prewritten,
+) {
+    for (key, list) in prewritten {
+        if state.lists.contains_key(key) {
+            stored.lists.insert(key.clone(), list.clone());
+        }
+    }
+}
+
+pub(crate) fn mark_prewritten(
+    db: &Db,
+    state: &crate::collection::State,
+    prewritten: &Prewritten,
+) -> Result<()> {
+    db.mark_lists(
+        prewritten
+            .iter()
+            .filter(|(key, _)| state.lists.contains_key(*key))
+            .map(|(key, list)| (key, list.len())),
+    )
+}
 
 /// A Collection's state is written as a difference from the state loaded, so an Epoch sealed
 /// since then makes it stale.
@@ -928,6 +978,7 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
         }
         stored.clone_from(&state);
         let mut replaced = 0;
+        let mut prewritten = Prewritten::new();
         loop {
             let Some(catalog) = pulling
                 .pull_next(&mut state, self, &mut held, &input)?
@@ -935,6 +986,7 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
             else {
                 break;
             };
+            prewrite_new_lists(db, &stored, &state, &mut prewritten)?;
             held.flush_files()?;
             let mutation = db.mutation()?;
             if sealed_since(db, &stored)? {
@@ -947,17 +999,23 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
                 state = db.load_state(db.sealed_state_for_pull(data_dir)?, &scope)?;
                 stored.clone_from(&state);
                 pulling.retry_last(&mut state, &input)?;
+                adopt_prewritten(&mut stored, &state, &prewritten);
                 crate::db::store_changes(db, &stored, &state, &scope, &now)?;
+                mark_prewritten(db, &state, &prewritten)?;
                 self.placed(pulling.report())?;
                 mutation.commit()?;
+                prewritten.clear();
                 stored.clone_from(&state);
                 continue;
             }
+            adopt_prewritten(&mut stored, &state, &prewritten);
             crate::db::store_changes(db, &stored, &state, &scope, &now)?;
+            mark_prewritten(db, &state, &prewritten)?;
             held.flush()?;
             self.report_catalog(&catalog)?;
             self.placed(pulling.report())?;
             mutation.commit()?;
+            prewritten.clear();
             stored.clone_from(&state);
         }
         Ok(if pulling.finish().suspended {

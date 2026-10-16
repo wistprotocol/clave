@@ -365,6 +365,41 @@ impl Db {
             .collect()
     }
 
+    pub(crate) fn prewrite_list(
+        &self,
+        key: &ListKey,
+        list: &[ListItem],
+        rows_per_transaction: usize,
+    ) -> Result<()> {
+        let size = rows_per_transaction.max(1);
+        for (batch, items) in list.chunks(size).enumerate() {
+            let mutation = self.mutation()?;
+            for (offset, item) in items.iter().enumerate() {
+                insert_list_item(&self.conn, key, batch * size + offset, item)?;
+            }
+            mutation.commit()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn mark_lists<'k>(
+        &self,
+        lists: impl IntoIterator<Item = (&'k ListKey, usize)>,
+    ) -> Result<()> {
+        for ((publisher, name, catalog_id), len) in lists {
+            self.conn.execute(
+                "DELETE FROM list_items WHERE publisher = ?1 AND name = ?2 AND catalog_id = ?3 AND idx >= ?4 AND NOT EXISTS (SELECT 1 FROM lists l WHERE l.publisher = ?1 AND l.name = ?2 AND l.catalog_id = ?3)",
+                (publisher, name, catalog_id, len as i64),
+            )?;
+            self.conn.execute(
+                "INSERT OR IGNORE INTO lists(publisher, name, catalog_id) VALUES (?1, ?2, ?3)",
+                (publisher, name, catalog_id),
+            )?;
+            bump_waiting_version(&self.conn, publisher)?;
+        }
+        Ok(())
+    }
+
     pub fn load_waiting_state(&self, sealed: Sealed) -> Result<State> {
         let publishers = self.waiting_publishers()?;
         self.load_state(sealed, &publishers)
@@ -546,7 +581,7 @@ fn load_publisher(conn: &Connection, state: &mut State, publisher: &str) -> Resu
     for key in keys {
         state.lists.insert(key, Vec::new());
     }
-    let mut statement = conn.prepare_cached("SELECT name, catalog_id, idx, url, item_id, kind, admission, code, read FROM list_items WHERE publisher = ?1 ORDER BY name, catalog_id, idx")?;
+    let mut statement = conn.prepare_cached("SELECT i.name, i.catalog_id, i.idx, i.url, i.item_id, i.kind, i.admission, i.code, i.read FROM list_items i JOIN lists l ON l.publisher = i.publisher AND l.name = i.name AND l.catalog_id = i.catalog_id WHERE i.publisher = ?1 ORDER BY i.name, i.catalog_id, i.idx")?;
     let rows = statement
         .query_map([publisher], |row| {
             Ok((

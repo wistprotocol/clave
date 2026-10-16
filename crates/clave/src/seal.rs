@@ -169,6 +169,7 @@ pub(crate) fn retain(db: &Db, data_dir: &Path, now: &str) -> Result<()> {
     }
     db.discard_unkept_lists()?;
     db.discard_unnamed_tree_files()?;
+    db.discard_unmarked_list_rows()?;
     for path in &unneeded {
         crate::db::remove_file(path)?;
     }
