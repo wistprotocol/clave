@@ -39,6 +39,21 @@ pub(crate) struct Mutation<'a> {
     conn: &'a Connection,
     committed: bool,
     top_level: bool,
+    began: Option<std::time::Instant>,
+}
+
+static LONGEST_WRITE_HOLD_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn longest_write_hold_ms() -> u64 {
+    LONGEST_WRITE_HOLD_MS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn record_write_hold(began: std::time::Instant) {
+    let held = u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let longest = LONGEST_WRITE_HOLD_MS.fetch_max(held, std::sync::atomic::Ordering::Relaxed);
+    if held > longest {
+        eprintln!("write lock held {held} ms");
+    }
 }
 
 impl<'a> Mutation<'a> {
@@ -51,15 +66,18 @@ impl<'a> Mutation<'a> {
     /// enclosing one's check.
     fn fenced(conn: &'a Connection, fence: Option<Fence>) -> Result<Self> {
         let top_level = conn.is_autocommit();
-        if top_level {
+        let began = if top_level {
             conn.execute_batch("BEGIN IMMEDIATE")?;
+            Some(std::time::Instant::now())
         } else {
             conn.execute_batch("SAVEPOINT clave_mutation")?;
-        }
+            None
+        };
         let mutation = Self {
             conn,
             committed: false,
             top_level,
+            began,
         };
         if let (true, Some(fence)) = (top_level, fence) {
             if !leases::fence_holds(conn, fence)? {
@@ -77,6 +95,9 @@ impl<'a> Mutation<'a> {
                 .execute_batch("RELEASE SAVEPOINT clave_mutation")?;
         }
         self.committed = true;
+        if let Some(began) = self.began {
+            record_write_hold(began);
+        }
         #[cfg(test)]
         if self.top_level {
             interrupt::committed();
@@ -135,6 +156,9 @@ impl Drop for Mutation<'_> {
                 "ROLLBACK TO SAVEPOINT clave_mutation; RELEASE SAVEPOINT clave_mutation",
             )
         };
+        if let Some(began) = self.began {
+            record_write_hold(began);
+        }
     }
 }
 
@@ -2164,6 +2188,21 @@ pub(crate) mod tests {
             .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
             .unwrap();
         assert_eq!(timeout, 60_000);
+    }
+
+    #[test]
+    fn a_top_level_mutation_held_50_ms_raises_the_longest_write_hold_and_a_nested_one_records_nothing(
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+        let outer = db.mutation().unwrap();
+        assert!(outer.began.is_some());
+        let nested = db.mutation().unwrap();
+        assert!(nested.began.is_none());
+        nested.commit().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        outer.commit().unwrap();
+        assert!(longest_write_hold_ms() >= 50);
     }
 
     #[test]
