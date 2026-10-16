@@ -7,7 +7,6 @@ use crate::db::{
     Db, ParamChangeRow, SealedDeclarationRow, SealedDisputeRow, SealedLabelRow, WithdrawalRow,
 };
 use crate::error::{Error, Result};
-use std::collections::BTreeSet;
 use std::path::Path;
 use wist_core::crypto::SigningKey;
 use wist_core::objects::StatusRejection;
@@ -300,19 +299,7 @@ pub(super) fn epoch(
         &sealed.root,
         Some(wist_core::timestamp::log_seconds(&prepared.sealed_at)?),
     );
-    let scope: BTreeSet<String> = prepared
-        .scope
-        .iter()
-        .cloned()
-        .chain(
-            after
-                .collections
-                .keys()
-                .map(|(publisher, _)| publisher.clone()),
-        )
-        .chain(after.urls.keys().map(|(publisher, _)| publisher.clone()))
-        .chain(after.discovered.keys().cloned())
-        .collect();
+    let scope = prepared.write_scope(&after);
     crate::db::store_changes(db, &prepared.before, &after, &scope, &prepared.sealed_at)?;
     if !rejected {
         record_sealed_items(db, &prepared)?;
@@ -340,5 +327,6 @@ pub(super) fn epoch(
         entry_count: prepared.entries.len() as u64,
         dropped: prepared.dropped,
         late: prepared.late,
+        replanned: 0,
     })
 }

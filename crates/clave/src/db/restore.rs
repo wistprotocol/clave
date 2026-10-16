@@ -211,6 +211,7 @@ impl Db {
             None => Vec::new(),
         };
         let tx = self.mutation()?;
+        bump_restored_publishers(&tx)?;
         tx.execute_batch(
             "DELETE FROM records; DELETE FROM removals; DELETE FROM sealed_items; DELETE FROM withdrawals; DELETE FROM payload_duties;
              UPDATE collections SET latest_envelope = NULL, latest_id = NULL, latest_height = NULL, latest_base = NULL;",
@@ -306,6 +307,7 @@ impl Db {
             )?;
             restored.payload_duties += 1;
         }
+        bump_restored_publishers(&tx)?;
         tx.commit()?;
         for entry in replay.withdrawals().entries() {
             crate::db::remove_file(&crate::db::served_payload_path(data_dir, &entry.item_id)?)?;
@@ -313,6 +315,17 @@ impl Db {
         }
         Ok(restored)
     }
+}
+
+fn bump_restored_publishers(conn: &rusqlite::Connection) -> Result<()> {
+    let publishers: Vec<String> = conn
+        .prepare("SELECT publisher FROM collections UNION SELECT publisher FROM records UNION SELECT publisher FROM removals")?
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for publisher in publishers {
+        super::collections::bump_waiting_version(conn, &publisher)?;
+    }
+    Ok(())
 }
 
 fn text(value: &Value, member: &str) -> Result<String> {

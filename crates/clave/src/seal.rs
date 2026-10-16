@@ -1,6 +1,6 @@
 use crate::db::{Db, Fence, SEALER_LEASE_SECONDS};
 use crate::error::{Error, Result};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
@@ -10,6 +10,8 @@ mod prepare;
 mod publish;
 #[cfg(test)]
 mod rejected_epoch_tests;
+#[cfg(test)]
+mod replan_tests;
 #[cfg(test)]
 mod withdrawal_tests;
 
@@ -22,7 +24,10 @@ pub struct SealReport {
     /// Entries sealed past WIST-4 §5's inclusion ceiling, counted from
     /// the Epoch each one's turn arrived in.
     pub late: Vec<String>,
+    pub replanned: usize,
 }
+
+const PLAN_ATTEMPTS: usize = 3;
 
 pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_unix: i64) -> Result<SealReport> {
     run_with_client(
@@ -188,9 +193,122 @@ pub(crate) fn run_confirming(
         .collect();
     crate::publication::confirm_mirrors(db, data_dir, client, &unconfirmed)?;
     crate::publication::recover(db, data_dir)?;
-    let mutation = db.mutation()?;
-    let prepared = prepare::epoch(db, data_dir, sk, now_unix)?;
-    let report = publish::epoch(db, data_dir, client, mutation, prepared)?;
+    let report = seal_epoch(db, data_dir, sk, client, now_unix)?;
     confirmed.extend(unconfirmed);
     Ok(report)
+}
+
+struct PlanInputs {
+    epoch: Option<u64>,
+    clock: i64,
+    versions: BTreeMap<String, i64>,
+    local_bounds: Vec<Option<i64>>,
+}
+
+impl PlanInputs {
+    fn read(db: &Db, scope: &BTreeSet<String>) -> Result<PlanInputs> {
+        Ok(PlanInputs {
+            epoch: db.last_epoch()?.map(|epoch| epoch.epoch_number),
+            clock: db.acceptance_clock()?,
+            versions: db.waiting_versions(scope)?,
+            local_bounds: crate::registry::LOCAL_BOUNDS
+                .iter()
+                .map(|name| crate::registry::local_bound(db, name))
+                .collect::<Result<_>>()?,
+        })
+    }
+
+    fn current(&self, now: &PlanInputs, advances_clock: bool) -> bool {
+        self.epoch == now.epoch
+            && self.versions == now.versions
+            && self.local_bounds == now.local_bounds
+            && (!advances_clock || self.clock == now.clock)
+    }
+}
+
+// The genesis Epoch's preparation queues its amendments, a write, so it plans under the write lock.
+fn seal_epoch(
+    db: &Db,
+    data_dir: &Path,
+    sk: &SigningKey,
+    client: &crate::fetch::Client,
+    now_unix: i64,
+) -> Result<SealReport> {
+    if db.last_epoch()?.is_none() {
+        return seal_under_lock(db, data_dir, sk, client, now_unix, 0);
+    }
+    catch_up_history(db, data_dir)?;
+    for replanned in 0..PLAN_ATTEMPTS {
+        let (prepared, scope, planned) = db.read_only(|| {
+            let prepared = prepare::epoch(db, data_dir, sk, now_unix)?;
+            let scope = prepared.checked_scope();
+            let planned = PlanInputs::read(db, &scope)?;
+            Ok((prepared, scope, planned))
+        })?;
+        #[cfg(test)]
+        between_plan_and_write::run();
+        let mutation = db.mutation()?;
+        if planned.current(&PlanInputs::read(db, &scope)?, prepared.advances_clock()) {
+            let mut report = publish::epoch(db, data_dir, client, mutation, prepared)?;
+            report.replanned = replanned;
+            return Ok(report);
+        }
+    }
+    seal_under_lock(db, data_dir, sk, client, now_unix, PLAN_ATTEMPTS)
+}
+
+fn seal_under_lock(
+    db: &Db,
+    data_dir: &Path,
+    sk: &SigningKey,
+    client: &crate::fetch::Client,
+    now_unix: i64,
+    replanned: usize,
+) -> Result<SealReport> {
+    let mutation = db.mutation()?;
+    let prepared = prepare::epoch(db, data_dir, sk, now_unix)?;
+    let mut report = publish::epoch(db, data_dir, client, mutation, prepared)?;
+    report.replanned = replanned;
+    Ok(report)
+}
+
+fn catch_up_history(db: &Db, data_dir: &Path) -> Result<()> {
+    let Some(head) = db.last_epoch()? else {
+        return Ok(());
+    };
+    if db.derived_declarations(&head)?.is_some() {
+        return Ok(());
+    }
+    let mutation = db.mutation()?;
+    crate::history::History::resume(db, data_dir)?;
+    mutation.commit()
+}
+
+#[cfg(test)]
+pub(crate) mod between_plan_and_write {
+    use std::cell::RefCell;
+
+    type Hook = Box<dyn FnMut()>;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn set(hook: impl FnMut() + 'static) {
+        HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(crate) fn clear() {
+        HOOK.with(|slot| slot.borrow_mut().take());
+    }
+
+    pub(super) fn run() {
+        let hook = HOOK.with(|slot| slot.borrow_mut().take());
+        if let Some(mut hook) = hook {
+            hook();
+            HOOK.with(|slot| {
+                slot.borrow_mut().get_or_insert(hook);
+            });
+        }
+    }
 }

@@ -285,7 +285,7 @@ fn exec_discover_declaration(conn: &Connection, domain: &str, envelope: &Value) 
         "INSERT INTO discovery_floors(domain, seq) VALUES (?1, ?2) ON CONFLICT(domain) DO UPDATE SET seq = MAX(seq, excluded.seq)",
         (domain, accepted_declaration_seq(domain, envelope)? as i64),
     )?;
-    Ok(())
+    collections::bump_waiting_version(conn, domain)
 }
 
 pub(super) fn exec_retain_declaration_seq(conn: &Connection, domain: &str, seq: u64) -> Result<()> {
@@ -307,6 +307,17 @@ pub(super) fn accepted_declaration_seq(domain: &str, doc: &Value) -> Result<u64>
 }
 
 pub type Publication = (u64, String);
+
+struct ReadOnly<'a>(&'a Connection);
+
+impl Drop for ReadOnly<'_> {
+    fn drop(&mut self) {
+        let _ = self.0.pragma_update(None, "query_only", false);
+        if !self.0.is_autocommit() {
+            let _ = self.0.execute_batch("ROLLBACK");
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct WitnessRow {
@@ -345,6 +356,15 @@ impl Db {
                 Err(error)
             }
         }
+    }
+
+    pub(crate) fn read_only<T>(&self, read: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.conn.execute_batch("BEGIN")?;
+        let _ended = ReadOnly(&self.conn);
+        self.conn.pragma_update(None, "query_only", true)?;
+        let value = read()?;
+        self.conn.execute_batch("PRAGMA query_only = 0; COMMIT")?;
+        Ok(value)
     }
 
     fn execute(&self, sql: &str, params: impl rusqlite::Params) -> Result<usize> {
@@ -1900,7 +1920,8 @@ impl Db {
             }
         }
         let urls = (!urls.is_empty()).then_some(urls);
-        self.execute(
+        let tx = self.mutation()?;
+        tx.execute(
             "INSERT INTO rejections(domain, code, at, id, detail, collection, urls_json, condition, change_list, left_epoch) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             rusqlite::params![
                 domain,
@@ -1915,7 +1936,10 @@ impl Db {
                 left_epoch.map(|epoch| epoch as i64),
             ],
         )?;
-        Ok(())
+        if rejection.code == crate::collection::state::CHAIN_DISCARDED {
+            collections::bump_waiting_version(&tx, domain)?;
+        }
+        tx.commit()
     }
 }
 

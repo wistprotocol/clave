@@ -38,6 +38,59 @@ pub(super) struct PreparedEpoch<'a> {
     pub(super) payload_window_days: i64,
 }
 
+impl PreparedEpoch<'_> {
+    pub(super) fn write_scope(&self, after: &State) -> BTreeSet<String> {
+        self.scope
+            .iter()
+            .cloned()
+            .chain(
+                after
+                    .collections
+                    .keys()
+                    .map(|(publisher, _)| publisher.clone()),
+            )
+            .chain(after.urls.keys().map(|(publisher, _)| publisher.clone()))
+            .chain(after.discovered.keys().cloned())
+            .collect()
+    }
+
+    pub(super) fn checked_scope(&self) -> BTreeSet<String> {
+        let mut scope = self.write_scope(&self.before);
+        scope.extend(self.write_scope(&self.planned.state));
+        scope
+    }
+
+    pub(super) fn advances_clock(&self) -> bool {
+        let event = self.before.events;
+        let state = &self.planned.state;
+        state
+            .collections
+            .values()
+            .filter_map(|collection| collection.accepted.as_ref())
+            .any(|accepted| accepted.place.event == event)
+            || state
+                .urls
+                .values()
+                .any(|waiting| waiting.place.event == event)
+            || state.queues.values().any(|queue| {
+                queue
+                    .queued
+                    .values()
+                    .any(|queued| queued.place.event == event)
+                    || queue.first.values().any(|first| first.event == event)
+            })
+            || state
+                .labels
+                .values()
+                .any(|label| label.place.event == event)
+            || state
+                .discovered
+                .values()
+                .flatten()
+                .any(|found| found.event == event)
+    }
+}
+
 fn sealing_slot(db: &Db, now_unix: i64) -> Result<(u64, i64, String)> {
     let (_, cadence) = registry::sealing_grid(db)?;
     let sealed_unix = now_unix.div_euclid(cadence) * cadence;

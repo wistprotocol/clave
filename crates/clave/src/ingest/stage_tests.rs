@@ -51,7 +51,7 @@ impl Site {
         Site::at("localhost")
     }
 
-    fn at(host: &str) -> Site {
+    pub(crate) fn at(host: &str) -> Site {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let client = Client::with_builder(
@@ -174,11 +174,15 @@ impl Site {
         .unwrap();
     }
 
-    fn read(&self, path: &str) -> Value {
+    pub(crate) fn read(&self, path: &str) -> Value {
         serde_json::from_slice(
             &std::fs::read(self.dir.path().join(".well-known/wist").join(path)).unwrap(),
         )
         .unwrap()
+    }
+
+    pub(crate) fn pull_into(&self, db: &Db, data_dir: &std::path::Path) -> Result<IngestReport> {
+        run(db, &self.client, data_dir, &self.host, NOW)
     }
 
     pub(crate) fn label(&self, subject: &str, asserted_at: &str) -> String {

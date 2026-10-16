@@ -355,6 +355,9 @@ fn run() -> Result<(), clave::Error> {
                 println!("late inclusion: {late}");
             }
             println!("seal took {} ms", sealing.as_millis());
+            if report.replanned > 0 {
+                println!("replanned {} times", report.replanned);
+            }
             if !no_snapshot {
                 produce_snapshot(&db_path, &data, clave::snapshot::Mode::Incremental)?;
             }

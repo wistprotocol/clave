@@ -32,10 +32,19 @@ CREATE TABLE IF NOT EXISTS sealed_items(item_id TEXT NOT NULL, publisher TEXT NO
 CREATE TABLE IF NOT EXISTS payload_duties(item_id TEXT PRIMARY KEY, publisher TEXT NOT NULL, url TEXT NOT NULL, until TEXT NOT NULL, served INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS discovered_declarations(domain TEXT NOT NULL, hash TEXT NOT NULL, ord INTEGER NOT NULL, envelope BLOB NOT NULL, event INTEGER NOT NULL, last_sealed_at_discovery INTEGER, reduces_authority INTEGER NOT NULL, last_seal_height INTEGER, competitor INTEGER NOT NULL, competes_with TEXT, PRIMARY KEY(domain, hash));
 CREATE TABLE IF NOT EXISTS discovery_floors(domain TEXT PRIMARY KEY, seq INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS waiting_versions(publisher TEXT PRIMARY KEY, version INTEGER NOT NULL);
 ";
 
 pub(super) fn create(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA)?;
+    Ok(())
+}
+
+pub(super) fn bump_waiting_version(conn: &Connection, publisher: &str) -> Result<()> {
+    conn.prepare_cached(
+        "INSERT INTO waiting_versions(publisher, version) VALUES (?1, 1) ON CONFLICT(publisher) DO UPDATE SET version = version + 1",
+    )?
+    .execute([publisher])?;
     Ok(())
 }
 
@@ -341,17 +350,36 @@ impl Db {
             .collect::<rusqlite::Result<_>>()?)
     }
 
+    pub fn waiting_versions(&self, publishers: &BTreeSet<String>) -> Result<BTreeMap<String, i64>> {
+        let mut statement = self
+            .conn
+            .prepare_cached("SELECT version FROM waiting_versions WHERE publisher = ?1")?;
+        publishers
+            .iter()
+            .map(|publisher| {
+                let version: Option<i64> = statement
+                    .query_row([publisher], |row| row.get(0))
+                    .optional()?;
+                Ok((publisher.clone(), version.unwrap_or(0)))
+            })
+            .collect()
+    }
+
     pub fn load_waiting_state(&self, sealed: Sealed) -> Result<State> {
         let publishers = self.waiting_publishers()?;
         self.load_state(sealed, &publishers)
     }
 
-    pub fn load_state(&self, sealed: Sealed, publishers: &BTreeSet<String>) -> Result<State> {
-        let events: i64 = self.conn.query_row(
+    pub fn acceptance_clock(&self) -> Result<i64> {
+        Ok(self.conn.query_row(
             "SELECT position FROM acceptance_clock WHERE id = 1",
             [],
             |row| row.get(0),
-        )?;
+        )?)
+    }
+
+    pub fn load_state(&self, sealed: Sealed, publishers: &BTreeSet<String>) -> Result<State> {
+        let events = self.acceptance_clock()?;
         let mut state = State {
             events: uint(events) + 1,
             height: sealed.height,
@@ -1015,6 +1043,7 @@ pub(crate) fn store_changes(
     at: &str,
 ) -> Result<()> {
     let conn = &db.conn;
+    let mut written: BTreeSet<&str> = BTreeSet::new();
     if after.events > before.events {
         if after.events - 1 > i64::MAX as u64 {
             return Err(Error::History(
@@ -1030,11 +1059,14 @@ pub(crate) fn store_changes(
         &k.0
     }) {
         store_collection(conn, key, collection, before.collections.get(key), at)?;
+        written.insert(&key.0);
     }
     for (key, list) in in_scope(&before.lists, &after.lists, publishers, |k| &k.0) {
         store_list(conn, key, list, before.lists.get(key))?;
+        written.insert(&key.0);
     }
     for ((publisher, url), waiting) in in_scope(&before.urls, &after.urls, publishers, |k| &k.0) {
+        written.insert(publisher);
         match waiting {
             None => conn.execute(
                 "DELETE FROM waiting_urls WHERE publisher = ?1 AND url = ?2",
@@ -1057,10 +1089,12 @@ pub(crate) fn store_changes(
     }
     for (publisher, queue) in in_scope(&before.queues, &after.queues, publishers, |k| k) {
         store_queue(conn, publisher, queue)?;
+        written.insert(publisher);
     }
     for ((publisher, url), record) in
         in_scope(&before.records, &after.records, publishers, |k| &k.0)
     {
+        written.insert(publisher);
         match record {
             None => conn.execute(
                 "DELETE FROM records WHERE publisher = ?1 AND url = ?2",
@@ -1084,6 +1118,7 @@ pub(crate) fn store_changes(
     for ((publisher, url), removal) in
         in_scope(&before.removals, &after.removals, publishers, |k| &k.0)
     {
+        written.insert(publisher);
         match removal {
             None => conn.execute(
                 "DELETE FROM removals WHERE publisher = ?1 AND url = ?2",
@@ -1112,8 +1147,10 @@ pub(crate) fn store_changes(
         .filter(|publisher| discovered_changed(publisher))
     {
         store_discovered(conn, publisher, after.discovered.get(publisher))?;
+        written.insert(publisher);
     }
     for (publisher, floor) in in_scope(&before.floors, &after.floors, publishers, |k| k) {
+        written.insert(publisher);
         match floor {
             None => {
                 if !after.declarations.domains().contains_key(publisher) {
@@ -1145,7 +1182,11 @@ pub(crate) fn store_changes(
         if publishers.contains(label_publisher(id)) && before.labels.get(id) != after.labels.get(id)
         {
             store_label(conn, id, after.labels.get(id))?;
+            written.insert(label_publisher(id));
         }
+    }
+    for publisher in written {
+        bump_waiting_version(conn, publisher)?;
     }
     Ok(())
 }

@@ -71,6 +71,9 @@ fn seal_at(
     for late in &report.late {
         let _ = writeln!(out, "late inclusion: {late}");
     }
+    if report.replanned > 0 {
+        let _ = writeln!(out, "replanned {} times", report.replanned);
+    }
     let _ = out.flush();
     Ok(())
 }
