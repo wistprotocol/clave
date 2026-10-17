@@ -25,6 +25,8 @@ pub struct SealReport {
     /// the Epoch each one's turn arrived in.
     pub late: Vec<String>,
     pub replanned: usize,
+    /// Per discarded plan, the publishers whose waiting state changed under it.
+    pub conflicts: Vec<Vec<String>>,
 }
 
 const PLAN_ATTEMPTS: usize = 3;
@@ -219,11 +221,23 @@ impl PlanInputs {
         })
     }
 
-    fn current(&self, now: &PlanInputs, advances_clock: bool) -> bool {
-        self.epoch == now.epoch
-            && self.versions == now.versions
-            && self.local_bounds == now.local_bounds
-            && (!advances_clock || self.clock == now.clock)
+    fn changed(&self, now: &PlanInputs, advances_clock: bool) -> Vec<String> {
+        let mut changed: Vec<String> = self
+            .versions
+            .iter()
+            .filter(|(publisher, version)| now.versions.get(*publisher) != Some(version))
+            .map(|(publisher, _)| publisher.clone())
+            .collect();
+        if self.epoch != now.epoch {
+            changed.push("<epoch>".into());
+        }
+        if self.local_bounds != now.local_bounds {
+            changed.push("<local bounds>".into());
+        }
+        if advances_clock && self.clock != now.clock {
+            changed.push("<acceptance clock>".into());
+        }
+        changed
     }
 }
 
@@ -239,6 +253,7 @@ fn seal_epoch(
         return seal_under_lock(db, data_dir, sk, client, now_unix, 0);
     }
     catch_up_history(db, data_dir)?;
+    let mut conflicts = Vec::new();
     for replanned in 0..PLAN_ATTEMPTS {
         let (prepared, scope, planned) = db.read_only(|| {
             let prepared = prepare::epoch(db, data_dir, sk, now_unix)?;
@@ -249,13 +264,18 @@ fn seal_epoch(
         #[cfg(test)]
         between_plan_and_write::run();
         let mutation = db.mutation()?;
-        if planned.current(&PlanInputs::read(db, &scope)?, prepared.advances_clock()) {
+        let changed = planned.changed(&PlanInputs::read(db, &scope)?, prepared.advances_clock());
+        if changed.is_empty() {
             let mut report = publish::epoch(db, data_dir, client, mutation, prepared)?;
             report.replanned = replanned;
+            report.conflicts = conflicts;
             return Ok(report);
         }
+        conflicts.push(changed);
     }
-    seal_under_lock(db, data_dir, sk, client, now_unix, PLAN_ATTEMPTS)
+    let mut report = seal_under_lock(db, data_dir, sk, client, now_unix, PLAN_ATTEMPTS)?;
+    report.conflicts = conflicts;
+    Ok(report)
 }
 
 fn seal_under_lock(

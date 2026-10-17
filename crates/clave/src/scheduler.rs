@@ -74,6 +74,9 @@ fn seal_at(
     if report.replanned > 0 {
         let _ = writeln!(out, "replanned {} times", report.replanned);
     }
+    for changed in &report.conflicts {
+        let _ = writeln!(out, "plan conflict: {}", changed.join(", "));
+    }
     let _ = out.flush();
     Ok(())
 }

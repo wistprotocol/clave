@@ -359,6 +359,9 @@ fn run() -> Result<(), clave::Error> {
             if report.replanned > 0 {
                 println!("replanned {} times", report.replanned);
             }
+            for changed in &report.conflicts {
+                println!("plan conflict: {}", changed.join(", "));
+            }
             if !no_snapshot {
                 produce_snapshot(&db_path, &data, clave::snapshot::Mode::Incremental)?;
             }

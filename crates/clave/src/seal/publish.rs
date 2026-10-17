@@ -328,5 +328,6 @@ pub(super) fn epoch(
         dropped: prepared.dropped,
         late: prepared.late,
         replanned: 0,
+        conflicts: Vec::new(),
     })
 }
