@@ -329,12 +329,15 @@ impl Db {
         Ok(rows)
     }
 
-    pub(crate) fn mark_payload_served(&self, item_id: &str) -> Result<()> {
-        self.execute(
-            "UPDATE payload_duties SET served = 1 WHERE item_id = ?1",
-            [item_id],
-        )?;
-        Ok(())
+    pub(crate) fn mark_payloads_served(&self, item_ids: &[String]) -> Result<()> {
+        self.write(|conn| {
+            let mut statement =
+                conn.prepare("UPDATE payload_duties SET served = 1 WHERE item_id = ?1")?;
+            for item_id in item_ids {
+                statement.execute([item_id])?;
+            }
+            Ok(())
+        })
     }
 
     /// WIST-3 §6.1: a record's Item keeps its duty whatever the window.

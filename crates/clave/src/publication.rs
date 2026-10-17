@@ -3,6 +3,7 @@
 //! never names a tree size whose Entries no path serves.
 use crate::db::Db;
 use crate::error::{Error, Result};
+use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use wist_core::checkpoint::Checkpoint;
@@ -323,12 +324,23 @@ pub fn finish_committed(db: &Db, data_dir: &Path) -> Result<Vec<u64>> {
     Ok(published)
 }
 
+const SERVED_PAYLOAD_BATCH: usize = 1_000;
+
 /// WIST-3 §6.1: the Payload of every page Item an Epoch seals is served before its Checkpoint.
 fn serve_duty_payloads(db: &Db, data_dir: &Path) -> Result<()> {
-    for duty in db.payload_duties()?.into_iter().filter(|duty| !duty.served) {
+    let unserved: Vec<_> = db
+        .payload_duties()?
+        .into_iter()
+        .filter(|duty| !duty.served)
+        .collect();
+    for batch in unserved.chunks(SERVED_PAYLOAD_BATCH) {
         db.check_fence()?;
-        let served = crate::db::served_payload_path(data_dir, &duty.item_id)?;
-        if !served.exists() {
+        let mut directories = BTreeSet::new();
+        for duty in batch {
+            let served = crate::db::served_payload_path(data_dir, &duty.item_id)?;
+            if served.exists() {
+                continue;
+            }
             let held = crate::db::held_payload_path(data_dir, &duty.item_id)?;
             let octets = std::fs::read(&held).map_err(|error| {
                 Error::Seal(format!(
@@ -336,9 +348,16 @@ fn serve_duty_payloads(db: &Db, data_dir: &Path) -> Result<()> {
                     duty.item_id
                 ))
             })?;
-            write_durable(&served, &octets)?;
+            write_synced(&served, &octets)?;
+            if let Some(parent) = served.parent() {
+                directories.insert(parent.to_path_buf());
+            }
         }
-        db.mark_payload_served(&duty.item_id)?;
+        for directory in directories {
+            sync_directory(&directory)?;
+        }
+        let item_ids: Vec<String> = batch.iter().map(|duty| duty.item_id.clone()).collect();
+        db.mark_payloads_served(&item_ids)?;
     }
     Ok(())
 }
