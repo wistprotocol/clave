@@ -366,16 +366,23 @@ fn build_tier0(dir: &Path, records: &[&TierRecord]) -> Result<Vec<u8>> {
     if sqlite_path.exists() {
         std::fs::remove_file(&sqlite_path)?;
     }
-    let conn = Connection::open(&sqlite_path)?;
+    let mut conn = Connection::open(&sqlite_path)?;
+    // The staged tree is synced whole before the swap and cleared after a
+    // crash, so the build writes without a journal or per-statement syncs.
+    let _mode: String = conn.query_row("PRAGMA journal_mode = OFF", [], |row| row.get(0))?;
+    conn.pragma_update(None, "synchronous", "OFF")?;
     conn.execute_batch(
         "CREATE TABLE records(url TEXT, publisher TEXT, item_id TEXT, observed_at TEXT, attested_at TEXT, title TEXT, abstract TEXT, lang TEXT, collection TEXT);
          CREATE VIRTUAL TABLE records_fts USING fts5(title, abstract, content=records, content_rowid=rowid);",
     )?;
-    for r in records {
-        let summary = &r.payload.content.summary;
-        conn.execute(
+    let transaction = conn.transaction()?;
+    {
+        let mut insert = transaction.prepare(
             "INSERT INTO records(url, publisher, item_id, observed_at, attested_at, title, abstract, lang, collection) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            rusqlite::params![
+        )?;
+        for r in records {
+            let summary = &r.payload.content.summary;
+            insert.execute(rusqlite::params![
                 r.tuple.url,
                 r.tuple.publisher,
                 r.tuple.item_id,
@@ -385,10 +392,11 @@ fn build_tier0(dir: &Path, records: &[&TierRecord]) -> Result<Vec<u8>> {
                 summary.r#abstract,
                 r.lang,
                 r.collection,
-            ],
-        )?;
+            ])?;
+        }
     }
-    conn.execute("INSERT INTO records_fts(records_fts) VALUES('rebuild')", [])?;
+    transaction.execute("INSERT INTO records_fts(records_fts) VALUES('rebuild')", [])?;
+    transaction.commit()?;
     drop(conn);
     Ok(std::fs::read(&sqlite_path)?)
 }
