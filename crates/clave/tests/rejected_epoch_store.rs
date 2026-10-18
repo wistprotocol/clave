@@ -651,6 +651,28 @@ fn the_label_readers_exclude_a_rejected_epochs_labels_and_keep_an_accepted_epoch
 }
 
 #[test]
+fn a_pull_state_holds_only_its_publishers_sealed_label_ids_and_no_subjects() {
+    let store = RejectedStore::build();
+    let db = &store.db;
+    let of = |publisher: &str| {
+        let publishers = std::collections::BTreeSet::from([publisher.to_owned()]);
+        db.sealed_state_for_pull(store.data.path(), &publishers)
+            .unwrap()
+    };
+    let labeler = of(LABELER);
+    assert_eq!(
+        labeler.sealed_labels,
+        std::collections::BTreeSet::from([ACCEPTED_LABEL_ID.to_owned()])
+    );
+    assert!(labeler.label_subjects.is_empty());
+    assert_eq!(
+        of("site.example.test").sealed_labels,
+        std::collections::BTreeSet::from([ACCEPTED_DISPUTE_ID.to_owned()])
+    );
+    assert!(of("other.example.test").sealed_labels.is_empty());
+}
+
+#[test]
 fn the_dispute_reader_excludes_a_rejected_epochs_disputes_and_keeps_an_accepted_epochs() {
     let store = RejectedStore::build();
     let db = &store.db;

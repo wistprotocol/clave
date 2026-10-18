@@ -147,7 +147,11 @@ impl Db {
         self.sealed_from(&history)
     }
 
-    pub fn sealed_state_for_pull(&self, data_dir: &Path) -> Result<Sealed> {
+    pub fn sealed_state_for_pull(
+        &self,
+        data_dir: &Path,
+        publishers: &BTreeSet<String>,
+    ) -> Result<Sealed> {
         let head = self.last_epoch()?;
         let declarations = match &head {
             None => Declarations::default(),
@@ -155,7 +159,10 @@ impl Db {
                 Some(declarations) => declarations,
                 None => {
                     let history = crate::history::History::resume(self, data_dir)?;
-                    return self.sealed_with(&history, SealedItems::new());
+                    let mut sealed = self.sealed_with(&history, SealedItems::new())?;
+                    sealed.sealed_labels = self.sealed_label_ids_of(publishers)?;
+                    sealed.label_subjects = BTreeMap::new();
+                    return Ok(sealed);
                 }
             },
         };
@@ -166,13 +173,25 @@ impl Db {
             declarations,
             withdrawals: WithdrawalReplay::from_state(&entries)?,
             sealed_items: SealedItems::new(),
-            sealed_labels: self.sealed_label_ids()?,
-            label_subjects: self
-                .sealed_labels()?
-                .into_iter()
-                .map(|sealed| (sealed.label_id, Some(sealed.label.subject)))
-                .collect(),
+            sealed_labels: self.sealed_label_ids_of(publishers)?,
+            label_subjects: BTreeMap::new(),
         })
+    }
+
+    // A Label ID hashes its labeler and a dispute ID its disputant, so the
+    // sealed IDs a pull of these publishers can meet again are all theirs.
+    fn sealed_label_ids_of(&self, publishers: &BTreeSet<String>) -> Result<BTreeSet<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT l.label_id FROM labels l JOIN epochs b ON b.epoch_number = l.epoch_number WHERE b.rejected = 0 AND l.labeler = ?1 UNION SELECT d.dispute_id FROM disputes d JOIN epochs b ON b.epoch_number = d.epoch_number WHERE b.rejected = 0 AND d.disputant = ?1",
+        )?;
+        let mut ids = BTreeSet::new();
+        for publisher in publishers {
+            ids.extend(
+                stmt.query_map([publisher], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<String>>>()?,
+            );
+        }
+        Ok(ids)
     }
 
     pub fn sealed_from(&self, history: &crate::history::History<'_>) -> Result<Sealed> {

@@ -79,6 +79,8 @@ CREATE TABLE IF NOT EXISTS walk_state(domain TEXT PRIMARY KEY, suspended INTEGER
 CREATE TABLE IF NOT EXISTS seen_labels(id TEXT PRIMARY KEY, domain TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS labels(label_id TEXT PRIMARY KEY, labeler TEXT NOT NULL, subject TEXT NOT NULL, name TEXT NOT NULL, value INTEGER, asserted_at TEXT NOT NULL, retracted INTEGER NOT NULL, expires_at TEXT, delta TEXT, epoch_number INTEGER NOT NULL, entry_index INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS disputes(dispute_id TEXT PRIMARY KEY, label_id TEXT NOT NULL, disputant TEXT NOT NULL, reason TEXT, asserted_at TEXT NOT NULL, epoch_number INTEGER NOT NULL, entry_index INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS labels_labeler ON labels(labeler);
+CREATE INDEX IF NOT EXISTS disputes_disputant ON disputes(disputant);
 CREATE TABLE IF NOT EXISTS label_feed_observations(domain TEXT PRIMARY KEY, generated_at_s INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS suffix_lists(sha256 TEXT PRIMARY KEY, octets BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS suffix_list_acts(rowid INTEGER PRIMARY KEY AUTOINCREMENT, epoch_number INTEGER NOT NULL, sha256 TEXT NOT NULL);

@@ -79,7 +79,9 @@ fn a_pull_state_read_without_derived_state_fills_it_and_equals_the_resumed_state
         .unwrap();
     let db = clave::db::Db::open(&path).unwrap();
     let head = db.last_epoch().unwrap().unwrap();
-    let pulled = db.sealed_state_for_pull(log.data.path()).unwrap();
+    let pulled = db
+        .sealed_state_for_pull(log.data.path(), &Default::default())
+        .unwrap();
     assert_eq!(pulled.height, Some(head.epoch_number));
     assert!(db.derived_declarations(&head).unwrap().is_some());
     assert_eq!(db.accepted_updates().unwrap().len(), 1);
@@ -91,7 +93,10 @@ fn a_pull_state_read_without_derived_state_fills_it_and_equals_the_resumed_state
 fn a_pull_state_read_before_any_epoch_has_no_height_and_equals_the_resumed_state() {
     let log = common::Rig::new();
     assert!(log.db.last_epoch().unwrap().is_none());
-    let pulled = log.db.sealed_state_for_pull(log.data.path()).unwrap();
+    let pulled = log
+        .db
+        .sealed_state_for_pull(log.data.path(), &Default::default())
+        .unwrap();
     assert_eq!(pulled.height, None);
     assert!(pulled.label_subjects.is_empty());
     common::assert_pull_state_equals_resumed(&log.db, log.data.path());
@@ -101,7 +106,10 @@ fn a_pull_state_read_before_any_epoch_has_no_height_and_equals_the_resumed_state
 fn a_pull_state_read_holds_the_sealed_withdrawal_without_a_replay() {
     let log = sealed_withdrawal();
     let (item_id, _, height) = log.db.withdrawal_state().unwrap().remove(0);
-    let pulled = log.db.sealed_state_for_pull(log.data.path()).unwrap();
+    let pulled = log
+        .db
+        .sealed_state_for_pull(log.data.path(), &Default::default())
+        .unwrap();
     assert!(pulled.withdrawals.is_withdrawn(&item_id));
     assert_eq!(pulled.withdrawals.withdrawn_height(&item_id), Some(height));
     common::assert_pull_state_equals_resumed(&log.db, log.data.path());

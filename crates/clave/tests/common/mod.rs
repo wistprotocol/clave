@@ -1083,7 +1083,19 @@ pub fn assert_resumes_as_replayed(db: &clave::db::Db, data_dir: &std::path::Path
 }
 
 pub fn assert_pull_state_equals_resumed(db: &clave::db::Db, data_dir: &std::path::Path) {
-    let pulled = db.sealed_state_for_pull(data_dir).unwrap();
+    let publishers: std::collections::BTreeSet<String> = db
+        .sealed_labels()
+        .unwrap()
+        .into_iter()
+        .map(|sealed| sealed.label.labeler)
+        .chain(
+            db.sealed_disputes()
+                .unwrap()
+                .into_iter()
+                .map(|sealed| sealed.dispute.disputant),
+        )
+        .collect();
+    let pulled = db.sealed_state_for_pull(data_dir, &publishers).unwrap();
     let resumed = clave::history::History::resume(db, data_dir).unwrap();
     let mut sealed = db.sealed_from(&resumed).unwrap();
     sealed.sealed_items = wist_core::withdrawal::SealedItems::new();
@@ -1123,5 +1135,5 @@ pub fn assert_pull_state_equals_resumed(db: &clave::db::Db, data_dir: &std::path
     );
     assert_eq!(pulled.sealed_items.sealed().count(), 0);
     assert_eq!(pulled.sealed_labels, sealed.sealed_labels);
-    assert_eq!(pulled.label_subjects, sealed.label_subjects);
+    assert!(pulled.label_subjects.is_empty());
 }

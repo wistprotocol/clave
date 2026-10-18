@@ -871,7 +871,7 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
         let mut held = crate::db::StoreHeld::new(db, data_dir, &now);
         let mutation = db.mutation()?;
         let mut scope = db.pull_scope(host)?;
-        let mut state = db.load_state(db.sealed_state_for_pull(data_dir)?, &scope)?;
+        let mut state = db.load_state(db.sealed_state_for_pull(data_dir, &scope)?, &scope)?;
         let mut stored = state.clone();
         let mut pulling = pull::begin(&mut state, self, &mut held, &input)?;
         crate::db::store_changes(db, &stored, &state, &scope, &now)?;
@@ -946,7 +946,7 @@ impl<C: Fn() -> jiff::Timestamp> Pull<'_, C> {
                     return Ok(Collections::Suspended);
                 }
                 scope = db.pull_scope(host)?;
-                state = db.load_state(db.sealed_state_for_pull(data_dir)?, &scope)?;
+                state = db.load_state(db.sealed_state_for_pull(data_dir, &scope)?, &scope)?;
                 stored.clone_from(&state);
                 pulling.retry_last(&mut state, &input)?;
                 adopt_prewritten(&mut stored, &state, &prewritten);
