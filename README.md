@@ -887,7 +887,11 @@ binary's `clave --version` reports the tag's version, and attaches
 `clave-<tag>-x86_64-unknown-linux-musl.tar.gz` (the `clave` binary at the
 archive root) and `SHA256SUMS` (`<sha256>  <asset>` lines) to a GitHub
 release named after the tag, whose notes name the core commit built. A
-tag with a `-` suffix publishes a pre-release.
+tag with a `-` suffix publishes a pre-release. The binary's global
+allocator is mimalloc: under musl's allocator a seal of the same Log ran
+about 50 % longer, and under glibc's default arenas the serving process
+retained freed memory across sustained-load rounds; with mimalloc both
+targets hold a flat resident size over thirty rounds.
 
 To cut a release: set the version in `crates/clave/Cargo.toml`, run
 `cargo build` so `Cargo.lock` records it, commit, tag `v<version>` and
