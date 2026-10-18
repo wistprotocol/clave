@@ -2,7 +2,6 @@ use crate::collection::state::{ListItem, ListKey};
 use crate::db::{Credit, Db, NewRun, Phase, PullObject, PullRun, Settled, Status, WalkPage};
 use crate::error::Result;
 use crate::fetch::Client;
-use crate::history::declarations::DeclarationsReplay;
 use serde_json::Value;
 use std::path::Path;
 use wist_core::objects::{PublisherEnvelope, PublisherKey};
@@ -13,6 +12,8 @@ use crate::registry;
 mod admit;
 mod feed;
 mod fetch_stage;
+#[cfg(test)]
+mod page_source_tests;
 #[cfg(test)]
 mod prewrite_tests;
 mod site;
@@ -82,80 +83,26 @@ fn page_declarations(
     host: &str,
     at: Option<u64>,
 ) -> Result<Vec<(i64, u64, Vec<PublisherKey>)>> {
-    let head = match at {
-        Some(height) => db.epoch_at(height)?,
-        None => None,
+    let Some(at) = at else {
+        return Ok(Vec::new());
     };
-    let mut history = crate::history::History::open(db, data_dir, head)?;
-    let mut state = crate::history::declarations::Declarations::default();
-    let mut sources = Vec::new();
-    let mut superseded = std::collections::BTreeSet::new();
-    // WIST-2 §3.2 resolves a Page against the Key Set WIST-1 §5.2 resolves
-    // at the sealing Epoch, which excludes a Declaration that is pending,
-    // that a reversal discarded, or that a recovery superseded. A pending
-    // head enters at the instant it activates, not the instant it sealed.
-    let mut pending = std::collections::BTreeSet::new();
-    let mut excluded = std::collections::BTreeSet::new();
-    while let Some(epoch) = history.next_epoch()? {
-        if epoch.rejected().is_some() {
-            state.seed_head(
-                epoch.epoch_number(),
-                epoch.root(),
-                Some(epoch.sealed_at_s()),
-            );
-            continue;
-        }
-        let effects = state.apply(&epoch)?;
-        for settlement in &effects.settlements {
-            if settlement.domain == host {
-                for source in &settlement.superseded {
-                    superseded.insert(source.hash().to_string());
-                }
-            }
-        }
-        for installation in &effects.installations {
-            if installation.declaration.envelope()["publisher"]["domain"] != host {
-                continue;
-            }
-            if installation.pending {
-                pending.insert(installation.declaration.hash().to_string());
-            }
-            if installation.reversed.is_some() {
-                excluded.append(&mut pending);
-            }
-        }
-        for activation in effects
-            .activations
-            .iter()
-            .filter(|activation| activation.domain == host)
-        {
-            pending.remove(activation.activated.hash());
-            let publisher = declaration::publisher_of(activation.activated.envelope())
-                .map_err(crate::error::Error::History)?;
-            sources.push((
-                activation.activated.hash().to_string(),
-                (epoch.sealed_at_s(), publisher.seq, publisher.keys),
-            ));
-        }
-        for entry in epoch.entries().iter().filter(|entry| {
-            entry["type"] == "publisher_declaration" && entry["body"]["publisher"]["domain"] == host
-        }) {
-            let source = &entry["body"];
-            let hash = declaration::inner_hash(source).map_err(crate::error::Error::History)?;
-            if pending.contains(&hash) || excluded.contains(&hash) {
-                continue;
-            }
-            let publisher =
-                declaration::publisher_of(source).map_err(crate::error::Error::History)?;
-            sources.push((hash, (epoch.sealed_at_s(), publisher.seq, publisher.keys)));
+    if db.epoch_at(at)?.is_none() {
+        return Ok(Vec::new());
+    }
+    let below = |db: &Db| -> Result<bool> {
+        Ok(db
+            .sealed_page_sources_recorded()?
+            .is_none_or(|recorded| recorded < at))
+    };
+    if below(db)? {
+        crate::history::record_sealed_page_sources(db, data_dir)?;
+        if below(db)? {
+            return Err(crate::error::Error::History(format!(
+                "the sealed Page sources at Epoch {at} are not recorded"
+            )));
         }
     }
-    Ok(sources
-        .into_iter()
-        .filter_map(|(hash, source)| {
-            (!superseded.contains(&hash) && !excluded.contains(&hash)).then_some(source)
-        })
-        .collect())
+    db.sealed_page_sources(host, at)
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

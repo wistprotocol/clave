@@ -232,7 +232,7 @@ pub(crate) struct Log {
 }
 
 impl Log {
-    fn new() -> Log {
+    pub(crate) fn new() -> Log {
         let data = tempfile::tempdir().unwrap();
         crate::init::run("127.0.0.1:0", data.path()).unwrap();
         let db = Db::open(&data.path().join("clave.sqlite")).unwrap();

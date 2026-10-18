@@ -92,6 +92,10 @@ CREATE TABLE IF NOT EXISTS sealing_reservation(id INTEGER PRIMARY KEY CHECK(id =
 CREATE TABLE IF NOT EXISTS sealed_in_force(domain TEXT PRIMARY KEY, declaration_json BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS derived_state(epoch_number INTEGER PRIMARY KEY, root TEXT NOT NULL, declarations_json BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS accepted_updates(update_id TEXT PRIMARY KEY, epoch_number INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS sealed_page_sources(domain TEXT NOT NULL, hash TEXT NOT NULL, epoch_number INTEGER NOT NULL, ordinal INTEGER NOT NULL, sealed_at_s INTEGER NOT NULL, seq INTEGER NOT NULL, keys_json BLOB NOT NULL, PRIMARY KEY(domain, hash, epoch_number));
+CREATE TABLE IF NOT EXISTS sealed_page_pending_heads(domain TEXT NOT NULL, hash TEXT NOT NULL, PRIMARY KEY(domain, hash));
+CREATE TABLE IF NOT EXISTS sealed_page_exclusions(domain TEXT NOT NULL, hash TEXT NOT NULL, epoch_number INTEGER NOT NULL, PRIMARY KEY(domain, hash));
+CREATE TABLE IF NOT EXISTS sealed_page_sources_recorded(id INTEGER PRIMARY KEY CHECK(id = 1), epoch_number INTEGER NOT NULL);
 ";
 
 fn relax_publisher_columns(conn: &Connection) -> Result<()> {

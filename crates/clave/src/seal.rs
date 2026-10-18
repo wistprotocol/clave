@@ -321,11 +321,18 @@ fn catch_up_history(db: &Db, data_dir: &Path) -> Result<()> {
     let Some(head) = db.last_epoch()? else {
         return Ok(());
     };
-    if db.derived_declarations(&head)?.is_some() {
+    let derived = db.derived_declarations(&head)?.is_some();
+    let recorded = db
+        .sealed_page_sources_recorded()?
+        .is_some_and(|recorded| recorded >= head.epoch_number);
+    if derived && recorded {
         return Ok(());
     }
     let mutation = db.mutation()?;
-    crate::history::History::resume(db, data_dir)?;
+    if !derived {
+        crate::history::History::resume(db, data_dir)?;
+    }
+    crate::history::record_sealed_page_sources(db, data_dir)?;
     mutation.commit()
 }
 

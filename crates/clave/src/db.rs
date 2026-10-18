@@ -11,6 +11,7 @@ mod pull_runs;
 mod pull_schedule;
 mod restore;
 mod schema;
+mod sealed_page_sources;
 mod sealing;
 mod tree;
 

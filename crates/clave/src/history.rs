@@ -136,6 +136,21 @@ impl VerifiedEpoch {
     }
 }
 
+pub fn record_sealed_page_sources(db: &Db, directory: &Path) -> Result<()> {
+    let Some(head) = db.last_epoch()? else {
+        return Ok(());
+    };
+    if db
+        .sealed_page_sources_recorded()?
+        .is_some_and(|recorded| recorded >= head.epoch_number)
+    {
+        return Ok(());
+    }
+    let mut history = History::open(db, directory, Some(head))?;
+    while history.next_epoch()?.is_some() {}
+    Ok(())
+}
+
 pub struct History<'a> {
     db: &'a Db,
     head: Option<EpochRow>,
@@ -458,15 +473,27 @@ impl<'a> History<'a> {
         self.schedule = Some(schedule);
         self.previous = Some(checkpoint);
         self.registry = registry;
-        if at_head && self.db.derived_state_due(&row)? {
-            // The judgment and the derived state it leaves commit in one transaction.
+        let derived_due = at_head && self.db.derived_state_due(&row)?;
+        let sources_due = self.db.sealed_page_sources_due(height)?;
+        if derived_due || sources_due {
+            // The judgment and the state it leaves commit in one transaction.
             let tx = self.db.mutation()?;
             self.db.record_epoch_judgment(height, rejected.is_some())?;
-            self.db.record_derived_state(
-                &row,
-                self.replay.declarations(),
-                &self.replay.registry_updates().entries(),
-            )?;
+            if derived_due {
+                self.db.record_derived_state(
+                    &row,
+                    self.replay.declarations(),
+                    &self.replay.registry_updates().entries(),
+                )?;
+            }
+            if sources_due {
+                self.db.record_sealed_page_sources(
+                    height,
+                    at,
+                    rejected.is_none().then(|| self.replay.last_effects()),
+                    &entries,
+                )?;
+            }
             tx.commit()?;
         } else {
             self.db.record_epoch_judgment(height, rejected.is_some())?;
