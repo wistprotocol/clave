@@ -261,12 +261,18 @@ pub(super) fn admit_label(
     };
     let admission = match outcome {
         Ok(()) => {
+            if db
+                .active_sealing_reservation()?
+                .is_some_and(|(_, reserved)| run.event.is_some_and(|event| event < reserved))
+            {
+                run.event = Some(db.take_event()?);
+            }
             let place = crate::collection::state::Place::url(
                 run.event.unwrap_or_default(),
                 run.positions,
                 index as u64,
             );
-            let eligibility = db.last_epoch()?.map_or(0, |epoch| epoch.epoch_number + 1);
+            let eligibility = db.next_eligible_epoch()?;
             db.insert_waiting_label(
                 id,
                 &crate::collection::state::WaitingLabel {

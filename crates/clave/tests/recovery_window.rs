@@ -1206,6 +1206,7 @@ fn a_window_opened_over_a_waiting_catalog_defers_its_held_items_at_every_epoch_i
             &held,
             &EpochInput {
                 height,
+                event: state.events,
                 sealed_at,
                 parameters: &parameters,
                 inclusion: &inclusion,

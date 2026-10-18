@@ -362,6 +362,9 @@ fn run() -> Result<(), clave::Error> {
             for changed in &report.conflicts {
                 println!("plan conflict: {}", changed.join(", "));
             }
+            if !report.merged.is_empty() {
+                println!("plan merged: {}", report.merged.join(", "));
+            }
             if !no_snapshot {
                 produce_snapshot(&db_path, &data, clave::snapshot::Mode::Incremental)?;
             }

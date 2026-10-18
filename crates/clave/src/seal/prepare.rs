@@ -59,36 +59,10 @@ impl PreparedEpoch<'_> {
         scope.extend(self.write_scope(&self.planned.state));
         scope
     }
+}
 
-    pub(super) fn advances_clock(&self) -> bool {
-        let event = self.before.events;
-        let state = &self.planned.state;
-        state
-            .collections
-            .values()
-            .filter_map(|collection| collection.accepted.as_ref())
-            .any(|accepted| accepted.place.event == event)
-            || state
-                .urls
-                .values()
-                .any(|waiting| waiting.place.event == event)
-            || state.queues.values().any(|queue| {
-                queue
-                    .queued
-                    .values()
-                    .any(|queued| queued.place.event == event)
-                    || queue.first.values().any(|first| first.event == event)
-            })
-            || state
-                .labels
-                .values()
-                .any(|label| label.place.event == event)
-            || state
-                .discovered
-                .values()
-                .flatten()
-                .any(|found| found.event == event)
-    }
+pub(super) fn next_epoch_number(db: &Db) -> Result<u64> {
+    Ok(db.last_epoch()?.map_or(0, |head| head.epoch_number + 1))
 }
 
 fn sealing_slot(db: &Db, now_unix: i64) -> Result<(u64, i64, String)> {
@@ -97,16 +71,12 @@ fn sealing_slot(db: &Db, now_unix: i64) -> Result<(u64, i64, String)> {
     let sealed_at = jiff::Timestamp::from_second(sealed_unix)
         .map_err(|_| Error::Seal("sealed_at out of range".into()))?
         .to_string();
-    let epoch_number = match db.last_epoch()? {
-        Some(p) => {
-            if sealed_at.as_str() <= p.sealed_at.as_str() {
-                return Err(Error::Seal("cadence slot already sealed".into()));
-            }
-            p.epoch_number + 1
+    if let Some(head) = db.last_epoch()? {
+        if sealed_at.as_str() <= head.sealed_at.as_str() {
+            return Err(Error::Seal("cadence slot already sealed".into()));
         }
-        None => 0,
-    };
-    Ok((epoch_number, sealed_unix, sealed_at))
+    }
+    Ok((next_epoch_number(db)?, sealed_unix, sealed_at))
 }
 
 // WIST-4 §5: a genesis amendment may be in force from Epoch 0's own `sealed_at`.
@@ -252,6 +222,7 @@ pub(super) fn epoch<'a>(
     data_dir: &Path,
     sk: &SigningKey,
     now_unix: i64,
+    event: u64,
 ) -> Result<PreparedEpoch<'a>> {
     let (epoch_number, sealed_unix, sealed_at) = sealing_slot(db, now_unix)?;
     if epoch_number == 0 {
@@ -375,6 +346,7 @@ pub(super) fn epoch<'a>(
     let planned = loop {
         let input = EpochInput {
             height: epoch_number,
+            event,
             sealed_at: &sealed_at,
             parameters: &parameters,
             inclusion: &inclusion,
@@ -1220,6 +1192,7 @@ mod tests {
     ) -> EpochInput<'a> {
         EpochInput {
             height: 1,
+            event: 1,
             sealed_at: "2026-08-09T01:00:00Z",
             parameters,
             inclusion,

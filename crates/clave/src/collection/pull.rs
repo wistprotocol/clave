@@ -524,7 +524,7 @@ pub(super) fn log_declaration(state: &State, publisher: &str) -> Result<Option<P
         .map_err(Error::History)
 }
 
-pub(super) fn place_order(
+pub(crate) fn place_order(
     state: &State,
     publisher: &str,
     declaration: Option<&Publisher>,
@@ -1414,7 +1414,7 @@ pub(super) fn waiting_candidates(
 }
 
 /// WIST-3 §3.3: a URL takes its place at the event from which it waits.
-pub(super) fn refresh_waiting(
+pub(crate) fn refresh_waiting(
     state: &mut State,
     held: &impl Held,
     publisher: &str,

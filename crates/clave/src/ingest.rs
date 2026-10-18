@@ -490,9 +490,12 @@ pub(crate) fn mark_prewritten(
 }
 
 /// A Collection's state is written as a difference from the state loaded, so an Epoch sealed
-/// since then makes it stale.
+/// or reserved since then makes it stale.
 fn sealed_since(db: &Db, loaded: &crate::collection::State) -> Result<bool> {
-    Ok(db.last_epoch()?.map(|epoch| epoch.epoch_number) != loaded.height)
+    Ok(
+        db.last_epoch()?.map(|epoch| epoch.epoch_number) != loaded.height
+            || db.sealing_reservation()? != loaded.reservation,
+    )
 }
 
 pub(crate) fn mirror_admission(

@@ -411,3 +411,93 @@ fn a_retried_pull_takes_an_event_no_concurrent_pull_shares() {
     };
     assert_ne!(event_of(&shop_url), event_of(&b_url));
 }
+
+fn reserve_on_fetch(s: &Store, hooks: &Hooks, suffix: &str) -> Arc<Mutex<Option<i64>>> {
+    let reserved = Arc::new(Mutex::new(None));
+    let (path, seen) = (s.path.clone(), reserved.clone());
+    hooks.on(suffix, move || {
+        let db = clave::db::Db::open(&path).unwrap();
+        *seen.lock().unwrap() = Some(db.reserve_epoch_event(0).unwrap() as i64);
+    });
+    reserved
+}
+
+fn waiting_places(s: &Store, sql: &str) -> Vec<(String, i64, i64)> {
+    rusqlite::Connection::open(&s.path)
+        .unwrap()
+        .prepare(sql)
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+#[test]
+fn a_collection_written_after_a_seal_reserves_its_event_is_placed_after_it_for_the_next_epoch() {
+    let (listener, host, client) = reserve_addr();
+    let p = make_publisher(&host);
+    let hooks = Hooks::default();
+    serve_hooked(listener, p.dir.path().to_path_buf(), hooks.clone());
+    let s = store(&host);
+    let (a, shop_url) = two_collections(&p, &host);
+    let reserved = reserve_on_fetch(&s, &hooks, "collections/shop/catalog.json");
+    clave::ingest::run(&s.db, &client, s.data.path(), &host, "2026-08-09T11:59:30Z").unwrap();
+    let event = reserved.lock().unwrap().expect("the reservation ran");
+
+    let places = waiting_places(
+        &s,
+        "SELECT url, place_event, eligibility FROM waiting_urls ORDER BY url",
+    );
+    eprintln!("DEBUG {places:?} {event}");
+    let journal = places.iter().find(|(url, ..)| *url == a.0["url"]).unwrap();
+    let shop = places.iter().find(|(url, ..)| *url == shop_url).unwrap();
+    assert!(
+        journal.1 < event,
+        "{journal:?} precedes the Epoch's event {event}"
+    );
+    assert_eq!(journal.2, 0);
+    assert!(shop.1 > event, "{shop:?} follows the Epoch's event {event}");
+    assert_eq!(shop.2, 1);
+}
+
+#[test]
+fn a_label_admitted_after_a_seal_reserves_its_event_is_placed_after_it_for_the_next_epoch() {
+    let (listener, host, client) = reserve_addr();
+    let p = make_publisher(&host);
+    let hooks = Hooks::default();
+    serve_hooked(listener, p.dir.path().to_path_buf(), hooks.clone());
+    let s = store(&host);
+    two_collections(&p, &host);
+    let label = add_label(&p, "https://subject.example/page", "2026-08-09T11:59:30Z");
+    write_label_feed(
+        &p,
+        &host,
+        std::slice::from_ref(&label),
+        "2026-08-09T11:59:30Z",
+    );
+    let file = format!("labels/{}.json", label.strip_prefix("sha256:").unwrap());
+    let reserved = reserve_on_fetch(&s, &hooks, &file);
+    let pulled =
+        clave::ingest::run(&s.db, &client, s.data.path(), &host, "2026-08-09T11:59:30Z").unwrap();
+    assert_eq!(pulled.labels, [label]);
+    let event = reserved.lock().unwrap().expect("the reservation ran");
+
+    for (url, place, eligibility) in
+        waiting_places(&s, "SELECT url, place_event, eligibility FROM waiting_urls")
+    {
+        assert!(place < event, "{url} precedes the Epoch's event {event}");
+        assert_eq!(eligibility, 0);
+    }
+    let labels = waiting_places(
+        &s,
+        "SELECT label_id, place_event, eligibility FROM pending_entries WHERE label_id IS NOT NULL",
+    );
+    assert_eq!(labels.len(), 1);
+    assert!(
+        labels[0].1 > event,
+        "{:?} follows the Epoch's event {event}",
+        labels[0]
+    );
+    assert_eq!(labels[0].2, 1);
+}

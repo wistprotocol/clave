@@ -75,6 +75,7 @@ pub enum Unsealed {
 
 pub struct EpochInput<'a> {
     pub height: u64,
+    pub event: u64,
     pub sealed_at: &'a str,
     pub parameters: &'a Parameters,
     pub inclusion: &'a Inclusion,
@@ -1282,7 +1283,7 @@ fn refresh_all<H: Held>(
     Ok(())
 }
 
-fn in_force_of(
+pub(crate) fn in_force_of(
     declarations: &wist_core::declarations::Declarations,
 ) -> Result<BTreeMap<String, Publisher>> {
     declarations
@@ -1356,12 +1357,54 @@ fn settle_due(
     Ok(settled)
 }
 
+pub(crate) fn defer_eligibility(
+    next: &mut State,
+    deferred: &[Deferred],
+    height: u64,
+    only: Option<&str>,
+) {
+    for deferred in deferred {
+        if only.is_some_and(|only| only != deferred.publication.publisher()) {
+            continue;
+        }
+        match &deferred.publication {
+            Publication::Catalog {
+                publisher,
+                collection,
+                ..
+            } => {
+                let key = (publisher.clone(), collection.clone());
+                if let Some(collection) = next.collections.get_mut(&key) {
+                    if collection.waiting().is_some() {
+                        if let Some(accepted) = collection.accepted.as_mut() {
+                            accepted.eligibility = height + 1;
+                        }
+                    }
+                }
+            }
+            Publication::Item { publisher, url, .. } => {
+                if next.window_holds(publisher) {
+                    continue;
+                }
+                if let Some(waiting) = next.urls.get_mut(&(publisher.clone(), url.clone())) {
+                    waiting.eligibility = height + 1;
+                }
+            }
+            Publication::Label { id, .. } => {
+                if let Some(label) = next.labels.get_mut(id) {
+                    label.eligibility = height + 1;
+                }
+            }
+        }
+    }
+}
+
 /// WIST-3 §3.2–§3.3 and §7.
 pub fn plan(state: &State, held: &impl Held, input: &EpochInput<'_>) -> Result<Planned> {
     let height = input.height;
     let mut next = state.clone();
-    let event = next.events;
-    next.events += 1;
+    let event = input.event;
+    next.events = next.events.max(event + 1);
     let parameters = input.parameters;
     let limits = parameters.limits()?;
     let mut fixed: Vec<Value> = Vec::new();
@@ -1758,37 +1801,7 @@ pub fn plan(state: &State, held: &impl Held, input: &EpochInput<'_>) -> Result<P
     let log = in_force_of(&next.declarations)?;
     refresh_all(&mut next, held, event, height + 1, &log, None)?;
     queue::open_windows(&mut next)?;
-    for deferred in &pass.deferred {
-        match &deferred.publication {
-            Publication::Catalog {
-                publisher,
-                collection,
-                ..
-            } => {
-                let key = (publisher.clone(), collection.clone());
-                if let Some(collection) = next.collections.get_mut(&key) {
-                    if collection.waiting().is_some() {
-                        if let Some(accepted) = collection.accepted.as_mut() {
-                            accepted.eligibility = height + 1;
-                        }
-                    }
-                }
-            }
-            Publication::Item { publisher, url, .. } => {
-                if next.window_holds(publisher) {
-                    continue;
-                }
-                if let Some(waiting) = next.urls.get_mut(&(publisher.clone(), url.clone())) {
-                    waiting.eligibility = height + 1;
-                }
-            }
-            Publication::Label { id, .. } => {
-                if let Some(label) = next.labels.get_mut(id) {
-                    label.eligibility = height + 1;
-                }
-            }
-        }
-    }
+    defer_eligibility(&mut next, &pass.deferred, height, None);
     for planned in &pass.planned {
         if let Publication::Label { id, .. } = &planned.publication {
             next.labels.remove(id);

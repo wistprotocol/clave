@@ -6,6 +6,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
 use wist_core::crypto::SigningKey;
 
+mod merge;
 mod prepare;
 mod publish;
 #[cfg(test)]
@@ -27,9 +28,12 @@ pub struct SealReport {
     pub replanned: usize,
     /// Per discarded plan, the publishers whose waiting state changed under it.
     pub conflicts: Vec<Vec<String>>,
+    pub merged: Vec<String>,
 }
 
 const PLAN_ATTEMPTS: usize = 3;
+const EPOCH_CHANGED: &str = "<epoch>";
+const LOCAL_BOUNDS_CHANGED: &str = "<local bounds>";
 
 pub fn run(db: &Db, data_dir: &Path, sk: &SigningKey, now_unix: i64) -> Result<SealReport> {
     run_with_client(
@@ -203,7 +207,6 @@ pub(crate) fn run_confirming(
 
 struct PlanInputs {
     epoch: Option<u64>,
-    clock: i64,
     versions: BTreeMap<String, i64>,
     local_bounds: Vec<Option<i64>>,
 }
@@ -212,7 +215,6 @@ impl PlanInputs {
     fn read(db: &Db, scope: &BTreeSet<String>) -> Result<PlanInputs> {
         Ok(PlanInputs {
             epoch: db.last_epoch()?.map(|epoch| epoch.epoch_number),
-            clock: db.acceptance_clock()?,
             versions: db.waiting_versions(scope)?,
             local_bounds: crate::registry::LOCAL_BOUNDS
                 .iter()
@@ -221,7 +223,7 @@ impl PlanInputs {
         })
     }
 
-    fn changed(&self, now: &PlanInputs, advances_clock: bool) -> Vec<String> {
+    fn changed(&self, now: &PlanInputs) -> Vec<String> {
         let mut changed: Vec<String> = self
             .versions
             .iter()
@@ -229,13 +231,10 @@ impl PlanInputs {
             .map(|(publisher, _)| publisher.clone())
             .collect();
         if self.epoch != now.epoch {
-            changed.push("<epoch>".into());
+            changed.push(EPOCH_CHANGED.into());
         }
         if self.local_bounds != now.local_bounds {
-            changed.push("<local bounds>".into());
-        }
-        if advances_clock && self.clock != now.clock {
-            changed.push("<acceptance clock>".into());
+            changed.push(LOCAL_BOUNDS_CHANGED.into());
         }
         changed
     }
@@ -254,28 +253,52 @@ fn seal_epoch(
     }
     catch_up_history(db, data_dir)?;
     let mut conflicts = Vec::new();
+    let event = reserve(db)?;
     for replanned in 0..PLAN_ATTEMPTS {
-        let (prepared, scope, planned) = db.read_only(|| {
-            let prepared = prepare::epoch(db, data_dir, sk, now_unix)?;
+        let (mut prepared, scope, planned) = db.read_only(|| {
+            let prepared = prepare::epoch(db, data_dir, sk, now_unix, event)?;
             let scope = prepared.checked_scope();
             let planned = PlanInputs::read(db, &scope)?;
             Ok((prepared, scope, planned))
         })?;
         #[cfg(test)]
-        between_plan_and_write::run();
+        hook::run(&hook::BETWEEN_PLAN_AND_WRITE);
         let mutation = db.mutation()?;
-        let changed = planned.changed(&PlanInputs::read(db, &scope)?, prepared.advances_clock());
-        if changed.is_empty() {
-            let mut report = publish::epoch(db, data_dir, client, mutation, prepared)?;
-            report.replanned = replanned;
-            report.conflicts = conflicts;
-            return Ok(report);
-        }
-        conflicts.push(changed);
+        let changed = planned.changed(&PlanInputs::read(db, &scope)?);
+        let merged = if changed.is_empty() {
+            Vec::new()
+        } else if changed
+            .iter()
+            .any(|name| name == EPOCH_CHANGED || name == LOCAL_BOUNDS_CHANGED)
+        {
+            conflicts.push(changed);
+            continue;
+        } else {
+            match merge::into_current(db, data_dir, &mut prepared, &changed)? {
+                merge::Merge::Done(publishers) => publishers,
+                merge::Merge::Replan(reasons) => {
+                    tracing::info!(?reasons, "the seal re-plans: its plan does not merge");
+                    conflicts.push(changed);
+                    continue;
+                }
+            }
+        };
+        let mut report = publish::epoch(db, data_dir, client, mutation, prepared)?;
+        report.replanned = replanned;
+        report.conflicts = conflicts;
+        report.merged = merged;
+        return Ok(report);
     }
     let mut report = seal_under_lock(db, data_dir, sk, client, now_unix, PLAN_ATTEMPTS)?;
     report.conflicts = conflicts;
     Ok(report)
+}
+
+fn reserve(db: &Db) -> Result<u64> {
+    let mutation = db.mutation()?;
+    let event = db.reserve_epoch_event(prepare::next_epoch_number(db)?)?;
+    mutation.commit()?;
+    Ok(event)
 }
 
 fn seal_under_lock(
@@ -287,7 +310,8 @@ fn seal_under_lock(
     replanned: usize,
 ) -> Result<SealReport> {
     let mutation = db.mutation()?;
-    let prepared = prepare::epoch(db, data_dir, sk, now_unix)?;
+    let event = db.reserve_epoch_event(prepare::next_epoch_number(db)?)?;
+    let prepared = prepare::epoch(db, data_dir, sk, now_unix, event)?;
     let mut report = publish::epoch(db, data_dir, client, mutation, prepared)?;
     report.replanned = replanned;
     Ok(report)
@@ -306,28 +330,30 @@ fn catch_up_history(db: &Db, data_dir: &Path) -> Result<()> {
 }
 
 #[cfg(test)]
-pub(crate) mod between_plan_and_write {
+pub(crate) mod hook {
     use std::cell::RefCell;
+    use std::thread::LocalKey;
 
-    type Hook = Box<dyn FnMut()>;
+    pub(crate) type Slot = RefCell<Option<Box<dyn FnMut()>>>;
+    pub(crate) type Point = &'static LocalKey<Slot>;
 
     thread_local! {
-        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+        pub(crate) static BETWEEN_PLAN_AND_WRITE: Slot = const { RefCell::new(None) };
     }
 
-    pub(crate) fn set(hook: impl FnMut() + 'static) {
-        HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    pub(crate) fn set(point: Point, hook: impl FnMut() + 'static) {
+        point.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
     }
 
-    pub(crate) fn clear() {
-        HOOK.with(|slot| slot.borrow_mut().take());
+    pub(crate) fn clear(point: Point) {
+        point.with(|slot| slot.borrow_mut().take());
     }
 
-    pub(super) fn run() {
-        let hook = HOOK.with(|slot| slot.borrow_mut().take());
+    pub(super) fn run(point: Point) {
+        let hook = point.with(|slot| slot.borrow_mut().take());
         if let Some(mut hook) = hook {
             hook();
-            HOOK.with(|slot| {
+            point.with(|slot| {
                 slot.borrow_mut().get_or_insert(hook);
             });
         }

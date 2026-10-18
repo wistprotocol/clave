@@ -77,6 +77,9 @@ fn seal_at(
     for changed in &report.conflicts {
         let _ = writeln!(out, "plan conflict: {}", changed.join(", "));
     }
+    if !report.merged.is_empty() {
+        let _ = writeln!(out, "plan merged: {}", report.merged.join(", "));
+    }
     let _ = out.flush();
     Ok(())
 }

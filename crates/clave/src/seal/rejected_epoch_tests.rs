@@ -34,7 +34,10 @@ fn first_contact(seed: &[u8; 32]) -> Value {
 fn seal_with_conflicting_declarations(log: &Log, at: &str) -> u64 {
     let signing = crate::keys::load(&log.data.path().join("keys/seed")).unwrap();
     let mutation = log.db.mutation().unwrap();
-    let mut prepared = super::prepare::epoch(&log.db, log.data.path(), &signing, unix(at)).unwrap();
+    let next = super::prepare::next_epoch_number(&log.db).unwrap();
+    let event = log.db.reserve_epoch_event(next).unwrap();
+    let mut prepared =
+        super::prepare::epoch(&log.db, log.data.path(), &signing, unix(at), event).unwrap();
     for kind in ["publisher_catalog", "publisher_item"] {
         assert!(
             prepared.entries.iter().any(|entry| entry["type"] == kind),

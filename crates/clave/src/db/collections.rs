@@ -74,6 +74,13 @@ fn int(value: u64) -> i64 {
     value.min(i64::MAX as u64) as i64
 }
 
+// A reservation at or below the sealed head was left by a seal that failed.
+fn sealing_above(height: Option<u64>, reservation: Option<(u64, u64)>) -> Option<u64> {
+    reservation
+        .map(|(epoch_number, _)| epoch_number)
+        .filter(|epoch_number| height.is_none_or(|height| *epoch_number > height))
+}
+
 fn uint(value: i64) -> u64 {
     value.max(0) as u64
 }
@@ -413,11 +420,68 @@ impl Db {
         )?)
     }
 
+    // One event per Epoch, taken before its first read-only plan: every write after it is a
+    // later event than the Epoch, every write before it an earlier one.
+    pub fn reserve_epoch_event(&self, epoch_number: u64) -> Result<u64> {
+        if let Some((reserved, event)) = self.sealing_reservation()? {
+            if reserved == epoch_number {
+                return Ok(event);
+            }
+        }
+        self.conn
+            .execute("UPDATE acceptance_clock SET position = position + 1", [])?;
+        let event = self.acceptance_clock()?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO sealing_reservation(id, epoch_number, event) VALUES (1, ?1, ?2)",
+            (int(epoch_number), event),
+        )?;
+        Ok(uint(event))
+    }
+
+    pub fn sealing_reservation(&self) -> Result<Option<(u64, u64)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT epoch_number, event FROM sealing_reservation WHERE id = 1",
+                [],
+                |row| Ok((uint(row.get(0)?), uint(row.get(1)?))),
+            )
+            .optional()?)
+    }
+
+    pub fn clear_sealing_reservation(&self) -> Result<()> {
+        self.conn.execute("DELETE FROM sealing_reservation", [])?;
+        Ok(())
+    }
+
+    pub fn take_event(&self) -> Result<u64> {
+        self.conn
+            .execute("UPDATE acceptance_clock SET position = position + 1", [])?;
+        Ok(uint(self.acceptance_clock()?))
+    }
+
+    pub fn active_sealing_reservation(&self) -> Result<Option<(u64, u64)>> {
+        let height = self.last_epoch()?.map(|epoch| epoch.epoch_number);
+        let reservation = self.sealing_reservation()?;
+        Ok(reservation.filter(|_| sealing_above(height, reservation).is_some()))
+    }
+
+    pub fn next_eligible_epoch(&self) -> Result<u64> {
+        let height = self.last_epoch()?.map(|epoch| epoch.epoch_number);
+        let sealing = self
+            .active_sealing_reservation()?
+            .map(|(epoch_number, _)| epoch_number);
+        Ok(State::first_epoch_given(height, sealing))
+    }
+
     pub fn load_state(&self, sealed: Sealed, publishers: &BTreeSet<String>) -> Result<State> {
         let events = self.acceptance_clock()?;
+        let reservation = self.sealing_reservation()?;
         let mut state = State {
             events: uint(events) + 1,
             height: sealed.height,
+            sealing: sealing_above(sealed.height, reservation),
+            reservation,
             declarations: sealed.declarations,
             withdrawals: sealed.withdrawals,
             sealed_items: sealed.sealed_items,

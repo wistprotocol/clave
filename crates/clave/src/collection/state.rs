@@ -276,6 +276,8 @@ pub type ListKey = (String, String, String);
 pub struct State {
     pub events: u64,
     pub height: Option<u64>,
+    pub sealing: Option<u64>,
+    pub reservation: Option<(u64, u64)>,
     pub declarations: Declarations,
     pub discovered: BTreeMap<String, Vec<Discovered>>,
     pub declaration_files: BTreeMap<String, ServedFile>,
@@ -331,6 +333,11 @@ impl State {
     }
 
     pub fn first_epoch_after(&self) -> u64 {
-        self.height.map_or(0, |height| height + 1)
+        State::first_epoch_given(self.height, self.sealing)
+    }
+
+    pub fn first_epoch_given(height: Option<u64>, sealing: Option<u64>) -> u64 {
+        let after_head = height.map_or(0, |height| height + 1);
+        sealing.map_or(after_head, |sealing| after_head.max(sealing + 1))
     }
 }

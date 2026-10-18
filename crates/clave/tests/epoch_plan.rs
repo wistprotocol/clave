@@ -802,6 +802,7 @@ impl<'a> Run<'a> {
         let key = move |kid: &str| (kid == log_kid).then(|| log_key.clone());
         let input = EpochInput {
             height: event["height"].as_u64().unwrap(),
+            event: self.state.events,
             sealed_at: event["sealed_at"].as_str().unwrap(),
             parameters: &map,
             inclusion: &history.inclusion,
@@ -1021,6 +1022,7 @@ fn a_planned_epoch_with_an_entry_the_judgment_ignores_or_out_of_order_fails_veri
     let key = |_: &str| None;
     let input = EpochInput {
         height: event["height"].as_u64().unwrap(),
+        event: run.state.events,
         sealed_at: event["sealed_at"].as_str().unwrap(),
         parameters: &map,
         inclusion: &run.history.inclusion,
@@ -1127,6 +1129,7 @@ fn a_label_of_a_labeler_whose_recovery_window_is_open_waits_with_its_eligibility
         state.events = 1;
         let input = EpochInput {
             height: 1,
+            event: state.events,
             sealed_at: "2026-10-01T01:00:00Z",
             parameters: &map,
             inclusion: &inclusion,
@@ -1393,6 +1396,7 @@ impl StoreRun {
         let key = move |kid: &str| (kid == log_kid).then(|| log_key.clone());
         let input = EpochInput {
             height: event["height"].as_u64().unwrap(),
+            event: before.events,
             sealed_at: event["sealed_at"].as_str().unwrap(),
             parameters: &map,
             inclusion: &history.inclusion,
@@ -2054,6 +2058,7 @@ fn labels_and_disputes_that_leave_at_one_epoch_are_planned_as_rejections_in_plac
     let unsealed = BTreeSet::new();
     let input = EpochInput {
         height: last["height"].as_u64().unwrap(),
+        event: run.state.events,
         sealed_at: last["sealed_at"].as_str().unwrap(),
         parameters: &map,
         inclusion: &run.history.inclusion,

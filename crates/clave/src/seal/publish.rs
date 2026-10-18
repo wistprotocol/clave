@@ -313,6 +313,7 @@ pub(super) fn epoch(
         &prepared.sealed_at,
     )?;
     crate::ingest::mirror_sealed(db, &after, &scope, &prepared.sealed_at)?;
+    db.clear_sealing_reservation()?;
     mutation.commit()?;
     crate::publication::recover(db, data_dir)?;
     db.check_fence()?;
@@ -329,5 +330,6 @@ pub(super) fn epoch(
         late: prepared.late,
         replanned: 0,
         conflicts: Vec::new(),
+        merged: Vec::new(),
     })
 }
