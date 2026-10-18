@@ -8,6 +8,8 @@ CREATE TABLE IF NOT EXISTS pull_objects(run_id INTEGER NOT NULL, kind TEXT NOT N
 CREATE TABLE IF NOT EXISTS pull_walk(domain TEXT NOT NULL, feed TEXT NOT NULL CHECK(feed IN ('label')), idx INTEGER NOT NULL, url TEXT NOT NULL, generated_at TEXT NOT NULL, ids_json BLOB NOT NULL, next_url TEXT, raw BLOB, PRIMARY KEY(domain, feed, idx));
 ";
 
+pub(super) const LOST_RUN_ENDED: &str = "fenced";
+
 pub(super) fn create(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA)?;
     Ok(())
@@ -295,6 +297,27 @@ impl Db {
             .ok_or_else(|| Error::History("pull run lost after insertion".into()))?;
         tx.commit()?;
         Ok((started, credited))
+    }
+
+    pub(crate) fn end_lost_pull_runs(&self) -> Result<usize> {
+        let tx = self.mutation()?;
+        let open = tx
+            .prepare("SELECT run_id, domain, token FROM pull_runs WHERE ended IS NULL AND token IS NOT NULL ORDER BY run_id")?
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut ended = 0;
+        for (run_id, domain, token) in open {
+            let partition = super::leases::partition_of(&tx, &domain)?;
+            if super::leases::fence_holds(&tx, super::Fence::Partition { partition, token })? {
+                continue;
+            }
+            ended += tx.execute(
+                "UPDATE pull_runs SET phase = 'aborted', ended = ?2 WHERE run_id = ?1",
+                (run_id, LOST_RUN_ENDED),
+            )?;
+        }
+        tx.commit()?;
+        Ok(ended)
     }
 
     pub(crate) fn pull_run(&self, run_id: i64) -> Result<Option<PullRun>> {

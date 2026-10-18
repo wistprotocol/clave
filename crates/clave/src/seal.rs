@@ -148,6 +148,7 @@ pub fn run_with_client(
 /// list or tree file nothing kept names is discarded. Files go after the rows that named them.
 pub(crate) fn retain(db: &Db, data_dir: &Path, now: &str) -> Result<()> {
     let mutation = db.mutation()?;
+    db.end_lost_pull_runs()?;
     let lapsed = db.lapsed_payload_duties(now)?;
     for item_id in &lapsed {
         db.end_payload_duty(item_id)?;

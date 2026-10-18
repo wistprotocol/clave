@@ -406,6 +406,77 @@ fn a_running_dispatcher_takes_over_a_lost_workers_partition_and_pulls_while_the_
     assert!(lease.is_some() || db.scheduled_pull(&f.host).unwrap().is_some());
 }
 
+fn query_count(data_dir: &Path, sql: &str) -> i64 {
+    rusqlite::Connection::open(data_dir.join("clave.sqlite"))
+        .unwrap()
+        .query_row(sql, [], |row| row.get(0))
+        .unwrap()
+}
+
+#[test]
+fn retention_ends_a_fenced_pulls_open_run_and_discards_its_unmarked_list_rows_and_held_payload_files(
+) {
+    let f = fixture(true);
+    let path = f.data.path().join("clave.sqlite");
+    let db = clave::db::Db::open(&path).unwrap();
+    let sk = clave::keys::load(&f.data.path().join("keys/seed")).unwrap();
+    let now = unix_now();
+    db.schedule_ping(&f.host, now - LAPSED, 4).unwrap();
+    let old = db
+        .claim_pulls(now - LAPSED, 1, "old", ALL, &[], &mut true, true)
+        .unwrap()
+        .remove(0);
+    let lost = {
+        let (path, data, host, at, fence, client) = (
+            path.clone(),
+            f.data.path().to_path_buf(),
+            f.host.clone(),
+            utc(now),
+            old.fence(),
+            f.client,
+        );
+        std::thread::spawn(move || {
+            let db = clave::db::Db::connect(&path).unwrap().fenced(fence);
+            clave::ingest::run(&db, &client, &data, &host, &at)
+        })
+    };
+    f.origin.wait_held();
+    db.reclaim_instance_leases("old", unix_now()).unwrap();
+    f.origin.release();
+    assert!(matches!(lost.join().unwrap(), Err(clave::Error::Fenced)));
+
+    let orphan = format!("sha256:{}", "ab".repeat(32));
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute(
+            "INSERT INTO list_items(publisher, name, catalog_id, idx, url, item_id, kind, admission) VALUES (?1, 'default', ?2, 0, 'https://example.com/orphan', ?2, 'page', 'unjudged')",
+            (&f.host, &orphan),
+        )
+        .unwrap();
+    let held = clave::db::held_payload_path(f.data.path(), &orphan).unwrap();
+    std::fs::create_dir_all(held.parent().unwrap()).unwrap();
+    std::fs::write(&held, b"{}").unwrap();
+    let open = "SELECT COUNT(*) FROM pull_runs WHERE ended IS NULL";
+    assert_eq!(query_count(f.data.path(), open), 1);
+
+    clave::seal::run(&db, f.data.path(), &sk, unix_now().div_euclid(3600) * 3600).unwrap();
+
+    assert_eq!(query_count(f.data.path(), open), 0);
+    assert_eq!(
+        query_count(
+            f.data.path(),
+            "SELECT COUNT(*) FROM pull_runs WHERE phase = 'aborted'"
+        ),
+        1
+    );
+    assert_eq!(
+        query_count(f.data.path(), "SELECT COUNT(*) FROM list_items"),
+        0
+    );
+    assert!(!held.exists());
+    assert_eq!(f.origin.served("/catalog.json"), 1);
+}
+
 #[test]
 fn a_ping_during_a_pull_in_flight_queues_one_follow_up_pull_that_starts_after_the_first_ends() {
     let f = fixture(true);

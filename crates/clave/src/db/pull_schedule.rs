@@ -1687,6 +1687,70 @@ mod tests {
         assert_eq!((lease.owner.as_str(), lease.attempts), ("me", 2));
     }
 
+    fn start_run(db: &Db, domain: &str) -> i64 {
+        db.start_pull_run(&super::super::NewRun {
+            domain,
+            now: &ts(NOW),
+            day: &ts(NOW)[..10],
+            unit: domain,
+            work_bytes: 1 << 20,
+            work_objects: 64,
+            pages_epoch: None,
+        })
+        .unwrap()
+        .run_id
+    }
+
+    #[test]
+    fn a_taken_over_partitions_open_run_is_ended_aborted_and_runs_whose_fence_holds_are_untouched()
+    {
+        let (tmp, db) = open_db();
+        db.insert_publisher("a.example", b"{}", "k", "p").unwrap();
+        let path = tmp.path().join("clave.sqlite");
+        let old = db
+            .claim_pulls(NOW, 1, "old", ALL, &[], &mut false, true)
+            .unwrap()
+            .remove(0);
+        let lost = start_run(
+            &Db::connect(&path).unwrap().fenced(old.fence()),
+            "a.example",
+        );
+        let unfenced = start_run(&db, "c.example");
+
+        let lapsed = NOW + PARTITION_LEASE_SECONDS;
+        db.claim_pulls(lapsed, 0, "new", ALL, &[], &mut false, true)
+            .unwrap();
+        let partition = db.partition_of("b.example").unwrap();
+        let (_, lease) = db
+            .partition_leases()
+            .unwrap()
+            .into_iter()
+            .find(|(number, _)| *number == partition)
+            .unwrap();
+        assert_eq!(lease.owner.as_deref(), Some("new"));
+        let holding = start_run(
+            &Db::connect(&path).unwrap().fenced(Fence::Partition {
+                partition,
+                token: lease.token,
+            }),
+            "b.example",
+        );
+
+        assert_eq!(db.end_lost_pull_runs().unwrap(), 1);
+        let ended = db.pull_run(lost).unwrap().unwrap();
+        assert_eq!(ended.phase, super::super::Phase::Aborted);
+        assert_eq!(
+            ended.ended.as_deref(),
+            Some(super::super::pull_runs::LOST_RUN_ENDED)
+        );
+        for run_id in [holding, unfenced] {
+            let open = db.pull_run(run_id).unwrap().unwrap();
+            assert_eq!(open.phase, super::super::Phase::Walk);
+            assert_eq!(open.ended, None);
+        }
+        assert_eq!(db.end_lost_pull_runs().unwrap(), 0);
+    }
+
     #[test]
     fn released_partitions_are_taken_at_once_and_fence_the_releasers_pulls() {
         let (_tmp, db) = open_db();
