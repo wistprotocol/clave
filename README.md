@@ -891,7 +891,9 @@ tag with a `-` suffix publishes a pre-release. The binary's global
 allocator is mimalloc: under musl's allocator a seal of the same Log ran
 about 50 % longer, and under glibc's default arenas the serving process
 retained freed memory across sustained-load rounds; with mimalloc both
-targets hold a flat resident size over thirty rounds.
+targets hold a flat resident size over thirty rounds. Its C override is
+on, so SQLite allocates through it too: on musl's allocator SQLite's
+allocations cost about a fifth of a pull.
 
 To cut a release: set the version in `crates/clave/Cargo.toml`, run
 `cargo build` so `Cargo.lock` records it, commit, tag `v<version>` and

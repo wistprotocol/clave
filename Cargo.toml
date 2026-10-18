@@ -22,7 +22,7 @@ sha2 = "0.10"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 url = "2"
-mimalloc = "0.1"
+mimalloc = { version = "0.1", features = ["override"] }
 
 [profile.dev.package.curve25519-dalek]
 opt-level = 3
