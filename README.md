@@ -151,6 +151,42 @@ page Item is served under `payloads/` before the Checkpoint is published
 and for as long as its record holds or its `payload_window_days` window
 runs.
 
+After its report, `clave seal` prints `write lock held N ms` and
+`write lock waited N ms`, the longest time in milliseconds a top-level
+write transaction of the process held the write lock and waited in
+`BEGIN IMMEDIATE` to take it, then one line `seal phases {...}`, a JSON
+object with one member per phase in this order. `serve` prints the last
+two lines with each seal's report on standard output, and every process
+prints `write lock held N ms` and `write lock waited N ms` to standard
+error whenever either maximum grows. The phases:
+
+- `catch_up`: recording Log-derived state the head lacks;
+- `planning`: reserving the Epoch's event and planning it, summed over
+  re-plans, under the write lock for the genesis Epoch and after the
+  last failed re-plan;
+- `lock_wait`: taking the sealing transaction's write lock, summed over
+  re-plans;
+- `merge`: re-reading the plan's inputs under the lock and merging the
+  publishers whose pulls changed them;
+- `entries`: writing the Epoch's Entries, tree and Checkpoint;
+- `replay`: replaying the sealed Epoch over its history;
+- `state`: writing the waiting state, sealed Items, Payload duties,
+  reports and mirrors;
+- `commit`: committing the sealing transaction, its fsync included;
+- `publication`: publishing the committed Epoch;
+- `retention`: discarding what nothing kept names;
+- `witness`: submitting the head to the configured Witnesses.
+
+Each member is `{"ms":N,"sqlite_ms":N,"rss_kb":N,"hwm_kb":N}`: `ms` is
+the phase's wall time, `sqlite_ms` the wall time statements of the
+process spent executing inside it, from a statement's first step to its
+completion, on every connection of the process, so a statement whose
+rows are iterated while other statements run counts its whole open
+interval once, the busy wait inside `BEGIN IMMEDIATE` falls in
+`lock_wait` and the commit fsync in `commit`, and `rss_kb` and `hwm_kb` are the process's `VmRSS` and
+`VmHWM` in kB at the phase's end, 0 where `/proc/self/status` cannot
+be read. A phase the seal did not run reports 0 in every field.
+
 The status endpoint (`/status/<domain>`, WIST-2 §7.1) lists one entry per
 Collection that the Declaration in force or the recovery head names or
 that the store holds, with its latest and last accepted Catalog IDs and

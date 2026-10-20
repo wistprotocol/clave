@@ -1,5 +1,5 @@
 use super::prepare::PreparedEpoch;
-use super::SealReport;
+use super::{SealReport, Step, Timings};
 use crate::collection::plan::{Planned, Publication};
 use crate::collection::{SettledOutcome, State};
 use crate::db::Mutation;
@@ -174,12 +174,24 @@ fn record_sealed_items(db: &Db, prepared: &PreparedEpoch<'_>, entries: &[Value])
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn epoch(
     db: &Db,
     data_dir: &Path,
     client: &crate::fetch::Client,
     mutation: Mutation<'_>,
+    prepared: PreparedEpoch<'_>,
+) -> Result<SealReport> {
+    timed_epoch(db, data_dir, client, mutation, prepared, Timings::default())
+}
+
+pub(super) fn timed_epoch(
+    db: &Db,
+    data_dir: &Path,
+    client: &crate::fetch::Client,
+    mutation: Mutation<'_>,
     mut prepared: PreparedEpoch<'_>,
+    mut timings: Timings,
 ) -> Result<SealReport> {
     let param_changes: Vec<ParamChangeRow> = prepared
         .accepted_changes
@@ -264,35 +276,39 @@ pub(super) fn epoch(
         })
         .collect();
     let signer_refs: Vec<&SigningKey> = prepared.signers.iter().collect();
-    let sealed = db.commit_seal_under(
-        &signer_refs,
-        Some(&prepared.key_entries),
-        &prepared.log_id,
-        &prepared.sealed_rowids,
-        prepared.epoch_number,
-        &prepared.sealed_at,
-        &prepared.entries,
-        prepared.octets,
-        &param_changes,
-        &withdrawal_rows,
-        &prepared.suffix_lists,
-        &label_rows,
-        &dispute_rows,
-        &declaration_rows,
-    )?;
-    prepared.history.extend(sealed.clone());
-    prepared
-        .history
-        .adopt_replay(crate::collection::plan::scoped_replay(
-            &prepared.before,
-            &prepared.scope,
-        )?)?;
+    let sealed = timings.time(Step::Entries, || {
+        db.commit_seal_under(
+            &signer_refs,
+            Some(&prepared.key_entries),
+            &prepared.log_id,
+            &prepared.sealed_rowids,
+            prepared.epoch_number,
+            &prepared.sealed_at,
+            &prepared.entries,
+            prepared.octets,
+            &param_changes,
+            &withdrawal_rows,
+            &prepared.suffix_lists,
+            &label_rows,
+            &dispute_rows,
+            &declaration_rows,
+        )
+    })?;
     let entries = std::mem::take(&mut prepared.entries);
     let entry_count = entries.len() as u64;
-    let verified = prepared
-        .history
-        .next_epoch_with(entries)?
-        .ok_or_else(|| Error::Seal("the sealed Epoch is missing from its history".into()))?;
+    let verified = timings.time(Step::Replay, || -> Result<_> {
+        prepared.history.extend(sealed.clone());
+        prepared
+            .history
+            .adopt_replay(crate::collection::plan::scoped_replay(
+                &prepared.before,
+                &prepared.scope,
+            )?)?;
+        prepared
+            .history
+            .next_epoch_with(entries)?
+            .ok_or_else(|| Error::Seal("the sealed Epoch is missing from its history".into()))
+    })?;
     let rejected = verified.rejected().is_some();
     if let Some(codes) = verified.rejected() {
         tracing::warn!(
@@ -301,40 +317,48 @@ pub(super) fn epoch(
             "the sealed Epoch is rejected: it stays in the Log and applies its key acts alone"
         );
     }
-    // WIST-3 §3.3, Rejected Epochs: no Catalog or Item of a rejected Epoch changes state.
-    let mut after = if rejected {
-        prepared.before.clone()
-    } else {
-        std::mem::take(&mut prepared.planned.state)
-    };
-    after.declarations.seed_head(
-        prepared.epoch_number,
-        &sealed.root,
-        Some(wist_core::timestamp::log_seconds(&prepared.sealed_at)?),
-    );
-    let scope = prepared.write_scope(&after);
-    crate::db::store_changes(db, &prepared.before, &after, &scope, &prepared.sealed_at)?;
-    if !rejected {
-        record_sealed_items(db, &prepared, verified.entries())?;
-    }
-    db.store_waiting_reports(&scope, &prepared.planned.deferred, &prepared.planned.held)?;
-    record_reports(
-        db,
-        &prepared.before,
-        &prepared.planned,
-        prepared.epoch_number,
-        &prepared.sealed_at,
-    )?;
-    crate::ingest::mirror_sealed(db, &after, &scope, &prepared.sealed_at)?;
-    db.clear_sealing_reservation()?;
-    mutation.commit()?;
-    crate::publication::recover(db, data_dir)?;
-    db.check_fence()?;
-    super::retain(db, data_dir, &prepared.sealed_at)?;
-    if let Err(error) = crate::witness::submit_head(db, client, data_dir) {
-        tracing::warn!(%error, "witness submission did not complete");
-    }
-    db.check_fence()?;
+    timings.time(Step::State, || -> Result<()> {
+        // WIST-3 §3.3, Rejected Epochs: no Catalog or Item of a rejected Epoch changes state.
+        let mut after = if rejected {
+            prepared.before.clone()
+        } else {
+            std::mem::take(&mut prepared.planned.state)
+        };
+        after.declarations.seed_head(
+            prepared.epoch_number,
+            &sealed.root,
+            Some(wist_core::timestamp::log_seconds(&prepared.sealed_at)?),
+        );
+        let scope = prepared.write_scope(&after);
+        crate::db::store_changes(db, &prepared.before, &after, &scope, &prepared.sealed_at)?;
+        if !rejected {
+            record_sealed_items(db, &prepared, verified.entries())?;
+        }
+        db.store_waiting_reports(&scope, &prepared.planned.deferred, &prepared.planned.held)?;
+        record_reports(
+            db,
+            &prepared.before,
+            &prepared.planned,
+            prepared.epoch_number,
+            &prepared.sealed_at,
+        )?;
+        crate::ingest::mirror_sealed(db, &after, &scope, &prepared.sealed_at)?;
+        db.clear_sealing_reservation()
+    })?;
+    timings.time(Step::Commit, || mutation.commit())?;
+    timings.time(Step::Publication, || -> Result<()> {
+        crate::publication::recover(db, data_dir)?;
+        db.check_fence()
+    })?;
+    timings.time(Step::Retention, || {
+        super::retain(db, data_dir, &prepared.sealed_at)
+    })?;
+    timings.time(Step::Witness, || {
+        if let Err(error) = crate::witness::submit_head(db, client, data_dir) {
+            tracing::warn!(%error, "witness submission did not complete");
+        }
+        db.check_fence()
+    })?;
 
     Ok(SealReport {
         epoch_number: prepared.epoch_number,
@@ -344,5 +368,6 @@ pub(super) fn epoch(
         replanned: 0,
         conflicts: Vec::new(),
         merged: Vec::new(),
+        phases: timings.phases(),
     })
 }

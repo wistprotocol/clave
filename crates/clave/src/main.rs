@@ -359,6 +359,11 @@ fn run() -> Result<(), clave::Error> {
             }
             println!("seal took {} ms", sealing.as_millis());
             println!("write lock held {} ms", clave::db::longest_write_hold_ms());
+            println!(
+                "write lock waited {} ms",
+                clave::db::longest_write_wait_ms()
+            );
+            println!("seal phases {}", report.phases_json());
             if report.replanned > 0 {
                 println!("replanned {} times", report.replanned);
             }

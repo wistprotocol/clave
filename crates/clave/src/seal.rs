@@ -3,7 +3,7 @@ use crate::error::{Error, Result};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use wist_core::crypto::SigningKey;
 
 mod merge;
@@ -29,6 +29,112 @@ pub struct SealReport {
     /// Per discarded plan, the publishers whose waiting state changed under it.
     pub conflicts: Vec<Vec<String>>,
     pub merged: Vec<String>,
+    pub phases: Vec<(&'static str, Phase)>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Phase {
+    pub ms: u64,
+    pub sqlite_ms: u64,
+    pub rss_kb: u64,
+    pub hwm_kb: u64,
+}
+
+pub const PHASES: [&str; 11] = [
+    "catch_up",
+    "planning",
+    "lock_wait",
+    "merge",
+    "entries",
+    "replay",
+    "state",
+    "commit",
+    "publication",
+    "retention",
+    "witness",
+];
+
+impl SealReport {
+    pub fn phases_json(&self) -> String {
+        let fields: Vec<String> = self
+            .phases
+            .iter()
+            .map(|(name, phase)| {
+                format!(
+                    "\"{name}\":{{\"ms\":{},\"sqlite_ms\":{},\"rss_kb\":{},\"hwm_kb\":{}}}",
+                    phase.ms, phase.sqlite_ms, phase.rss_kb, phase.hwm_kb
+                )
+            })
+            .collect();
+        format!("{{{}}}", fields.join(","))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Step {
+    CatchUp,
+    Planning,
+    LockWait,
+    Merge,
+    Entries,
+    Replay,
+    State,
+    Commit,
+    Publication,
+    Retention,
+    Witness,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct Timings {
+    spent: [(Duration, u64); PHASES.len()],
+    memory: [(u64, u64); PHASES.len()],
+}
+
+impl Timings {
+    pub(crate) fn time<T>(&mut self, step: Step, work: impl FnOnce() -> T) -> T {
+        let started = Instant::now();
+        let sqlite = crate::db::sqlite_nanos();
+        let done = work();
+        let (spent, sqlite_nanos) = &mut self.spent[step as usize];
+        *spent += started.elapsed();
+        *sqlite_nanos += crate::db::sqlite_nanos().saturating_sub(sqlite);
+        self.memory[step as usize] = memory_kb();
+        done
+    }
+
+    pub(crate) fn phases(&self) -> Vec<(&'static str, Phase)> {
+        PHASES
+            .iter()
+            .zip(self.spent.iter().zip(&self.memory))
+            .map(|(name, ((spent, sqlite_nanos), (rss_kb, hwm_kb)))| {
+                (
+                    *name,
+                    Phase {
+                        ms: u64::try_from(spent.as_millis()).unwrap_or(u64::MAX),
+                        sqlite_ms: sqlite_nanos / 1_000_000,
+                        rss_kb: *rss_kb,
+                        hwm_kb: *hwm_kb,
+                    },
+                )
+            })
+            .collect()
+    }
+}
+
+fn memory_kb() -> (u64, u64) {
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return (0, 0);
+    };
+    let field = |name: &str| {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix(name))
+            .and_then(|rest| rest.trim().strip_suffix("kB"))
+            .and_then(|kb| kb.trim().parse().ok())
+            .unwrap_or(0)
+    };
+    (field("VmRSS:"), field("VmHWM:"))
 }
 
 const PLAN_ATTEMPTS: usize = 3;
@@ -249,48 +355,56 @@ fn seal_epoch(
     client: &crate::fetch::Client,
     now_unix: i64,
 ) -> Result<SealReport> {
+    let mut timings = Timings::default();
     if db.last_epoch()?.is_none() {
-        return seal_under_lock(db, data_dir, sk, client, now_unix, 0);
+        return seal_under_lock(db, data_dir, sk, client, now_unix, 0, timings);
     }
-    catch_up_history(db, data_dir)?;
+    timings.time(Step::CatchUp, || catch_up_history(db, data_dir))?;
     let mut conflicts = Vec::new();
-    let event = reserve(db)?;
+    let event = timings.time(Step::Planning, || reserve(db))?;
     for replanned in 0..PLAN_ATTEMPTS {
-        let (mut prepared, scope, planned) = db.read_only(|| {
-            let prepared = prepare::epoch(db, data_dir, sk, now_unix, event)?;
-            let scope = prepared.checked_scope();
-            let planned = PlanInputs::read(db, &scope)?;
-            Ok((prepared, scope, planned))
+        let (mut prepared, scope, planned) = timings.time(Step::Planning, || {
+            db.read_only(|| {
+                let prepared = prepare::epoch(db, data_dir, sk, now_unix, event)?;
+                let scope = prepared.checked_scope();
+                let planned = PlanInputs::read(db, &scope)?;
+                Ok((prepared, scope, planned))
+            })
         })?;
         #[cfg(test)]
         hook::run(&hook::BETWEEN_PLAN_AND_WRITE);
-        let mutation = db.mutation()?;
-        let changed = planned.changed(&PlanInputs::read(db, &scope)?);
-        let merged = if changed.is_empty() {
-            Vec::new()
-        } else if changed
-            .iter()
-            .any(|name| name == EPOCH_CHANGED || name == LOCAL_BOUNDS_CHANGED)
-        {
-            conflicts.push(changed);
-            continue;
-        } else {
+        let mutation = timings.time(Step::LockWait, || db.mutation())?;
+        let merged = timings.time(Step::Merge, || -> Result<Option<Vec<String>>> {
+            let changed = planned.changed(&PlanInputs::read(db, &scope)?);
+            if changed.is_empty() {
+                return Ok(Some(Vec::new()));
+            }
+            if changed
+                .iter()
+                .any(|name| name == EPOCH_CHANGED || name == LOCAL_BOUNDS_CHANGED)
+            {
+                conflicts.push(changed);
+                return Ok(None);
+            }
             match merge::into_current(db, data_dir, &mut prepared, &changed)? {
-                merge::Merge::Done(publishers) => publishers,
+                merge::Merge::Done(publishers) => Ok(Some(publishers)),
                 merge::Merge::Replan(reasons) => {
                     tracing::info!(?reasons, "the seal re-plans: its plan does not merge");
                     conflicts.push(changed);
-                    continue;
+                    Ok(None)
                 }
             }
+        })?;
+        let Some(merged) = merged else {
+            continue;
         };
-        let mut report = publish::epoch(db, data_dir, client, mutation, prepared)?;
+        let mut report = publish::timed_epoch(db, data_dir, client, mutation, prepared, timings)?;
         report.replanned = replanned;
         report.conflicts = conflicts;
         report.merged = merged;
         return Ok(report);
     }
-    let mut report = seal_under_lock(db, data_dir, sk, client, now_unix, PLAN_ATTEMPTS)?;
+    let mut report = seal_under_lock(db, data_dir, sk, client, now_unix, PLAN_ATTEMPTS, timings)?;
     report.conflicts = conflicts;
     Ok(report)
 }
@@ -309,11 +423,14 @@ fn seal_under_lock(
     client: &crate::fetch::Client,
     now_unix: i64,
     replanned: usize,
+    mut timings: Timings,
 ) -> Result<SealReport> {
-    let mutation = db.mutation()?;
-    let event = db.reserve_epoch_event(prepare::next_epoch_number(db)?)?;
-    let prepared = prepare::epoch(db, data_dir, sk, now_unix, event)?;
-    let mut report = publish::epoch(db, data_dir, client, mutation, prepared)?;
+    let mutation = timings.time(Step::LockWait, || db.mutation())?;
+    let prepared = timings.time(Step::Planning, || {
+        let event = db.reserve_epoch_event(prepare::next_epoch_number(db)?)?;
+        prepare::epoch(db, data_dir, sk, now_unix, event)
+    })?;
+    let mut report = publish::timed_epoch(db, data_dir, client, mutation, prepared, timings)?;
     report.replanned = replanned;
     Ok(report)
 }

@@ -57,6 +57,66 @@ fn record_write_hold(began: std::time::Instant) {
     }
 }
 
+static LONGEST_WRITE_WAIT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn longest_write_wait_ms() -> u64 {
+    LONGEST_WRITE_WAIT_MS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn record_write_wait(waited: std::time::Duration) {
+    let waited = u64::try_from(waited.as_millis()).unwrap_or(u64::MAX);
+    let longest = LONGEST_WRITE_WAIT_MS.fetch_max(waited, std::sync::atomic::Ordering::Relaxed);
+    if waited > longest {
+        eprintln!("write lock waited {waited} ms");
+    }
+}
+
+static SQLITE_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn sqlite_nanos() -> u64 {
+    SQLITE_NANOS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+thread_local! {
+    static ACTIVE_STATEMENTS: std::cell::Cell<(u64, Option<std::time::Instant>)> =
+        const { std::cell::Cell::new((0, None)) };
+}
+
+fn statement_event(event: rusqlite::trace::TraceEvent<'_>) {
+    match event {
+        // SQLite reports each trigger subprogram it enters as a "--" comment with no PROFILE event.
+        rusqlite::trace::TraceEvent::Stmt(_, sql) if !sql.starts_with("--") => statement_began(),
+        rusqlite::trace::TraceEvent::Profile(..) => statement_ended(),
+        _ => {}
+    }
+}
+
+fn statement_began() {
+    ACTIVE_STATEMENTS.with(|active| {
+        let (depth, since) = active.get();
+        let since = if depth == 0 {
+            Some(std::time::Instant::now())
+        } else {
+            since
+        };
+        active.set((depth + 1, since));
+    });
+}
+
+fn statement_ended() {
+    ACTIVE_STATEMENTS.with(|active| match active.get() {
+        (0, _) => {}
+        (1, since) => {
+            active.set((0, None));
+            if let Some(since) = since {
+                let nanos = u64::try_from(since.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                SQLITE_NANOS.fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        (depth, since) => active.set((depth - 1, since)),
+    });
+}
+
 impl<'a> Mutation<'a> {
     pub(super) fn new(conn: &'a Connection) -> Result<Self> {
         Self::fenced(conn, None)
@@ -68,7 +128,10 @@ impl<'a> Mutation<'a> {
     fn fenced(conn: &'a Connection, fence: Option<Fence>) -> Result<Self> {
         let top_level = conn.is_autocommit();
         let began = if top_level {
-            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let asked = std::time::Instant::now();
+            let begun = conn.execute_batch("BEGIN IMMEDIATE");
+            record_write_wait(asked.elapsed());
+            begun?;
             Some(std::time::Instant::now())
         } else {
             conn.execute_batch("SAVEPOINT clave_mutation")?;
@@ -414,6 +477,11 @@ impl Db {
     /// background pass) takes its own.
     pub fn connect(path: &Path) -> Result<Db> {
         let conn = Connection::open(path)?;
+        conn.trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT
+                | rusqlite::trace::TraceEventCodes::SQLITE_TRACE_PROFILE,
+            Some(statement_event),
+        );
         conn.busy_timeout(std::time::Duration::from_millis(60_000))?;
         let _mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
         conn.pragma_update(None, "synchronous", "FULL")?;
@@ -2204,6 +2272,94 @@ pub(crate) mod tests {
         std::thread::sleep(std::time::Duration::from_millis(50));
         outer.commit().unwrap();
         assert!(longest_write_hold_ms() >= 50);
+    }
+
+    #[test]
+    fn a_mutation_waiting_on_another_connection_s_write_lock_raises_the_longest_write_wait() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("clave.sqlite");
+        let holder = Db::open(&path).unwrap();
+        holder.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let waiter = std::thread::spawn(move || {
+            let db = Db::connect(&path).unwrap();
+            let mutation = db.mutation().unwrap();
+            mutation.commit().unwrap();
+        });
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        holder.conn.execute_batch("COMMIT").unwrap();
+        waiter.join().unwrap();
+        assert!(longest_write_wait_ms() >= 50);
+    }
+
+    #[test]
+    fn statements_on_a_connection_add_their_time_to_the_sqlite_counter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+        let before = sqlite_nanos();
+        let holder = Db::connect(&tmp.path().join("clave.sqlite")).unwrap();
+        holder.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let path = tmp.path().join("clave.sqlite");
+        let waiter = std::thread::spawn(move || {
+            let db = Db::connect(&path).unwrap();
+            db.set_param("a", 1).unwrap();
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        holder.conn.execute_batch("COMMIT").unwrap();
+        waiter.join().unwrap();
+        assert_eq!(db.param("a").unwrap(), 1);
+        assert!(sqlite_nanos() - before >= 50_000_000);
+    }
+
+    fn statement_depth() -> u64 {
+        ACTIVE_STATEMENTS.with(|active| active.get().0)
+    }
+
+    #[test]
+    fn a_thousand_sub_millisecond_statements_add_a_positive_time_to_the_sqlite_counter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+        let before = sqlite_nanos();
+        for _ in 0..1000 {
+            let one: i64 = db.conn.query_row("SELECT 1", [], |row| row.get(0)).unwrap();
+            assert_eq!(one, 1);
+        }
+        assert!(sqlite_nanos() > before);
+        assert_eq!(statement_depth(), 0);
+    }
+
+    #[test]
+    fn a_statement_firing_a_trigger_returns_the_statement_depth_to_zero_and_the_next_is_counted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+        assert_eq!(statement_depth(), 0);
+        db.conn
+            .execute(
+                "INSERT INTO pending_entries(entry_type, domain, entry_json, chain_pos) VALUES ('publisher_item', 'a.example', x'7b7d', 0)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(statement_depth(), 0);
+        let ordered: Option<i64> = db
+            .conn
+            .query_row("SELECT acceptance_order FROM pending_entries", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(ordered.is_some());
+        let before = sqlite_nanos();
+        db.conn.execute_batch("SELECT 1").unwrap();
+        assert!(sqlite_nanos() > before);
+        assert_eq!(statement_depth(), 0);
+    }
+
+    #[test]
+    fn a_profile_without_a_matching_statement_leaves_the_depth_at_zero() {
+        ACTIVE_STATEMENTS.with(|active| active.set((0, None)));
+        statement_ended();
+        assert_eq!(statement_depth(), 0);
+        statement_began();
+        statement_ended();
+        assert_eq!(ACTIVE_STATEMENTS.with(|active| active.get()), (0, None));
     }
 
     #[test]

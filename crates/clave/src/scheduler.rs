@@ -71,6 +71,12 @@ fn seal_at(
     for late in &report.late {
         let _ = writeln!(out, "late inclusion: {late}");
     }
+    let _ = writeln!(
+        out,
+        "write lock waited {} ms",
+        crate::db::longest_write_wait_ms()
+    );
+    let _ = writeln!(out, "seal phases {}", report.phases_json());
     if report.replanned > 0 {
         let _ = writeln!(out, "replanned {} times", report.replanned);
     }
