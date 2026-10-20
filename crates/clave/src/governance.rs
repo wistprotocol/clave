@@ -5,7 +5,6 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use wist_core::crypto::{hex_encode, SigningKey};
 use wist_core::envelope::sign_envelope;
-use wist_core::withdrawal::SealedItems;
 
 pub struct GovernanceReport {
     pub update_id: String,
@@ -58,7 +57,11 @@ pub fn withdraw(
         ));
     }
     let height = db.last_epoch()?.map_or(0, |epoch| epoch.epoch_number + 1);
-    if sealed_items(db)?.meets_contract(item_id, domain, height) != Some(true) {
+    if db
+        .sealed_items_named(&[item_id])?
+        .meets_contract(item_id, domain, height)
+        != Some(true)
+    {
         return Err(Error::Governance(format!(
             "{item_id} is not an Item sealed for {domain} (WIST-4 \u{a7}5.1)"
         )));
@@ -73,8 +76,4 @@ pub fn withdraw(
     });
     let id = enqueue(db, sk, update)?;
     Ok(GovernanceReport { update_id: id })
-}
-
-pub(crate) fn sealed_items(db: &Db) -> Result<SealedItems> {
-    db.sealed_items()
 }

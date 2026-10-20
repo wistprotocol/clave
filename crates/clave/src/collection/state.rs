@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use wist_core::declarations::Declarations;
 use wist_core::objects::status::{RejectionCondition, StatusRejection};
 use wist_core::withdrawal::{SealedItems, WithdrawalReplay};
@@ -212,14 +213,25 @@ impl RecoveryQueue {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Record {
-    pub item: Value,
+    pub item: Arc<Value>,
     pub item_id: String,
     pub collection: String,
     pub catalog_id: String,
     pub generated_at: String,
     pub sealing_height: u64,
+}
+
+impl PartialEq for Record {
+    fn eq(&self, other: &Self) -> bool {
+        (Arc::ptr_eq(&self.item, &other.item) || self.item == other.item)
+            && self.item_id == other.item_id
+            && self.collection == other.collection
+            && self.catalog_id == other.catalog_id
+            && self.generated_at == other.generated_at
+            && self.sealing_height == other.sealing_height
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

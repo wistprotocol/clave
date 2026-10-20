@@ -384,12 +384,12 @@ fn an_item_withdrawn_in_the_log_is_not_admitted_and_its_payload_is_not_fetched()
 
 fn record(url: &str) -> Record {
     Record {
-        item: json!({
+        item: std::sync::Arc::new(json!({
             "publisher": DOMAIN,
             "url": url,
             "observed_at": "2026-09-14T00:00:00Z",
             "removed": true,
-        }),
+        })),
         item_id: "sha256:00".into(),
         collection: "journal".into(),
         catalog_id: "sha256:01".into(),

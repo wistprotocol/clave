@@ -923,7 +923,7 @@ fn a_merge_refuses_a_replacement_catalog_that_omits_a_record_the_epoch_seals_und
     planned.records.insert(
         (publisher.clone(), "https://p.example/a".into()),
         Record {
-            item: serde_json::json!({}),
+            item: std::sync::Arc::new(serde_json::json!({})),
             item_id: "sha256:a".into(),
             collection: "default".into(),
             catalog_id: x,

@@ -180,7 +180,10 @@ impl Db {
 
     // A Label ID hashes its labeler and a dispute ID its disputant, so the
     // sealed IDs a pull of these publishers can meet again are all theirs.
-    fn sealed_label_ids_of(&self, publishers: &BTreeSet<String>) -> Result<BTreeSet<String>> {
+    pub(crate) fn sealed_label_ids_of(
+        &self,
+        publishers: &BTreeSet<String>,
+    ) -> Result<BTreeSet<String>> {
         let mut stmt = self.conn.prepare(
             "SELECT l.label_id FROM labels l JOIN epochs b ON b.epoch_number = l.epoch_number WHERE b.rejected = 0 AND l.labeler = ?1 UNION SELECT d.dispute_id FROM disputes d JOIN epochs b ON b.epoch_number = d.epoch_number WHERE b.rejected = 0 AND d.disputant = ?1",
         )?;
@@ -192,6 +195,68 @@ impl Db {
             );
         }
         Ok(ids)
+    }
+
+    pub(crate) fn sealed_label_subjects_of(
+        &self,
+        labelers: &BTreeSet<String>,
+    ) -> Result<BTreeMap<String, Option<String>>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT l.label_id, l.subject FROM labels l JOIN epochs b ON b.epoch_number = l.epoch_number WHERE b.rejected = 0 AND l.labeler = ?1",
+        )?;
+        let mut subjects = BTreeMap::new();
+        for labeler in labelers {
+            for row in stmt.query_map([labeler], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })? {
+                let (label_id, subject) = row?;
+                subjects.insert(label_id, Some(subject));
+            }
+        }
+        Ok(subjects)
+    }
+
+    pub fn sealed_label_subjects_named(
+        &self,
+        label_ids: &BTreeSet<String>,
+    ) -> Result<BTreeMap<String, Option<String>>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT l.subject FROM labels l JOIN epochs b ON b.epoch_number = l.epoch_number WHERE b.rejected = 0 AND l.label_id = ?1",
+        )?;
+        let mut subjects = BTreeMap::new();
+        for label_id in label_ids {
+            if let Some(subject) = stmt
+                .query_row([label_id], |row| row.get::<_, String>(0))
+                .optional()?
+            {
+                subjects.insert(label_id.clone(), Some(subject));
+            }
+        }
+        Ok(subjects)
+    }
+
+    pub fn sealed_items_named(&self, item_ids: &[&str]) -> Result<SealedItems> {
+        let mut sealed_items = SealedItems::new();
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT publisher, kind, first_height FROM sealed_items WHERE item_id = ?1",
+        )?;
+        for item_id in item_ids {
+            for row in stmt.query_map([item_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })? {
+                let (publisher, kind, height) = row?;
+                let kind = match kind_of(&kind)? {
+                    ItemKind::Page => wist_core::item::Kind::Page,
+                    ItemKind::Removed => wist_core::item::Kind::Removed,
+                };
+                sealed_items.seal(item_id, &publisher, kind, uint(height));
+            }
+        }
+        Ok(sealed_items)
     }
 
     pub fn sealed_from(&self, history: &crate::history::History<'_>) -> Result<Sealed> {
@@ -312,7 +377,7 @@ impl Db {
         Ok(entries)
     }
 
-    fn withdrawal_entries(&self) -> Result<Vec<StateEntry>> {
+    pub(crate) fn withdrawal_entries(&self) -> Result<Vec<StateEntry>> {
         Ok(self
             .withdrawal_state()?
             .into_iter()
@@ -786,7 +851,7 @@ fn load_publisher(conn: &Connection, state: &mut State, publisher: &str) -> Resu
         state.records.insert(
             (publisher.to_owned(), url),
             Record {
-                item: parse(&item)?,
+                item: std::sync::Arc::new(parse(&item)?),
                 item_id,
                 collection,
                 catalog_id,

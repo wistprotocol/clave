@@ -836,7 +836,7 @@ fn a_list_obtained_by_a_chain_is_refused_for_a_dropped_record_and_stays_held() {
         (DOMAIN.into(), dropped.clone()),
         clave::collection::state::Record {
             item_id: wist_core::item::item_id(&gone).unwrap(),
-            item: gone,
+            item: std::sync::Arc::new(gone),
             collection: "journal".into(),
             catalog_id: earlier.id.clone(),
             generated_at: "2026-10-02T00:00:00Z".into(),

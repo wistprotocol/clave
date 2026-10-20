@@ -1,6 +1,7 @@
 use crate::collection::plan::{self, EpochInput, Inclusion, Planned, Publication, Unsealed};
+use crate::collection::state::LabelKind;
 use crate::collection::{Parameters, State};
-use crate::db::{Db, PendingEntryRow};
+use crate::db::{Db, PendingEntryRow, Sealed};
 use crate::error::{Error, Result};
 use crate::history::History;
 use crate::registry;
@@ -216,6 +217,39 @@ fn entry_octets(entry: &Value) -> Result<u64> {
     Ok(jcs::canonicalize(entry)?.len() as u64 + 2)
 }
 
+// A Label ID hashes its labeler, so the sealed Labels an Epoch of the scope can carry again are
+// the scope's; a dispute reads the subject of the Label it names (WIST-3 §3.2).
+fn load_scoped_state(
+    db: &Db,
+    history: &History<'_>,
+    scope: &BTreeSet<String>,
+    withdrawn: &[&str],
+) -> Result<State> {
+    let replay = history.replay();
+    let sealed = Sealed {
+        height: history.height(),
+        declarations: replay.declarations().clone(),
+        withdrawals: replay.withdrawals().clone(),
+        sealed_items: db.sealed_items_named(withdrawn)?,
+        sealed_labels: db.sealed_label_ids_of(scope)?,
+        label_subjects: db.sealed_label_subjects_of(scope)?,
+    };
+    let mut state = db.load_state(sealed, scope)?;
+    let named: BTreeSet<String> = state
+        .labels
+        .values()
+        .filter(|waiting| waiting.kind == LabelKind::Dispute)
+        .filter_map(|waiting| waiting.envelope["dispute"]["label"].as_str())
+        .filter(|label_id| !state.label_subjects.contains_key(*label_id))
+        .map(str::to_owned)
+        .collect();
+    for (label_id, subject) in db.sealed_label_subjects_named(&named)? {
+        state.sealed_labels.insert(label_id.clone());
+        state.label_subjects.insert(label_id, subject);
+    }
+    Ok(state)
+}
+
 /// WIST-3 §3.3, Waiting.
 pub(super) fn epoch<'a>(
     db: &'a Db,
@@ -228,9 +262,9 @@ pub(super) fn epoch<'a>(
     if epoch_number == 0 {
         queue_genesis_amendments(db, sk, &sealed_at)?;
     }
-    let history = History::resume(db, data_dir)?;
-    let sealed = db.sealed_from(&history)?;
-    for (domain, state) in sealed.declarations.domains() {
+    let history = History::resume_without_records(db, data_dir)?;
+    let declarations = history.replay().declarations();
+    for (domain, state) in declarations.domains() {
         let Some(window) = state.window() else {
             continue;
         };
@@ -242,16 +276,6 @@ pub(super) fn epoch<'a>(
             )));
         }
     }
-    let mut scope = db.waiting_publishers()?;
-    for (domain, state) in sealed.declarations.domains() {
-        if state.window().is_some() || state.pending().is_some() {
-            scope.insert(domain.clone());
-        }
-    }
-    let state = db.load_state(sealed, &scope)?;
-    let parameters = sealing_parameters(db, sealed_unix)?;
-    let payload_window_days = parameters.value("payload_window_days")?;
-
     let (pending, _) = db.peek_pending_entries()?;
     let (updates, oversize): (Vec<SealEntry>, Vec<SealEntry>) = storage_order(
         pending
@@ -261,6 +285,33 @@ pub(super) fn epoch<'a>(
     )?
     .into_iter()
     .partition(|entry| entry.canonical.len() as u64 <= tiles::ENTRY_MAX_BYTES);
+    let withdrawn: Vec<(&str, &str)> = updates
+        .iter()
+        .map(|entry| &entry.body["update"])
+        .filter(|update| update["action"] == "payload_withdrawal")
+        .map(|update| {
+            (
+                update["details"]["delta_id"].as_str().unwrap_or_default(),
+                update["subject"].as_str().unwrap_or_default(),
+            )
+        })
+        .collect();
+    let mut scope = db.waiting_publishers()?;
+    for (domain, state) in declarations.domains() {
+        if state.window().is_some() || state.pending().is_some() {
+            scope.insert(domain.clone());
+        }
+    }
+    scope.extend(
+        withdrawn
+            .iter()
+            .filter(|(_, subject)| !subject.is_empty())
+            .map(|(_, subject)| (*subject).to_owned()),
+    );
+    let item_ids: Vec<&str> = withdrawn.iter().map(|(item_id, _)| *item_id).collect();
+    let state = load_scoped_state(db, &history, &scope, &item_ids)?;
+    let parameters = sealing_parameters(db, sealed_unix)?;
+    let payload_window_days = parameters.value("payload_window_days")?;
     let GovernanceOutcome {
         kept,
         param_changes,
@@ -270,7 +321,15 @@ pub(super) fn epoch<'a>(
         dropped_rowids,
         key_registry,
         schedule: amended,
-    } = enforce_governance(db, &history, updates, sealed_unix, epoch_number, 0)?;
+    } = enforce_governance(
+        db,
+        &history,
+        &state.sealed_items,
+        updates,
+        sealed_unix,
+        epoch_number,
+        0,
+    )?;
     // WIST-4 §5: the Epoch seals under the smallest cap of the maps left after its own
     // candidates are processed; a candidate raising the cap does not widen the Epoch sealing
     // it, which a Consumer bounds from the verified prefix alone (WIST-3 §6).
@@ -343,7 +402,7 @@ pub(super) fn epoch<'a>(
                 .insert(Unsealed::Label { id: id.clone() });
         }
     }
-    let planned = loop {
+    let mut planned = loop {
         let input = EpochInput {
             height: epoch_number,
             event,
@@ -398,7 +457,7 @@ pub(super) fn epoch<'a>(
         }
     };
 
-    let entries = planned.entries.clone();
+    let entries = std::mem::take(&mut planned.entries);
     let octets = entries.iter().map(entry_octets).sum::<Result<u64>>()?;
     let in_epoch = |body: &Value| {
         entries
@@ -788,6 +847,7 @@ fn repeated_act(update: &Value, update_id: &str, accepted_height: Option<u64>) -
 pub(super) fn enforce_governance(
     db: &Db,
     history: &History<'_>,
+    sealed_items: &wist_core::withdrawal::SealedItems,
     entries: Vec<SealEntry>,
     sealed_unix: i64,
     epoch_number: u64,
@@ -823,7 +883,6 @@ pub(super) fn enforce_governance(
         key_registry,
         schedule: schedule.clone(),
     };
-    let sealed_items = crate::governance::sealed_items(db)?;
     let mut replay = wist_core::withdrawal::WithdrawalReplay::new();
     for (item_id, domain, height) in db.withdrawal_state()? {
         replay.adopt(&item_id, &domain, height);
@@ -906,7 +965,7 @@ pub(super) fn enforce_governance(
                     public_key_of,
                     &e.body,
                     epoch_number,
-                    &sealed_items,
+                    sealed_items,
                 ) {
                     Ok(Withdrawal::Owned(withdrawal)) => {
                         out.withdrawals.push(withdrawal);

@@ -7,6 +7,7 @@ use crate::db::{
     Db, ParamChangeRow, SealedDeclarationRow, SealedDisputeRow, SealedLabelRow, WithdrawalRow,
 };
 use crate::error::{Error, Result};
+use serde_json::Value;
 use std::path::Path;
 use wist_core::crypto::SigningKey;
 use wist_core::objects::StatusRejection;
@@ -122,13 +123,12 @@ fn declaration_domain(before: &State, hash: &str) -> Option<String> {
 }
 
 /// WIST-3 §6.1, §6.2.
-fn record_sealed_items(db: &Db, prepared: &PreparedEpoch<'_>) -> Result<()> {
+fn record_sealed_items(db: &Db, prepared: &PreparedEpoch<'_>, entries: &[Value]) -> Result<()> {
     let sealed_at_s = wist_core::timestamp::log_seconds(&prepared.sealed_at)?;
     let until = crate::registry::instant(
         sealed_at_s.saturating_add(prepared.payload_window_days.saturating_mul(DAY_SECONDS)),
     )?;
-    for entry in prepared
-        .entries
+    for entry in entries
         .iter()
         .filter(|entry| entry["type"] == "publisher_item")
     {
@@ -276,9 +276,17 @@ pub(super) fn epoch(
         &declaration_rows,
     )?;
     prepared.history.extend(sealed.clone());
+    prepared
+        .history
+        .adopt_replay(crate::collection::plan::scoped_replay(
+            &prepared.before,
+            &prepared.scope,
+        )?)?;
+    let entries = std::mem::take(&mut prepared.entries);
+    let entry_count = entries.len() as u64;
     let verified = prepared
         .history
-        .next_epoch()?
+        .next_epoch_with(entries)?
         .ok_or_else(|| Error::Seal("the sealed Epoch is missing from its history".into()))?;
     let rejected = verified.rejected().is_some();
     if let Some(codes) = verified.rejected() {
@@ -292,7 +300,7 @@ pub(super) fn epoch(
     let mut after = if rejected {
         prepared.before.clone()
     } else {
-        prepared.planned.state.clone()
+        std::mem::take(&mut prepared.planned.state)
     };
     after.declarations.seed_head(
         prepared.epoch_number,
@@ -302,7 +310,7 @@ pub(super) fn epoch(
     let scope = prepared.write_scope(&after);
     crate::db::store_changes(db, &prepared.before, &after, &scope, &prepared.sealed_at)?;
     if !rejected {
-        record_sealed_items(db, &prepared)?;
+        record_sealed_items(db, &prepared, verified.entries())?;
     }
     db.store_waiting_reports(&scope, &prepared.planned.deferred, &prepared.planned.held)?;
     record_reports(
@@ -325,7 +333,7 @@ pub(super) fn epoch(
 
     Ok(SealReport {
         epoch_number: prepared.epoch_number,
-        entry_count: prepared.entries.len() as u64,
+        entry_count,
         dropped: prepared.dropped,
         late: prepared.late,
         replanned: 0,

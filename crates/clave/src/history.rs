@@ -163,6 +163,7 @@ pub struct History<'a> {
     schedule: Option<Schedule>,
     failed: bool,
     replay: Replay,
+    judges: bool,
     suffix_lists: SuffixListReplay,
 }
 
@@ -186,11 +187,20 @@ impl<'a> History<'a> {
             schedule: None,
             failed: false,
             replay: Replay::new(),
+            judges: true,
             suffix_lists: SuffixListReplay::new(),
         })
     }
 
     pub fn resume(db: &'a Db, directory: &Path) -> Result<Self> {
+        Self::resume_holding(db, directory, true)
+    }
+
+    pub fn resume_without_records(db: &'a Db, directory: &Path) -> Result<Self> {
+        Self::resume_holding(db, directory, false)
+    }
+
+    fn resume_holding(db: &'a Db, directory: &Path, records: bool) -> Result<Self> {
         let Some(head) = db.last_epoch()? else {
             return Self::open(db, directory, None);
         };
@@ -207,17 +217,28 @@ impl<'a> History<'a> {
         let at = checkpoint
             .sealed_at_s()
             .map_err(|e| failure(&e.to_string()))?;
-        let mut entries = db.log_state_entries()?;
+        let mut entries = if records {
+            db.log_state_entries()?
+        } else {
+            db.withdrawal_entries()?
+        };
         entries.extend(db.accepted_update_entries()?);
         let accepted = AcceptedUpdates::from_state(&entries)?;
         let mut replay =
-            Replay::resumed(head.epoch_number, &head.sealed_at, declarations, &entries)?;
+            Replay::resumed_owned(head.epoch_number, &head.sealed_at, declarations, entries)?;
         replay.hold_walk_floor(None);
-        for sealed in db.sealed_items()?.sealed() {
-            replay.hold_sealed_item(sealed.item_id, sealed.publisher, sealed.kind, sealed.height);
-        }
-        for sealed in db.sealed_labels()? {
-            replay.hold_sealed_label(&sealed.label_id, Some(&sealed.label.subject));
+        if records {
+            for sealed in db.sealed_items()?.sealed() {
+                replay.hold_sealed_item(
+                    sealed.item_id,
+                    sealed.publisher,
+                    sealed.kind,
+                    sealed.height,
+                );
+            }
+            for sealed in db.sealed_labels()? {
+                replay.hold_sealed_label(&sealed.label_id, Some(&sealed.label.subject));
+            }
         }
         let key_entries = db.aggregator_key_entries()?;
         let mut registry = if key_entries.is_empty() {
@@ -248,8 +269,18 @@ impl<'a> History<'a> {
             schedule: Some(schedule),
             failed: false,
             replay,
+            judges: records,
             suffix_lists,
         })
+    }
+
+    pub fn adopt_replay(&mut self, replay: Replay) -> Result<()> {
+        if replay.next_height() != self.next_height {
+            return Err(failure("the adopted Replay is not at the history's height"));
+        }
+        self.replay = replay;
+        self.judges = true;
+        Ok(())
     }
 
     pub fn extend(&mut self, head: EpochRow) {
@@ -294,15 +325,28 @@ impl<'a> History<'a> {
     }
 
     pub fn next_epoch(&mut self) -> Result<Option<VerifiedEpoch>> {
+        self.next_verified(None)
+    }
+
+    pub fn next_epoch_with(&mut self, entries: Vec<Value>) -> Result<Option<VerifiedEpoch>> {
+        self.next_verified(Some(entries))
+    }
+
+    fn next_verified(&mut self, entries: Option<Vec<Value>>) -> Result<Option<VerifiedEpoch>> {
         if self.failed {
             return Err(failure("history reader cannot continue after a failure"));
         }
-        let result = self.read_next();
+        if !self.judges {
+            return Err(failure(
+                "a history resumed without record state cannot judge an Epoch",
+            ));
+        }
+        let result = self.read_next(entries);
         self.failed = result.is_err();
         result
     }
 
-    fn read_next(&mut self) -> Result<Option<VerifiedEpoch>> {
+    fn read_next(&mut self, entries: Option<Vec<Value>>) -> Result<Option<VerifiedEpoch>> {
         let Some(head) = &self.head else {
             return Ok(None);
         };
@@ -351,7 +395,10 @@ impl<'a> History<'a> {
         .map_err(|e| failure(&e.to_string()))?;
 
         let previous_size = self.db.size_before(height)?;
-        let entries = self.db.epoch_entries(height)?;
+        let entries = match entries {
+            Some(entries) => entries,
+            None => self.db.epoch_entries(height)?,
+        };
         let summary = wist_core::epoch::verify_epoch_tree(
             previous_size,
             &checkpoint,

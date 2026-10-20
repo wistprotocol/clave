@@ -7,6 +7,7 @@ use super::state::{
 use crate::error::{Error, Result};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use wist_core::crypto::PublicKey;
 use wist_core::declaration;
 use wist_core::item;
@@ -332,7 +333,7 @@ fn tuples(state: &State, publishers: &BTreeSet<String>) -> Vec<StateEntry> {
             out.push(StateEntry::Record(RecordEntry {
                 publisher: publisher.clone(),
                 url: url.clone(),
-                item: record.item.clone(),
+                item: (*record.item).clone(),
                 collection: record.collection.clone(),
                 catalog_id: record.catalog_id.clone(),
                 generated_at: record.generated_at.clone(),
@@ -356,6 +357,14 @@ fn tuples(state: &State, publishers: &BTreeSet<String>) -> Vec<StateEntry> {
             .entries()
             .into_iter()
             .map(StateEntry::Withdrawal),
+    );
+    out.extend(
+        state
+            .withdrawals
+            .accepted_updates()
+            .entries()
+            .into_iter()
+            .map(StateEntry::RegistryUpdate),
     );
     out
 }
@@ -427,15 +436,13 @@ pub struct Judged {
     pub publishers: BTreeSet<String>,
 }
 
-/// Resumed from the tuples of the Publishers the Epoch's Entries and transitions touch: no
-/// other Publisher's state enters a judgment of WIST-3 §3.3. Every sealed Item and Label ID is
-/// handed over, so a withdrawal or dispute reads what a full replay reads.
-pub fn judge(state: &State, input: &EpochInput<'_>, entries: &[Value]) -> Result<Judged> {
-    let parameters = input.parameters.sealing()?;
-    let publishers = judged_publishers(state, entries, changed_domains(state, input, entries));
+/// Resumed from the tuples of `publishers`: no other Publisher's state enters a judgment of
+/// WIST-3 §3.3. The State's sealed Items and Label IDs are handed over, so a withdrawal or
+/// dispute of these Publishers reads what a full replay reads.
+pub fn scoped_replay(state: &State, publishers: &BTreeSet<String>) -> Result<Replay> {
     let mut replay = match state.height {
         None => Replay::new(),
-        Some(height) => Replay::resumed(
+        Some(height) => Replay::resumed_owned(
             height,
             &wist_core::timestamp::instant(
                 state
@@ -444,7 +451,7 @@ pub fn judge(state: &State, input: &EpochInput<'_>, entries: &[Value]) -> Result
                     .ok_or_else(|| history("a sealed Epoch without its sealed_at"))?,
             )?,
             state.declarations.clone(),
-            &tuples(state, &publishers),
+            tuples(state, publishers),
         )?,
     };
     replay.hold_walk_floor(None);
@@ -454,6 +461,13 @@ pub fn judge(state: &State, input: &EpochInput<'_>, entries: &[Value]) -> Result
     for (label_id, subject) in &state.label_subjects {
         replay.hold_sealed_label(label_id, subject.as_deref());
     }
+    Ok(replay)
+}
+
+pub fn judge(state: &State, input: &EpochInput<'_>, entries: &[Value]) -> Result<Judged> {
+    let parameters = input.parameters.sealing()?;
+    let publishers = judged_publishers(state, entries, changed_domains(state, input, entries));
+    let mut replay = scoped_replay(state, &publishers)?;
     let outcome = replay.epoch(&Epoch {
         height: input.height,
         root: CANDIDATE_ROOT,
@@ -538,14 +552,15 @@ fn absorb(next: &mut State, judged: &Judged, height: u64) {
                 continue;
             }
             let key = (owner.to_owned(), url.to_owned());
-            let sealing_height = old
-                .get(&key)
-                .filter(|old| old.item_id == record.item_id)
-                .map_or(height, |old| old.sealing_height);
+            let kept = old.get(&key).filter(|old| old.item_id == record.item_id);
+            let sealing_height = kept.map_or(height, |old| old.sealing_height);
+            let item = kept
+                .filter(|old| *old.item == record.item)
+                .map_or_else(|| Arc::new(record.item.clone()), |old| old.item.clone());
             next.records.insert(
                 key,
                 Record {
-                    item: record.item.clone(),
+                    item,
                     item_id: record.item_id.clone(),
                     collection: record.collection.clone(),
                     catalog_id: record.catalog.clone(),
