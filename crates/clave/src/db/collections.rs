@@ -1,10 +1,10 @@
 use super::Db;
 use crate::collection::site::Held;
 use crate::collection::state::{
-    AcceptedCatalog, Admission, CollectionKey, CollectionState, Discard, DiscardedChain,
-    Discovered, ItemKind, LabelKind, ListItem, ListKey, Place, QueuedCatalog, Record,
-    RecoveryQueue, Removal, SealedCatalog, ServedFile, State, WaitingLabel, WaitingUrl,
-    CHAIN_DISCARDED,
+    of_publisher, AcceptedCatalog, Admission, CollectionKey, CollectionState, Discard,
+    DiscardedChain, Discovered, ItemKind, LabelKind, ListItem, ListKey, Place, PublisherKey,
+    QueuedCatalog, Record, RecoveryQueue, Removal, SealedCatalog, ServedFile, State, WaitingLabel,
+    WaitingUrl, CHAIN_DISCARDED,
 };
 use crate::error::{Error, Result};
 use rusqlite::{Connection, OptionalExtension};
@@ -966,16 +966,15 @@ fn load_publisher(conn: &Connection, state: &mut State, publisher: &str) -> Resu
     Ok(())
 }
 
-fn in_scope<'a, K: Ord, V: PartialEq>(
+fn in_scope<'a, K: PublisherKey, V: PartialEq>(
     before: &'a BTreeMap<K, V>,
     after: &'a BTreeMap<K, V>,
-    publishers: &BTreeSet<String>,
-    publisher: impl Fn(&K) -> &str,
+    publishers: &'a BTreeSet<String>,
 ) -> Vec<(&'a K, Option<&'a V>)> {
-    let keys: BTreeSet<&K> = before
-        .keys()
-        .chain(after.keys())
-        .filter(|key| publishers.contains(publisher(key)))
+    let keys: BTreeSet<&K> = publishers
+        .iter()
+        .flat_map(|publisher| of_publisher(before, publisher).chain(of_publisher(after, publisher)))
+        .map(|(key, _)| key)
         .collect();
     keys.into_iter()
         .filter(|key| before.get(key) != after.get(key))
@@ -1238,17 +1237,15 @@ pub(crate) fn store_changes(
             [int(after.events - 1)],
         )?;
     }
-    for (key, collection) in in_scope(&before.collections, &after.collections, publishers, |k| {
-        &k.0
-    }) {
+    for (key, collection) in in_scope(&before.collections, &after.collections, publishers) {
         store_collection(conn, key, collection, before.collections.get(key), at)?;
         written.insert(&key.0);
     }
-    for (key, list) in in_scope(&before.lists, &after.lists, publishers, |k| &k.0) {
+    for (key, list) in in_scope(&before.lists, &after.lists, publishers) {
         store_list(conn, key, list, before.lists.get(key))?;
         written.insert(&key.0);
     }
-    for ((publisher, url), waiting) in in_scope(&before.urls, &after.urls, publishers, |k| &k.0) {
+    for ((publisher, url), waiting) in in_scope(&before.urls, &after.urls, publishers) {
         written.insert(publisher);
         match waiting {
             None => conn.execute(
@@ -1270,13 +1267,11 @@ pub(crate) fn store_changes(
             )?,
         };
     }
-    for (publisher, queue) in in_scope(&before.queues, &after.queues, publishers, |k| k) {
+    for (publisher, queue) in in_scope(&before.queues, &after.queues, publishers) {
         store_queue(conn, publisher, queue)?;
         written.insert(publisher);
     }
-    for ((publisher, url), record) in
-        in_scope(&before.records, &after.records, publishers, |k| &k.0)
-    {
+    for ((publisher, url), record) in in_scope(&before.records, &after.records, publishers) {
         written.insert(publisher);
         match record {
             None => conn.execute(
@@ -1298,9 +1293,7 @@ pub(crate) fn store_changes(
             )?,
         };
     }
-    for ((publisher, url), removal) in
-        in_scope(&before.removals, &after.removals, publishers, |k| &k.0)
-    {
+    for ((publisher, url), removal) in in_scope(&before.removals, &after.removals, publishers) {
         written.insert(publisher);
         match removal {
             None => conn.execute(
@@ -1332,7 +1325,7 @@ pub(crate) fn store_changes(
         store_discovered(conn, publisher, after.discovered.get(publisher))?;
         written.insert(publisher);
     }
-    for (publisher, floor) in in_scope(&before.floors, &after.floors, publishers, |k| k) {
+    for (publisher, floor) in in_scope(&before.floors, &after.floors, publishers) {
         written.insert(publisher);
         match floor {
             None => {

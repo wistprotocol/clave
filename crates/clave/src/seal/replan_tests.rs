@@ -977,3 +977,100 @@ fn a_merge_refuses_a_replacement_of_a_catalog_whose_item_the_epoch_refused() {
         super::merge::splice(&mut base, &current, &mut planned, &publisher, &fresh).unwrap_err();
     assert!(refused.contains("the Epoch refused an Item"), "{refused}");
 }
+
+fn waiting_url(collection: &str, item: char) -> WaitingUrl {
+    WaitingUrl {
+        collection: collection.into(),
+        item_id: format!("sha256:{}", item.to_string().repeat(64)),
+        place: Place::url(3, 0, 0),
+        eligibility: 4,
+    }
+}
+
+fn record(item: char) -> Record {
+    Record {
+        item: std::sync::Arc::new(serde_json::json!({ "item": item.to_string() })),
+        item_id: format!("sha256:{}", item.to_string().repeat(64)),
+        collection: "default".into(),
+        catalog_id: format!("sha256:{}", "c".repeat(64)),
+        generated_at: "2026-08-09T11:00:00Z".into(),
+        sealing_height: 1,
+    }
+}
+
+#[test]
+fn a_merge_of_a_publisher_leaves_the_state_of_a_publisher_its_name_prefixes_untouched() {
+    let (publisher, longer) = ("a.example", "a.example.net");
+    let own = (publisher.to_owned(), "default".to_owned());
+    let other = (longer.to_owned(), "default".to_owned());
+    let other_url = (longer.to_owned(), "https://a.example.net/x".to_owned());
+    let x = format!("sha256:{}", "a".repeat(64));
+    let y = format!("sha256:{}", "b".repeat(64));
+    let mut before = State::default();
+    before.collections.insert(own.clone(), accepted(&x, 4));
+    before.collections.insert(other.clone(), accepted(&x, 4));
+    before.records.insert(other_url.clone(), record('1'));
+    let mut planned = before.clone();
+    if let Some(accepted) = planned
+        .collections
+        .get_mut(&other)
+        .and_then(|collection| collection.accepted.as_mut())
+    {
+        accepted.failed_c4 = true;
+    }
+    let mut current = before.clone();
+    current.collections.insert(own.clone(), accepted(&y, 4));
+    current.collections.insert(other.clone(), accepted(&y, 4));
+    current.records.insert(other_url.clone(), record('2'));
+    current
+        .urls
+        .insert(other_url.clone(), waiting_url("default", '3'));
+    current.floors.insert(longer.to_owned(), 7);
+
+    let mut base = before.clone();
+    let planned_other = planned.collections[&other].clone();
+    let fresh = super::merge::Fresh::new(5, 9, 5);
+    super::merge::splice(&mut base, &current, &mut planned, publisher, &fresh).unwrap();
+
+    assert_eq!(accepted_catalog(&planned, &own), y);
+    assert_eq!(base.collections[&own], current.collections[&own]);
+    assert_eq!(planned.collections[&other], planned_other);
+    assert_eq!(base.collections[&other], before.collections[&other]);
+    assert!(!planned.urls.contains_key(&other_url));
+    assert!(!planned.floors.contains_key(longer));
+    assert_eq!(base.records, before.records);
+}
+
+fn accepted_catalog(state: &State, key: &(String, String)) -> String {
+    state.collections[key]
+        .accepted
+        .as_ref()
+        .unwrap()
+        .catalog_id
+        .clone()
+}
+
+#[test]
+fn store_changes_writes_nothing_of_a_publisher_outside_the_scope_whose_name_a_scoped_one_prefixes()
+{
+    let data = tempfile::tempdir().unwrap();
+    crate::init::run("127.0.0.1:0", data.path()).unwrap();
+    let db = Db::open(&data.path().join("clave.sqlite")).unwrap();
+    let both: BTreeSet<String> = ["a.example", "a.example.net"].map(String::from).into();
+    let before = State::default();
+    let mut after = before.clone();
+    for publisher in &both {
+        after.urls.insert(
+            (publisher.clone(), format!("https://{publisher}/x")),
+            waiting_url("default", '0'),
+        );
+        after.floors.insert(publisher.clone(), 3);
+    }
+    let scope: BTreeSet<String> = ["a.example".to_owned()].into();
+    db.store_state(&before, &after, &scope, "2026-08-09T12:00:00Z")
+        .unwrap();
+
+    let versions = db.waiting_versions(&both).unwrap();
+    assert_eq!(versions["a.example"], 1);
+    assert_eq!(versions["a.example.net"], 0);
+}

@@ -3,7 +3,8 @@ use crate::collection::plan;
 pub(super) use crate::collection::plan::Publication;
 use crate::collection::pull;
 use crate::collection::state::{
-    AcceptedCatalog, CollectionKey, CollectionState, ListItem, ListKey, Place, Record, State,
+    of_publisher, AcceptedCatalog, CollectionKey, CollectionState, ListItem, ListKey, Place,
+    PublisherKey, Record, State,
 };
 use crate::db::{Db, Sealed, StoreHeld};
 use crate::error::Result;
@@ -171,14 +172,9 @@ fn three_way<K: Ord + Clone, V: Clone + PartialEq>(
     base: &mut BTreeMap<K, V>,
     current: &BTreeMap<K, V>,
     merged: &mut BTreeMap<K, V>,
-    own: impl Fn(&K, &V) -> bool,
+    keys: BTreeSet<K>,
     mut take: impl FnMut(&K, Option<&V>, Option<&V>, Option<&V>) -> Taken<V>,
 ) -> std::result::Result<(), String> {
-    let keys: BTreeSet<K> = [&*base, current, &*merged]
-        .into_iter()
-        .flat_map(|map| map.iter().filter(|(key, value)| own(key, value)))
-        .map(|(key, _)| key.clone())
-        .collect();
     let mut decided = Vec::new();
     for key in keys {
         let (was, now) = (base.get(&key), current.get(&key));
@@ -199,6 +195,16 @@ fn three_way<K: Ord + Clone, V: Clone + PartialEq>(
         };
     }
     Ok(())
+}
+
+fn publisher_keys<K: PublisherKey + Clone, V>(
+    maps: [&BTreeMap<K, V>; 3],
+    publisher: &str,
+) -> BTreeSet<K> {
+    maps.into_iter()
+        .flat_map(|map| of_publisher(map, publisher))
+        .map(|(key, _)| key.clone())
+        .collect()
 }
 
 fn without_plan_effects(collection: Option<&CollectionState>) -> Option<CollectionState> {
@@ -253,9 +259,8 @@ impl Floor<'_> {
             .flatten()
             .map(|status| status.url.as_str())
             .collect();
-        let unlisted = self.sealed.iter().find(|(key, record)| {
-            key.0 == self.publisher
-                && record.collection == name
+        let unlisted = of_publisher(self.sealed, self.publisher).find(|(key, record)| {
+            record.collection == name
                 && self.before.get(*key) != Some(*record)
                 && !listed.contains(key.1.as_str())
         });
@@ -267,15 +272,6 @@ impl Floor<'_> {
             None => Ok(()),
         }
     }
-}
-
-fn publisher_entries<'a, K, V>(
-    map: &'a BTreeMap<(String, K), V>,
-    publisher: &'a str,
-) -> impl Iterator<Item = (&'a K, &'a V)> {
-    map.iter()
-        .filter(move |((owner, _), _)| owner == publisher)
-        .map(|((_, key), value)| (key, value))
 }
 
 fn accepted_id(collection: Option<&CollectionState>) -> Option<&str> {
@@ -303,19 +299,15 @@ pub(super) fn splice(
     if current.declaration_files.get(publisher) != base.declaration_files.get(publisher) {
         return Err("served another Declaration file".into());
     }
-    if !publisher_entries(&base.records, publisher)
-        .eq(publisher_entries(&current.records, publisher))
-        || !publisher_entries(&base.removals, publisher)
-            .eq(publisher_entries(&current.removals, publisher))
+    if !of_publisher(&base.records, publisher).eq(of_publisher(&current.records, publisher))
+        || !of_publisher(&base.removals, publisher).eq(of_publisher(&current.removals, publisher))
     {
         return Err("changed its records".into());
     }
-    let refused_in: BTreeSet<String> = base
-        .lists
-        .keys()
-        .chain(merged.lists.keys())
-        .filter(|key| key.0 == publisher && base.lists.get(*key) != merged.lists.get(*key))
-        .map(|(_, name, _)| name.clone())
+    let refused_in: BTreeSet<String> = of_publisher(&base.lists, publisher)
+        .chain(of_publisher(&merged.lists, publisher))
+        .filter(|(key, _)| base.lists.get(*key) != merged.lists.get(*key))
+        .map(|((_, name, _), _)| name.clone())
         .collect();
     if let Some(name) = refused_in.iter().find(|name| {
         accepted_id(base.collection(publisher, name))
@@ -331,11 +323,15 @@ pub(super) fn splice(
         lists: &current.lists,
         publisher,
     };
+    let keys = publisher_keys(
+        [&base.collections, &current.collections, &merged.collections],
+        publisher,
+    );
     three_way(
         &mut base.collections,
         &current.collections,
         &mut merged.collections,
-        |key, _| key.0 == publisher,
+        keys,
         |(_, name), was, now, plan| {
             if without_plan_effects(plan) != without_plan_effects(was) {
                 return Err(format!(
@@ -365,11 +361,12 @@ pub(super) fn splice(
             Ok(Some(taken))
         },
     )?;
+    let keys = publisher_keys([&base.lists, &current.lists, &merged.lists], publisher);
     three_way(
         &mut base.lists,
         &current.lists,
         &mut merged.lists,
-        |key, _| key.0 == publisher,
+        keys,
         |(_, name, catalog_id), was, now, plan| {
             if plan != was {
                 return Err(format!(
@@ -381,11 +378,12 @@ pub(super) fn splice(
             })
         },
     )?;
+    let keys = publisher_keys([&base.urls, &current.urls, &merged.urls], publisher);
     three_way(
         &mut base.urls,
         &current.urls,
         &mut merged.urls,
-        |key, _| key.0 == publisher,
+        keys,
         |_, _, now, plan| {
             let mut taken = now.cloned();
             if let Some(waiting) = taken.as_mut() {
@@ -395,11 +393,17 @@ pub(super) fn splice(
             Ok(taken)
         },
     )?;
+    let keys: BTreeSet<String> = [&base.labels, &current.labels, &merged.labels]
+        .into_iter()
+        .flat_map(|labels| labels.iter())
+        .filter(|(_, label)| label.publisher == publisher)
+        .map(|(id, _)| id.clone())
+        .collect();
     three_way(
         &mut base.labels,
         &current.labels,
         &mut merged.labels,
-        |_, label| label.publisher == publisher,
+        keys,
         |id, was, now, plan| {
             if plan != was {
                 return Err(format!("the Epoch and the pull both change Label {id}"));
@@ -412,11 +416,12 @@ pub(super) fn splice(
             Ok(taken)
         },
     )?;
+    let keys = publisher_keys([&base.floors, &current.floors, &merged.floors], publisher);
     three_way(
         &mut base.floors,
         &current.floors,
         &mut merged.floors,
-        |owner, _| owner == publisher,
+        keys,
         |_, was, now, plan| {
             if plan != was {
                 return Err("the Epoch and the pull both change its discovery floor".into());

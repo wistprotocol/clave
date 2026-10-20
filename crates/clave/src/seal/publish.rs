@@ -8,6 +8,7 @@ use crate::db::{
 };
 use crate::error::{Error, Result};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::Path;
 use wist_core::crypto::SigningKey;
 use wist_core::objects::StatusRejection;
@@ -128,6 +129,20 @@ fn record_sealed_items(db: &Db, prepared: &PreparedEpoch<'_>, entries: &[Value])
     let until = crate::registry::instant(
         sealed_at_s.saturating_add(prepared.payload_window_days.saturating_mul(DAY_SECONDS)),
     )?;
+    let mut publishers: HashMap<(&str, &str), &str> = HashMap::new();
+    for sealed in &prepared.planned.sealed {
+        if let Publication::Item {
+            publisher,
+            url,
+            item,
+            ..
+        } = &sealed.publication
+        {
+            publishers
+                .entry((item.as_str(), url.as_str()))
+                .or_insert(publisher.as_str());
+        }
+    }
     for entry in entries
         .iter()
         .filter(|entry| entry["type"] == "publisher_item")
@@ -135,24 +150,14 @@ fn record_sealed_items(db: &Db, prepared: &PreparedEpoch<'_>, entries: &[Value])
         let item = &entry["body"]["item"];
         let item_id = wist_core::item::item_id(item)?;
         let url = item["url"].as_str().unwrap_or_default();
-        let publisher = prepared
-            .planned
-            .sealed
-            .iter()
-            .find_map(|sealed| match &sealed.publication {
-                Publication::Item {
-                    publisher,
-                    url: sealed_url,
-                    item,
-                    ..
-                } if *item == item_id && sealed_url == url => Some(publisher.clone()),
-                _ => None,
-            })
+        let publisher = publishers
+            .get(&(item_id.as_str(), url))
+            .copied()
             .ok_or_else(|| Error::Seal(format!("a sealed Item of {url} has no publication")))?;
         let kind = wist_core::item::kind(item);
         db.record_sealed_item(
             &item_id,
-            &publisher,
+            publisher,
             match kind {
                 wist_core::item::Kind::Page => crate::collection::state::ItemKind::Page,
                 wist_core::item::Kind::Removed => crate::collection::state::ItemKind::Removed,
@@ -160,7 +165,7 @@ fn record_sealed_items(db: &Db, prepared: &PreparedEpoch<'_>, entries: &[Value])
             prepared.epoch_number,
         )?;
         if kind == wist_core::item::Kind::Page {
-            db.add_payload_duty(&item_id, &publisher, url, &until)?;
+            db.add_payload_duty(&item_id, publisher, url, &until)?;
         }
     }
     for withdrawal in &prepared.withdrawals {

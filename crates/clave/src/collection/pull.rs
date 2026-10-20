@@ -3,8 +3,9 @@ use super::queue::{self, Settled, Settling};
 use super::site::{Answer, Held, Object, Request, Site};
 pub use super::state::Discard;
 use super::state::{
-    AcceptedCatalog, Admission, CollectionState, Discovered, ItemKind, LabelKind, ListItem, Place,
-    QueuedCatalog, ServedFile, State, WaitingLabel, WaitingUrl, CHAIN_DISCARDED,
+    of_publisher, AcceptedCatalog, Admission, CollectionKey, CollectionState, Discovered, ItemKind,
+    LabelKind, ListItem, Place, QueuedCatalog, ServedFile, State, WaitingLabel, WaitingUrl,
+    CHAIN_DISCARDED,
 };
 use crate::error::{Error, Result};
 use serde_json::{json, Value};
@@ -1427,9 +1428,13 @@ pub(crate) fn refresh_waiting(
         return Ok(());
     }
     let candidates = waiting_candidates(state, held, publisher, in_force)?;
-    state
-        .urls
-        .retain(|(p, url), _| p != publisher || candidates.contains_key(url));
+    let gone: Vec<CollectionKey> = of_publisher(&state.urls, publisher)
+        .filter(|((_, url), _)| !candidates.contains_key(url))
+        .map(|(key, _)| key.clone())
+        .collect();
+    for key in &gone {
+        state.urls.remove(key);
+    }
     let fallback = order.len() as u64;
     for (url, candidate) in candidates {
         let position = order

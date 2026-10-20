@@ -284,6 +284,49 @@ pub type CollectionKey = (String, String);
 
 pub type ListKey = (String, String, String);
 
+pub trait PublisherKey: Ord {
+    fn least(publisher: &str) -> Self;
+    fn publisher(&self) -> &str;
+}
+
+impl PublisherKey for String {
+    fn least(publisher: &str) -> Self {
+        publisher.to_owned()
+    }
+
+    fn publisher(&self) -> &str {
+        self
+    }
+}
+
+impl PublisherKey for CollectionKey {
+    fn least(publisher: &str) -> Self {
+        (publisher.to_owned(), String::new())
+    }
+
+    fn publisher(&self) -> &str {
+        &self.0
+    }
+}
+
+impl PublisherKey for ListKey {
+    fn least(publisher: &str) -> Self {
+        (publisher.to_owned(), String::new(), String::new())
+    }
+
+    fn publisher(&self) -> &str {
+        &self.0
+    }
+}
+
+pub fn of_publisher<'a, K: PublisherKey, V>(
+    map: &'a BTreeMap<K, V>,
+    publisher: &'a str,
+) -> impl Iterator<Item = (&'a K, &'a V)> + 'a {
+    map.range(K::least(publisher)..)
+        .take_while(move |(key, _)| key.publisher() == publisher)
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct State {
     pub events: u64,
@@ -313,10 +356,8 @@ impl State {
     }
 
     pub fn collection_names(&self, publisher: &str) -> Vec<String> {
-        self.collections
-            .keys()
-            .filter(|(p, _)| p == publisher)
-            .map(|(_, name)| name.clone())
+        of_publisher(&self.collections, publisher)
+            .map(|((_, name), _)| name.clone())
             .collect()
     }
 
@@ -351,5 +392,67 @@ impl State {
     pub fn first_epoch_given(height: Option<u64>, sealing: Option<u64>) -> u64 {
         let after_head = height.map_or(0, |height| height + 1);
         sealing.map_or(after_head, |sealing| after_head.max(sealing + 1))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn of_publisher_yields_exactly_the_publisher_s_keys_beside_a_publisher_it_prefixes() {
+        let collections: BTreeMap<CollectionKey, u8> = [
+            (("a.example".into(), "default".into()), 1),
+            (("a.example".into(), "z".into()), 2),
+            (("a.example.net".into(), String::new()), 3),
+            (("a.example.net".into(), "default".into()), 4),
+            (("a.exampl".into(), "zz".into()), 5),
+        ]
+        .into();
+        let values: Vec<u8> = of_publisher(&collections, "a.example")
+            .map(|(_, value)| *value)
+            .collect();
+        assert_eq!(values, vec![1, 2]);
+        let values: Vec<u8> = of_publisher(&collections, "a.example.net")
+            .map(|(_, value)| *value)
+            .collect();
+        assert_eq!(values, vec![3, 4]);
+        assert_eq!(of_publisher(&collections, "b.example").count(), 0);
+
+        let lists: BTreeMap<ListKey, u8> = [
+            (("a.example".into(), "default".into(), "x".into()), 1),
+            (("a.example.net".into(), String::new(), String::new()), 2),
+        ]
+        .into();
+        let values: Vec<u8> = of_publisher(&lists, "a.example")
+            .map(|(_, value)| *value)
+            .collect();
+        assert_eq!(values, vec![1]);
+
+        let floors: BTreeMap<String, u8> =
+            [("a.example".into(), 1), ("a.example.net".into(), 2)].into();
+        let values: Vec<u8> = of_publisher(&floors, "a.example")
+            .map(|(_, value)| *value)
+            .collect();
+        assert_eq!(values, vec![1]);
+    }
+
+    #[test]
+    fn collection_names_stop_at_the_exact_publisher() {
+        let mut state = State::default();
+        for (publisher, name) in [
+            ("a.example", "default"),
+            ("a.example.net", "default"),
+            ("a.example.net", "news"),
+        ] {
+            state
+                .collections
+                .insert((publisher.into(), name.into()), CollectionState::default());
+        }
+        assert_eq!(state.collection_names("a.example"), vec!["default"]);
+        assert_eq!(
+            state.collection_names("a.example.net"),
+            vec!["default", "news"]
+        );
     }
 }
