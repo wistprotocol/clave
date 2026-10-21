@@ -261,10 +261,13 @@ tree size is durably stored and retrievable at its path. A full tile or
 bundle is immutable once written, and the partial files at an index are
 removed on the run that first writes the full one. `seal` and `serve`
 start by running distribution, which finishes every interrupted
-publication and restores any file of the head Epoch the disk has lost or
-left torn; lower Epochs are checked by `verify-history` and reopening,
-not at every start. Snapshots are produced separately, as described
-under [Snapshot production](#snapshot-production).
+publication, restores any file of the head Epoch the disk has lost and
+repairs the head's partial files. A full tile or bundle on disk is not
+read again once its Epoch is published, except at `serve` start, the
+only pass that repairs a torn one of the head. Lower Epochs are checked
+by `verify-history` and reopening, not at every start. Snapshots are
+produced separately, as described under
+[Snapshot production](#snapshot-production).
 
 The served layout is:
 

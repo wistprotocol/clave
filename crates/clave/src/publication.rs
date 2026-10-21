@@ -228,19 +228,22 @@ fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<bool> {
 
 /// WIST-3 §6: a partial tile or bundle is removed once the full one at its
 /// index exists.
-fn publish_tree(db: &Db, data_dir: &Path, from: u64, to: u64) -> Result<bool> {
+fn publish_tree(db: &Db, data_dir: &Path, from: u64, to: u64, force: bool) -> Result<bool> {
     let mut wrote = false;
     for bundle in tiles::required_entry_bundles(to) {
         let path = served(data_dir, &bundle.path());
         let (start, end) = bundle.leaf_range();
-        let recompute = bundle.width < TILE_WIDTH || meets((start, end), from, to);
+        let full = bundle.width == TILE_WIDTH;
+        let recompute = !full || (force && meets((start, end), from, to));
         if !recompute && path.exists() {
             continue;
         }
+        #[cfg(test)]
+        entry_reads::count();
         let bytes = tiles::encode_entry_bundle(&db.entry_range(start, end)?)
             .map_err(|e| Error::Seal(e.to_string()))?;
         wrote |= write_if_changed(&path, &bytes)?;
-        if bundle.width == TILE_WIDTH {
+        if full {
             remove_partials(
                 data_dir,
                 &tiles::EntryBundle {
@@ -253,7 +256,7 @@ fn publish_tree(db: &Db, data_dir: &Path, from: u64, to: u64) -> Result<bool> {
     }
     for tile in tiles::required_tiles(to) {
         let path = served(data_dir, &tile.path());
-        let recompute = tile.width < TILE_WIDTH || meets(tile.leaf_range(), from, to);
+        let recompute = tile.width < TILE_WIDTH || (force && meets(tile.leaf_range(), from, to));
         if !recompute && path.exists() {
             continue;
         }
@@ -293,7 +296,13 @@ fn remove_partials(data_dir: &Path, partial_path: &str) -> Result<()> {
     Ok(())
 }
 
-fn publish_epoch(db: &Db, data_dir: &Path, epoch_number: u64, note: &str) -> Result<bool> {
+fn publish_epoch(
+    db: &Db,
+    data_dir: &Path,
+    epoch_number: u64,
+    note: &str,
+    force: bool,
+) -> Result<bool> {
     let checkpoint = Checkpoint::parse(note).map_err(|e| Error::Seal(e.to_string()))?;
     if checkpoint.epoch_number() != epoch_number {
         return Err(Error::Seal(
@@ -301,7 +310,7 @@ fn publish_epoch(db: &Db, data_dir: &Path, epoch_number: u64, note: &str) -> Res
         ));
     }
     let from = db.size_before(epoch_number)?;
-    let mut wrote = publish_tree(db, data_dir, from, checkpoint.tree_size())?;
+    let mut wrote = publish_tree(db, data_dir, from, checkpoint.tree_size(), force)?;
     wrote |= write_if_changed(&archive_path(data_dir, epoch_number), note.as_bytes())?;
     wrote |= write_if_changed(&head_path(data_dir), note.as_bytes())?;
     Ok(wrote)
@@ -317,7 +326,7 @@ pub fn finish_committed(db: &Db, data_dir: &Path) -> Result<Vec<u64>> {
     let mut published = Vec::new();
     for (epoch_number, note) in db.unpublished_publications()? {
         db.check_fence()?;
-        publish_epoch(db, data_dir, epoch_number, &note)?;
+        publish_epoch(db, data_dir, epoch_number, &note, true)?;
         db.mark_published(epoch_number)?;
         published.push(epoch_number);
     }
@@ -328,11 +337,7 @@ const SERVED_PAYLOAD_BATCH: usize = 1_000;
 
 /// WIST-3 §6.1: the Payload of every page Item an Epoch seals is served before its Checkpoint.
 fn serve_duty_payloads(db: &Db, data_dir: &Path) -> Result<()> {
-    let unserved: Vec<_> = db
-        .payload_duties()?
-        .into_iter()
-        .filter(|duty| !duty.served)
-        .collect();
+    let unserved = db.unserved_payload_duties()?;
     for batch in unserved.chunks(SERVED_PAYLOAD_BATCH) {
         db.check_fence()?;
         let mut directories = BTreeSet::new();
@@ -384,7 +389,8 @@ fn repair(db: &Db, data_dir: &Path, every_document: bool) -> Result<Vec<u64>> {
     let mut republished = finish_committed(db, data_dir)?;
     if let Some((epoch_number, note)) = db.head_publication()? {
         db.check_fence()?;
-        if !republished.contains(&epoch_number) && publish_epoch(db, data_dir, epoch_number, &note)?
+        if !republished.contains(&epoch_number)
+            && publish_epoch(db, data_dir, epoch_number, &note, every_document)?
         {
             republished.push(epoch_number);
         }
@@ -404,4 +410,124 @@ pub fn republish_checkpoint(db: &Db, data_dir: &Path, epoch_number: u64, note: &
         write_durable(&head_path(data_dir), note.as_bytes())?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod entry_reads {
+    use std::cell::Cell;
+
+    thread_local! {
+        static READS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(super) fn count() {
+        READS.with(|reads| reads.set(reads.get() + 1));
+    }
+
+    pub(super) fn take() -> u64 {
+        READS.with(|reads| reads.replace(0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::tests::{signing_key, LOG_ID};
+    use std::collections::BTreeMap;
+    use std::time::SystemTime;
+
+    const ENTRIES: u64 = 300;
+
+    fn published_store(data_dir: &Path) -> Db {
+        let db = Db::open(&data_dir.join("clave.sqlite")).unwrap();
+        let entries: Vec<serde_json::Value> = (0..ENTRIES)
+            .map(|index| serde_json::json!({"type": "test", "index": index}))
+            .collect();
+        db.commit_seal(
+            &signing_key(),
+            LOG_ID,
+            &[],
+            0,
+            "2026-08-09T12:00:00Z",
+            &entries,
+            0,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(finish_committed(&db, data_dir).unwrap(), vec![0]);
+        db
+    }
+
+    fn modified(directory: &Path, into: &mut BTreeMap<PathBuf, SystemTime>) {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                modified(&path, into);
+            } else {
+                let time = std::fs::metadata(&path).unwrap().modified().unwrap();
+                into.insert(path, time);
+            }
+        }
+    }
+
+    fn files(data_dir: &Path) -> BTreeMap<PathBuf, SystemTime> {
+        let mut found = BTreeMap::new();
+        for directory in ["tile", "log"] {
+            modified(&data_dir.join(directory), &mut found);
+        }
+        found.insert(
+            head_path(data_dir),
+            std::fs::metadata(head_path(data_dir))
+                .unwrap()
+                .modified()
+                .unwrap(),
+        );
+        found
+    }
+
+    #[test]
+    fn republishing_a_published_head_writes_no_file_and_reads_only_the_partial_bundle() {
+        let data = tempfile::tempdir().unwrap();
+        let db = published_store(data.path());
+        let before = files(data.path());
+        assert!(before.contains_key(&data.path().join("tile/entries/000")));
+        assert!(before.contains_key(&data.path().join("tile/0/000")));
+        entry_reads::take();
+
+        assert!(recover(&db, data.path()).unwrap().is_empty());
+
+        assert_eq!(entry_reads::take(), 1);
+        assert_eq!(files(data.path()), before);
+    }
+
+    #[test]
+    fn publishing_an_unpublished_epoch_rereads_the_full_bundles_it_overlaps() {
+        let data = tempfile::tempdir().unwrap();
+        published_store(data.path());
+        assert_eq!(entry_reads::take(), 2);
+    }
+
+    #[test]
+    fn recovery_at_start_restores_a_deleted_full_bundle_and_tile_of_the_head() {
+        let data = tempfile::tempdir().unwrap();
+        let db = published_store(data.path());
+        let bundle = data.path().join("tile/entries/000");
+        let tile = data.path().join("tile/0/000");
+        let (bundle_bytes, tile_bytes) = (
+            std::fs::read(&bundle).unwrap(),
+            std::fs::read(&tile).unwrap(),
+        );
+        std::fs::write(&tile, b"torn").unwrap();
+        std::fs::remove_file(&bundle).unwrap();
+
+        assert_eq!(recover_at_start(&db, data.path()).unwrap(), vec![0]);
+
+        assert_eq!(std::fs::read(&bundle).unwrap(), bundle_bytes);
+        assert_eq!(std::fs::read(&tile).unwrap(), tile_bytes);
+    }
 }

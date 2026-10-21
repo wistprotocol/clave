@@ -415,6 +415,8 @@ pub struct WitnessRow {
     pub last_size: u64,
 }
 
+const STATEMENT_CACHE_CAPACITY: usize = 128;
+
 pub struct Db {
     conn: Connection,
     fence: Option<Fence>,
@@ -482,6 +484,7 @@ impl Db {
                 | rusqlite::trace::TraceEventCodes::SQLITE_TRACE_PROFILE,
             Some(statement_event),
         );
+        conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
         conn.busy_timeout(std::time::Duration::from_millis(60_000))?;
         let _mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
         conn.pragma_update(None, "synchronous", "FULL")?;
@@ -1213,7 +1216,8 @@ impl Db {
         }
         let tx = self.mutation()?;
         for rowid in sealed_rowids {
-            tx.execute("DELETE FROM pending_entries WHERE rowid = ?1", [rowid])?;
+            tx.prepare_cached("DELETE FROM pending_entries WHERE rowid = ?1")?
+                .execute([rowid])?;
         }
         let previous_size = self.size_before(epoch_number)?;
         let mut leaf_data = Vec::with_capacity(entries.len());
@@ -1239,11 +1243,14 @@ impl Db {
             checkpoint.sign(signer);
         }
         if let Some(entries) = key_entries {
-            tx.execute("DELETE FROM aggregator_keys", [])?;
+            tx.prepare_cached("DELETE FROM aggregator_keys")?
+                .execute([])?;
             for entry in entries {
                 let public_key = wist_core::crypto::PublicKey::from_b64u(&entry.public_key)?;
-                tx.execute(
+                tx.prepare_cached(
                     "INSERT INTO aggregator_keys(note_key_id, key_id, public_key, added_epoch, removed_epoch, adding_act, removing_act) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                )?
+                .execute(
                     (
                         wist_core::crypto::hex_encode(&wist_core::checkpoint::aggregator_key_id(
                             log_id,
@@ -1274,8 +1281,10 @@ impl Db {
             sealed_at: sealed_at.to_owned(),
         };
         tree::put_entries(&tx, epoch_number, previous_size, &leaf_data)?;
-        tx.execute(
+        tx.prepare_cached(
             "INSERT INTO epochs(epoch_number, tree_size, root, sealed_at, note, published, epoch_bytes) VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)",
+        )?
+        .execute(
             (
                 epoch_number as i64,
                 tree_size as i64,
@@ -1286,10 +1295,12 @@ impl Db {
             ),
         )?;
         for d in declarations {
-            tx.execute(
+            tx.prepare_cached(
                 "INSERT INTO sealed_declarations(domain, seq, epoch_number, sealed_at, declaration_json) VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(domain, seq) DO UPDATE SET epoch_number = excluded.epoch_number, sealed_at = excluded.sealed_at, declaration_json = excluded.declaration_json
                  WHERE (SELECT rejected = 1 OR judged = 0 FROM epochs WHERE epoch_number = sealed_declarations.epoch_number)",
+            )?
+            .execute(
                 (
                     d.domain,
                     d.seq as i64,
@@ -1300,34 +1311,41 @@ impl Db {
             )?;
         }
         if epoch_number == 0 {
-            tx.execute("DELETE FROM genesis_params", [])?;
+            tx.prepare_cached("DELETE FROM genesis_params")?
+                .execute([])?;
         }
         for c in param_changes {
-            tx.execute(
+            tx.prepare_cached(
                 "INSERT INTO param_changes(parameter, value, effective_at, epoch_number, entry_index) VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?
+            .execute(
                 (c.parameter, c.value, c.effective_at, epoch_number as i64, c.entry_index),
             )?;
         }
         for w in withdrawals {
-            tx.execute(
+            tx.prepare_cached(
                 "INSERT INTO withdrawals(item_id, domain, update_id, epoch_number, sealed_at) VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(item_id) DO UPDATE SET domain = excluded.domain, update_id = excluded.update_id, epoch_number = excluded.epoch_number, sealed_at = excluded.sealed_at
                  WHERE (SELECT rejected = 1 OR judged = 0 FROM epochs WHERE epoch_number = withdrawals.epoch_number)",
+            )?
+            .execute(
                 (w.item_id, w.domain, w.update_id, epoch_number as i64, sealed_at),
             )?;
         }
         for identifier in suffix_lists {
-            tx.execute(
+            tx.prepare_cached(
                 "INSERT INTO suffix_list_acts(epoch_number, sha256) VALUES (?1, ?2)",
-                (epoch_number as i64, identifier),
-            )?;
+            )?
+            .execute((epoch_number as i64, identifier))?;
         }
         for row in labels {
             let label = row.label;
-            tx.execute(
+            tx.prepare_cached(
                 "INSERT INTO labels(label_id, labeler, subject, name, value, asserted_at, retracted, expires_at, delta, epoch_number, entry_index) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                  ON CONFLICT(label_id) DO UPDATE SET labeler = excluded.labeler, subject = excluded.subject, name = excluded.name, value = excluded.value, asserted_at = excluded.asserted_at, retracted = excluded.retracted, expires_at = excluded.expires_at, delta = excluded.delta, epoch_number = excluded.epoch_number, entry_index = excluded.entry_index
                  WHERE (SELECT rejected = 1 OR judged = 0 FROM epochs WHERE epoch_number = labels.epoch_number)",
+            )?
+            .execute(
                 rusqlite::params![
                     row.label_id,
                     label.labeler,
@@ -1345,10 +1363,12 @@ impl Db {
         }
         for row in disputes {
             let dispute = row.dispute;
-            tx.execute(
+            tx.prepare_cached(
                 "INSERT INTO disputes(dispute_id, label_id, disputant, reason, asserted_at, epoch_number, entry_index) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT(dispute_id) DO UPDATE SET label_id = excluded.label_id, disputant = excluded.disputant, reason = excluded.reason, asserted_at = excluded.asserted_at, epoch_number = excluded.epoch_number, entry_index = excluded.entry_index
                  WHERE (SELECT rejected = 1 OR judged = 0 FROM epochs WHERE epoch_number = disputes.epoch_number)",
+            )?
+            .execute(
                 rusqlite::params![
                     row.dispute_id,
                     dispute.label,
@@ -1360,6 +1380,7 @@ impl Db {
                 ],
             )?;
         }
+        self.store_parameter_cache()?;
         tx.commit()?;
         Ok(epoch)
     }
@@ -1547,6 +1568,15 @@ impl Db {
                 "UPDATE epochs SET judged = 1, rejected = ?2 WHERE epoch_number = ?1",
                 (epoch_number as i64, rejected),
             )?;
+            let remarked = marked.is_some_and(|(_, marked)| marked != rejected);
+            if remarked
+                && conn.execute(
+                    "DELETE FROM parameter_schedule_cache WHERE epoch_number >= ?1",
+                    [epoch_number as i64],
+                )? > 0
+            {
+                self.store_parameter_cache()?;
+            }
             // WIST-3 §3.3, Rejected Epochs; WIST-3 §3.2 and WIST-2 §5.5 for the seen IDs.
             if rejected {
                 conn.execute(
@@ -1810,11 +1840,26 @@ impl Db {
         &self,
         first_epoch_s: i64,
     ) -> Result<(wist_core::parameters::Schedule, u64)> {
-        let mut stmt = self.conn.prepare(
-            "SELECT epoch_number, sealed_at, epoch_bytes, rejected FROM epochs ORDER BY epoch_number",
+        let cached: Option<(i64, u64, Vec<u8>)> = self
+            .conn
+            .prepare_cached(
+                "SELECT c.epoch_number, c.largest, c.schedule_json FROM parameter_schedule_cache c JOIN epochs e ON e.epoch_number = c.epoch_number AND e.root = c.root WHERE c.id = 1",
+            )?
+            .query_row([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .optional()?;
+        let cached = cached.and_then(|(epoch_number, largest, json)| {
+            serde_json::from_slice::<wist_core::parameters::Schedule>(&json)
+                .ok()
+                .map(|schedule| (epoch_number, largest, schedule))
+        });
+        let above = cached
+            .as_ref()
+            .map_or(-1, |(epoch_number, _, _)| *epoch_number);
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT epoch_number, sealed_at, epoch_bytes, rejected FROM epochs WHERE epoch_number > ?1 ORDER BY epoch_number",
         )?;
         let epochs = stmt
-            .query_map([], |row| {
+            .query_map([above], |row| {
                 Ok((
                     row.get::<_, u64>(0)?,
                     row.get::<_, String>(1)?,
@@ -1823,17 +1868,22 @@ impl Db {
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        let first = epochs
-            .first()
-            .map(|b| crate::registry::unix(&b.1))
-            .transpose()?
-            .unwrap_or(first_epoch_s);
-        let mut schedule = wist_core::parameters::Schedule::new(first);
-        let mut stmt = self.conn.prepare(
-            "SELECT parameter, value, epoch_number, entry_index, effective_at FROM param_changes ORDER BY epoch_number, entry_index",
+        let (mut schedule, mut largest) = match cached {
+            Some((_, largest, schedule)) => (schedule, largest),
+            None => {
+                let first = epochs
+                    .first()
+                    .map(|b| crate::registry::unix(&b.1))
+                    .transpose()?
+                    .unwrap_or(first_epoch_s);
+                (wist_core::parameters::Schedule::new(first), 0)
+            }
+        };
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT parameter, value, epoch_number, entry_index, effective_at FROM param_changes WHERE epoch_number > ?1 ORDER BY epoch_number, entry_index",
         )?;
         let changes = stmt
-            .query_map([], |row| {
+            .query_map([above], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, i64>(1)?,
@@ -1844,7 +1894,6 @@ impl Db {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let mut changes = changes.into_iter().peekable();
-        let mut largest = 0;
         for (height, sealed_at, bytes, rejected) in epochs {
             let tentative = largest.max(bytes);
             let at = crate::registry::unix(&sealed_at)?;
@@ -1878,6 +1927,24 @@ impl Db {
             ));
         }
         Ok((schedule, largest))
+    }
+
+    fn store_parameter_cache(&self) -> Result<()> {
+        let Some(head) = self.last_epoch()? else {
+            return Ok(());
+        };
+        let (schedule, largest) = self.replay_parameters(0)?;
+        self.conn
+            .prepare_cached(
+                "INSERT OR REPLACE INTO parameter_schedule_cache(id, epoch_number, root, largest, schedule_json) VALUES (1, ?1, ?2, ?3, ?4)",
+            )?
+            .execute((
+                head.epoch_number as i64,
+                &head.root,
+                largest as i64,
+                serde_json::to_vec(&schedule)?,
+            ))?;
+        Ok(())
     }
 
     pub fn parameter_state(&self, at: &str) -> Result<Vec<(String, i64, String)>> {
@@ -2479,6 +2546,280 @@ pub(crate) mod tests {
             crate::registry::effective(&db, "feed_window", "2026-01-25T00:00:00Z").unwrap(),
             800
         );
+    }
+
+    fn change<'a>(parameter: &'a str, value: i64, effective_at: &'a str) -> ParamChangeRow<'a> {
+        ParamChangeRow {
+            entry_index: 0,
+            parameter,
+            value,
+            effective_at,
+        }
+    }
+
+    fn seal_sized(
+        db: &Db,
+        epoch_number: u64,
+        sealed_at: &str,
+        bytes: u64,
+        changes: &[ParamChangeRow],
+    ) {
+        db.commit_seal(
+            &signing_key(),
+            LOG_ID,
+            &[],
+            epoch_number,
+            sealed_at,
+            &[],
+            bytes,
+            changes,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+    }
+
+    const REPLAY_INSTANTS: [&str; 5] = [
+        "2026-01-01T00:00:00Z",
+        "2026-01-15T00:00:00Z",
+        "2026-02-01T00:00:00Z",
+        "2026-03-01T00:00:00Z",
+        "2026-06-01T00:00:00Z",
+    ];
+
+    fn replays(db: &Db) -> Vec<(Value, u64)> {
+        REPLAY_INSTANTS
+            .iter()
+            .map(|at| {
+                let at = crate::registry::unix(at).unwrap();
+                let schedule = db.parameter_schedule(at).unwrap();
+                (
+                    serde_json::to_value(&schedule).unwrap(),
+                    db.largest_epoch_bytes().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    fn cache_rows(db: &Db) -> i64 {
+        db.conn
+            .query_row("SELECT COUNT(*) FROM parameter_schedule_cache", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    }
+
+    fn sealed_parameter_history(db: &Db) {
+        seal_sized(
+            db,
+            0,
+            "2026-01-01T00:00:00Z",
+            100,
+            &[change("feed_window", 500, "2026-01-10T00:00:00Z")],
+        );
+        seal_sized(
+            db,
+            1,
+            "2026-01-02T00:00:00Z",
+            200,
+            &[change("feed_window", 800, "2026-01-20T00:00:00Z")],
+        );
+        seal_sized(
+            db,
+            2,
+            "2026-01-03T00:00:00Z",
+            300,
+            &[change("feed_window", 900, "2026-01-03T01:00:00Z")],
+        );
+        seal_sized(
+            db,
+            3,
+            "2026-01-04T00:00:00Z",
+            400,
+            &[change("feed_window", 700, "2026-02-01T00:00:00Z")],
+        );
+        db.record_epoch_judgment(3, true).unwrap();
+        seal_sized(
+            db,
+            4,
+            "2026-01-05T00:00:00Z",
+            1 << 40,
+            &[change("feed_window", 600, "2026-02-10T00:00:00Z")],
+        );
+        seal_sized(
+            db,
+            5,
+            "2026-01-06T00:00:00Z",
+            500,
+            &[change("feed_window", 400, "2026-03-01T00:00:00Z")],
+        );
+    }
+
+    #[test]
+    fn the_cached_parameter_replay_equals_the_replay_from_genesis() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+        sealed_parameter_history(&db);
+        assert_eq!(cache_rows(&db), 1);
+        let cached = replays(&db);
+
+        db.conn
+            .execute("DELETE FROM parameter_schedule_cache", [])
+            .unwrap();
+        let from_genesis = replays(&db);
+
+        assert_eq!(cached, from_genesis);
+        assert_eq!(cache_rows(&db), 0);
+        for (at, value) in [("2026-01-15T00:00:00Z", 500), ("2026-02-15T00:00:00Z", 800)] {
+            let at = crate::registry::unix(at).unwrap();
+            assert_eq!(
+                db.parameter_schedule(at)
+                    .unwrap()
+                    .value_at("feed_window", at),
+                Some(value)
+            );
+        }
+        let at = crate::registry::unix("2026-06-01T00:00:00Z").unwrap();
+        assert_eq!(
+            db.parameter_schedule(at)
+                .unwrap()
+                .value_at("feed_window", at),
+            Some(400)
+        );
+        assert_eq!(db.largest_epoch_bytes().unwrap(), 500);
+    }
+
+    #[test]
+    fn rejecting_a_cached_epoch_replaces_the_cache_with_the_replay_that_omits_its_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+        seal_sized(&db, 0, "2026-01-01T00:00:00Z", 100, &[]);
+        seal_sized(
+            &db,
+            1,
+            "2026-01-02T00:00:00Z",
+            200,
+            &[change("feed_window", 800, "2026-01-20T00:00:00Z")],
+        );
+        let at = crate::registry::unix("2026-02-01T00:00:00Z").unwrap();
+        assert_eq!(
+            db.parameter_schedule(at)
+                .unwrap()
+                .value_at("feed_window", at),
+            Some(800)
+        );
+
+        db.record_epoch_judgment(1, true).unwrap();
+
+        assert_eq!(cache_rows(&db), 1);
+        assert_eq!(
+            db.parameter_schedule(at)
+                .unwrap()
+                .value_at("feed_window", at),
+            Some(1000)
+        );
+        let cached = replays(&db);
+        db.conn
+            .execute("DELETE FROM parameter_schedule_cache", [])
+            .unwrap();
+        assert_eq!(cached, replays(&db));
+    }
+
+    #[test]
+    fn the_parameter_replay_starts_from_a_cache_naming_a_held_epoch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+        sealed_parameter_history(&db);
+        let genesis = serde_json::to_vec(&wist_core::parameters::Schedule::new(0)).unwrap();
+        db.conn
+            .execute(
+                "UPDATE parameter_schedule_cache SET schedule_json = ?1, largest = 7",
+                [&genesis],
+            )
+            .unwrap();
+
+        let at = crate::registry::unix("2026-06-01T00:00:00Z").unwrap();
+        assert_eq!(
+            db.parameter_schedule(at)
+                .unwrap()
+                .value_at("feed_window", at),
+            Some(1000)
+        );
+        assert_eq!(db.largest_epoch_bytes().unwrap(), 7);
+    }
+
+    #[test]
+    fn a_cache_naming_an_epoch_the_store_lacks_or_unreadable_is_ignored_and_left_unwritten() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+        sealed_parameter_history(&db);
+        let expected = replays(&db);
+        let genesis = serde_json::to_vec(&wist_core::parameters::Schedule::new(0)).unwrap();
+        for (tamper, schedule) in [
+            (
+                "UPDATE parameter_schedule_cache SET epoch_number = 9, schedule_json = ?1",
+                genesis.as_slice(),
+            ),
+            (
+                "UPDATE parameter_schedule_cache SET epoch_number = 5, root = 'other', schedule_json = ?1",
+                genesis.as_slice(),
+            ),
+            (
+                "UPDATE parameter_schedule_cache SET epoch_number = 5, root = (SELECT root FROM epochs WHERE epoch_number = 5), schedule_json = ?1",
+                b"{}".as_slice(),
+            ),
+        ] {
+            db.conn.execute(tamper, [schedule]).unwrap();
+            let held: (i64, String) = db
+                .conn
+                .query_row(
+                    "SELECT epoch_number, root FROM parameter_schedule_cache",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+
+            assert_eq!(replays(&db), expected);
+
+            let after: (i64, String) = db
+                .conn
+                .query_row(
+                    "SELECT epoch_number, root FROM parameter_schedule_cache",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(after, held);
+        }
+    }
+
+    #[test]
+    fn unserved_payload_duties_omit_the_served_in_publisher_url_and_item_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+        for (item_id, publisher, url) in [
+            ("sha256:03", "b.example", "https://b.example/a"),
+            ("sha256:02", "a.example", "https://a.example/z"),
+            ("sha256:01", "a.example", "https://a.example/y"),
+            ("sha256:04", "a.example", "https://a.example/x"),
+        ] {
+            db.add_payload_duty(item_id, publisher, url, "2026-12-01T00:00:00Z")
+                .unwrap();
+        }
+        db.mark_payloads_served(&["sha256:04".to_owned()]).unwrap();
+
+        let unserved: Vec<String> = db
+            .unserved_payload_duties()
+            .unwrap()
+            .into_iter()
+            .map(|duty| duty.item_id)
+            .collect();
+
+        assert_eq!(unserved, ["sha256:01", "sha256:02", "sha256:03"]);
+        assert_eq!(db.payload_duties().unwrap().len(), 4);
     }
 
     fn store_with_required_publisher_columns(path: &Path, floor: bool) {

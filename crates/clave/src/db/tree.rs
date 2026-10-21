@@ -109,11 +109,11 @@ pub(super) fn append(
     }
     let root = merkle::root_from(&extended, size).map_err(merkle_failure)?;
     for (level, index, bytes) in written {
-        conn.execute(
+        conn.prepare_cached(
             "INSERT INTO log_tiles(level, tile_index, hashes) VALUES (?1, ?2, ?3)
              ON CONFLICT(level, tile_index) DO UPDATE SET hashes = excluded.hashes",
-            (i64::from(level), index as i64, bytes),
-        )?;
+        )?
+        .execute((i64::from(level), index as i64, bytes))?;
     }
     Ok(root)
 }
@@ -124,15 +124,15 @@ pub(super) fn put_entries(
     first_index: u64,
     entries: &[Vec<u8>],
 ) -> Result<()> {
+    let mut statement = conn.prepare_cached(
+        "INSERT INTO log_entries(leaf_index, epoch_number, entry_json) VALUES (?1, ?2, ?3)",
+    )?;
     for (offset, entry) in entries.iter().enumerate() {
-        conn.execute(
-            "INSERT INTO log_entries(leaf_index, epoch_number, entry_json) VALUES (?1, ?2, ?3)",
-            (
-                (first_index + offset as u64) as i64,
-                epoch_number as i64,
-                entry,
-            ),
-        )?;
+        statement.execute((
+            (first_index + offset as u64) as i64,
+            epoch_number as i64,
+            entry,
+        ))?;
     }
     Ok(())
 }

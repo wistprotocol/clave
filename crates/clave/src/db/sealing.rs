@@ -312,9 +312,19 @@ impl Db {
     }
 
     pub fn payload_duties(&self) -> Result<Vec<PayloadDutyRow>> {
-        let mut statement = self.conn.prepare(
+        self.duty_rows(
             "SELECT item_id, publisher, url, until, served FROM payload_duties ORDER BY publisher, url, item_id",
-        )?;
+        )
+    }
+
+    pub fn unserved_payload_duties(&self) -> Result<Vec<PayloadDutyRow>> {
+        self.duty_rows(
+            "SELECT item_id, publisher, url, until, served FROM payload_duties WHERE served = 0 ORDER BY publisher, url, item_id",
+        )
+    }
+
+    fn duty_rows(&self, sql: &str) -> Result<Vec<PayloadDutyRow>> {
+        let mut statement = self.conn.prepare(sql)?;
         let rows = statement
             .query_map([], |row| {
                 Ok(PayloadDutyRow {

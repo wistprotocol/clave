@@ -990,16 +990,16 @@ fn store_collection(
     at: &str,
 ) -> Result<()> {
     let Some(collection) = collection else {
-        conn.execute(
-            "DELETE FROM collections WHERE publisher = ?1 AND name = ?2",
-            (publisher, name),
-        )?;
+        conn.prepare_cached("DELETE FROM collections WHERE publisher = ?1 AND name = ?2")?
+            .execute((publisher, name))?;
         return Ok(());
     };
     let latest = collection.latest.as_ref();
     let accepted = collection.accepted.as_ref();
-    conn.execute(
+    conn.prepare_cached(
         "INSERT OR REPLACE INTO collections(publisher, name, latest_envelope, latest_id, latest_height, latest_base, accepted_envelope, accepted_id, accepted_key, accepted_base, accepted_failed_c1, accepted_failed_c4, accepted_event, accepted_position, accepted_eligibility, left_chain, catalog_octets, catalog_validator, accepted_read) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+    )?
+    .execute(
         rusqlite::params![
             publisher,
             name,
@@ -1030,13 +1030,15 @@ fn store_collection(
     let previous = before.and_then(|before| before.discarded_chain.as_ref());
     if let Some(chain) = &collection.discarded_chain {
         if previous != Some(chain) {
-            conn.execute(
+            conn.prepare_cached(
                 "DELETE FROM rejections WHERE domain = ?1 AND collection = ?2 AND code = ?3",
-                (publisher, name, CHAIN_DISCARDED),
-            )?;
+            )?
+            .execute((publisher, name, CHAIN_DISCARDED))?;
             let at = if chain.at.is_empty() { at } else { &chain.at };
-            conn.execute(
+            conn.prepare_cached(
                 "INSERT INTO rejections(domain, code, at, id, collection, condition, change_list) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?
+            .execute(
                 (
                     publisher,
                     CHAIN_DISCARDED,
@@ -1053,8 +1055,10 @@ fn store_collection(
 }
 
 fn insert_list_item(conn: &Connection, key: &ListKey, idx: usize, item: &ListItem) -> Result<()> {
-    conn.execute(
+    conn.prepare_cached(
         "INSERT OR REPLACE INTO list_items(publisher, name, catalog_id, idx, url, item_id, kind, admission, code, read) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+    )?
+    .execute(
         rusqlite::params![
             key.0,
             key.1,
@@ -1086,17 +1090,21 @@ fn store_list(
             }
         }
         _ => {
-            conn.execute(
+            conn.prepare_cached(
                 "DELETE FROM list_items WHERE publisher = ?1 AND name = ?2 AND catalog_id = ?3",
-                (&key.0, &key.1, &key.2),
-            )?;
+            )?
+            .execute((&key.0, &key.1, &key.2))?;
             match list {
-                Some(_) => conn.execute(
+                Some(_) => conn.prepare_cached(
                     "INSERT OR IGNORE INTO lists(publisher, name, catalog_id) VALUES (?1, ?2, ?3)",
+                )?
+                .execute(
                     (&key.0, &key.1, &key.2),
                 )?,
-                None => conn.execute(
+                None => conn.prepare_cached(
                     "DELETE FROM lists WHERE publisher = ?1 AND name = ?2 AND catalog_id = ?3",
+                )?
+                .execute(
                     (&key.0, &key.1, &key.2),
                 )?,
             };
@@ -1110,10 +1118,8 @@ fn store_list(
 
 fn store_queue(conn: &Connection, publisher: &str, queue: Option<&RecoveryQueue>) -> Result<()> {
     for table in ["catalog_queues", "catalog_queue", "catalog_queue_first"] {
-        conn.execute(
-            &format!("DELETE FROM {table} WHERE publisher = ?1"),
-            [publisher],
-        )?;
+        conn.prepare_cached(&format!("DELETE FROM {table} WHERE publisher = ?1"))?
+            .execute([publisher])?;
     }
     let Some(queue) = queue else {
         return Ok(());
@@ -1122,13 +1128,13 @@ fn store_queue(conn: &Connection, publisher: &str, queue: Option<&RecoveryQueue>
         queue.end_s.map(i64::try_from).transpose().map_err(|_| {
             Error::History("a recovery window ends outside the stored range".into())
         })?;
-    conn.execute(
-        "INSERT INTO catalog_queues(publisher, owner, end_s) VALUES (?1, ?2, ?3)",
-        (publisher, &queue.owner, end_s),
-    )?;
+    conn.prepare_cached("INSERT INTO catalog_queues(publisher, owner, end_s) VALUES (?1, ?2, ?3)")?
+        .execute((publisher, &queue.owner, end_s))?;
     for ((name, key), queued) in &queue.queued {
-        conn.execute(
+        conn.prepare_cached(
             "INSERT INTO catalog_queue(publisher, name, key_x, envelope, catalog_id, place_event, place_position, sources_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        )?
+        .execute(
             rusqlite::params![
                 publisher,
                 name,
@@ -1142,8 +1148,10 @@ fn store_queue(conn: &Connection, publisher: &str, queue: Option<&RecoveryQueue>
         )?;
     }
     for (name, first) in &queue.first {
-        conn.execute(
+        conn.prepare_cached(
             "INSERT INTO catalog_queue_first(publisher, name, place_event, place_position) VALUES (?1, ?2, ?3, ?4)",
+        )?
+        .execute(
             (publisher, name, int(first.event), int(first.position)),
         )?;
     }
@@ -1155,13 +1163,13 @@ fn store_discovered(
     publisher: &str,
     found: Option<&Vec<Discovered>>,
 ) -> Result<()> {
-    conn.execute(
-        "DELETE FROM discovered_declarations WHERE domain = ?1",
-        [publisher],
-    )?;
+    conn.prepare_cached("DELETE FROM discovered_declarations WHERE domain = ?1")?
+        .execute([publisher])?;
     for (ord, found) in found.into_iter().flatten().enumerate() {
-        conn.execute(
+        conn.prepare_cached(
             "INSERT INTO discovered_declarations(domain, hash, ord, envelope, event, last_sealed_at_discovery, reduces_authority, last_seal_height, competitor, competes_with) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        )?
+        .execute(
             rusqlite::params![
                 publisher,
                 found.hash,
@@ -1181,11 +1189,14 @@ fn store_discovered(
 
 fn store_label(conn: &Connection, id: &str, label: Option<&WaitingLabel>) -> Result<()> {
     let Some(label) = label else {
-        conn.execute("DELETE FROM pending_entries WHERE label_id = ?1", [id])?;
+        conn.prepare_cached("DELETE FROM pending_entries WHERE label_id = ?1")?
+            .execute([id])?;
         return Ok(());
     };
-    let updated = conn.execute(
+    let updated = conn.prepare_cached(
         "UPDATE pending_entries SET place_event = ?2, place_position = ?3, place_index = ?4, eligibility = ?5 WHERE label_id = ?1",
+    )?
+    .execute(
         rusqlite::params![
             id,
             int(label.place.event),
@@ -1201,8 +1212,10 @@ fn store_label(conn: &Connection, id: &str, label: Option<&WaitingLabel>) -> Res
 }
 
 fn insert_waiting_label(conn: &Connection, id: &str, label: &WaitingLabel) -> Result<()> {
-    conn.execute(
+    conn.prepare_cached(
         "INSERT INTO pending_entries(entry_type, domain, entry_json, chain_pos, label_id, place_event, place_position, place_index, eligibility) VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, ?7, ?8)",
+    )?
+    .execute(
         rusqlite::params![
             label.kind.as_str(),
             label.publisher,
@@ -1232,10 +1245,10 @@ pub(crate) fn store_changes(
                 "the acceptance clock has no event left to assign".into(),
             ));
         }
-        conn.execute(
+        conn.prepare_cached(
             "UPDATE acceptance_clock SET position = MAX(position, ?1) WHERE id = 1",
-            [int(after.events - 1)],
-        )?;
+        )?
+        .execute([int(after.events - 1)])?;
     }
     for (key, collection) in in_scope(&before.collections, &after.collections, publishers) {
         store_collection(conn, key, collection, before.collections.get(key), at)?;
@@ -1248,12 +1261,16 @@ pub(crate) fn store_changes(
     for ((publisher, url), waiting) in in_scope(&before.urls, &after.urls, publishers) {
         written.insert(publisher);
         match waiting {
-            None => conn.execute(
+            None => conn.prepare_cached(
                 "DELETE FROM waiting_urls WHERE publisher = ?1 AND url = ?2",
+            )?
+            .execute(
                 (publisher, url),
             )?,
-            Some(waiting) => conn.execute(
+            Some(waiting) => conn.prepare_cached(
                 "INSERT OR REPLACE INTO waiting_urls(publisher, url, collection, item_id, place_event, place_position, place_index, eligibility) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            )?
+            .execute(
                 rusqlite::params![
                     publisher,
                     url,
@@ -1274,12 +1291,16 @@ pub(crate) fn store_changes(
     for ((publisher, url), record) in in_scope(&before.records, &after.records, publishers) {
         written.insert(publisher);
         match record {
-            None => conn.execute(
+            None => conn.prepare_cached(
                 "DELETE FROM records WHERE publisher = ?1 AND url = ?2",
+            )?
+            .execute(
                 (publisher, url),
             )?,
-            Some(record) => conn.execute(
+            Some(record) => conn.prepare_cached(
                 "INSERT OR REPLACE INTO records(publisher, url, item, item_id, collection, catalog_id, generated_at, sealing_height) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            )?
+            .execute(
                 rusqlite::params![
                     publisher,
                     url,
@@ -1296,12 +1317,16 @@ pub(crate) fn store_changes(
     for ((publisher, url), removal) in in_scope(&before.removals, &after.removals, publishers) {
         written.insert(publisher);
         match removal {
-            None => conn.execute(
+            None => conn.prepare_cached(
                 "DELETE FROM removals WHERE publisher = ?1 AND url = ?2",
+            )?
+            .execute(
                 (publisher, url),
             )?,
-            Some(removal) => conn.execute(
+            Some(removal) => conn.prepare_cached(
                 "INSERT OR REPLACE INTO removals(publisher, url, item_id, catalog_id, generated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?
+            .execute(
                 (publisher, url, &removal.item_id, &removal.catalog_id, &removal.generated_at),
             )?,
         };
@@ -1330,20 +1355,17 @@ pub(crate) fn store_changes(
         match floor {
             None => {
                 if !after.declarations.domains().contains_key(publisher) {
-                    conn.execute(
-                        "DELETE FROM declaration_floors WHERE domain = ?1",
-                        [publisher],
-                    )?;
+                    conn.prepare_cached("DELETE FROM declaration_floors WHERE domain = ?1")?
+                        .execute([publisher])?;
                 }
-                conn.execute(
-                    "DELETE FROM discovery_floors WHERE domain = ?1",
-                    [publisher],
-                )?
+                conn.prepare_cached("DELETE FROM discovery_floors WHERE domain = ?1")?
+                    .execute([publisher])?
             }
-            Some(seq) => conn.execute(
-                "INSERT OR REPLACE INTO discovery_floors(domain, seq) VALUES (?1, ?2)",
-                (publisher, int(*seq)),
-            )?,
+            Some(seq) => conn
+                .prepare_cached(
+                    "INSERT OR REPLACE INTO discovery_floors(domain, seq) VALUES (?1, ?2)",
+                )?
+                .execute((publisher, int(*seq)))?,
         };
     }
     let label_publisher = |id: &String| {

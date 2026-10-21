@@ -11,6 +11,7 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
     super::pull_runs::create(conn)?;
     super::collections::create(conn)?;
     add_missing_columns(conn)?;
+    conn.execute_batch(INDEXES)?;
     relax_publisher_columns(conn)?;
     restore_acceptance_order(conn)?;
     backfill_key_acts(conn)?;
@@ -98,6 +99,16 @@ CREATE TABLE IF NOT EXISTS sealed_page_sources(domain TEXT NOT NULL, hash TEXT N
 CREATE TABLE IF NOT EXISTS sealed_page_pending_heads(domain TEXT NOT NULL, hash TEXT NOT NULL, PRIMARY KEY(domain, hash));
 CREATE TABLE IF NOT EXISTS sealed_page_exclusions(domain TEXT NOT NULL, hash TEXT NOT NULL, epoch_number INTEGER NOT NULL, PRIMARY KEY(domain, hash));
 CREATE TABLE IF NOT EXISTS sealed_page_sources_recorded(id INTEGER PRIMARY KEY CHECK(id = 1), epoch_number INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS parameter_schedule_cache(id INTEGER PRIMARY KEY CHECK(id = 1), epoch_number INTEGER NOT NULL, root TEXT NOT NULL, largest INTEGER NOT NULL, schedule_json BLOB NOT NULL);
+";
+
+const INDEXES: &str = "
+CREATE INDEX IF NOT EXISTS payload_duties_unserved ON payload_duties(publisher, url, item_id) WHERE served = 0;
+CREATE INDEX IF NOT EXISTS rejections_left_epoch ON rejections(domain, left_epoch);
+CREATE INDEX IF NOT EXISTS rejections_collection_code ON rejections(domain, collection, code);
+CREATE INDEX IF NOT EXISTS pending_entries_domain ON pending_entries(domain);
+CREATE INDEX IF NOT EXISTS records_item ON records(item_id);
+CREATE INDEX IF NOT EXISTS param_changes_epoch ON param_changes(epoch_number, entry_index);
 ";
 
 fn relax_publisher_columns(conn: &Connection) -> Result<()> {
@@ -315,4 +326,111 @@ pub(super) fn restore_acceptance_order(conn: &Connection) -> Result<()> {
     )?;
     tx.commit()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::db::Db;
+
+    fn plan(db: &Db, sql: &str) -> Vec<String> {
+        let mut statement = db
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap();
+        let count = statement.parameter_count();
+        let parameters: Vec<String> = (0..count).map(|_| String::new()).collect();
+        statement
+            .query_map(rusqlite::params_from_iter(parameters), |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn the_queries_that_grow_with_the_log_search_their_indexes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("clave.sqlite")).unwrap();
+        for (sql, expected) in [
+            (
+                "SELECT item_id, publisher, url, until, served FROM payload_duties WHERE served = 0 ORDER BY publisher, url, item_id",
+                "SCAN payload_duties USING INDEX payload_duties_unserved",
+            ),
+            (
+                "SELECT r.code, r.at, r.id, r.detail, r.collection, r.urls_json, r.condition, r.change_list FROM rejections r WHERE r.domain = ?1 ORDER BY COALESCE((SELECT MAX(g.rowid) FROM rejections g WHERE g.domain = r.domain AND g.left_epoch = r.left_epoch), r.rowid) DESC, r.rowid ASC",
+                "SEARCH g USING COVERING INDEX rejections_left_epoch (domain=? AND left_epoch=?)",
+            ),
+            (
+                "SELECT at, id, condition, change_list FROM rejections WHERE domain = ?1 AND collection = ?2 AND code = ?3 ORDER BY rowid DESC LIMIT 1",
+                "SEARCH rejections USING INDEX rejections_collection_code (domain=? AND collection=? AND code=?)",
+            ),
+            (
+                "DELETE FROM rejections WHERE domain = ?1 AND collection = ?2 AND code = ?3",
+                "SEARCH rejections USING INDEX rejections_collection_code (domain=? AND collection=? AND code=?)",
+            ),
+            (
+                "SELECT entry_type, label_id, entry_json, place_event, place_position, place_index, eligibility FROM pending_entries WHERE domain = ?1 AND label_id IS NOT NULL AND place_event IS NOT NULL",
+                "SEARCH pending_entries USING INDEX pending_entries_domain (domain=?)",
+            ),
+            (
+                "SELECT item_id FROM payload_duties WHERE until <= ?1 AND item_id NOT IN (SELECT item_id FROM records) ORDER BY item_id",
+                "USING INDEX records_item FOR IN-OPERATOR",
+            ),
+            (
+                "SELECT EXISTS(SELECT 1 FROM payload_duties WHERE item_id = ?1 AND (until > ?2 OR item_id IN (SELECT item_id FROM records)))",
+                "USING INDEX records_item FOR IN-OPERATOR",
+            ),
+            (
+                "SELECT item_id FROM records",
+                "SCAN records USING COVERING INDEX records_item",
+            ),
+            (
+                "SELECT parameter, value, epoch_number, entry_index, effective_at FROM param_changes WHERE epoch_number > ?1 ORDER BY epoch_number, entry_index",
+                "SEARCH param_changes USING INDEX param_changes_epoch (epoch_number>?)",
+            ),
+        ] {
+            let plan = plan(&db, sql);
+            assert!(plan.iter().any(|line| line == expected), "{sql}: {plan:?}");
+        }
+    }
+
+    #[test]
+    fn a_store_without_the_indexes_gains_them_at_open_and_keeps_its_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("clave.sqlite");
+        let indexes = [
+            "payload_duties_unserved",
+            "rejections_left_epoch",
+            "rejections_collection_code",
+            "pending_entries_domain",
+            "records_item",
+            "param_changes_epoch",
+        ];
+        drop(Db::open(&path).unwrap());
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        for index in indexes {
+            conn.execute_batch(&format!("DROP INDEX {index}")).unwrap();
+        }
+        drop(conn);
+
+        let db = Db::open(&path).unwrap();
+
+        for index in indexes {
+            let held: bool = db
+                .conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1)",
+                    [index],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(held, "{index}");
+        }
+        let version: i64 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, super::LAYOUT_VERSION);
+    }
 }
