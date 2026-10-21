@@ -497,3 +497,19 @@ fn a_history_resumed_without_records_judges_only_under_an_adopted_replay_at_its_
         .unwrap();
     assert!(light.next_epoch().unwrap().is_none());
 }
+
+#[test]
+fn a_seal_persists_derived_declarations_headed_at_its_real_root() {
+    let log = common::Rig::new();
+    log.pull("2026-08-09T12:00:05Z");
+    log.seal("2026-08-09T13:00:00Z");
+    log.seal("2026-08-09T14:00:00Z");
+    let head = log.db.last_epoch().unwrap().unwrap();
+    assert!(head.epoch_number > 0);
+    let declarations = log.db.derived_declarations(&head).unwrap().unwrap();
+    assert_eq!(
+        declarations.head(),
+        Some((head.epoch_number, head.root.as_str()))
+    );
+    assert_ne!(head.root, "candidate");
+}

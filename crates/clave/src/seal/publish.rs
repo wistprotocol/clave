@@ -296,18 +296,15 @@ pub(super) fn timed_epoch(
     })?;
     let entries = std::mem::take(&mut prepared.entries);
     let entry_count = entries.len() as u64;
+    let judged = prepared.planned.judged.take();
     let verified = timings.time(Step::Replay, || -> Result<_> {
         prepared.history.extend(sealed.clone());
+        let (before, scope) = (&prepared.before, &prepared.scope);
         prepared
             .history
-            .adopt_replay(crate::collection::plan::scoped_replay(
-                &prepared.before,
-                &prepared.scope,
-            )?)?;
-        prepared
-            .history
-            .next_epoch_with(entries)?
-            .ok_or_else(|| Error::Seal("the sealed Epoch is missing from its history".into()))
+            .seal_next(entries, prepared.octets, judged, &|| {
+                crate::collection::plan::scoped_replay(before, scope)
+            })
     })?;
     let rejected = verified.rejected().is_some();
     if let Some(codes) = verified.rejected() {

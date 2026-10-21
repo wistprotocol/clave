@@ -1074,3 +1074,94 @@ fn store_changes_writes_nothing_of_a_publisher_outside_the_scope_whose_name_a_sc
     assert_eq!(versions["a.example"], 1);
     assert_eq!(versions["a.example.net"], 0);
 }
+
+fn page_source_rows(log: &Log) -> Vec<String> {
+    let conn = rusqlite::Connection::open(log.path()).unwrap();
+    let mut rows = Vec::new();
+    for sql in [
+        "SELECT domain || ' ' || hash || ' ' || epoch_number || ' ' || ordinal || ' ' || sealed_at_s || ' ' || seq || ' ' || CAST(keys_json AS TEXT) FROM sealed_page_sources ORDER BY domain, hash, epoch_number",
+        "SELECT domain || ' ' || hash || ' ' || epoch_number FROM sealed_page_exclusions ORDER BY domain, hash",
+    ] {
+        let mut statement = conn.prepare(sql).unwrap();
+        rows.extend(
+            statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .map(Result::unwrap),
+        );
+    }
+    rows
+}
+
+#[test]
+fn a_seal_merged_with_a_concurrent_pull_persists_the_derived_state_a_full_replay_derives() {
+    let site = Rc::new(Site::new());
+    let log = Log::onboard(&site);
+    let first = site.page_item("https://localhost/a", "first page");
+    site.collection(
+        "default",
+        std::slice::from_ref(&first),
+        "2026-08-09T11:00:00Z",
+    );
+    log.pull(&site).unwrap();
+    let second = site.page_item("https://localhost/b", "second page");
+    site.collection("default", &[first, second], "2026-08-09T12:00:00Z");
+
+    let (hooked, _) = racing_pull_once(&log, &site);
+    let report = seal(&log, "2026-08-09T13:00:00Z");
+    drop(hooked);
+    assert_eq!(report.merged, vec![site.host.clone()]);
+
+    let head = log.db.last_epoch().unwrap().unwrap();
+    assert_eq!(head.epoch_number, report.epoch_number);
+    let declarations = log.db.derived_declarations(&head).unwrap().unwrap();
+    assert_eq!(
+        declarations.head(),
+        Some((head.epoch_number, head.root.as_str()))
+    );
+    let accepted = log.db.accepted_updates().unwrap();
+    let sources = page_source_rows(&log);
+    assert!(!sources.is_empty());
+    rusqlite::Connection::open(log.path())
+        .unwrap()
+        .execute_batch(
+            "DELETE FROM sealed_page_sources; DELETE FROM sealed_page_exclusions; DELETE FROM sealed_page_sources_recorded;",
+        )
+        .unwrap();
+
+    let mut full = crate::history::History::open(&log.db, log.data.path(), Some(head)).unwrap();
+    while full.next_epoch().unwrap().is_some() {}
+    assert_eq!(
+        serde_json::to_value(&declarations).unwrap(),
+        serde_json::to_value(full.replay().declarations()).unwrap()
+    );
+    assert_eq!(accepted, full.replay().registry_updates().entries());
+    assert_eq!(page_source_rows(&log), sources);
+}
+
+#[test]
+fn a_merge_refuses_a_pull_whose_state_moved_a_sealed_catalog_the_plan_judged_against() {
+    let publisher = "p.example";
+    let key = (publisher.to_owned(), "default".to_owned());
+    let x = format!("sha256:{}", "a".repeat(64));
+    let mut before = State::default();
+    let mut collection = accepted(&x, 4);
+    sealed_as_latest(&mut collection, &x);
+    before.collections.insert(key.clone(), collection);
+    let mut planned = before.clone();
+    let mut current = before.clone();
+    if let Some(latest) = current
+        .collections
+        .get_mut(&key)
+        .and_then(|collection| collection.latest.as_mut())
+    {
+        latest.sealing_height = 3;
+    }
+
+    let mut base = before.clone();
+    let fresh = super::merge::Fresh::new(5, 9, 5);
+    assert_eq!(
+        super::merge::splice(&mut base, &current, &mut planned, publisher, &fresh),
+        Err("changed its sealed Catalogs".to_owned())
+    );
+}

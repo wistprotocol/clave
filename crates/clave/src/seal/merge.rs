@@ -4,7 +4,7 @@ pub(super) use crate::collection::plan::Publication;
 use crate::collection::pull;
 use crate::collection::state::{
     of_publisher, AcceptedCatalog, CollectionKey, CollectionState, ListItem, ListKey, Place,
-    PublisherKey, Record, State,
+    PublisherKey, Record, SealedCatalog, State,
 };
 use crate::db::{Db, Sealed, StoreHeld};
 use crate::error::Result;
@@ -280,6 +280,15 @@ fn accepted_id(collection: Option<&CollectionState>) -> Option<&str> {
         .map(|accepted| accepted.catalog_id.as_str())
 }
 
+fn sealed_catalogs<'s>(
+    state: &'s State,
+    publisher: &'s str,
+) -> Vec<(&'s CollectionKey, &'s SealedCatalog)> {
+    of_publisher(&state.collections, publisher)
+        .filter_map(|(key, collection)| collection.latest.as_ref().map(|latest| (key, latest)))
+        .collect()
+}
+
 pub(super) fn splice(
     base: &mut State,
     current: &State,
@@ -303,6 +312,9 @@ pub(super) fn splice(
         || !of_publisher(&base.removals, publisher).eq(of_publisher(&current.removals, publisher))
     {
         return Err("changed its records".into());
+    }
+    if sealed_catalogs(base, publisher) != sealed_catalogs(current, publisher) {
+        return Err("changed its sealed Catalogs".into());
     }
     let refused_in: BTreeSet<String> = of_publisher(&base.lists, publisher)
         .chain(of_publisher(&merged.lists, publisher))

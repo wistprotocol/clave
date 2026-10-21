@@ -5,6 +5,7 @@ use super::state::{
     Admission, CollectionKey, ItemKind, LabelKind, Place, Record, Removal, SealedCatalog, State,
 };
 use crate::error::{Error, Result};
+use crate::history::PlannedJudgment;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -256,6 +257,7 @@ pub struct Planned {
     pub records_removed: Vec<Removed>,
     pub payloads_destroyed: Vec<String>,
     pub state: State,
+    pub judged: Option<PlannedJudgment>,
 }
 
 type PlaceKey = (u64, String, u64, Option<u64>);
@@ -434,6 +436,23 @@ pub struct Judged {
     pub outcome: Outcome,
     pub replay: Replay,
     pub publishers: BTreeSet<String>,
+}
+
+impl Judged {
+    pub fn into_planned(self) -> PlannedJudgment {
+        let (judgments, records_removed) = match self.outcome {
+            Outcome::Accepted {
+                entries,
+                records_removed,
+            } => (entries, records_removed),
+            Outcome::Rejected { .. } => (Vec::new(), Vec::new()),
+        };
+        PlannedJudgment {
+            replay: self.replay,
+            judgments,
+            records_removed,
+        }
+    }
 }
 
 /// Resumed from the tuples of `publishers`: no other Publisher's state enters a judgment of
@@ -1859,6 +1878,7 @@ pub fn plan(state: &State, held: &impl Held, input: &EpochInput<'_>) -> Result<P
         records_removed,
         payloads_destroyed: turn.destroyed.into_iter().collect(),
         state: next,
+        judged: Some(judged.into_planned()),
     })
 }
 

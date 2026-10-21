@@ -180,6 +180,7 @@ pub(crate) fn under_renewed_lease<T>(
     let (stop, stopped) = mpsc::channel::<()>();
     std::thread::scope(|scope| {
         scope.spawn(move || {
+            crate::db::exclude_thread_from_counters();
             let Ok(db) = Db::connect(db_path) else {
                 return;
             };

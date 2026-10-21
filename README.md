@@ -154,7 +154,8 @@ runs.
 After its report, `clave seal` prints `write lock held N ms` and
 `write lock waited N ms`, the longest time in milliseconds a top-level
 write transaction of the process held the write lock and waited in
-`BEGIN IMMEDIATE` to take it, then one line `seal phases {...}`, a JSON
+`BEGIN IMMEDIATE` to take it, the sealer lease's renewal excluded, then
+one line `seal phases {...}`, a JSON
 object with one member per phase in this order. `serve` prints the last
 two lines with each seal's report on standard output, and every process
 prints `write lock held N ms` and `write lock waited N ms` to standard
@@ -169,7 +170,8 @@ error whenever either maximum grows. The phases:
 - `merge`: re-reading the plan's inputs under the lock and merging the
   publishers whose pulls changed them;
 - `entries`: writing the Epoch's Entries, tree and Checkpoint;
-- `replay`: replaying the sealed Epoch over its history;
+- `replay`: recording the sealed Epoch's derived state and its acts'
+  acceptance;
 - `state`: writing the waiting state, sealed Items, Payload duties,
   reports and mirrors;
 - `commit`: committing the sealing transaction, its fsync included;
@@ -180,7 +182,8 @@ error whenever either maximum grows. The phases:
 Each member is `{"ms":N,"sqlite_ms":N,"rss_kb":N,"hwm_kb":N}`: `ms` is
 the phase's wall time, `sqlite_ms` the wall time statements of the
 process spent executing inside it, from a statement's first step to its
-completion, on every connection of the process, so a statement whose
+completion, on every connection of the process but the sealer lease's
+renewal, so a statement whose
 rows are iterated while other statements run counts its whole open
 interval once, the busy wait inside `BEGIN IMMEDIATE` falls in
 `lock_wait` and the commit fsync in `commit`, and `rss_kb` and `hwm_kb` are the process's `VmRSS` and

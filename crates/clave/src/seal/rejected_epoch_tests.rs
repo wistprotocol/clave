@@ -48,6 +48,7 @@ fn seal_with_conflicting_declarations(log: &Log, at: &str) -> u64 {
     prepared.entries.push(first_contact(&[8u8; 32]));
     wist_core::epoch::sort_entries(&mut prepared.entries).unwrap();
     prepared.octets = wist_core::epoch::epoch_octets(&prepared.entries).unwrap();
+    prepared.planned.judged = None;
     let height = prepared.epoch_number;
     super::publish::epoch(
         &log.db,
@@ -172,4 +173,43 @@ fn a_rejected_epoch_persists_none_of_its_catalogs_and_items_and_the_next_seal_se
     assert_eq!(height, Some(accepted as i64));
     assert_eq!(sealed_item_heights(&log, &id), [accepted]);
     common::assert_resumes_as_replayed(&log.db, log.data.path());
+}
+
+#[test]
+fn a_planned_epoch_whose_octets_exceed_the_size_bound_is_rejected_whole_despite_its_planned_judgment(
+) {
+    let site = Site::new();
+    let log = Log::onboard(&site);
+    let (item, payload) = site.page_item(URL, "page body");
+    site.collection(COLLECTION, &[(item, payload)], "2026-08-09T11:00:00Z");
+    log.pull(&site).unwrap();
+    let before = latest_catalog(&log, &site.host);
+
+    let signing = crate::keys::load(&log.data.path().join("keys/seed")).unwrap();
+    let mutation = log.db.mutation().unwrap();
+    let next = super::prepare::next_epoch_number(&log.db).unwrap();
+    let event = log.db.reserve_epoch_event(next).unwrap();
+    let mut prepared = super::prepare::epoch(
+        &log.db,
+        log.data.path(),
+        &signing,
+        unix("2026-08-09T13:00:00Z"),
+        event,
+    )
+    .unwrap();
+    assert!(prepared.planned.judged.is_some());
+    prepared.octets = u64::from(u32::MAX);
+    let height = prepared.epoch_number;
+    super::publish::epoch(
+        &log.db,
+        log.data.path(),
+        &crate::fetch::Client::new(false),
+        mutation,
+        prepared,
+    )
+    .unwrap();
+
+    assert!(epoch_rejected(&log, height));
+    assert_eq!(record_height(&log, &site.host), None);
+    assert_eq!(latest_catalog(&log, &site.host), before);
 }

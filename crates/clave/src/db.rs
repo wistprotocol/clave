@@ -64,6 +64,9 @@ pub fn longest_write_wait_ms() -> u64 {
 }
 
 fn record_write_wait(waited: std::time::Duration) {
+    if UNCOUNTED.with(std::cell::Cell::get) {
+        return;
+    }
     let waited = u64::try_from(waited.as_millis()).unwrap_or(u64::MAX);
     let longest = LONGEST_WRITE_WAIT_MS.fetch_max(waited, std::sync::atomic::Ordering::Relaxed);
     if waited > longest {
@@ -78,11 +81,22 @@ pub fn sqlite_nanos() -> u64 {
 }
 
 thread_local! {
+    static UNCOUNTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub fn exclude_thread_from_counters() {
+    UNCOUNTED.with(|uncounted| uncounted.set(true));
+}
+
+thread_local! {
     static ACTIVE_STATEMENTS: std::cell::Cell<(u64, Option<std::time::Instant>)> =
         const { std::cell::Cell::new((0, None)) };
 }
 
 fn statement_event(event: rusqlite::trace::TraceEvent<'_>) {
+    if UNCOUNTED.with(std::cell::Cell::get) {
+        return;
+    }
     match event {
         // SQLite reports each trigger subprogram it enters as a "--" comment with no PROFILE event.
         rusqlite::trace::TraceEvent::Stmt(_, sql) if !sql.starts_with("--") => statement_began(),

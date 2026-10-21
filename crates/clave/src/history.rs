@@ -151,6 +151,24 @@ pub fn record_sealed_page_sources(db: &Db, directory: &Path) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct PlannedJudgment {
+    pub replay: Replay,
+    pub judgments: Vec<Option<Judgment>>,
+    pub records_removed: Vec<Removed>,
+}
+
+enum Read<'s> {
+    Stored,
+    Given(Vec<Value>),
+    Sealed {
+        entries: Vec<Value>,
+        octets: u64,
+        judged: Option<Box<PlannedJudgment>>,
+        before: &'s dyn Fn() -> Result<Replay>,
+    },
+}
+
 pub struct History<'a> {
     db: &'a Db,
     head: Option<EpochRow>,
@@ -325,14 +343,38 @@ impl<'a> History<'a> {
     }
 
     pub fn next_epoch(&mut self) -> Result<Option<VerifiedEpoch>> {
-        self.next_verified(None)
+        self.next_verified(Read::Stored)
     }
 
     pub fn next_epoch_with(&mut self, entries: Vec<Value>) -> Result<Option<VerifiedEpoch>> {
-        self.next_verified(Some(entries))
+        self.next_verified(Read::Given(entries))
     }
 
-    fn next_verified(&mut self, entries: Option<Vec<Value>>) -> Result<Option<VerifiedEpoch>> {
+    pub fn seal_next(
+        &mut self,
+        entries: Vec<Value>,
+        octets: u64,
+        judged: Option<PlannedJudgment>,
+        before: &dyn Fn() -> Result<Replay>,
+    ) -> Result<VerifiedEpoch> {
+        if self.failed {
+            return Err(failure("history reader cannot continue after a failure"));
+        }
+        let result = self
+            .read_next(Read::Sealed {
+                entries,
+                octets,
+                judged: judged.map(Box::new),
+                before,
+            })
+            .and_then(|verified| {
+                verified.ok_or_else(|| failure("the sealed Epoch is missing from its history"))
+            });
+        self.failed = result.is_err();
+        result
+    }
+
+    fn next_verified(&mut self, read: Read<'_>) -> Result<Option<VerifiedEpoch>> {
         if self.failed {
             return Err(failure("history reader cannot continue after a failure"));
         }
@@ -341,12 +383,12 @@ impl<'a> History<'a> {
                 "a history resumed without record state cannot judge an Epoch",
             ));
         }
-        let result = self.read_next(entries);
+        let result = self.read_next(read);
         self.failed = result.is_err();
         result
     }
 
-    fn read_next(&mut self, entries: Option<Vec<Value>>) -> Result<Option<VerifiedEpoch>> {
+    fn read_next(&mut self, read: Read<'_>) -> Result<Option<VerifiedEpoch>> {
         let Some(head) = &self.head else {
             return Ok(None);
         };
@@ -394,20 +436,31 @@ impl<'a> History<'a> {
         }
         .map_err(|e| failure(&e.to_string()))?;
 
-        let previous_size = self.db.size_before(height)?;
-        let entries = match entries {
-            Some(entries) => entries,
-            None => self.db.epoch_entries(height)?,
+        let (entries, octets, sealed) = match read {
+            Read::Sealed {
+                entries,
+                octets,
+                judged,
+                before,
+            } => (entries, octets, Some((judged, before))),
+            Read::Stored | Read::Given(_) => {
+                let previous_size = self.db.size_before(height)?;
+                let entries = match read {
+                    Read::Given(entries) => entries,
+                    _ => self.db.epoch_entries(height)?,
+                };
+                let summary = wist_core::epoch::verify_epoch_tree(
+                    previous_size,
+                    &checkpoint,
+                    &entries,
+                    &self.db.log_tree(),
+                )
+                .map_err(|e| failure(&e.to_string()))?;
+                (entries, summary.octets, None)
+            }
         };
-        let summary = wist_core::epoch::verify_epoch_tree(
-            previous_size,
-            &checkpoint,
-            &entries,
-            &self.db.log_tree(),
-        )
-        .map_err(|e| failure(&e.to_string()))?;
 
-        let largest = self.largest.max(summary.octets);
+        let largest = self.largest.max(octets);
 
         // WIST-3 §§3.3, 3.4, 5: the key acts of every Epoch, a rejected one's included, apply under
         // the keys valid at N−1 before the Checkpoint is verified under the keys valid at N.
@@ -465,12 +518,37 @@ impl<'a> History<'a> {
         };
         // WIST-4 §5: an Epoch over the smallest cap at its `sealed_at` and every accepted later
         // `effective_at` is rejected whole (WIST-3 §3.3, Rejected Epochs).
-        let size_rejected = summary.octets > candidate.epoch_size_bounds(at).0;
-        let outcome = if size_rejected {
-            self.replay
-                .reject_epoch(&epoch, vec![EPOCH_SIZE_REJECTED.to_owned()])
-        } else {
-            self.replay.epoch(&epoch)
+        let size_rejected = octets > candidate.epoch_size_bounds(at).0;
+        let judged = match sealed {
+            Some((Some(judged), _)) if !size_rejected => Some(judged),
+            Some((_, before)) => {
+                self.replay = before()?;
+                self.judges = true;
+                None
+            }
+            None => None,
+        };
+        let planned = judged.is_some();
+        let outcome = match judged {
+            Some(judged) => {
+                if judged.replay.next_height() != height + 1
+                    || judged.judgments.len() != entries.len()
+                {
+                    return Err(failure(
+                        "the planned judgment is not of the sealed Epoch's Entries",
+                    ));
+                }
+                self.replay = judged.replay;
+                self.judges = true;
+                Ok(Outcome::Accepted {
+                    entries: judged.judgments,
+                    records_removed: judged.records_removed,
+                })
+            }
+            None if size_rejected => self
+                .replay
+                .reject_epoch(&epoch, vec![EPOCH_SIZE_REJECTED.to_owned()]),
+            None => self.replay.epoch(&epoch),
         }
         .map_err(|e| failure(&e.to_string()))?;
         let (rejected, judgments, records_removed) = match outcome {
@@ -527,9 +605,14 @@ impl<'a> History<'a> {
             let tx = self.db.mutation()?;
             self.db.record_epoch_judgment(height, rejected.is_some())?;
             if derived_due {
+                let seeded = planned.then(|| {
+                    let mut declarations = self.replay.declarations().clone();
+                    declarations.seed_head(height, &row.root, Some(at));
+                    declarations
+                });
                 self.db.record_derived_state(
                     &row,
-                    self.replay.declarations(),
+                    seeded.as_ref().unwrap_or(self.replay.declarations()),
                     &self.replay.registry_updates().entries(),
                 )?;
             }
@@ -552,7 +635,7 @@ impl<'a> History<'a> {
             sealed_at: row.sealed_at,
             entries,
             sealed_at_s: at,
-            octets: summary.octets,
+            octets,
             rejected_parameters,
             recovery_window_days,
             declaration_activation_epochs,

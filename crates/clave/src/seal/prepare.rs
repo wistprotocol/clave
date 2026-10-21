@@ -444,7 +444,6 @@ pub(super) fn epoch<'a>(
                 .map(|(_, entry)| entry.clone())
                 .collect()
         } else {
-            plan::verify(&state, &input, &planned.entries)?;
             break planned;
         };
         if out.is_empty() {
