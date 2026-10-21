@@ -14,6 +14,8 @@ mod rejected_epoch_tests;
 #[cfg(test)]
 mod replan_tests;
 #[cfg(test)]
+mod retention_tests;
+#[cfg(test)]
 mod withdrawal_tests;
 
 pub(crate) use prepare::validate_pending_parameter;
@@ -253,44 +255,44 @@ pub fn run_with_client(
 /// WIST-3 §6.1: a Payload whose duty ended is no longer served; WIST-2 §5.3: a held Payload,
 /// list or tree file nothing kept names is discarded. Files go after the rows that named them.
 pub(crate) fn retain(db: &Db, data_dir: &Path, now: &str) -> Result<()> {
-    let mutation = db.mutation()?;
     db.end_lost_pull_runs()?;
-    let lapsed = db.lapsed_payload_duties(now)?;
-    for item_id in &lapsed {
-        db.end_payload_duty(item_id)?;
-    }
-    let needed = db.payload_items_needed()?;
-    let mut unneeded = Vec::new();
-    match std::fs::read_dir(data_dir.join("held/payloads")) {
-        Ok(entries) => {
-            for entry in entries {
-                let path = entry?.path();
-                let Some(hex) = path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .and_then(|name| name.strip_suffix(".json"))
-                else {
-                    continue;
-                };
-                if !needed.contains(&format!("sha256:{hex}")) {
-                    unneeded.push(path);
-                }
-            }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-    db.discard_unkept_lists()?;
-    db.discard_unnamed_tree_files()?;
-    db.discard_unmarked_list_rows()?;
-    for path in &unneeded {
+    let held = held_payloads(data_dir)?;
+    let scan = db.read_only(|| db.scan_retention(now, held))?;
+    #[cfg(test)]
+    hook::run(&hook::BETWEEN_RETENTION_SCAN_AND_WRITE);
+    let mutation = db.mutation()?;
+    let retained = db.apply_retention(now, scan)?;
+    // An orphan is unlinked before the commit so that a pull reading the directory after it
+    // finds no file to reuse and fetches the Payload again.
+    for path in &retained.orphans {
         crate::db::remove_file(path)?;
     }
     mutation.commit()?;
-    for item_id in &lapsed {
+    for item_id in &retained.ended {
         crate::db::remove_file(&crate::db::served_payload_path(data_dir, item_id)?)?;
     }
     Ok(())
+}
+
+fn held_payloads(data_dir: &Path) -> Result<Vec<(String, std::path::PathBuf)>> {
+    let entries = match std::fs::read_dir(data_dir.join("held/payloads")) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut held = Vec::new();
+    for entry in entries {
+        let path = entry?.path();
+        let Some(hex) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(".json"))
+        else {
+            continue;
+        };
+        held.push((format!("sha256:{hex}"), path));
+    }
+    Ok(held)
 }
 
 pub(crate) fn run_confirming(
@@ -464,6 +466,7 @@ pub(crate) mod hook {
 
     thread_local! {
         pub(crate) static BETWEEN_PLAN_AND_WRITE: Slot = const { RefCell::new(None) };
+        pub(crate) static BETWEEN_RETENTION_SCAN_AND_WRITE: Slot = const { RefCell::new(None) };
     }
 
     pub(crate) fn set(point: Point, hook: impl FnMut() + 'static) {

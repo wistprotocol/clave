@@ -109,6 +109,9 @@ CREATE INDEX IF NOT EXISTS rejections_collection_code ON rejections(domain, coll
 CREATE INDEX IF NOT EXISTS pending_entries_domain ON pending_entries(domain);
 CREATE INDEX IF NOT EXISTS records_item ON records(item_id);
 CREATE INDEX IF NOT EXISTS param_changes_epoch ON param_changes(epoch_number, entry_index);
+CREATE INDEX IF NOT EXISTS payload_duties_until ON payload_duties(until);
+CREATE INDEX IF NOT EXISTS waiting_urls_item ON waiting_urls(item_id);
+CREATE INDEX IF NOT EXISTS list_items_item ON list_items(item_id);
 ";
 
 fn relax_publisher_columns(conn: &Connection) -> Result<()> {
@@ -374,12 +377,40 @@ mod tests {
                 "SEARCH pending_entries USING INDEX pending_entries_domain (domain=?)",
             ),
             (
-                "SELECT item_id FROM payload_duties WHERE until <= ?1 AND item_id NOT IN (SELECT item_id FROM records) ORDER BY item_id",
+                "SELECT item_id FROM payload_duties WHERE until <= ?1 AND item_id NOT IN (SELECT item_id FROM records)",
                 "USING INDEX records_item FOR IN-OPERATOR",
             ),
             (
                 "SELECT EXISTS(SELECT 1 FROM payload_duties WHERE item_id = ?1 AND (until > ?2 OR item_id IN (SELECT item_id FROM records)))",
                 "USING INDEX records_item FOR IN-OPERATOR",
+            ),
+            (
+                "SELECT item_id FROM payload_duties WHERE until <= ?1 AND item_id NOT IN (SELECT item_id FROM records)",
+                "SEARCH payload_duties USING INDEX payload_duties_until (until<?)",
+            ),
+            (
+                "DELETE FROM payload_duties WHERE item_id = ?1 AND until <= ?2 AND item_id NOT IN (SELECT item_id FROM records)",
+                "SEARCH payload_duties USING INDEX sqlite_autoindex_payload_duties_1 (item_id=?)",
+            ),
+            (
+                "SELECT EXISTS(SELECT 1 FROM records WHERE item_id = ?1) OR EXISTS(SELECT 1 FROM waiting_urls WHERE item_id = ?1) OR EXISTS(SELECT 1 FROM list_items i JOIN pull_runs r ON r.domain = i.publisher WHERE i.item_id = ?1 AND r.ended IS NULL)",
+                "SEARCH waiting_urls USING COVERING INDEX waiting_urls_item (item_id=?)",
+            ),
+            (
+                "SELECT EXISTS(SELECT 1 FROM records WHERE item_id = ?1) OR EXISTS(SELECT 1 FROM waiting_urls WHERE item_id = ?1) OR EXISTS(SELECT 1 FROM list_items i JOIN pull_runs r ON r.domain = i.publisher WHERE i.item_id = ?1 AND r.ended IS NULL)",
+                "SEARCH i USING INDEX list_items_item (item_id=?)",
+            ),
+            (
+                "SELECT DISTINCT publisher, name, catalog_id FROM list_items WHERE item_id = ?1 AND admission IN ('admitted', 'unjudged')",
+                "SEARCH list_items USING INDEX list_items_item (item_id=?)",
+            ),
+            (
+                "DELETE FROM list_items WHERE publisher = ?1 AND name = ?2 AND catalog_id = ?3 AND NOT EXISTS (SELECT 1 FROM lists l WHERE l.publisher = ?1 AND l.name = ?2 AND l.catalog_id = ?3) AND NOT EXISTS (SELECT 1 FROM pull_runs WHERE domain = ?1 AND ended IS NULL)",
+                "SEARCH list_items USING COVERING INDEX sqlite_autoindex_list_items_1 (publisher=? AND name=? AND catalog_id=?)",
+            ),
+            (
+                "SELECT EXISTS(SELECT 1 FROM catalog_queue WHERE publisher = ?1 AND name = ?2 AND catalog_id = ?3)",
+                "SEARCH catalog_queue USING INDEX sqlite_autoindex_catalog_queue_1 (publisher=? AND name=?)",
             ),
             (
                 "SELECT item_id FROM records",
@@ -406,6 +437,9 @@ mod tests {
             "pending_entries_domain",
             "records_item",
             "param_changes_epoch",
+            "payload_duties_until",
+            "waiting_urls_item",
+            "list_items_item",
         ];
         drop(Db::open(&path).unwrap());
         let conn = rusqlite::Connection::open(&path).unwrap();

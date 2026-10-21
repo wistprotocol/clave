@@ -20,6 +20,10 @@ struct Built {
     disputed: clave::seal::SealReport,
     waiting_at_dispute: BTreeSet<String>,
     waiting_at_withdrawal: BTreeSet<String>,
+    narrowed_url: String,
+    narrowed: clave::seal::SealReport,
+    foreign_item: String,
+    refused: clave::seal::SealReport,
 }
 
 fn sign_dispute(p: &common::TestPub, inner: Value) -> (String, Value) {
@@ -67,7 +71,7 @@ fn built() -> Built {
     let (a, a_payload) = log.page("a", "withdrawable body");
     let (b, b_payload) = log.page("b", "kept body");
     let first = log.publish(
-        &[(a.clone(), Some(a_payload)), (b, Some(b_payload))],
+        &[(a.clone(), Some(a_payload)), (b.clone(), Some(b_payload))],
         "2026-08-09T12:00:00Z",
         None,
     );
@@ -114,21 +118,40 @@ fn built() -> Built {
     let mut successor = initial["publisher"].clone();
     successor["seq"] = 1.into();
     successor["prev_declaration"] = declaration_hash(&initial).into();
+    successor["collections"] = json!([{"name": "default", "scope": [
+        {"url": log.url("a"), "match": "exact"},
+        {"url": log.url("c"), "match": "exact"},
+    ]}]);
     write_declaration(&log.p, &successor, &K1_SEED);
+    log.pull("2026-08-09T15:30:05Z");
+    let conn = rusqlite::Connection::open(log.data.path().join("clave.sqlite")).unwrap();
+    let narrowed_url = log.url("b");
+    assert!(record_urls(&conn).contains(&narrowed_url));
+    let narrowed = log.seal("2026-08-09T16:00:00Z");
+    assert!(!record_urls(&conn).contains(&narrowed_url));
+
     let (c, c_payload) = log.page("c", "later body");
     log.publish(
         &[(a, None), (c, Some(c_payload))],
-        "2026-08-09T15:30:00Z",
+        "2026-08-09T16:30:00Z",
         Some(&first),
     );
-    log.pull("2026-08-09T15:30:05Z");
-    for at in [
-        "2026-08-09T16:00:00Z",
-        "2026-08-09T17:00:00Z",
-        "2026-08-09T18:00:00Z",
-    ] {
-        log.seal(at);
-    }
+    write_label_feed(
+        &log.p,
+        &log.host,
+        std::slice::from_ref(&label_id),
+        "2026-08-09T16:30:00Z",
+    );
+    let relisted = log.pull("2026-08-09T16:30:05Z");
+    assert!(
+        !relisted.labels.contains(&label_id),
+        "{:?}",
+        relisted.labels
+    );
+    let foreign_item = common::item_id(&b);
+    queue_foreign_withdrawal(&log, &disputant, &foreign_item);
+    let refused = log.seal("2026-08-09T17:00:00Z");
+    log.seal("2026-08-09T18:00:00Z");
     Built {
         log,
         _site: site,
@@ -139,7 +162,33 @@ fn built() -> Built {
         disputed,
         waiting_at_dispute,
         waiting_at_withdrawal,
+        narrowed_url,
+        narrowed,
+        foreign_item,
+        refused,
     }
+}
+
+fn queue_foreign_withdrawal(log: &common::Rig, subject: &str, item_id: &str) {
+    let update = json!({
+        "wist_version": "1.0.0", "action": "payload_withdrawal", "subject": subject,
+        "details": {"delta_id": item_id, "legal_basis": "court order", "jurisdiction": "DE"},
+        "effective_at": "2026-08-09T16:40:00Z",
+    });
+    let kid = log.db.signing_key_id(&log.sk.public()).unwrap();
+    let envelope = wist_core::envelope::sign_envelope(&update, "update", &kid, &log.sk).unwrap();
+    log.db
+        .insert_pending_entry("registry_update", "", &envelope, 0)
+        .unwrap();
+}
+
+fn record_urls(conn: &rusqlite::Connection) -> BTreeSet<String> {
+    conn.prepare("SELECT url FROM records")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
 }
 
 fn judgment_at(log: &common::Rig, height: u64, entry_type: &str) -> Option<Judgment> {
@@ -252,14 +301,158 @@ fn scoped_seals_persist_the_derived_state_a_full_replay_derives() {
     )
     .unwrap();
 
+    let rejected = rejected_flags(&conn);
+    let records = stored_records(&conn);
+    let removals = stored_removals(&conn);
+    let sealed_items = stored_sealed_items(&conn);
+    assert!(!records.is_empty());
+    assert!(sealed_items.iter().any(|(_, _, _, height)| *height > 0));
+
     let mut full = clave::history::History::open(&log.db, log.data.path(), Some(head)).unwrap();
-    while full.next_epoch().unwrap().is_some() {}
+    let mut judged = Vec::new();
+    while let Some(verified) = full.next_epoch().unwrap() {
+        judged.push((verified.epoch_number(), verified.rejected().is_some()));
+    }
+    assert_eq!(rejected, judged);
+    assert_eq!(rejected_flags(&conn), rejected);
     assert_eq!(
         serde_json::to_value(&declarations).unwrap(),
         serde_json::to_value(full.replay().declarations()).unwrap()
     );
     assert_eq!(accepted, full.replay().registry_updates().entries());
     assert_eq!(page_source_rows(&conn), sources);
+    let replayed = full.replay().records();
+    assert_eq!(
+        records,
+        replayed
+            .records()
+            .map(|(publisher, url, record)| (
+                publisher.to_owned(),
+                url.to_owned(),
+                record.item.clone(),
+                record.item_id.clone(),
+                record.collection.clone(),
+                record.catalog.clone(),
+                record.generated_at.clone(),
+            ))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        removals,
+        replayed
+            .removals()
+            .map(|(publisher, url, removal)| (
+                publisher.to_owned(),
+                url.to_owned(),
+                removal.item_id.clone(),
+                removal.catalog.clone(),
+                removal.generated_at.clone(),
+            ))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        sealed_items,
+        full.replay()
+            .sealed_items()
+            .sealed()
+            .map(|sealed| (
+                sealed.item_id.to_owned(),
+                sealed.publisher.to_owned(),
+                match sealed.kind {
+                    wist_core::item::Kind::Page => "page".to_owned(),
+                    wist_core::item::Kind::Removed => "removed".to_owned(),
+                },
+                sealed.height,
+            ))
+            .collect::<BTreeSet<_>>()
+    );
+}
+
+#[test]
+fn the_scenario_narrows_a_record_away_and_refuses_a_foreign_withdrawal_and_a_label_sealed_before() {
+    let built = built();
+    let log = &built.log;
+    assert!(log
+        .entries(built.narrowed.epoch_number)
+        .iter()
+        .any(|entry| entry["type"] == "publisher_declaration"
+            && entry["body"]["publisher"]["seq"] == 1));
+    assert!(
+        !built
+            .log
+            .state()
+            .records
+            .contains_key(&(log.host.clone(), built.narrowed_url.clone())),
+        "{:?}",
+        built.narrowed.dropped
+    );
+    assert_eq!(
+        built.refused.dropped,
+        [format!(
+            "WIST4-E04 payload_withdrawal {} is not sealed",
+            built.foreign_item
+        )]
+    );
+    let entries = log.entries(built.refused.epoch_number);
+    assert!(!entries
+        .iter()
+        .any(|entry| entry["type"] == "registry_update"
+            && entry["body"]["update"]["subject"] == built.disputant.as_str()));
+    assert!(!entries.iter().any(|entry| entry["type"] == "label"));
+    assert_eq!(log.db.sealed_labels().unwrap().len(), 1);
+    assert_eq!(log.db.count_pending_entries("label").unwrap(), 0);
+}
+
+fn rejected_flags(conn: &rusqlite::Connection) -> Vec<(u64, bool)> {
+    conn.prepare("SELECT epoch_number, rejected FROM epochs ORDER BY epoch_number")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+type StoredRecord = (String, String, Value, String, String, String, String);
+
+fn stored_records(conn: &rusqlite::Connection) -> Vec<StoredRecord> {
+    conn.prepare("SELECT publisher, url, item, item_id, collection, catalog_id, generated_at FROM records ORDER BY publisher, url")
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                serde_json::from_slice(&row.get::<_, Vec<u8>>(2)?).unwrap(),
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+fn stored_removals(conn: &rusqlite::Connection) -> Vec<(String, String, String, String, String)> {
+    conn.prepare("SELECT publisher, url, item_id, catalog_id, generated_at FROM removals ORDER BY publisher, url")
+        .unwrap()
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+fn stored_sealed_items(conn: &rusqlite::Connection) -> BTreeSet<(String, String, String, u64)> {
+    conn.prepare("SELECT item_id, publisher, kind, first_height FROM sealed_items")
+        .unwrap()
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
 }
 
 #[test]

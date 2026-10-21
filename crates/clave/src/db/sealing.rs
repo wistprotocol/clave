@@ -1,10 +1,11 @@
 use super::Db;
 use crate::collection::plan::{Deferred, HeldBack, Hold, Publication};
+use crate::collection::state::ListKey;
 use crate::error::{Error, Result};
 use rusqlite::OptionalExtension;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use wist_core::declarations::Domain;
 use wist_core::objects::{CollectionStatus, Deferral, WaitingStatus};
 
@@ -25,6 +26,8 @@ pub struct WaitingReport {
 }
 
 type ReportKey = (bool, String, String);
+
+type KeptIds = (Option<String>, Option<String>, Option<Vec<u8>>);
 
 type KeptRow = (
     Option<Vec<u8>>,
@@ -63,6 +66,28 @@ fn waiting_status(
         deferrals,
         held,
     })
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct RetentionScan {
+    lapsed: Vec<String>,
+    orphans: Vec<(String, PathBuf)>,
+    unkept_lists: Vec<ListKey>,
+    unnamed_tree_files: Vec<String>,
+    unmarked_lists: Vec<ListKey>,
+    versions: BTreeMap<String, i64>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct Retained {
+    pub(crate) ended: Vec<String>,
+    pub(crate) orphans: Vec<PathBuf>,
+}
+
+fn fetched_catalog_id(octets: Option<Vec<u8>>) -> Option<String> {
+    octets
+        .and_then(|octets| crate::json::parse(&octets).ok())
+        .and_then(|envelope| wist_core::catalog::catalog_id(&envelope["catalog"]).ok())
 }
 
 fn envelope_octets(value: &Value) -> Result<Vec<u8>> {
@@ -350,17 +375,6 @@ impl Db {
         })
     }
 
-    /// WIST-3 §6.1: a record's Item keeps its duty whatever the window.
-    pub(crate) fn lapsed_payload_duties(&self, now: &str) -> Result<Vec<String>> {
-        let mut statement = self.conn.prepare(
-            "SELECT item_id FROM payload_duties WHERE until <= ?1 AND item_id NOT IN (SELECT item_id FROM records) ORDER BY item_id",
-        )?;
-        let rows = statement
-            .query_map([now], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
-    }
-
     pub fn holds_payload_duty(&self, item_id: &str) -> Result<bool> {
         Ok(self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM payload_duties WHERE item_id = ?1)",
@@ -377,13 +391,172 @@ impl Db {
         )?)
     }
 
-    fn kept_catalogs(&self) -> Result<BTreeSet<(String, String, String)>> {
-        let mut kept = BTreeSet::new();
-        let mut statement = self.conn.prepare(
-            "SELECT publisher, name, latest_id, accepted_id, catalog_octets FROM collections",
+    /// WIST-3 §6.1: a record's Item keeps its duty whatever the window.
+    pub(crate) fn scan_retention(
+        &self,
+        now: &str,
+        held: Vec<(String, PathBuf)>,
+    ) -> Result<RetentionScan> {
+        let lapsed = self
+            .conn
+            .prepare(
+                "SELECT item_id FROM payload_duties WHERE until <= ?1 AND item_id NOT IN (SELECT item_id FROM records)",
+            )?
+            .query_map([now], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<BTreeSet<_>>>()?
+            .into_iter()
+            .collect();
+        let kept = self.kept_catalogs(None)?;
+        let mut orphans = Vec::new();
+        for (item_id, path) in held {
+            if !self.payload_needed_by(&item_id, |key| Ok(kept.contains(key)))? {
+                orphans.push((item_id, path));
+            }
+        }
+        let unkept_lists = self
+            .conn
+            .prepare("SELECT publisher, name, catalog_id FROM held_lists")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<ListKey>>>()?
+            .into_iter()
+            .filter(|key| !kept.contains(key))
+            .collect();
+        let unnamed_tree_files: Vec<String> = match self.tree_files_named(&kept)? {
+            Some(named) => self
+                .conn
+                .prepare("SELECT sha256 FROM tree_files")?
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+                .into_iter()
+                .filter(|hex| !named.contains(hex))
+                .collect(),
+            None => Vec::new(),
+        };
+        let unmarked_lists = self
+            .conn
+            .prepare(
+                "SELECT DISTINCT publisher, name, catalog_id FROM list_items i WHERE NOT EXISTS (SELECT 1 FROM lists l WHERE l.publisher = i.publisher AND l.name = i.name AND l.catalog_id = i.catalog_id) AND NOT EXISTS (SELECT 1 FROM pull_runs r WHERE r.domain = i.publisher AND r.ended IS NULL)",
+            )?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<ListKey>>>()?;
+        let versions = if unnamed_tree_files.is_empty() {
+            BTreeMap::new()
+        } else {
+            self.all_waiting_versions()?
+        };
+        Ok(RetentionScan {
+            lapsed,
+            orphans,
+            unkept_lists,
+            unnamed_tree_files,
+            unmarked_lists,
+            versions,
+        })
+    }
+
+    // Pulls commit during the scan without always advancing the acceptance clock, so each
+    // candidate is re-checked here, under the write lock, before it is discarded.
+    pub(crate) fn apply_retention(&self, now: &str, scan: RetentionScan) -> Result<Retained> {
+        let mut ended = Vec::new();
+        let mut end = self.conn.prepare(
+            "DELETE FROM payload_duties WHERE item_id = ?1 AND until <= ?2 AND item_id NOT IN (SELECT item_id FROM records)",
         )?;
-        let rows = statement
-            .query_map([], |row| {
+        for item_id in scan.lapsed {
+            if end.execute((&item_id, now))? > 0 {
+                ended.push(item_id);
+            }
+        }
+        let mut kept: BTreeMap<ListKey, bool> = BTreeMap::new();
+        let mut is_kept = |key: &ListKey| -> Result<bool> {
+            if let Some(known) = kept.get(key) {
+                return Ok(*known);
+            }
+            let known = self.catalog_kept(key)?;
+            kept.insert(key.clone(), known);
+            Ok(known)
+        };
+        let mut orphans = Vec::new();
+        for (item_id, path) in scan.orphans {
+            if !self.payload_needed_by(&item_id, &mut is_kept)? {
+                orphans.push(path);
+            }
+        }
+        for key in &scan.unkept_lists {
+            if !is_kept(key)? {
+                self.conn.execute(
+                    "DELETE FROM held_lists WHERE publisher = ?1 AND name = ?2 AND catalog_id = ?3",
+                    (&key.0, &key.1, &key.2),
+                )?;
+            }
+        }
+        if !scan.unnamed_tree_files.is_empty() {
+            let current = self.all_waiting_versions()?;
+            let changed: BTreeSet<&String> = current
+                .iter()
+                .filter(|(publisher, version)| scan.versions.get(*publisher) != Some(version))
+                .map(|(publisher, _)| publisher)
+                .chain(
+                    scan.versions
+                        .keys()
+                        .filter(|publisher| !current.contains_key(*publisher)),
+                )
+                .collect();
+            let mut rewalked = BTreeSet::new();
+            for publisher in changed {
+                rewalked.extend(self.kept_catalogs(Some(publisher))?);
+            }
+            if let Some(named) = self.tree_files_named(&rewalked)? {
+                let mut discard = self
+                    .conn
+                    .prepare("DELETE FROM tree_files WHERE sha256 = ?1")?;
+                for hex in scan
+                    .unnamed_tree_files
+                    .iter()
+                    .filter(|hex| !named.contains(*hex))
+                {
+                    discard.execute([hex])?;
+                }
+            }
+        }
+        let mut unmarked = self.conn.prepare(
+            "DELETE FROM list_items WHERE publisher = ?1 AND name = ?2 AND catalog_id = ?3 AND NOT EXISTS (SELECT 1 FROM lists l WHERE l.publisher = ?1 AND l.name = ?2 AND l.catalog_id = ?3) AND NOT EXISTS (SELECT 1 FROM pull_runs WHERE domain = ?1 AND ended IS NULL)",
+        )?;
+        for key in &scan.unmarked_lists {
+            unmarked.execute((&key.0, &key.1, &key.2))?;
+        }
+        Ok(Retained { ended, orphans })
+    }
+
+    fn all_waiting_versions(&self) -> Result<BTreeMap<String, i64>> {
+        Ok(self
+            .conn
+            .prepare("SELECT publisher, version FROM waiting_versions")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// WIST-2 §5.3: the lists of the latest, last accepted and queued Catalogs, and of the
+    /// Catalog fetched last, which a refusal for a dropped record leaves held.
+    fn kept_catalogs(&self, publisher: Option<&str>) -> Result<BTreeSet<ListKey>> {
+        let (collections, queued) = match publisher {
+            Some(_) => (
+                "SELECT publisher, name, latest_id, accepted_id, catalog_octets FROM collections WHERE publisher = ?1",
+                "SELECT publisher, name, catalog_id FROM catalog_queue WHERE publisher = ?1",
+            ),
+            None => (
+                "SELECT publisher, name, latest_id, accepted_id, catalog_octets FROM collections",
+                "SELECT publisher, name, catalog_id FROM catalog_queue",
+            ),
+        };
+        let parameters: &[&dyn rusqlite::ToSql] = match &publisher {
+            Some(publisher) => &[publisher],
+            None => &[],
+        };
+        let mut kept = BTreeSet::new();
+        let rows = self
+            .conn
+            .prepare(collections)?
+            .query_map(parameters, |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
@@ -394,63 +567,63 @@ impl Db {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         for (publisher, name, latest, accepted, fetched) in rows {
-            let fetched = fetched
-                .and_then(|octets| crate::json::parse(&octets).ok())
-                .and_then(|envelope| wist_core::catalog::catalog_id(&envelope["catalog"]).ok());
-            for id in [latest, accepted, fetched].into_iter().flatten() {
+            for id in [latest, accepted, fetched_catalog_id(fetched)]
+                .into_iter()
+                .flatten()
+            {
                 kept.insert((publisher.clone(), name.clone(), id));
             }
         }
-        let mut statement = self
-            .conn
-            .prepare("SELECT publisher, name, catalog_id FROM catalog_queue")?;
         kept.extend(
-            statement
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            self.conn
+                .prepare(queued)?
+                .query_map(parameters, |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?
                 .collect::<rusqlite::Result<Vec<_>>>()?,
         );
         Ok(kept)
     }
 
-    pub(crate) fn discard_unmarked_list_rows(&self) -> Result<usize> {
-        Ok(self.conn.execute(
-            "DELETE FROM list_items WHERE NOT EXISTS (SELECT 1 FROM lists l WHERE l.publisher = list_items.publisher AND l.name = list_items.name AND l.catalog_id = list_items.catalog_id) AND publisher NOT IN (SELECT domain FROM pull_runs WHERE ended IS NULL)",
-            [],
-        )?)
-    }
-
-    /// WIST-2 §5.3: the lists of the latest, last accepted and queued Catalogs, and of the
-    /// Catalog fetched last, which a refusal for a dropped record leaves held.
-    pub(crate) fn discard_unkept_lists(&self) -> Result<usize> {
-        let kept = self.kept_catalogs()?;
-        let held: Vec<(String, String, String)> = self
+    fn catalog_kept(&self, (publisher, name, catalog_id): &ListKey) -> Result<bool> {
+        let row: Option<KeptIds> = self
             .conn
-            .prepare("SELECT publisher, name, catalog_id FROM held_lists")?
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut discarded = 0;
-        for key in held.into_iter().filter(|key| !kept.contains(key)) {
-            discarded += self.conn.execute(
-                "DELETE FROM held_lists WHERE publisher = ?1 AND name = ?2 AND catalog_id = ?3",
-                (&key.0, &key.1, &key.2),
-            )?;
+            .prepare_cached(
+                "SELECT latest_id, accepted_id, catalog_octets FROM collections WHERE publisher = ?1 AND name = ?2",
+            )?
+            .query_row((publisher, name), |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .optional()?;
+        if let Some((latest, accepted, fetched)) = row {
+            if latest.as_ref() == Some(catalog_id)
+                || accepted.as_ref() == Some(catalog_id)
+                || fetched_catalog_id(fetched).as_ref() == Some(catalog_id)
+            {
+                return Ok(true);
+            }
         }
-        Ok(discarded)
+        Ok(self
+            .conn
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM catalog_queue WHERE publisher = ?1 AND name = ?2 AND catalog_id = ?3)",
+            )?
+            .query_row((publisher, name, catalog_id), |row| row.get(0))?)
     }
 
     /// WIST-2 §5.3: tree files are held by hash across Collections, so where the files a kept
     /// Catalog names cannot all be read from those held, as after a chain, none is discarded.
-    pub(crate) fn discard_unnamed_tree_files(&self) -> Result<usize> {
+    fn tree_files_named(&self, kept: &BTreeSet<ListKey>) -> Result<Option<BTreeSet<String>>> {
         let mut named: BTreeSet<String> = BTreeSet::new();
-        for (publisher, name, catalog_id) in self.kept_catalogs()? {
-            let envelope = self.kept_envelope(&publisher, &name, &catalog_id)?;
+        for (publisher, name, catalog_id) in kept {
+            let envelope = self.kept_envelope(publisher, name, catalog_id)?;
             let Some(envelope) = envelope else {
-                return Ok(0);
+                return Ok(None);
             };
             let Ok(catalog) =
                 serde_json::from_value::<wist_core::objects::Catalog>(envelope["catalog"].clone())
             else {
-                return Ok(0);
+                return Ok(None);
             };
             let mut read = Vec::new();
             let walk =
@@ -462,24 +635,48 @@ impl Db {
                     }
                 });
             if !matches!(walk, wist_core::tree::Walk::Listed(_)) {
-                return Ok(0);
+                return Ok(None);
             }
             named.extend(read);
         }
-        let held: Vec<String> = self
-            .conn
-            .prepare("SELECT sha256 FROM tree_files")?
-            .query_map([], |row| row.get(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut discarded = 0;
-        for hex in held.into_iter().filter(|hex| !named.contains(hex)) {
-            discarded += self
-                .conn
-                .execute("DELETE FROM tree_files WHERE sha256 = ?1", [&hex])?;
-        }
-        Ok(discarded)
+        Ok(Some(named))
     }
 
+    pub fn payload_item_needed(&self, item_id: &str) -> Result<bool> {
+        self.payload_needed_by(item_id, |key| self.catalog_kept(key))
+    }
+
+    fn payload_needed_by(
+        &self,
+        item_id: &str,
+        mut is_kept: impl FnMut(&ListKey) -> Result<bool>,
+    ) -> Result<bool> {
+        if self.is_withdrawn(item_id)? {
+            return Ok(false);
+        }
+        let named: bool = self
+            .conn
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM records WHERE item_id = ?1) OR EXISTS(SELECT 1 FROM waiting_urls WHERE item_id = ?1) OR EXISTS(SELECT 1 FROM list_items i JOIN pull_runs r ON r.domain = i.publisher WHERE i.item_id = ?1 AND r.ended IS NULL)",
+            )?
+            .query_row([item_id], |row| row.get(0))?;
+        if named {
+            return Ok(true);
+        }
+        let lists = self
+            .conn
+            .prepare_cached(
+                "SELECT DISTINCT publisher, name, catalog_id FROM list_items WHERE item_id = ?1 AND admission IN ('admitted', 'unjudged')",
+            )?
+            .query_map([item_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<ListKey>>>()?;
+        for key in &lists {
+            if is_kept(key)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
     fn held_tree_file(&self, hex: &str) -> Result<Option<Vec<u8>>> {
         Ok(self
             .conn
@@ -534,42 +731,6 @@ impl Db {
         queued
             .map(|octets| Ok(crate::json::parse(&octets)?))
             .transpose()
-    }
-
-    pub fn payload_items_needed(&self) -> Result<BTreeSet<String>> {
-        let mut needed: BTreeSet<String> = BTreeSet::new();
-        for (publisher, name, catalog_id) in self.kept_catalogs()? {
-            let mut statement = self.conn.prepare_cached(
-                "SELECT item_id FROM list_items WHERE publisher = ?1 AND name = ?2 AND catalog_id = ?3 AND admission IN ('admitted', 'unjudged')",
-            )?;
-            needed.extend(
-                statement
-                    .query_map((&publisher, &name, &catalog_id), |row| {
-                        row.get::<_, String>(0)
-                    })?
-                    .collect::<rusqlite::Result<Vec<_>>>()?,
-            );
-        }
-        for sql in [
-            "SELECT item_id FROM records",
-            "SELECT item_id FROM waiting_urls",
-            "SELECT item_id FROM list_items WHERE publisher IN (SELECT domain FROM pull_runs WHERE ended IS NULL)",
-        ] {
-            needed.extend(
-                self.conn
-                    .prepare(sql)?
-                    .query_map([], |row| row.get::<_, String>(0))?
-                    .collect::<rusqlite::Result<Vec<_>>>()?,
-            );
-        }
-        for item_id in self
-            .conn
-            .prepare("SELECT w.item_id FROM withdrawals w JOIN epochs b ON b.epoch_number = w.epoch_number WHERE b.rejected = 0")?
-            .query_map([], |row| row.get::<_, String>(0))?
-        {
-            needed.remove(&item_id?);
-        }
-        Ok(needed)
     }
 
     pub fn discovered_declarations(&self, domain: &str) -> Result<Vec<Value>> {

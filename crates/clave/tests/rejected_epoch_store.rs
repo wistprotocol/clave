@@ -964,7 +964,7 @@ fn a_rejected_epochs_declaration_raises_no_floor_and_an_accepted_epochs_does() {
 }
 
 #[test]
-fn the_payload_items_needed_keep_an_item_withdrawn_only_by_a_rejected_epoch() {
+fn a_payload_item_withdrawn_only_by_a_rejected_epoch_stays_needed() {
     let store = RejectedStore::build();
     let db = &store.db;
     seal_with(
@@ -993,7 +993,6 @@ fn the_payload_items_needed_keep_an_item_withdrawn_only_by_a_rejected_epoch() {
         )
         .unwrap();
     }
-    let needed = db.payload_items_needed().unwrap();
-    assert!(needed.contains(ITEM_ID));
-    assert!(!needed.contains(OTHER_ITEM_ID));
+    assert!(db.payload_item_needed(ITEM_ID).unwrap());
+    assert!(!db.payload_item_needed(OTHER_ITEM_ID).unwrap());
 }
